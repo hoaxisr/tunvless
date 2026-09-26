@@ -88,3 +88,7 @@ build/reconmatch
 build/platmatch
 build/ndk/
 build/ndk-*.log
+build/nftvmap-tool
+build/urltestmatch
+build/nftvmapmatch
+build/groupsmatch
