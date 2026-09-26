@@ -174,8 +174,11 @@ run v6 env <<EOF
   "channels": [ { "name": "v6", "match": { "srs_file": "FIX/v6.srs" }, "out": "vpn" } ] }
 EOF
 check "IPv6 в наборе: принят" 0 "$rc"
-check "… v6 пропущены с предупреждением" yes "$(has "$(cat "$tmp/v6.err")" 'IPv6 пропущены')"
+# С 1.9 подсети IPv6 набора — в парный набор группы, у правила — v6-двойник (docs/architecture.md, «4б»).
+check "… IPv6 не пропущены" no "$(has "$(cat "$tmp/v6.err")" 'IPv6')"
 check "… v4 на месте" yes "$(has "$(cat "$tmp/v6.nft")" 'elements = { 198.51.100.0/24 }')"
+check "… v6 — в парном наборе" yes "$(has "$(cat "$tmp/v6.nft")" 'elements = { 2001:db8::/32, 2001:db9::1/128 }')"
+check "… и v6-двойник правила" yes "$(has "$(cat "$tmp/v6.nft")" 'iifname "br-lan" ip6 daddr @vpn_ip6')"
 run gone env <<EOF
 { "schema": 1, "from_default": ["192.168.1.0/24"], $OUT,
   "channels": [ { "name": "gone", "match": { "srs_file": "TMP/nope.srs" }, "out": "vpn" } ] }

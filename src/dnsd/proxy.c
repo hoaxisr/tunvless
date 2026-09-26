@@ -783,9 +783,10 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
 
     /* Matched a rule. AAAA, HTTPS (65), and SVCB (64) are suppressed outright
      * (NODATA) rather than relayed:
-     * - AAAA: splify has no IPv6 routing at all (VPN_SET/DIRECT_SET are IPv4-only),
-     *   so letting a real AAAA answer through would hand a dual-stack client a real
-     *   unmanaged address bypassing the tunnel.
+     * - AAAA: the engine routes IPv6 since 1.9 (paired `<group>6` sets, `ip -6 rule` per
+     *   output — docs/architecture.md, «4б»), but the resolver does not yet put AAAA answers
+     *   into those sets (no fake-IP v6 pool, no real-ip v6), so letting a real AAAA answer
+     *   through would hand a dual-stack client a real unmanaged address bypassing the tunnel.
      * - HTTPS/SVCB: upstream HTTPS responses contain ipv4hint/ipv6hint (real IPs) and
      *   h3 (QUIC ALPN). Letting real IPv4/IPv6 hints through causes modern browsers to
      *   attempt direct connections to real IPs outside fake-IP DNAT/set, causing 1-3s delays. */

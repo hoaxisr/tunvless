@@ -133,7 +133,8 @@ static void client_flow(FILE *f, const struct spec_client *c) {
         const char *v = c->from[i];
         if (!strcmp(v, "self")) self = 1;
         else if (!strncmp(v, "uid:", 4)) uid[un++] = v + 4;
-        else if (strchr(v, ':')) mac[mn++] = v;
+        /* MAC — по форме MAC, а не по двоеточию: с 1.9 в addr бывают и адреса IPv6. */
+        else if (spec_is_mac(v)) mac[mn++] = v;
         else addr[an++] = v;
     }
     struct flow w = { f, 0 };

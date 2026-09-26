@@ -8,8 +8,9 @@
  * роутере то же делает чужой `ip rule flush` (скрипт, другой пакет маршрутизации). Поэтому механизм
  * один на обе платформы и живёт в демоне-движке (`--watch`).
  *
- * СОБЫТИЯ. Отдельный сокет rtnetlink на группы RTNLGRP_IPV4_RULE и RTNLGRP_IPV6_RULE (IPv6 —
- * задел: свои правила IPv6 движок пока не ставит, и проверка ниже смотрит только IPv4). Фильтр BPF
+ * СОБЫТИЯ. Отдельный сокет rtnetlink на группы RTNLGRP_IPV4_RULE и RTNLGRP_IPV6_RULE (с 1.9 у
+ * выходов с KC_IPV6 есть и правила IPv6 — docs/architecture.md, «4б», — и проверка ниже сверяет
+ * оба семейства; починка `apply-commit --rule` возвращает оба). Фильтр BPF
  * на сокете пропускает из ядра только RTM_DELRULE: netd добавляет и снимает свои правила на каждой
  * смене сети, и будить демон ради чужих добавлений незачем. Из удалений повод — только наше
  * правило: метка в поле меток движка с нашей маской (STEER_MARK_MASK) или, где приоритет свой
@@ -86,6 +87,17 @@ struct rulewd {
 
 /* ---- проверка ------------------------------------------------------------------------------ */
 
+/* Снято ли чужой рукой правило IPv6 выхода — тем же признаком, что у IPv4 (см. шапку): правила нет,
+ * а таблица IPv6 занята. Ядро без IPv6 (дамп не прочитался) — не снято. */
+static int rule6_missing(const struct output *o) {
+    static char rules6[16384], routes6[8192];
+    if (!out_route6(o)) return 0;
+    if (rtnl_rules_text6(rules6, sizeof(rules6)) != 0 || !rules6[0]) return 0;
+    if (rtnl_routes_text6(o->table, routes6, sizeof(routes6)) != 0) return 0;
+    struct route_facts f = route_facts_of(rules6, routes6, o->mark, o->table);
+    return f.known && !f.rule && !(f.table == TBL_EMPTY && !f.backstop);
+}
+
 int rulewd_missing(const struct spec *sp, char *list, size_t n) {
     static char rules[16384], routes[8192];
     if (n) list[0] = '\0';
@@ -99,8 +111,9 @@ int rulewd_missing(const struct spec *sp, char *list, size_t n) {
         if (rtnl_routes_text(o->table, routes, sizeof(routes)) != 0) return -1;
         struct route_facts f = route_facts_of(rules, routes, o->mark, o->table);
         if (!f.known) return -1;
-        /* Таблица пуста — правило снято вместе с ней, и это наше решение (см. шапку). */
-        if (f.rule || (f.table == TBL_EMPTY && !f.backstop)) continue;
+        /* Таблица пуста — правило снято вместе с ней, и это наше решение (см. шапку). С 1.9 у
+         * выхода с маршрутом IPv6 так же сверяется и его правило IPv6. */
+        if ((f.rule || (f.table == TBL_EMPTY && !f.backstop)) && !rule6_missing(o)) continue;
         int w = snprintf(list + k, n > k ? n - k : 0, "%s%s", cnt ? "," : "", o->name);
         if (w > 0 && k + (size_t)w < n) k += (size_t)w;
         cnt++;

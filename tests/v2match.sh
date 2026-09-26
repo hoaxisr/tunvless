@@ -161,6 +161,14 @@ if [ -x "$XK" ]; then
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec arch2.yaml --state-dir "$tmp/state" 2>&1)"
     if echo "$out" | grep -qF "ещё не поддерживается в этой версии движка"; then ok; else
         bad "пример раздела 3 — отказ «ещё не поддерживается»" "$out"; fi
+    # balance и IPv6: член без IPv6 (VLESS) — группа без IPv6; её IPv6 первым правилом цепочки
+    # уходит в метку группы, а forward_v6 его отвергает (отказ, а не часть соединений мимо туннеля).
+    printf 'version: 2\noutputs:\n  a: { kind: interface, device: wg0 }\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl }\n  bal: { kind: group, pick: balance, members: [a, nl] }\nrules:\n  - { to: all, out: bal }\n' > "$tmp/bal6.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec bal6.yaml --state-dir "$tmp/state" 2>&1)"
+    bm="$(echo "$out" | grep -o 'goto bal_[0-9]*' | head -n 1 | cut -d_ -f2)"
+    if [ -n "$bm" ] && echo "$out" | grep -q "meta nfproto ipv6 goto mark_$bm comment \"steer-balance-v6:bal\"" &&
+       echo "$out" | grep -q 'reject with icmpx type admin-prohibited comment "steer-v6drop:bal"'; then ok; else
+        bad "balance с членом без IPv6 — IPv6 группы в отказ" "$(echo "$out" | grep -E 'bal_|v6' | head -n 8)"; fi
 else
     bad "не собран $XK (make build/steer-xk)"
 fi
@@ -356,12 +364,37 @@ dns:
 EOF
 refused "dns.upstreams — ещё не поддерживается" "dns.upstreams" 6
 
+# Адреса IPv6 клиентов и lan законны с 1.9 (docs/architecture.md, «4б»): правило получает
+# v6-двойник, convert печатает адреса как есть.
+y <<'EOF'
+version: 2
+lan: { addr: [192.168.1.0/24, "fd00:1::/64"] }
+clients:
+  v6: { addr: [192.168.1.5, "fd00::5"] }
+lists:
+  a: { prefixes_file: TMP/a.lst }
+outputs:
+  vpn: { kind: interface, device: wg0 }
+rules:
+  - { for: v6, to: a, out: vpn }
+EOF
+accepted "адреса IPv6 в clients и lan — приняты"
+out6="$("$BIN" apply --dry-run --spec "$tmp/s.yaml" $S 2>&1)"
+if echo "$out6" | grep -q 'ip saddr { 192.168.1.5 } ip daddr @vpn_ip' &&
+   echo "$out6" | grep -q 'ip6 saddr fd00:1::/64 udp dport 53'; then ok
+else bad "адреса IPv6 — правило IPv4 без них, заворот DNS по подсети IPv6 lan" "$(echo "$out6" | head -n 30)"; fi
+"$BIN" spec convert --spec "$tmp/s.yaml" > "$tmp/c6.yaml" 2>&1
+if grep -q 'addr: \[192.168.1.5, fd00::5\]' "$tmp/c6.yaml" && grep -q 'fd00:1::/64' "$tmp/c6.yaml"; then ok
+else bad "convert печатает адреса IPv6 клиентов и lan (в addr, не в mac)" "$(head -n 20 "$tmp/c6.yaml")"; fi
+"$BIN" spec convert --spec "$tmp/c6.yaml" > "$tmp/c6b.yaml" 2>&1
+if cmp -s "$tmp/c6.yaml" "$tmp/c6b.yaml"; then ok
+else bad "convert с адресами IPv6 — неподвижная точка" "$(head -n 20 "$tmp/c6b.yaml")"; fi
 y <<'EOF'
 version: 2
 clients:
-  v6: { addr: [fd00::5] }
+  v6: { addr: ["fd00::/129"] }
 EOF
-refused "адрес IPv6 — ещё не поддерживается" "адреса IPv6" 3:16
+refused "адрес IPv6 с негодной длиной — отказ" "не адрес IPv4 или IPv6" 3:16
 
 y <<'EOF'
 version: 2

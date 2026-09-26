@@ -709,6 +709,13 @@ static inline int out_failopen_capable(const struct output *o) {
  * Одна функция на двух читателей одного файла: компилятор берёт отсюда адреса, резолвер —
  * домены. Подробнее — у определения в spec.c. */
 int spec_line_is_addr(const char *s);
+/* Семейство адресной строки: 4, 6 или 0 — не адрес. Компилятор кладёт строки 4 в набор
+ * ipv4_addr, строки 6 — в парный набор ipv6_addr (docs/architecture.md, «4б»); резолвер
+ * пропускает обе. */
+int spec_line_family(const char *s);
+/* MAC-адрес (шесть групп по 1-2 шестнадцатеричные цифры). В «кому» он отличается от адреса
+ * IPv6 именно этим, а не двоеточием. */
+int spec_is_mac(const char *s);
 
 /* Одиночный хозяин: адрес, адрес/32 или MAC. Подсеть — нет. Нужно правилу на устройство,
  * см. поле dev_scope у правила. */
@@ -925,6 +932,23 @@ void rule_drop(unsigned mark, int table);
  * копии и прежние формы снимаются уже после. Зачем так, а не rule_drop + rule_add, — у
  * определения в failover.c («без мгновения пустоты»). */
 void rule_ensure(unsigned mark, int table);
+
+/* ---- маршрутизация IPv6 выхода (docs/architecture.md, «4б») ------------------------------
+ *
+ * Выход с устройством и свойством KC_IPV6 (interface, awg, группа из таких) получает правило
+ * `ip -6 rule fwmark <метка> table <таблица>` и маршрут по умолчанию в свою таблицу IPv6 — с той же
+ * меткой и тем же номером таблицы (у IPv6 свой набор таблиц). Выход без KC_IPV6 маршрута IPv6 не
+ * получает, и IPv6 его правил отвергается в наборе правил (цепочка forward_v6, generate.c), а не
+ * уходит напрямую. Устройство и доводы — у определений в failover.c. */
+static inline int out_route6(const struct output *o) {
+    return out_has_device(o) && out_has_cap(o, KC_IPV6);
+}
+void rule_ensure6(unsigned mark, int table);
+void rule_drop6(unsigned mark, int table);
+void route6_flush(int table);
+/* Половина IPv6 привязки: маршрут в dev (NULL — запрет) и правило. У выхода без out_route6 — ничего,
+ * 0. Иначе 0 — маршрут встал; не встал — в таблице запрет. */
+int route6_bind(const struct output *o, const char *dev);
 /* Маршрут по умолчанию таблицы выхода — в устройство dev (или запрет, если dev == NULL) одной
  * заменой, без сброса таблицы; всё прочее в таблице снимается после. 0 — встал; иначе
  * таблица осталась, как была, и решать вызывающему. Там же, в failover.c. */

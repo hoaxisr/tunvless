@@ -68,6 +68,10 @@ struct group {
      * объявляется без строки elements: `elements = {  }` nft не принимает и отвергает весь
      * набор правил — то есть один такой список снимал бы маршрутизацию целиком. */
     size_t addrs;
+    /* Сколько строк IPv6 в тех же файлах — они идут в парный набор «<имя>6» (ipv6_addr), а
+     * правило получает v6-двойника (docs/architecture.md, «4б»). Считает тот же
+     * check_address_lists; ноль — набора IPv6 у группы нет вовсе. */
+    size_t addrs6;
     /* Which channels fed it — reported so a counter still has names behind it. */
     const char *members[MAX_RULES];
     size_t members_n;
@@ -80,6 +84,7 @@ struct group {
     const struct srs_psel **srs;
     size_t srs_n, srs_cap;
     size_t srs_addrs;
+    size_t srs_addrs6;          /* подсетей v6 из наборов (не у доп. группы — см. srsplan.c) */
     /* Составной набор (ipv4_addr . inet_proto . inet_service): у списка канала смешанное
      * сужение, и у каждого элемента оно своё — правило одно, без x_l4. files_l4 — сужение, с
      * которым идут адреса каждого файла files (параллельно files). */
@@ -103,6 +108,22 @@ static inline int group_srs_v4(const struct group *g) {
 /* Есть ли у группы набор адресов (правило с поиском в нём), а не «весь трафик». */
 static inline int group_has_set(const struct group *g) {
     return g->files_n || g->srs_n || g->domains || g->emptied;
+}
+
+/* Есть ли у группы парный набор IPv6 «<имя>6» — по СОДЕРЖИМОМУ списков: строки IPv6 в файлах
+ * и подсети IPv6 из наборов .srs. Считает check_address_lists, поэтому ответ верен только после
+ * него (apply, план демона); status, diag и explain его не зовут, и для них ответ — «нет».
+ * Набора без элементов не заводится: пустой поиск на каждом пакете IPv6 ничего бы не дал, а
+ * адресов IPv6 доменных групп резолвер пока не выдаёт (AAAA для имён под правилом подавлены
+ * до fake-IP v6). */
+static inline int group_has_set6(const struct group *g) {
+    return !g->extra && (g->addrs6 || g->srs_addrs6);
+}
+
+/* Имя парного набора IPv6: имя группы и «6». Имена групп рассчитаны на 31 символ старых ядер
+ * (group_set_name), и одна цифра в них укладывается: самое длинное имя с ней — 28 символов. */
+static inline void group_set6_name(const struct group *g, char *dst, size_t n) {
+    snprintf(dst, n, "%.62s6", g->name);
 }
 
 

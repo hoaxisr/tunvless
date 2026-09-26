@@ -112,6 +112,18 @@ static void build_one(struct nft_table *t, const struct spec *sp, const struct o
     }
 
     struct nft_chain *c = ir_chain_add(t, ir_strdup(t->rs, chain));
+    /* IPv6. Группа несёт IPv6, только если его несут все члены (свойства группы — пересечение,
+     * KC_IPV6): тогда IPv6 раздаётся той же картой и держится той же меткой соединения, а метка
+     * члена ведёт в его таблицу IPv6 (ip -6 rule члена). Иначе IPv6 группы — в метку самой группы
+     * первым правилом, и цепочка forward_v6 отвергает его (выход без IPv6, generate.c): отказ
+     * заметный и сразу, а не «часть соединений v6 работает, часть уходит в отказ» по случайному
+     * слоту. */
+    if (!out_has_cap(g, KC_IPV6)) {
+        struct nft_rule *r6 = ir_rule(c);
+        ir_family(r6, 6);
+        ir_x(r6, "goto %s", fall);
+        ir_comment(r6, "steer-balance-v6:%s", g->name);
+    }
     restore_rules(t, c, sp, g, 0);
     struct nft_rule *r = ir_rule(c);
     ir_x(r, "numgen random mod %d vmap @%s", GROUP_BAL_SLOTS, map);

@@ -317,14 +317,10 @@ int has_fakeip(const struct groups *gr) {
  * Чего он НЕ умеет: MAC виден только у соседа по L2. За вторым роутером или повторителем в
  * пакете будет MAC этого роутера, а не устройства, и правило накроет всех, кто за ним. Это
  * свойство сети, а не наша недоделка, но сказать об этом обязаны — в интерфейсе есть подсказка. */
+/* С 1.9 в «кому» бывают и адреса IPv6, у которых тоже двоеточия (пять — у «a::b:c:d:e»): форма
+ * MAC проверяется по группам, одним определением с разбором спеки (spec_is_mac в parse.c). */
 int is_mac(const char *s) {
-    int colons = 0;
-    for (const char *p = s; *p; p++) {
-        if (*p == ':') { colons++; continue; }
-        if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')))
-            return 0;
-    }
-    return colons == 5;
+    return spec_is_mac(s);
 }
 
 
@@ -363,7 +359,7 @@ int has_via(const struct spec *sp) {
  *
  * Отдельным проходом, до генерации: сообщение об ошибке должно появиться раньше, чем
  * мы начнём собирать набор, и раньше, чем что-либо будет применено. */
-static int count_list(const char *path, size_t *total, size_t *bad,
+static int count_list(const char *path, size_t *total, size_t *bad, size_t *v6,
                       char *first_bad, size_t first_bad_n, size_t *first_bad_line,
                       struct err *e) {
     FILE *in = fopen(path, "r");
@@ -374,7 +370,7 @@ static int count_list(const char *path, size_t *total, size_t *bad,
     if (!in) return err_set(e, "%s: cannot read a channel's list", path);
     char line[512];
     size_t lineno = 0;
-    *total = *bad = 0;
+    *total = *bad = *v6 = 0;
     if (first_bad_n) first_bad[0] = '\0';
     while (fgets(line, sizeof(line), in)) {
         lineno++;
@@ -384,7 +380,10 @@ static int count_list(const char *path, size_t *total, size_t *bad,
         while (*p == ' ' || *p == '\t') p++;
         if (!*p || *p == '#' || *p == ';') continue;
         (*total)++;
-        if (spec_line_is_addr(p)) continue;
+        /* Строка IPv6 — адрес, но другого набора (парного «<имя>6»): считается отдельно. */
+        int fam = spec_line_family(p);
+        if (fam == 6) (*v6)++;
+        if (fam) continue;
         if (!(*bad)++ && first_bad_n) {
             /* Точность в формате, а не только размер буфера: строка из файла бывает
              * длиннее образца, и обрезать её надо явно, а не «как получится». */
@@ -423,13 +422,16 @@ int check_address_lists(struct groups *gr, struct err *e) {
     }
     for (size_t i = 0; i < gr->n; i++) {
         struct group *g = &gr->g[i];
-        g->srs_addrs = 0;
+        g->srs_addrs = g->srs_addrs6 = 0;
         for (size_t k = 0; k < g->srs_n; k++) {
             const struct srs_psel *ps = g->srs[k];
             for (size_t c = 0; c < ps->ncl; c++)
                 if (ps->sel[c >> 3] & (1u << (c & 7))) {
                     const struct srs_clause *cl = srs_clause(ps->set, c);
-                    if (cl->kind == SRS_C_CIDR) g->srs_addrs += cl->n_v4;
+                    if (cl->kind != SRS_C_CIDR) continue;
+                    g->srs_addrs += cl->n_v4;
+                    /* Доп. группе набор IPv6 не положен (её условия есть только для IPv4). */
+                    if (!g->extra) g->srs_addrs6 += cl->n_v6;
                 }
         }
     }
@@ -459,11 +461,13 @@ int check_address_lists(struct groups *gr, struct err *e) {
         /* Раньше здесь стоял пропуск доменных групп целиком. Теперь у группы могут быть и
          * адресные файлы: пропускать её значило бы не заметить пустой или сломанный список. */
         for (size_t k = 0; k < g->files_n; k++) {
-            size_t total = 0, bad = 0, bad_line = 0;
+            size_t total = 0, bad = 0, v6 = 0, bad_line = 0;
             char sample[128];
-            if (count_list(g->files[k], &total, &bad, sample, sizeof(sample), &bad_line, e) != 0)
+            if (count_list(g->files[k], &total, &bad, &v6, sample, sizeof(sample), &bad_line,
+                           e) != 0)
                 return -1;
-            g->addrs += total - bad;
+            g->addrs += total - bad - v6;
+            g->addrs6 += v6;
             if (!total) {
                 fprintf(stderr, LOG_W "%s: список пуст — канал «%s» ничего не поймает\n",
                         g->files[k], g->members_n ? g->members[0] : g->name);

@@ -221,6 +221,13 @@ static int bridge_nf_on(void) {
     return -1;
 }
 
+/* Замечания IPv6 (v6_notes в generate.c) — проверками diag с их приговором. */
+static void diag_v6_note(void *ctx, const char *id, const char *verdict, const char *what,
+                         const char *why) {
+    (void)ctx;
+    diag(id, verdict, what, why);
+}
+
 int cmd_diag(const char *spec) {
     static struct spec cfg;
     static struct groups gr;
@@ -404,30 +411,14 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
              "выключите DoH в браузере или пользуйтесь адресными списками");
     }
 
-    /* 5. IPv6. Адресных каналов для IPv6 нет вовсе, значит при живом IPv6 наружу трафик
-     *    к тем же целям уходит мимо канала. Для on_fail=drop это утечка, а не неудобство,
-     *    поэтому там fail. Проверяем НАЛИЧИЕ маршрута, а не убеждения: без него нет и
-     *    повода тревожить. */
-    int v6 = rtnl_default6() == 1;
-    if (v6) {
-        int drops = 0;
-        for (size_t i = 0; i < sp->out_n; i++)
-            if (sp->out[i].on_fail == FAIL_DROP) drops++;
-        int dom_only = 1;
-        for (size_t i = 0; i < gr->n; i++)
-            if (gr->g[i].files_n || group_srs_v4(&gr->g[i])) dom_only = 0;
-        if (drops)
-            diag("ipv6", "fail", "IPv6 наружу работает, а каналы его не разбирают",
-                 "выход с on_fail=drop останавливает только IPv4: то, что должно быть "
-                 "отброшено, уйдёт по IPv6 — отключите IPv6 у провайдера или на роутере");
-        else if (!dom_only)
-            diag("ipv6", "warn", "IPv6 наружу работает, а адресные каналы только про IPv4",
-                 "сайт, доступный по IPv6, пойдёт мимо канала: доменные каналы прикрыты "
-                 "подавлением AAAA, адресные — нет");
-        else
-            diag("ipv6", "ok", "IPv6 наружу работает, доменные каналы прикрыты",
-                 "");
-    }
+    /* 5. IPv6. С 1.9 правила разбирают IPv6 сами (docs/architecture.md, «4б»): подсети IPv6
+     *    списков — в парных наборах, выход с IPv6 ведёт его своей таблицей (и on_fail=drop
+     *    останавливает оба семейства), выход без IPv6 его отвергает, доменные каналы прикрыты
+     *    подавлением AAAA. Что остаётся назвать — выходы без IPv6 и клиентов, которых по IPv6 не
+     *    узнать, — говорит проверка 9 (v6_notes). Здесь — только факт, что IPv6 наружу есть
+     *    (маршрут по умолчанию — по rtnetlink, без процесса). */
+    if (rtnl_default6() == 1)
+        diag("ipv6", "ok", "IPv6 наружу работает, правила его разбирают", "");
 
     /* 6. Публичный резолвер внутри списка канала на выходе VLESS.
      *
@@ -640,6 +631,9 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
         for (size_t i = 0; i < sp->out_n; i++)
             if (kind_of(&sp->out[i]) == k) k->diag(diag, sp, &sp->out[i]);
     }
+
+    /* 9. IPv6 правил: выходы без IPv6 и клиенты, которых по IPv6 не узнать. */
+    v6_notes(sp, gr, diag_v6_note, NULL);
 
     fprintf(out, "],\"warn\":%d,\"fail\":%d}\n", g_diag_warn, g_diag_fail);
     /* Код возврата — чтобы это годилось в скрипт, а не только глазам. */

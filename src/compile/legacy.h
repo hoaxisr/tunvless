@@ -20,7 +20,9 @@ int legacy_rewrite(struct nft_rs *rs, const struct spec *sp, int nftc, struct er
 
 /* Какие таблицы, кроме inet, есть в старой раскладке этого запуска (g_nftc). */
 int legacy_has_ip(const struct spec *sp);
-int legacy_has_ip6(void);
+/* ip6 — если ядро умеет nat в ip6 (заворот DNS по IPv6) или если спека метит IPv6 самого
+ * устройства (нужна цепочка перемаршрутизации IPv6, см. legacy.c). */
+int legacy_has_ip6(const struct spec *sp);
 /* Может ли у доменной группы быть статическая половина набора («<имя>_n») в ядре — для
  * читателей ядра, diag и explain. */
 int legacy_may_have_static(const struct group *g);

@@ -125,7 +125,10 @@ check "метка сокета туннеля без via" "${AWG_FWMARK:-off}" "
 check "адрес из Address" "1" "$(ip -4 addr show dev nl | grep -c '10.77.0.2/24')"
 check "MTU по умолчанию 1420" "1" "$(ip link show nl | grep -c 'mtu 1420')"
 check "предупреждение про DNS из файла" "1" "$(printf '%s\n' "$err" | grep -c 'DNS из файла не применяется')"
-check "таблица выхода ведёт в nl" "1" "$(ip route show table all 2>/dev/null | grep -c '^default dev nl table')"
+# Таблицы IPv4 — `ip -4`: с 1.9 у выхода awg (KC_IPV6) есть и таблица IPv6 с тем же номером, а
+# `ip route show table all` здешнего iproute2 печатает оба семейства.
+check "таблица выхода ведёт в nl" "1" "$(ip -4 route show table all 2>/dev/null | grep -c '^default dev nl table')"
+check "  и таблица IPv6 выхода — тоже в nl" "1" "$(ip -6 route show table all 2>/dev/null | grep -c '^default dev nl table')"
 check "в status ключа нет" "0" "$(st | grep -c "$(cat "$tmp/our.key" | cut -c1-20)")"
 check "status: impl" "wireguard" "$(field impl)"
 # Android-сборка: masquerade туннелю ставит сам движок правилом iptables (android_masq_sync), как
@@ -154,13 +157,13 @@ check "пир видит рукопожатие (сторона wg)" "1" "$($P w
 
 # ---- 3. сторож: здоровье по рукопожатию, без проб ---------------------------------------
 "$BIN" failover $S >/dev/null 2>&1
-check "сторож: выход жив, маршрут на месте" "1" "$(ip route show table all | grep -c '^default dev nl table')"
+check "сторож: выход жив, маршрут на месте" "1" "$(ip -4 route show table all | grep -c '^default dev nl table')"
 # Запасной запрет (blackhole с метрикой STEER_BACKSTOP_METRIC) лежит у выхода с drop всегда и
 # запретом в таблице не считается — проверки ниже смотрят на основной, без метрики.
 nobs() { grep -v ' metric 65535'; }
-check "сторож: без blackhole" "0" "$(ip route show table all | nobs | grep -c 'blackhole default')"
+check "сторож: без blackhole" "0" "$(ip -4 route show table all | nobs | grep -c 'blackhole default')"
 check "запасной запрет у выхода с drop на месте" "1" \
-      "$(ip route show table all | grep -c 'blackhole default.* metric 65535')"
+      "$(ip -4 route show table all | grep -c 'blackhole default.* metric 65535')"
 
 # ---- 4. смена файла — перенастройка без пересоздания ------------------------------------
 idx="$(cat /sys/class/net/nl/ifindex)"
@@ -198,7 +201,7 @@ check "отказ назван" "1" "$(printf '%s\n' "$err" | grep -c 'нет м
 check "устройство nl2 не создано" "0" "$(ip link show nl2 2>/dev/null | grep -c nl2)"
 check "устройство выхода, убранного из спеки, снято" "0" "$(ip link show nl 2>/dev/null | grep -c 'nl:')"
 check "таблица выхода без устройства — blackhole (on_fail=drop)" "1" \
-      "$(ip route show table all | nobs | grep -c 'blackhole default')"
+      "$(ip -4 route show table all | nobs | grep -c 'blackhole default')"
 
 # ---- 6. имя, выдающее туннель, заменяется ------------------------------------------------
 mkconf ""
@@ -329,7 +332,7 @@ check "круг: выбор устройств без перемен не пер
 check "круг: мёртвый dd объявлен по замеру прошлого прохода (память между проходами)" "1" \
       "$(grep -c 'выход dd: живых устройств нет, трафик остановлен' "$tmp/loop.out")"
 check "круг: у dd запрет" "1" "$(ip route show table "$ddtable" | nobs | grep -c 'blackhole default')"
-check "круг: живой nl не тронут" "1" "$(ip route show table all | grep -c '^default dev nl table')"
+check "круг: живой nl не тронут" "1" "$(ip -4 route show table all | grep -c '^default dev nl table')"
 check "круг: подпись dd при починке не переписана (та же)" "$sig0" \
       "$(stat -c %y "$tmp/state/awg-dd.sig" 2>/dev/null)"
 check "круг: починка dd была" "1" "$([ "$(grep -c 'dd: туннель молчит' "$tmp/loop.out")" -ge 1 ] && echo 1 || echo 0)"
