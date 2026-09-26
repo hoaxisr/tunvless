@@ -21,6 +21,7 @@
 #include "generate.h"
 #include "srs.h"
 #include "nftdump.h"
+#include "balance.h"
 
 /* Короткий строковый буфер для выражений-перечней («ip saddr { a, b }», «th dport { … }»).
  * 4 КБ с запасом: самый длинный перечень — MAX_FROM (32) адресов или устройств по 63 символа,
@@ -487,6 +488,17 @@ static int build_prerouting_mark(struct nft_table *t, const struct spec *sp,
         /* Метка СОЕДИНЕНИЯ ставится не всем: она живёт в conntrack и переживает
          * снятие правил, поэтому у выходов, которым она не нужна, её нет вовсе — см.
          * out_needs_ctmark в spec.h и что из-за неё случалось после удаления tgws. */
+        /* Группа pick: balance метку не ставит здесь: правило переходит в её цепочку, и метку
+         * члена выбирает карта (compile/balance.c). goto, а не jump: конец цепочки группы — это
+         * конец и этой цепочки, как `return` ниже, — первое совпавшее правило решает. */
+        if (out_balanced(o)) {
+            char bc[32];
+            group_bal_chain(o, bc, sizeof(bc));
+            x_counter_carried(r, g->name, 0);
+            ir_x(r, "goto %s", bc);
+            ir_comment(r, "steer:%s", g->name);
+            continue;
+        }
         x_mark(r, o, out_skips_zapret(o) ? (o->mark | ZAPRET_SKIP_MARK) : o->mark);
         /* `return` and not `accept`: it ends OUR chain, letting the rest of the
          * firewall proceed, while making the first matching group the winner. */
@@ -906,6 +918,9 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
     struct nft_table *t = ir_table_add(rs, NFT_FAM_INET, nft_table());
     build_group_sets(t, gr);
     if (build_prerouting_mark(t, sp, gr, e) != 0) return -1;
+    /* Группы balance: цепочки, карты и цепочки меток (compile/balance.c). Без таких групп — ничего,
+     * и текст прежний до байта. */
+    if (nft_emit_balance(t, sp, gr) != 0) return err_set(e, "out of memory building the ruleset", NULL);
     if (plat()->local_channels && has_local(gr) && nft_emit_output_mark(rs, sp, gr, e) != 0)
         return -1;
     build_failopen(t, sp);

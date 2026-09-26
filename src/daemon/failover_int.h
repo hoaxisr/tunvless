@@ -62,6 +62,10 @@ struct rule_copies {
 
 struct rule_copies rule_copies_of(const char *rules, uint32_t mark, int table);
 
+/* on_fail выхода o — то, что проход делает при отказе (apply_failed с объявлением в журнале).
+ * Наружу — ради команды select (fogroup.c): выбранный человеком член не работает. */
+void fo_fail_apply(struct output *o);
+
 /* ---- прочее, что тест дёргает напрямую, в обход cmd_failover ----------------------- */
 void active_get(const char *out, char *dev, size_t n);
 int revive(const struct spec *sp, const struct output *o, const char *dev, int verbose);

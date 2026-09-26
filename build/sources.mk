@@ -102,20 +102,21 @@ DNSD_SRC := src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c \
 # которым нужны TLS и клиенты туннелей, — только в полном пакете (PROFILE_extended и android).
 # tgws — базовый: правила перехвата пишет любой движок, мост живёт своей программой (полный
 # пакет, микропакет stgws). Состав проверяет tests/buildmatch.sh.
-KINDS_BASE_SRC := src/kinds/kind.c src/kinds/direct.c src/kinds/group.c src/kinds/interface.c src/kinds/zapret.c \
-                  src/kinds/tgws.c src/kinds/awg.c
+KINDS_BASE_SRC := src/kinds/kind.c src/kinds/direct.c src/kinds/group.c src/kinds/grpurl.c src/kinds/interface.c \
+                  src/kinds/zapret.c src/kinds/tgws.c src/kinds/awg.c
 KINDS_EXT_SRC  := src/kinds/vless.c src/kinds/xsteer.c
 
 # src/daemon/steer.c нарезан на модули (docs/architecture.md, раздел 2, «Слои и каталоги»):
 # компиляция спеки в правила — в src/compile, остальное ядро — в src/daemon, порядок ниже
 # такой же, как был в steer.c (lib/run.c раньше всех — на него ссылаются и compile, и daemon).
-CORE_SRC := src/lib/run.c src/lib/jsonw.c src/lib/evline.c src/compile/groups.c src/compile/generate.c src/compile/ir.c src/compile/print.c src/compile/legacy.c src/daemon/fwcheck.c \
+CORE_SRC := src/lib/run.c src/lib/jsonw.c src/lib/evline.c src/compile/groups.c src/compile/generate.c src/compile/balance.c src/compile/ir.c src/compile/print.c src/compile/legacy.c src/daemon/fwcheck.c \
             src/daemon/apply.c src/daemon/status.c src/daemon/nftquery.c src/daemon/diag.c \
             src/daemon/explain.c src/daemon/helpers.c src/daemon/supervise.c src/daemon/supd.c src/daemon/watch.c src/daemon/main.c \
             $(MODEL_SRC) $(DNSD_SRC) src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
             src/cli/cli.c src/tools/srsread.c src/tools/hwid.c src/daemon/ctl.c \
             src/daemon/conns.c src/daemon/loop.c src/daemon/state.c src/daemon/watchd.c src/daemon/recon.c src/daemon/rulewd.c \
-            src/daemon/foprobe.c src/daemon/gaiw.c $(KINDS_BASE_SRC)
+            src/daemon/foprobe.c src/daemon/gaiw.c src/daemon/urltest.c src/daemon/fogroup.c src/lib/nftvmap.c \
+            $(KINDS_BASE_SRC)
 
 # Общее для обеих ролей: формат кадра, конфигурация, маршрутизация, рукопожатие, соединение
 # и то, на чём они стоят (TLS-записи, примитивы Reality, TUN). Расходиться на проводе этим
@@ -138,7 +139,8 @@ XS_COMMON_SRC := src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/x
                  src/proto/xsteer/xsadmin.c
 EXT_ROUTER_SRC := src/proto/vless/sub.c src/proto/vless/vless_proto.c src/proto/vless/vision.c \
                   src/proto/vless/client.c src/tunnel/tunnel.c src/tunnel/rtx.c \
-                  src/proto/xsteer/xsclient.c src/proto/vless/subfetch.c src/proto/tgws/tgws.c src/proto/tls/tlsprobe.c
+                  src/proto/xsteer/xsclient.c src/proto/vless/subfetch.c src/proto/tgws/tgws.c src/proto/tls/tlsprobe.c \
+                  src/proto/tls/urltls.c
 EXT_SERVER_SRC := src/proto/xsteer/xshub.c
 EXT_TGWS_SRC := src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c \
                 src/proto/tls/chello.c src/proto/tgws/tgws.c src/proto/tls/tlsprobe.c

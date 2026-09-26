@@ -277,8 +277,35 @@ size_t out_members(const struct spec *sp, const struct output *o, const struct o
 int group_of_devices(struct spec *sp, struct output *o, const char (*devs)[32], size_t n,
                      struct err *e);
 /* Замкнуть группу, когда её члены известны: свойства группы — пересечение свойств членов
- * (group_cfg.caps). 0 — годится; -1 — отказ (членов нет, член не годится), текст в e. */
+ * (group_cfg.caps). Вложенная группа замыкается раньше внешней. 0 — годится; -1 — отказ (членов
+ * нет, член не годится, balance членом группы с одной таблицей), текст в e. */
 int group_seal(struct spec *sp, struct output *g, struct err *e);
+/* Настройка группы до разбора: умолчания (def, idle_timeout_s, состояние cur/sel/lat_ms — «нет»). */
+void group_cfg_init(struct group_cfg *g);
+/* Члены — именованные выходы спеки (v2), а не безымянные члены пула v1: у каждого своя метка,
+ * своя таблица и свой приговор сторожа в том же проходе (src/daemon/failover.c). */
+int group_named(const struct group_cfg *g);
+/* Имя pick (enum group_pick в spec.h), как пишется в спеке. */
+const char *group_pick_name(int p);
+/* balance: карта ядра — GROUP_BAL_SLOTS слотов `numgen random mod N`; owner[s] — номер члена
+ * слота s (0..members_n-1) по весам живых членов alive (бит на члена), 0xff — живых нет. Почему
+ * слоты, а не `mod <живых>` — у определения. */
+#define GROUP_BAL_SLOTS 120
+void group_balance_slots(const struct group_cfg *g, unsigned alive,
+                         unsigned char owner[GROUP_BAL_SLOTS]);
+/* Имена объектов balance в таблице движка (compile/balance.c строит, сторож переписывает карту):
+ * цепочка группы `bal_<таблица>`, её карта `balmap_<таблица>` (`type mark : verdict`, ключ — слот
+ * numgen) и цепочка метки выхода `mark_<таблица>` (член или сама группа — запасной путь). */
+void group_bal_chain(const struct output *o, char *dst, size_t n);
+void group_bal_map(const struct output *o, char *dst, size_t n);
+void group_mark_chain(const struct output *o, char *dst, size_t n);
+/* Куда ведёт слот карты, отданный члену m: вложенная balance — в её цепочку (её доля делится
+ * дальше по её весам), остальные — в цепочку метки члена. */
+void group_bal_target(const struct output *m, char *dst, size_t n);
+/* Вес члена balance — 1..GROUP_WEIGHT_MAX (`weights` спеки v2). */
+#define GROUP_WEIGHT_MAX 100
+/* Сколько секунд без трафика через группу urltest не делается — предел `idle_timeout`. */
+#define GROUP_IDLE_MAX_S 86400
 /* ВЫБОР ПО ЗАМЕРУ (pick: latency): ms — задержки членов по порядку (-1 — не измерено). Лучший —
  * наименьшая задержка; из тех, кто хуже лучшего не больше чем на tol, берётся самый
  * предпочтительный (первый по порядку): порядок человека решает при равенстве. Возврат — номер

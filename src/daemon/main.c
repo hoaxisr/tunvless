@@ -43,6 +43,7 @@
 #include "daemon.h"
 #include "groups.h"
 #include "v2.h"
+#include "fogroup.h"
 
 /* Уровень в журнале — см. одноимённые макросы в failover.c и obfs.c. Метка подсистемы
  * здесь «apply»: все строки ниже пишутся при компиляции и применении спеки. Отказы
@@ -361,6 +362,9 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "supervise")) return cmd_supervise(spec);
     if (!strcmp(cmd, "failover"))
         return a.loop ? failover_loop(spec, a.verbose, a.loop) : cmd_failover(spec, a.verbose);
+    /* Без демона (клиент его не нашёл или движок позван напрямую): то же, что делает демон, но с
+     * памятью сторожа в файлах каталога состояния (src/daemon/fogroup.c). */
+    if (!strcmp(cmd, "select")) return cmd_select(spec, a.pos[0], a.pos[1]);
     if (!strcmp(cmd, "explain")) {
         /* Адрес ИЛИ имя. Проверка формы обязательна для обоих: аргумент подставляется в
          * вызов nft, и именно здесь однажды была дыра — адрес уходил в system(). */

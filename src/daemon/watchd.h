@@ -37,5 +37,13 @@ void watchd_helper_changed(struct watchd *w);
 /* Демон уходит: идущий проход прерывается (правило пробы снимается, команда оживления
  * убивается). */
 void watchd_stop(struct watchd *w);
+/* Команда select меняет выбор группы мимо прохода: идущий проход прерывается (его решения о
+ * выборе ещё не записаны и легли бы поверх выбора человека), следующий — после успокоения. */
+void watchd_preempt(struct watchd *w);
+
+/* Событие сторожа (switched, failed, revived, balance) — подписчикам, в формате docs/ctl.md. Им же
+ * шлёт свои события команда select. */
+struct fo_event;
+void steerd_fo_emit(struct steerd *d, const struct fo_event *e);
 
 #endif

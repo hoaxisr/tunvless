@@ -7,9 +7,23 @@
  *   order   — первый живой член по порядку. Это прежний пул `devices` у выхода v1: перевод
  *             (model/v1.c) делает из каждого устройства безымянный член-интерфейс, а имя группы
  *             — прежнее имя выхода, поэтому status, реестр меток и имена наборов не меняются;
- *   latency — самый быстрый с допуском (прежний `prefer: latency`);
- *   manual, balance, вложенные группы — шаг 3 из 1.9; структура заложена, поведения нет, и
- *             спека v1 их не рождает.
+ *   latency — самый быстрый с допуском (прежний `prefer: latency`); задержка — urltest,
+ *             HTTP(S)-запрос к url через члена (src/daemon/urltest.c);
+ *   manual  — член, выбранный человеком командой `select` (default — до первой команды);
+ *   balance — ядро раскидывает НОВЫЕ соединения по живым членам: правило группы переходит в
+ *             свою цепочку, та по карте `numgen random mod GROUP_BAL_SLOTS` ставит метку члена и
+ *             сохраняет её в метке соединения (compile/generate.c, build_balance); упавший член
+ *             сторож вынимает из карты по netlink (src/daemon/fogroup.c).
+ * Спека v1 рождает только order и latency из безымянных членов; v2 — все четыре из именованных.
+ *
+ * ВЛОЖЕННОСТЬ. Член группы — любой выход с устройством, в том числе другая группа. order, latency
+ * и manual разворачивают выбор до ЛИСТА: таблица группы ведёт в устройство, которое сейчас несёт
+ * трафик выбранного члена (у вложенной группы — её текущий лист; сторож проходит вложенную
+ * раньше внешней). У balance вложенная группа — ОДИН член со своим весом: её метка ведёт в её
+ * таблицу, а таблица — в её текущий лист, то есть её собственный выбор (order, manual) внутри
+ * доли balance сохраняется; вложенная balance — переход в её цепочку, и доля внешней делится
+ * внутренней по её весам. Группа balance членом order/latency/manual быть не может: у таких
+ * групп одна таблица — одно устройство, а у balance устройство на каждое соединение своё.
  *
  * ЧТО ЗДЕСЬ, А ЧТО У СТОРОЖА. Сторож (src/daemon/failover.c) — автомат на цикле событий: он
  * пробует устройства, ждёт ответов и оживляет. Решения о выборе — чистые функции над ответами
@@ -62,16 +76,37 @@ size_t out_members(const struct spec *sp, const struct output *o, const struct o
     return 1;
 }
 
+void group_cfg_init(struct group_cfg *g) {
+    memset(g, 0, sizeof(*g));
+    g->def = -1;
+    g->idle_timeout_s = -1;
+    g->cur = -1;
+    g->sel = -1;
+    for (size_t i = 0; i < MAX_MEMBERS; i++) g->lat_ms[i] = -1;
+}
+
+int group_named(const struct group_cfg *g) {
+    return g && g->members_n && g->members[0] < MAX_OUTPUTS;
+}
+
 int group_seal(struct spec *sp, struct output *go, struct err *e) {
     struct group_cfg *g = &go->grp;
     if (!g->members_n) return err_set(e, "outputs.%s: у группы нет членов", go->name);
     unsigned caps = ~0u;
     for (size_t i = 0; i < g->members_n; i++) {
         const struct output *m = &sp->out[g->members[i]];
-        /* Вложенные группы — шаг 3: выбор разворачивается до листа, и сторожу нужна своя ветка
-         * на это. Перевод v1 вложенных не рождает. */
-        if (out_group(m))
-            return err_set(e, "outputs.%s: группа в группе — пока нет (шаг 3 из 1.9)", go->name);
+        /* Вложенная группа замыкается раньше внешней (разбор v2 идёт по вложенности), и её
+         * свойства уже посчитаны. balance внутри группы с одной таблицей — отказ: выбрать ей
+         * одно устройство нечем (см. шапку, «ВЛОЖЕННОСТЬ»). */
+        const struct group_cfg *mg = out_group(m);
+        if (mg && mg->pick == PICK_BALANCE && g->pick != PICK_BALANCE) {
+            char msg[320];
+            snprintf(msg, sizeof(msg), "outputs.%s: %s — группа pick: balance, а членом группы pick: %s "
+                     "она быть не может: у такой группы трафик идёт в одно устройство, а у balance "
+                     "устройство на каждое соединение своё", go->name, m->name,
+                     group_pick_name(g->pick));
+            return err_set(e, "%s", msg);
+        }
         if (!out_has_device(m))
             return err_set(e, "outputs.%s: член группы без устройства", go->name);
         caps &= out_caps(m);
@@ -102,7 +137,7 @@ int group_of_devices(struct spec *sp, struct output *o, const char (*devs)[32], 
     g.mark = o->mark;
     g.table = o->table;
     g.kind = &kind_group;
-    g.grp.def = -1;
+    group_cfg_init(&g.grp);
     g.grp.shown = k;
     for (size_t i = 0; i < n; i++) {
         size_t idx = MAX_OUTPUTS + sp->anon_n++;
@@ -142,6 +177,68 @@ int group_hysteresis(int cur, int first, int cur_alive, int streak, int hyst, in
         if (hyst > 0 && s < hyst) { *new_streak = s; return cur; }
     }
     return first;
+}
+
+const char *group_pick_name(int p) {
+    static const char *const N[] = { "order", "latency", "manual", "balance" };
+    return p >= 0 && (size_t)p < sizeof(N) / sizeof(N[0]) ? N[p] : "order";
+}
+
+/* РАЗДАЧА СЛОТОВ balance. Правило ядра — `numgen random mod GROUP_BAL_SLOTS vmap @карта`: число
+ * слотов постоянное, а меняются только элементы карты. Иначе уход члена менял бы `mod N` в самом
+ * правиле, то есть правило, а не элемент, — а переписывать правило сторож не должен (ни процесса
+ * nft, ни перезагрузки набора на отказ туннеля). 120 делится на 1..6, 8, 10, 12, 15: у частых
+ * случаев (2-6 равных членов) доли точные, у семи — 17 и 18 слотов, перекос долей ~6%.
+ *
+ * Доля — по весам живых членов методом наибольшего остатка; слоты раздаются подряд, по порядку
+ * членов (порядок внутри карты для случайного numgen ничего не значит). Чистая функция: её зовут
+ * компилятор (карта при apply — все члены живы) и сторож (карта по живым), а сверяет стенд. */
+void group_balance_slots(const struct group_cfg *g, unsigned alive,
+                         unsigned char owner[GROUP_BAL_SLOTS]) {
+    unsigned w[MAX_MEMBERS], total = 0;
+    size_t n = g->members_n;
+    for (size_t k = 0; k < n; k++) {
+        w[k] = (alive >> k) & 1u ? (g->weight[k] ? g->weight[k] : 1u) : 0u;
+        total += w[k];
+    }
+    memset(owner, 0xff, GROUP_BAL_SLOTS);
+    if (!total) return;
+    unsigned cnt[MAX_MEMBERS], rem[MAX_MEMBERS], used = 0;
+    for (size_t k = 0; k < n; k++) {
+        cnt[k] = GROUP_BAL_SLOTS * w[k] / total;
+        rem[k] = GROUP_BAL_SLOTS * w[k] % total;
+        used += cnt[k];
+    }
+    /* Остаток слотов — тем, у кого больше дробная часть; при равенстве — первому по порядку. */
+    while (used < GROUP_BAL_SLOTS) {
+        size_t best = n;
+        for (size_t k = 0; k < n; k++)
+            if (w[k] && (best == n || rem[k] > rem[best])) best = k;
+        cnt[best]++;
+        rem[best] = 0;
+        used++;
+    }
+    size_t s = 0;
+    for (size_t k = 0; k < n; k++)
+        for (unsigned c = 0; c < cnt[k] && s < GROUP_BAL_SLOTS; c++) owner[s++] = (unsigned char)k;
+}
+
+/* Имена объектов balance в таблице движка — по номеру таблицы выхода из реестра, а не по имени:
+ * имя выхода бывает до 31 байта, и с приставкой оно не влезло бы в предел имени цепочки старых
+ * ядер (32 с нулём, ядро 4.9 телефона). Номер таблицы у выхода свой и живёт в реестре. */
+void group_bal_chain(const struct output *o, char *dst, size_t n) {
+    snprintf(dst, n, "bal_%d", o->table);
+}
+void group_bal_map(const struct output *o, char *dst, size_t n) {
+    snprintf(dst, n, "balmap_%d", o->table);
+}
+void group_mark_chain(const struct output *o, char *dst, size_t n) {
+    snprintf(dst, n, "mark_%d", o->table);
+}
+void group_bal_target(const struct output *m, char *dst, size_t n) {
+    const struct group_cfg *g = out_group(m);
+    if (g && g->pick == PICK_BALANCE) group_bal_chain(m, dst, n);
+    else group_mark_chain(m, dst, n);
 }
 
 static unsigned group_caps_of(const struct output *o) {

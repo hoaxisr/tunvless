@@ -50,6 +50,7 @@ enum fo_ev_kind {
     FO_EV_SWITCHED,   /* выход сменил устройство: from (NULL — не было), to, why */
     FO_EV_FAILED,     /* живых устройств нет, on_fail применён: from (NULL — не было), why */
     FO_EV_REVIVED,    /* сторож оживил устройство (перезапуск, перенастройка, ожидание), и оно ответило */
+    FO_EV_BALANCE,    /* группа balance: сменился состав живых членов (alive) — карта переписана */
 };
 struct fo_event {
     enum fo_ev_kind kind;
@@ -58,11 +59,18 @@ struct fo_event {
     /* switched: start — первый выбор (записи не было); recovered — выход был в отказе;
      *   spec — прежнее устройство больше не кандидат; down — прежнее не отвечает;
      *   preferred — более предпочтительное ожило и подтвердило здоровье (гистерезис);
-     *   latency — выбор по замеру задержки.
+     *   latency — выбор по замеру задержки; select — выбор человека у pick: manual.
      * failed: down — ни одно устройство не ответило; via — не работает выход, через который
      *   идёт этот. */
     const char *why;
     const char *on_fail;   /* режим отказа выхода: drop | direct | zapret */
+    /* Группа с именованными членами (v2): выбранный член (switched), NULL — не группа v2 (у пула
+     * v1 членов по имени нет, и событие остаётся прежним до байта). */
+    const char *member;
+    /* Кто переключил: NULL — сторож; "select" — команда select. */
+    const char *by;
+    /* balance: живые члены через запятую ("" — ни одного). */
+    const char *alive;
 };
 typedef void (*fo_event_fn)(void *arg, const struct fo_event *e);
 
@@ -150,6 +158,16 @@ struct fo_hsrc {
 
 /* Файлы каталога состояния и procd: прежний путь. */
 extern struct fo_hsrc fo_hsrc_files;
+
+/* ТРАФИК ЧЕРЕЗ ГРУППУ — для idle_timeout замера urltest (fogroup.c): пакеты правил каналов, ведущих
+ * в группу g (и в группы, которые выбирают g), по счётчикам nft. Счётчики знает только тот, у кого
+ * есть группы каналов спеки (демон: struct groups в памяти), поэтому это шов: демон его ставит,
+ * у `steer failover` его нет — и трафик тогда считается идущим (замер по интервалу, как прежде).
+ * 0 — *pkts заполнен; -1 — узнать не вышло. */
+typedef int (*fo_traffic_fn)(void *arg, const struct spec *sp, const struct output *g,
+                             unsigned long long *pkts);
+/* Звать сразу после fo_pass_start, как fo_pass_helpers. */
+void fo_pass_traffic(struct fo_run *r, fo_traffic_fn fn, void *arg);
 /* Спрашивать о помощниках hs, а не файлы (умолчание прохода — fo_hsrc_files). Звать сразу после
  * fo_pass_start: первый шаг прохода идёт оборотом цикла. hs живёт до конца прохода. */
 void fo_pass_helpers(struct fo_run *r, struct fo_hsrc *hs);

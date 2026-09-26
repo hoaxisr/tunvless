@@ -268,8 +268,10 @@ outputs:
   wg1: { kind: interface, device: wg1 }
   eu:  { kind: group, pick: manual, members: [wg0, wg1], default: wg1 }
 EOF
-refused "pick: manual — ещё не поддерживается" "ещё не поддерживается в этой версии движка: outputs.eu.pick: manual" 5:29
+accepted "pick: manual с default"
 
+# Шаг 3 из 1.9: вложенность, balance с весами, urltest — принимаются; balance в ruleset — переход
+# в цепочку группы, карта numgen и метка соединения.
 y <<'EOF'
 version: 2
 outputs:
@@ -277,8 +279,64 @@ outputs:
   wg1: { kind: interface, device: wg1 }
   in:  { kind: group, members: [wg0, wg1] }
   out: { kind: group, members: [in, wg1] }
+  bal: { kind: group, pick: balance, members: [in, wg1], weights: [3, 1] }
+  lat: { kind: group, pick: latency, members: [wg0, out], url: "http://1.1.1.1:8080/generate_204", idle_timeout: 0 }
+rules:
+  - { name: b, to: all, out: bal }
 EOF
-refused "группа в группе — ещё не поддерживается" "группа в группе" 6
+accepted "группа в группе, balance с весами, url и idle_timeout"
+out="$("$BIN" apply --dry-run --spec "$tmp/s.yaml" $S 2>&1)"
+if echo "$out" | grep -q 'counter goto bal_[0-9]* comment "steer:bal_all"' &&
+   echo "$out" | grep -q 'numgen random mod 120 vmap @balmap_' &&
+   echo "$out" | grep -q 'ct mark set mark comment "steer-mark:in"' &&
+   [ "$(echo "$out" | grep -o 'goto mark_[0-9]*' | sort -u | wc -l)" -ge 3 ]; then ok; else
+    bad "balance: goto в цепочку группы, карта numgen, метки членов" "$(echo "$out" | head -n 20)"; fi
+
+y <<'EOF'
+version: 2
+outputs:
+  wg0: { kind: interface, device: wg0 }
+  wg1: { kind: interface, device: wg1 }
+  bal: { kind: group, pick: balance, members: [wg0, wg1] }
+  res: { kind: group, pick: order, members: [bal, wg1] }
+EOF
+refused "balance членом order — отказ" "группа pick: balance, а членом группы pick: order" 6
+
+y <<'EOF'
+version: 2
+outputs:
+  wg0: { kind: interface, device: wg0 }
+  wg1: { kind: interface, device: wg1 }
+  bal: { kind: group, pick: balance, members: [wg0, wg1], weights: [1] }
+EOF
+refused "weights не по числу членов" "весов 1, а членов 2" 5
+
+y <<'EOF'
+version: 2
+outputs:
+  wg0: { kind: interface, device: wg0 }
+  wg1: { kind: interface, device: wg1 }
+  m: { kind: group, pick: manual, members: [wg0, wg1], url: "http://x/generate_204" }
+EOF
+refused "url не у latency" "url — замер задержки, он есть только у pick: latency" 5
+
+y <<'EOF'
+version: 2
+outputs:
+  wg0: { kind: interface, device: wg0 }
+  wg1: { kind: interface, device: wg1 }
+  l: { kind: group, pick: latency, members: [wg0, wg1], url: "ftp://x/" }
+EOF
+refused "url не http/https" "outputs.l.url:" 5
+
+y <<'EOF'
+version: 2
+outputs:
+  wg0: { kind: interface, device: wg0 }
+  wg1: { kind: interface, device: wg1 }
+  l: { kind: group, pick: latency, members: [wg0, wg1], url: "https://www.gstatic.com/generate_204" }
+EOF
+refused "https в steer-mini — отказ с понятным текстом" "https:// в этой сборке нет (steer-mini без TLS)" 5
 
 y <<'EOF'
 version: 2

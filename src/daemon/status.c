@@ -28,6 +28,7 @@
 #include "daemon.h"
 #include "groups.h"
 #include "generate.h"
+#include "grpurl.h"
 
 
 /* ---- status --------------------------------------------------------------- */
@@ -93,6 +94,50 @@ int status_fast(FILE *out) {
     return 0;
 }
 
+/* ГРУППА СПЕКИ v2 (kind: group, docs/contract-v1.md, §2): как она выбирает и что выбрала. Только
+ * у групп, которые видны снаружи группой: пул v1 (`devices`) выглядит прежним выходом interface, и
+ * его объект не меняется (контракт со splify2 меняется в паре). Поля — только добавлены:
+ *   pick     — order | latency | manual | balance;
+ *   members  — члены по порядку (имена выходов, в том числе вложенных групп);
+ *   selected — член, чей лист сейчас несёт трафик группы (null — отказ или сторож ещё не проходил);
+ *              у balance — член, в чьё устройство ведёт таблица самой группы (сокеты с её меткой);
+ *   alive    — живые члены по последнему проходу; у balance это и есть состав карты раздачи;
+ *   select   — manual: выбор человека (команда select) или default, пока выбора не было;
+ *   url, latency — latency: адрес проверки и замеры urltest по членам, мс (только измеренные);
+ *   weights  — balance: веса членов по порядку. */
+static void group_emit(FILE *out, const struct spec *sp, const struct output *o) {
+    const struct group_cfg *g = out_group(o);
+    if (!g || g->shown) return;
+    fprintf(out, ",\"group\":{\"pick\":\"%s\",\"members\":[", group_pick_name(g->pick));
+    for (size_t k = 0; k < g->members_n; k++)
+        fprintf(out, "%s\"%s\"", k ? "," : "", sp->out[g->members[k]].name);
+    if (g->cur >= 0 && (size_t)g->cur < g->members_n)
+        fprintf(out, "],\"selected\":\"%s\",\"alive\":[", sp->out[g->members[g->cur]].name);
+    else
+        fprintf(out, "],\"selected\":null,\"alive\":[");
+    int n = 0;
+    for (size_t k = 0; k < g->members_n; k++)
+        if ((g->alive >> k) & 1u) fprintf(out, "%s\"%s\"", n++ ? "," : "", sp->out[g->members[k]].name);
+    fprintf(out, "]");
+    if (g->pick == PICK_MANUAL && g->sel >= 0 && (size_t)g->sel < g->members_n)
+        fprintf(out, ",\"select\":\"%s\"", sp->out[g->members[g->sel]].name);
+    if (g->pick == PICK_LATENCY) {
+        fprintf(out, ",\"url\":\"%s\",\"latency\":{", g->url[0] ? g->url : GROUP_URL_DEFAULT);
+        n = 0;
+        for (size_t k = 0; k < g->members_n; k++)
+            if (g->lat_ms[k] >= 0)
+                fprintf(out, "%s\"%s\":%d", n++ ? "," : "", sp->out[g->members[k]].name, g->lat_ms[k]);
+        fprintf(out, "}");
+    }
+    if (g->pick == PICK_BALANCE) {
+        fprintf(out, ",\"weights\":[");
+        for (size_t k = 0; k < g->members_n; k++)
+            fprintf(out, "%s%u", k ? "," : "", g->weight[k] ? g->weight[k] : 1u);
+        fprintf(out, "]");
+    }
+    fprintf(out, "}");
+}
+
 /* Сам ответ. Поток параметром, потому что печатается он ДВАЖДЫ в разные места: в снимок на
  * диске и человеку (точнее, тому, кто позвал). Считать его два раза было бы вдвое дороже
  * ровно того, ради чего снимок и заведён. */
@@ -126,7 +171,7 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
     fprintf(out, "{\"schema\":1,\"at\":%ld,"
                  "\"features\":[\"lan_devices\",\"nodes\",\"pool\",\"active_device\","
                  "\"status_cache\",\"xslink\",\"xsteer_state\",\"spec_schema2\",\"awg\","
-                 "\"via\",\"failed\"]",
+                 "\"via\",\"failed\",\"groups\"]",
             (long)time(NULL));
     /* Локальные устройства — следом: интерфейс показывает, с чего забирается трафик, и
      * без этого поля ему пришлось бы читать спеку вторым источником, то есть однажды
@@ -205,6 +250,7 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
             fprintf(out, "],\"on_fail\":\"%s\"",
                    sp->out[i].on_fail == FAIL_DROP ? "drop" :
                    sp->out[i].on_fail == FAIL_ZAPRET ? "zapret" : "direct");
+            group_emit(out, sp, &sp->out[i]);
         }
         /* Свои поля вида (kind_ops.status): у vless — выбранные узлы подписки, у interface —
          * обфускация, у awg — рукопожатие и счётчики из ядра (все три — после on_fail, в объекте

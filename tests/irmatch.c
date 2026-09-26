@@ -395,6 +395,98 @@ static void t_phone(int nftc) {
 }
 
 /* ---- 4. само дерево: поиск, клон, арена ------------------------------------------------- */
+/* ---- группы balance (шаг 3 из 1.9): переход в цепочку группы, карта numgen, метка соединения ---- */
+static const struct output *oname(const char *n) {
+    for (size_t i = 0; i < g_spec.out_n; i++)
+        if (!strcmp(g_spec.out[i].name, n)) return &g_spec.out[i];
+    return NULL;
+}
+static size_t nels(const struct nft_set *s) {
+    size_t n = 0;
+    for (const struct nft_elsrc *e = s ? s->els : NULL; e; e = e->next) n++;
+    return n;
+}
+static int els_with(const struct nft_set *s, const char *needle) {
+    int n = 0;
+    for (const struct nft_elsrc *e = s ? s->els : NULL; e; e = e->next)
+        n += e->k == NFT_EL_VALUE && strstr(e->s, needle) != NULL;
+    return n;
+}
+
+static void t_balance(int nftc) {
+    printf("\n-- balance: карта numgen, метка соединения, вложенность (раскладка %d) --\n", nftc);
+    put("bal.lst", "203.0.113.0/24\n");
+    if (load("version: 2\n"
+             "lists:\n  l: { prefixes_file: TMP/bal.lst }\n"
+             "outputs:\n"
+             "  a:   { kind: interface, device: wg0 }\n"
+             "  b:   { kind: interface, device: wg1 }\n"
+             "  c:   { kind: interface, device: wg2 }\n"
+             "  res: { kind: group, pick: order, members: [a, b] }\n"
+             "  in:  { kind: group, pick: balance, members: [b, c] }\n"
+             "  top: { kind: group, pick: balance, members: [res, in, a], weights: [2, 1, 1] }\n"
+             "rules:\n  - { name: t, to: [l], out: top }\n") < 0) return;
+    struct nft_rs rs;
+    if (build(&rs, nftc) < 0) return;
+    struct nft_table *t = ir_table_find(&rs, NFT_FAM_INET, NULL);
+    const struct output *top = oname("top"), *in = oname("in"), *res = oname("res"),
+                        *a = oname("a"), *b = oname("b"), *c = oname("c");
+    char bc[32], bm[32], ic[32], mres[32], ma[32], mb[32], mc[32], mtop[32];
+    group_bal_chain(top, bc, sizeof(bc));
+    group_bal_map(top, bm, sizeof(bm));
+    group_bal_chain(in, ic, sizeof(ic));
+    group_mark_chain(res, mres, sizeof(mres));
+    group_mark_chain(a, ma, sizeof(ma));
+    group_mark_chain(b, mb, sizeof(mb));
+    group_mark_chain(c, mc, sizeof(mc));
+    group_mark_chain(top, mtop, sizeof(mtop));
+
+    const struct group *g = group_of("top", 0);
+    const struct nft_rule *r = g ? ir_rule_find(ir_chain_find(t, "prerouting_mark"), cm("steer:", g->name)) : NULL;
+    check("правило канала — goto в цепочку группы, без метки", 1,
+          r && ir_rule_has(r, cm("goto ", bc)) && !ir_expr_find(r, NFT_X_MARKSET) &&
+          ir_expr_find(r, NFT_X_COUNTER) != NULL);
+    const struct nft_set *m = ir_set_find(t, bm);
+    check_str("карта: type mark : verdict", "mark verdict",
+              m ? ir_printf(&rs, "%s %s", m->key, m->data ? m->data : "-") : "-");
+    check("  слотов 120 — все члены живы", GROUP_BAL_SLOTS, (long)nels(m));
+    check("  по весам 2:1:1 — res 60, вложенная in 30, a 30", 603030,
+          els_with(m, cm("goto ", mres)) * 10000L + els_with(m, cm("goto ", ic)) * 100L +
+          els_with(m, cm("goto ", ma)));
+    const struct nft_chain *ch = ir_chain_find(t, bc);
+    check("цепочка группы: восстановление по метке соединения — по листу на правило", 4,
+          (long)(ch ? ir_rule_count(ch, NULL) : 0) - 2);
+    int rest = 0, numgen = 0, fall = 0;
+    for (const struct nft_rule *q = ch ? ch->rules : NULL; q; q = q->next) {
+        if (ir_rule_has(q, "ct mark and ")) rest++;
+        if (ir_rule_has(q, ir_printf(&rs, "numgen random mod %d vmap @%s", GROUP_BAL_SLOTS, bm))) numgen++;
+        if (ir_rule_has(q, cm("goto ", mtop)) && !q->next) fall++;
+    }
+    check("  листья: res (одна метка), a, и листья вложенной b, c", 4, rest);
+    check("  затем numgen по карте и запасной goto в метку группы", 11, numgen * 10 + fall);
+    const struct nft_rule *lr = ch ? ch->rules : NULL;
+    int leaf_b = 0;
+    for (; lr; lr = lr->next)
+        if (ir_rule_has(lr, ir_printf(&rs, "== 0x%08x", b->mark)) && ir_rule_has(lr, cm("goto ", mb)))
+            leaf_b = 1;
+    check("  соединение на члене вложенной balance — сразу в его метку", 1, leaf_b);
+    const struct nft_chain *mk = ir_chain_find(t, mres);
+    const struct nft_rule *mr = mk ? mk->rules : NULL;
+    check("цепочка метки: метка члена и ct mark set mark", 1,
+          mr && ir_expr_find(mr, NFT_X_MARKSET) &&
+          ir_rule_has(mr, ir_printf(&rs, "0x%08x", res->mark | ZAPRET_SKIP_MARK)) &&
+          ir_rule_has(mr, "ct mark set mark"));
+    /* res (order: a, b) — один член со своей меткой: её таблица ведёт в её текущий лист. Слоты a —
+     * только его собственные 30 (как члена top), а не доля res; b в карте top не бывает вовсе. */
+    check("вложенная order — один член: её листья в карту не раскрываются", 1,
+          els_with(m, cm("goto ", ma)) == 30 && els_with(m, cm("goto ", mb)) == 0);
+    const struct nft_set *im = ir_set_find(t, ir_printf(&rs, "balmap_%d", in->table));
+    check("вложенная balance — своя карта со своими членами", 1,
+          im && els_with(im, cm("goto ", mb)) == 60 && els_with(im, cm("goto ", mc)) == 60);
+    check("отказа памяти не было", 0, rs.oom);
+    nft_rs_free(&rs);
+}
+
 static void t_tree(void) {
     printf("\n-- дерево: поиск и переделка --\n");
     struct nft_rs rs;
@@ -444,6 +536,8 @@ int main(void) {
         t_mixed_legacy(NFTC_LEGACY);
         t_mixed_legacy(NFTC_LEGACY | NFTC_IP6NAT | NFTC_NOTRACK);
         t_mixed_order();
+        t_balance(0);
+        t_balance(NFTC_LEGACY | NFTC_IP6NAT | NFTC_NOTRACK);
     } else {
         t_phone(0);
         t_phone(NFTC_LEGACY);
