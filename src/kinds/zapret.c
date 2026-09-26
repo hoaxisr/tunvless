@@ -53,9 +53,20 @@ static int zapret_parse(struct output *o, const struct out_keys *k, struct err *
     /* Абсолютный путь и годность к JSON: путь печатается в status и в diag, а
      * запускает процесс procd со своим рабочим каталогом — относительный «работал
      * бы из шелла» и не работал бы у службы. Тот же барьер, что у conf. */
-    else if (o->zp.opts[0] != '/' || !label_ok(o->zp.opts))
-        return err_set(e, "outputs.%s: opts_file должен быть абсолютным путём без кавычек", o->name);
+    else if (o->zp.opts[0] != '/' || !label_ok(o->zp.opts)) {
+        char msg[192];
+        snprintf(msg, sizeof(msg), "outputs.%s: %s должен быть абсолютным путём без кавычек",
+                 o->name, out_key(k, "opts_file", "strategy"));
+        return err_set(e, "%s", msg);
+    }
     return 0;
+}
+
+/* Обратное zapret_parse (`steer spec convert`): путь, выведенный из имени выхода, не пишется. */
+static void zapret_keys_of(const struct output *o, struct out_keys *k) {
+    char def[256];
+    snprintf(def, sizeof(def), "%s/zapret/%.200s.opts", plat()->etc_dir, o->name);
+    if (strcmp(def, o->zp.opts) != 0) snprintf(k->opts_file, sizeof(k->opts_file), "%s", o->zp.opts);
 }
 
 /* on_fail=zapret у выхода kind=zapret — это «при отказе обхода включить обход».
@@ -489,6 +500,7 @@ const struct kind_ops kind_zapret = {
     .caps = KC_MARK | KC_CTMARK | KC_SKIP_ZAPRET | KC_IPV6,
     .keys = KK_OPTS,
     .parse = zapret_parse,
+    .keys_of = zapret_keys_of,
     .check = zapret_check,
     .emit = zapret_emit,
     .status = zapret_status,

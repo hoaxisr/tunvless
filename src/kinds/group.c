@@ -29,6 +29,12 @@
 
 #include "spec.h"
 
+/* Спека v2 знает группу по имени; спека v1 — нет (kind_by_name её не находит, см. kind.h). */
+const struct kind_ops *kind_by_name_v2(const char *name) {
+    if (!strcmp(name, kind_group.name)) return &kind_group;
+    return kind_by_name(name);
+}
+
 const struct group_cfg *out_group(const struct output *o) {
     return kind_of(o) == &kind_group ? &o->grp : NULL;
 }

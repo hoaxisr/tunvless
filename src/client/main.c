@@ -384,7 +384,7 @@ static int same_daemon(const struct call *c) {
     free(raw);
     if (ok) {
         char a[PATH_MAX + 1], b[PATH_MAX + 1];
-        canon(c->spec ? c->spec : plat()->spec_path, a, sizeof(a));
+        canon(c->spec ? c->spec : plat_spec_default(), a, sizeof(a));
         canon(r.spec_path.p, b, sizeof(b));
         ok = !strcmp(a, b);
         canon(c->state_dir ? c->state_dir : plat()->state_dir, a, sizeof(a));
@@ -484,7 +484,7 @@ int main(int argc, char **argv) {
     } else if (!strcmp(c.cmd, "apply")) {
         /* Спеку демону — телом, как её присылает приложение: он проверит её, положит на место
          * (это тот же файл — сверено выше) и применит только изменившееся. */
-        body = read_file(c.spec ? c.spec : plat()->spec_path, &body_n);
+        body = read_file(c.spec ? c.spec : plat_spec_default(), &body_n);
         if (!body) run_engine();
         snprintf(line, sizeof(line), "apply %zu\n", body_n);
         readonly = 0;

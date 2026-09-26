@@ -2558,7 +2558,9 @@ int ctl_serve_main(int argc, char **argv) {
     static struct ctl_srv S;
     struct ctl_conf *cf = &S.cf;
     cf->sock = plat()->ctl_sock;
-    cf->spec = plat()->spec_path;
+    /* spec.json или spec.yaml — какая из двух лежит (plat_spec_default); apply кладёт тело в неё
+     * же, какого бы формата тело ни было: формат load_spec узнаёт по содержимому. */
+    cf->spec = plat_spec_default();
     cf->lists_dir = plat()->lists_dir;
     cf->allow_domain = plat()->ctl_allow_domain;
     for (int i = 0; i < argc; i++) {

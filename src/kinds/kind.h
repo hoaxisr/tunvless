@@ -62,8 +62,9 @@ enum kind_cap {
 /* Ключи спеки, которые принадлежат виду. Разбирает их parse.c — для всех видов, в том числе не
  * вошедших в сборку: иначе базовая сборка перестала бы отвечать прежними отказами на ключ
  * расширенного вида у чужого выхода («stream есть только у kind=xsteer»). Бит говорит, чей ключ:
- * у выхода другого вида такой ключ — отказ. `conf` и `sub_file` сюда не входят: у чужого вида
- * они и прежде молча ничего не делали, и отказ на них сломал бы работавшие спеки. */
+ * у выхода другого вида такой ключ — отказ. `conf` и `sub_file` у чужого вида в v1 и прежде молча
+ * ничего не делали, и отказ на них сломал бы работавшие спеки: их биты (KK_CONF, KK_SUB) читает
+ * только разбор v2. */
 enum kind_key {
     KK_OBFS   = 1 << 0,
     KK_STREAM = 1 << 1,
@@ -73,6 +74,11 @@ enum kind_key {
     /* `devices` спеки v1 — пул кандидатов. Принимает его только interface: пул устройств — это
      * группа (kind: group), и собирает её перевод v1 (model/v1.c) из безымянных интерфейсов. */
     KK_DEVICES = 1 << 5,
+    /* `conf` (xsteer, awg) и подписка (vless: `sub_file` в v1, `subscription` в v2). Спека v1 по
+     * этим битам НЕ отказывает — у чужого вида ключи и прежде молча ничего не делали (см. выше);
+     * по ним отказывает разбор v2, где неизвестный или чужой ключ — всегда отказ. */
+    KK_CONF   = 1 << 6,
+    KK_SUB    = 1 << 7,
 };
 
 /* Помощник выхода — процесс, который поднимает супервизор (daemon/helpers.c: `steer supervise` и
@@ -139,8 +145,17 @@ struct kind_ops {
 
     /* ---- спека ---- */
     /* Свои ключи и умолчания: k — что спека написала в ключах видов, выход уже с общими полями.
-     * 0 — годится; -1 — отказ, текст в e. */
+     * 0 — годится; -1 — отказ, текст в e.
+     *
+     * ОДИН РАЗБОР НА ОБА ФОРМАТА. struct out_keys — не JSON и не YAML, а значения ключей: их
+     * заполняет читатель формата (model/v1.c из JSON, model/v2.c из дерева YAML), а вид
+     * проверяет и толкует одинаково для обоих. Где форматы называют ключ по-разному
+     * (`opts_file`/`strategy`, `sub_file`/`subscription`), вид берёт имя для отказа у out_key. */
     int (*parse)(struct output *o, const struct out_keys *k, struct err *e);
+    /* Обратное parse: что выход написал бы в ключах видов (`steer spec convert`). Умолчания,
+     * которые parse выводит сам (путь conf из имени выхода, имя устройства), не пишутся — тогда
+     * k->device_derived = 1 про устройство. NULL — своих ключей у вида нет. */
+    void (*keys_of)(const struct output *o, struct out_keys *k);
     /* Проверка после разбора и общих проверок выхода (владельцы ключей) — то, что зависит от
      * общих полей (on_fail). sp — спека с выходами, разобранными до этого. */
     int (*check)(const struct spec *sp, const struct output *o, struct err *e);
@@ -191,6 +206,8 @@ struct kind_ops {
 /* Запись вида по имени из спеки, в том числе вида вне сборки (у неё absent); NULL — такого вида
  * нет вовсе. */
 const struct kind_ops *kind_by_name(const char *name);
+/* То же для спеки v2: реестр и группа (kind: group — её в реестре нет, см. ниже). */
+const struct kind_ops *kind_by_name_v2(const char *name);
 /* Все виды по порядку реестра: direct, interface, vless, xsteer, zapret, tgws, awg. */
 size_t kind_count(void);
 const struct kind_ops *kind_at(size_t i);
@@ -210,7 +227,7 @@ void kind_emit_all(struct nft_rs *rs, const struct spec *sp);
  * его порядку ложатся правила видов (kind_emit_all) и проверки diag. Группа — часть модели v2:
  * спека v1 её не знает (`"kind": "group"` в v1 обязан остаться неизвестным видом, иначе спека,
  * принятая с ним, значила бы то, чего v1 не обещал), своих правил и проверок у неё нет, а
- * собирает её перевод v1 (model/v1.c) напрямую. Разбор v2 (шаг 2 из 1.9) найдёт её сам. */
+ * собирает её перевод v1 (model/v1.c) напрямую. Разбор v2 находит её через kind_by_name_v2. */
 extern const struct kind_ops kind_direct, kind_interface, kind_vless, kind_xsteer, kind_zapret,
                              kind_tgws, kind_awg, kind_group;
 
@@ -275,6 +292,12 @@ int group_latency_keep(const int *ms, int cur, int pick, int tol);
  * тиков подряд. streak — сколько тиков подряд оно уже было здорово до этого прохода, cur_alive —
  * жив ли текущий. Возврат — номер выбранного; *new_streak — серия, которую запомнить. */
 int group_hysteresis(int cur, int first, int cur_alive, int streak, int hyst, int *new_streak);
+/* Пределы настройки замера (pick: latency). Ноль допуска законен — «переключаться на любое
+ * улучшение»; интервал короче тика сторожа означал бы замер всех членов на каждом тике. Спека v1
+ * пишет те же числа в своих текстах отказа (model/v1.c). */
+#define GROUP_TOL_MAX_MS  60000
+#define GROUP_INT_MIN_S   30
+#define GROUP_INT_MAX_S   86400
 
 /* interface: обфускация транспорта или NULL, если её нет (или выход не interface). */
 const struct out_obfs *iface_obfs(const struct output *o);

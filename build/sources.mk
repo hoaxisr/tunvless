@@ -52,8 +52,22 @@ THIRD_DEFS := -DHAVE_CONFIG_H
 # метки), пути состояния. Стенды, компонующие модель, получают платформу тем же списком.
 PLATFORM_SRC := src/platform/platform.c src/platform/openwrt.c src/platform/android.c
 
-MODEL_SRC := $(PLATFORM_SRC) src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/v1.c src/model/registry.c \
-             src/model/probe.c src/compile/nftcompat.c src/lib/puff.c src/model/srs.c src/model/srsplan.c
+# Чтение YAML (docs/architecture.md, «4в. Устройство 1.9», шаг 2): событийный парсер libyaml 0.2.5
+# (src/third_party/libyaml, MIT; только разбор — без загрузчика и эмиттера) и обёртка движка
+# src/lib/ynode.c, которая строит из событий дерево с пределами и отказом на алиасах. В ядре, а
+# не в полном пакете: спеку v2 читает и мини-движок, и полный. JSON спеки v1 читается тем же
+# парсером (стенд tests/yamlmatch.c). В модели, а не рядом с ней: load_spec сам выбирает формат
+# и зовёт разбор v2 (src/model/v2.c), так что всякий, кто компонует модель, компонует и YAML.
+LIBYAML_SRC := src/third_party/libyaml/api.c src/third_party/libyaml/reader.c \
+               src/third_party/libyaml/scanner.c src/third_party/libyaml/parser.c
+YAML_SRC := src/lib/ynode.c $(LIBYAML_SRC)
+
+# Разбор спеки: parse.c (общее и выбор формата), v1.c (перевод v1), v2.c и v2print.c (спека v2 и
+# её печать — `steer spec convert`), check.c (сквозные проверки, общие для обоих форматов).
+MODEL_SRC := $(PLATFORM_SRC) src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/v1.c \
+             src/model/check.c src/model/v2.c src/model/v2print.c src/model/registry.c \
+             src/model/probe.c src/compile/nftcompat.c src/lib/puff.c src/model/srs.c src/model/srsplan.c \
+             $(YAML_SRC)
 
 # Резолвер: src/dnsd/dnsd.c был один файл, теперь — DNSD_SRC. lib/sindex.c, lib/nftnl.c,
 # lib/ctnl.c родились из того же файла (хеш-индекс строк, транзакции nf_tables по netlink,
@@ -87,15 +101,6 @@ KINDS_BASE_SRC := src/kinds/kind.c src/kinds/direct.c src/kinds/group.c src/kind
                   src/kinds/tgws.c src/kinds/awg.c
 KINDS_EXT_SRC  := src/kinds/vless.c src/kinds/xsteer.c
 
-# Чтение YAML (docs/architecture.md, «4в. Устройство 1.9», шаг 2): событийный парсер libyaml 0.2.5
-# (src/third_party/libyaml, MIT; только разбор — без загрузчика и эмиттера) и обёртка движка
-# src/lib/ynode.c, которая строит из событий дерево с пределами и отказом на алиасах. В ядре, а
-# не в полном пакете: спеку v2 читает и мини-движок, и полный. JSON спеки v1 читается тем же
-# парсером (стенд tests/yamlmatch.c).
-LIBYAML_SRC := src/third_party/libyaml/api.c src/third_party/libyaml/reader.c \
-               src/third_party/libyaml/scanner.c src/third_party/libyaml/parser.c
-YAML_SRC := src/lib/ynode.c $(LIBYAML_SRC)
-
 # src/daemon/steer.c нарезан на модули (docs/architecture.md, раздел 2, «Слои и каталоги»):
 # компиляция спеки в правила — в src/compile, остальное ядро — в src/daemon, порядок ниже
 # такой же, как был в steer.c (lib/run.c раньше всех — на него ссылаются и compile, и daemon).
@@ -105,7 +110,7 @@ CORE_SRC := src/lib/run.c src/lib/jsonw.c src/lib/evline.c src/compile/groups.c 
             $(MODEL_SRC) $(DNSD_SRC) src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
             src/cli/cli.c src/tools/srsread.c src/tools/hwid.c src/daemon/ctl.c \
             src/daemon/conns.c src/daemon/loop.c src/daemon/state.c src/daemon/watchd.c src/daemon/recon.c src/daemon/rulewd.c \
-            src/lib/rtnl.c src/daemon/foprobe.c src/daemon/gaiw.c $(KINDS_BASE_SRC) $(YAML_SRC)
+            src/lib/rtnl.c src/daemon/foprobe.c src/daemon/gaiw.c $(KINDS_BASE_SRC)
 
 # Общее для обеих ролей: формат кадра, конфигурация, маршрутизация, рукопожатие, соединение
 # и то, на чём они стоят (TLS-записи, примитивы Reality, TUN). Расходиться на проводе этим
