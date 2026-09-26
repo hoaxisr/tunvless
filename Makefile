@@ -36,7 +36,7 @@ MODEL_KINDS := $(MODEL_SRC) $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC)) src/
 # -I на все каталоги слоёв — через override, чтобы `make CFLAGS=...` его не терял.
 override CFLAGS += $(addprefix -I,$(INC_DIRS))
 
-.PHONY: all test clean ext-syntax ext-test snapshot-record print-inc
+.PHONY: all test clean ext-syntax ext-test snapshot-record print-inc ndk-check
 all: $(BUILD)/steerd $(BUILD)/steer
 
 # Два бинарника, как в пакете (docs/architecture.md, раздел 4а, «Бинарники»): build/steerd — весь
@@ -143,6 +143,22 @@ print-inc:
 
 snapshot-record: all $(BUILD)/steer-android $(BUILD)/tgwssim
 	@sh tests/snapshot.sh record
+
+# Сборка под Android тем же NDK, что прошивка (Android.bp, bionic): ни стенды на хосте, ни
+# QEMU-роутер (musl) не видят, чего нет в bionic, — так в origin/main однажды ушёл fopencookie.
+# Гонять перед пушем. Скрипт и mbedtls живут в деревьях работы над Android-портом; нет их на
+# машине — цель пропускается, а не падает.
+NDK_BPBUILD ?= /root/der-exp/android_vendor_der/tools/ndk-check/bpbuild.py
+NDK_MBEDTLS ?= /root/der-exp/android_external_mbedtls
+ndk-check:
+	@if [ ! -f "$(NDK_BPBUILD)" ] || [ ! -d "$(NDK_MBEDTLS)" ]; then \
+		echo "ndk-check: нет $(NDK_BPBUILD) или $(NDK_MBEDTLS) — пропуск"; exit 0; fi; \
+	for a in aarch64 x86_64; do \
+		python3 "$(NDK_BPBUILD)" --static --arch $$a --out $(BUILD)/ndk/$$a . "$(NDK_MBEDTLS)" \
+			-- steerd steer > $(BUILD)/ndk-$$a.log 2>&1 || \
+			{ echo "ndk-check: $$a не собирается:"; grep -m5 'error:' $(BUILD)/ndk-$$a.log; exit 1; }; \
+		echo "ndk-check: $$a — steerd и steer собираются"; \
+	done
 
 # Мини-сборка микропакета tgws на хосте — для стенда tgwsmark: ядро движка с -DSTEER_TGWS,
 # мост заменён заглушкой (tests/tgws-stub.c), потому что настоящий тянет TLS и docker.

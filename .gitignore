@@ -84,3 +84,5 @@ build/warmmatch
 build/evmatch
 build/reconmatch
 build/platmatch
+build/ndk/
+build/ndk-*.log
