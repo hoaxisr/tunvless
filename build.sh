@@ -67,6 +67,8 @@ fi
 . ./build/sources.sh
 BASE_SRC="$(profile_src base)" || exit 2
 BASE_INC="$(for d in $(profile_var INC_DIRS); do printf -- '-I%s ' "$d"; done)"
+# Определения стороннего кода в ядре (libyaml: -DHAVE_CONFIG_H) — см. THIRD_DEFS в sources.mk.
+THIRD_DEFS="$(profile_var THIRD_DEFS)" || exit 2
 # Клиент сокета `steer` — второй бинарник пакета (docs/architecture.md, раздел 4а, «Бинарники»):
 # движок — steerd, а под именем steer его зовут rpcd splify2, init-скрипт и человек. Клиент один
 # на оба пакета (в нём нет ни видов, ни протоколов), собирается один раз на архитектуру.
@@ -244,7 +246,7 @@ for spec in $ISAS; do
     if docker run --rm -v "$PWD:/src" -w /src "$IMAGE" \
             cc -target "$target" -mcpu="$mcpu" -static -Os -Wall -Wextra \
                -DSTEER_VERSION="\"$VERSION\"" -DSTEER_REV="\"$REV\"" \
-               -o "build/steerd-$arch" $BASE_INC $BASE_SRC \
+               -o "build/steerd-$arch" $BASE_INC $THIRD_DEFS $BASE_SRC \
                2>"build/$arch.err"; then
         echo "$(stat -c %s "build/steerd-$arch") bytes"
     else
