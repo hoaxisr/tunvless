@@ -159,6 +159,7 @@
 #include "helpers.h"
 #include "recon.h"
 #include "rulewd.h"
+#include "fogroup.h"
 #include "ctl.h"
 
 /* Путь сокета по умолчанию — путь платформы (ctl_sock, src/platform/platform.h). */
@@ -570,6 +571,7 @@ static void mem_dns_log(struct conn *c, struct cbuf *r);
 static void ctl_do_put_file(struct conn *c, struct cbuf *r);
 static void ctl_do_list_files(struct conn *c, struct cbuf *r);
 static void ctl_do_rm_file(struct conn *c, struct cbuf *r);
+static void mem_select(struct conn *c, struct cbuf *r);
 static void st_apply(struct conn *c);
 static void st_check(struct conn *c);
 static void st_reload(struct conn *c);
@@ -612,6 +614,10 @@ static const struct ctl_cmd CTL_CMDS[] = {
     {"rm-file",     NULL, ctl_do_rm_file, NULL, 0, 1, 1, {{CA_FILE, NULL, NULL, 0, 0}}, 0, 0, 1},
     {"sub-check",   NULL, NULL, st_sub_check, CTL_FILE_MAX, 0, 0, {{0}}, 0, 0, 0},
     {"subscribe",   NULL, NULL, st_subscribe, 0, 0, 0, {{0}}, 0, 0, 0},
+    /* Выбор члена группы pick: manual (docs/ctl.md): в процессе, без apply — изменяющая, идёт по
+     * одной с apply и reload (они пишут те же таблицы). */
+    {"select",      NULL, mem_select, NULL, 0, 2, 2,
+        {{CA_NAME, NULL, NULL, 0, 0}, {CA_NAME, NULL, NULL, 0, 0}}, 0, 0, 1},
 };
 
 static const struct ctl_cmd *ctl_lookup(const char *name) {
@@ -1101,6 +1107,35 @@ static void mem_conns(struct conn *c, struct cbuf *r) {
     FILE *f = mem_begin(&m);
     if (!f) { resp_error(r, "internal", "нет памяти под ответ"); return; }
     int code = ctnl_conns_print(f);
+    mem_end(&m, r, code);
+}
+
+/* select ГРУППА ЧЛЕН — выбор члена группы pick: manual без apply (fogroup.c, fog_select): выбор
+ * кладётся в память сторожа (и в файл select рядом с реестром меток), таблица группы тут же
+ * переписывается на лист члена, подписчикам — switched с by: select (или failed, если член не
+ * работает: у manual это on_fail группы, а не другой член). Идущий проход сторожа прерывается —
+ * его решения легли бы поверх выбора, — и следующий идёт после успокоения. Движок выключен —
+ * выбор только запоминается. */
+static void sel_emit(void *arg, const struct fo_event *e) {
+    steerd_fo_emit(arg, e);
+}
+
+static void mem_select(struct conn *c, struct cbuf *r) {
+    struct ctl_srv *s = c->srv;
+    struct steerd *d = &s->d;
+    struct mem_run m;
+    FILE *f = mem_begin(&m);
+    if (!f) { resp_error(r, "internal", "нет памяти под ответ"); return; }
+    int code;
+    if (!d->have) {
+        code = mem_no_spec(d);
+    } else {
+        watchd_preempt(s->watch);
+        memcpy(d->view, d->sp, sizeof(*d->view));
+        code = fog_select(d->view, d->outs ? d->outs : &fo_store_files, c->q.argv[0], c->q.argv[1],
+                          ctl_enabled(), sel_emit, d, f);
+        if (code == 0) watchd_spec_changed(s->watch);
+    }
     mem_end(&m, r, code);
 }
 

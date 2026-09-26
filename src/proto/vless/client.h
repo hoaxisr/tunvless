@@ -152,4 +152,9 @@ const char *vless_strerror(int rc);
  * один раз до целой записи TLS. */
 #define VLESS_MIN_RECV_CAP H2_MIN_READ_CAP
 
+/* Хранилище корней для проверки сертификата (auth.roots у tls13_handshake_auth): шов стенда, на
+ * телефоне — склейка системного каталога, на роутере — NULL (умолчание certverify). Наружу — ради
+ * замера urltest по HTTPS (src/proto/tls/urltls.c): одни корни на весь движок. */
+const char *vless_cert_roots(void);
+
 #endif

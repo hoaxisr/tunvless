@@ -113,11 +113,27 @@ static int via_idx(const struct spec *sp, const struct output *o) { return (int)
 
 /* Устройства, в которые может уйти трафик выхода: у группы — устройства её членов, у выхода с
  * устройством — его собственное (out_members). */
-static size_t via_devs(const struct spec *sp, const struct output *o, const char **dst) {
+/* Устройства выхода: у группы — листья всех членов, вниз по вложенным группам (любое из них может
+ * оказаться выбранным); dst — на MAX_MEMBERS * 4 записей (вложенность глубже на деле не пишут, а
+ * сверх предела листья просто не проверяются). leaves = 0 — только члены без групп: так смотрит
+ * проверка дубликатов, где вложенная группа с общими листьями законна (bal из res и wg1, а рядом
+ * запасной wg0). */
+#define VIA_DEVS_MAX (MAX_MEMBERS * 4)
+static size_t devs_of(const struct spec *sp, const struct output *o, const char **dst, size_t n,
+                      int leaves, int depth) {
     const struct output *m[MAX_MEMBERS];
-    size_t n = out_members(sp, o, m, MAX_MEMBERS);
-    for (size_t i = 0; i < n; i++) dst[i] = m[i]->device;
+    size_t mn = out_members(sp, o, m, MAX_MEMBERS);
+    for (size_t i = 0; i < mn && n < VIA_DEVS_MAX; i++) {
+        if (m[i] != o && out_group(m[i])) {
+            if (leaves && depth < MAX_OUTPUTS) n = devs_of(sp, m[i], dst, n, leaves, depth + 1);
+            continue;
+        }
+        dst[n++] = m[i]->device;
+    }
     return n;
+}
+static size_t via_devs(const struct spec *sp, const struct output *o, const char **dst) {
+    return devs_of(sp, o, dst, 0, 1, 0);
 }
 
 /* Выход, которому принадлежит устройство пула, — тот же ответ, что device_owner в failover.c
@@ -204,7 +220,7 @@ static int over_check(const struct spec *sp, const char *w, int *bad, struct err
                          "пула — туннель однажды пошёл бы внутрь себя", o->name, w);
                 return err_set(e, "%s", msg);
             }
-            const char *td[MAX_MEMBERS], *od[MAX_MEMBERS];
+            const char *td[VIA_DEVS_MAX], *od[VIA_DEVS_MAX];
             size_t tn = via_devs(sp, t, td), on = via_devs(sp, o, od);
             for (size_t d = 0; d < tn; d++) {
                 for (size_t k = 0; k < on; k++)
@@ -251,8 +267,8 @@ int spec_check_outputs(const struct spec *sp, const char *over_word, int *bad, s
 
         /* Дубликат устройства внутри одного пула делает failover бессмысленным: второй
          * кандидат ничем не отличается от первого. */
-        const char *dv[MAX_MEMBERS];
-        size_t dn = via_devs(sp, o, dv);
+        const char *dv[VIA_DEVS_MAX];
+        size_t dn = devs_of(sp, o, dv, 0, 0, 0);
         for (size_t a = 0; a < dn; a++)
             for (size_t b = a + 1; b < dn; b++)
                 if (!strcmp(dv[a], dv[b])) {

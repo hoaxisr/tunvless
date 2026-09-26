@@ -81,7 +81,7 @@ $(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_DEFAULT_PLATFORM=android -o $@ $(CORE_SRC)
 
-test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch
+test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/snapshot.sh
@@ -144,6 +144,9 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@$(BUILD)/irmatch-android
 	@$(BUILD)/evmatch
 	@$(BUILD)/yamlmatch
+	@$(BUILD)/urltestmatch
+	@sh tests/nftvmapmatch.sh
+	@sh tests/groupsmatch.sh
 
 # Перезапись снимка генератора (tests/snapshot.sh). Только когда ruleset меняется
 # намеренно, и в том же коммите, что и изменение: иначе снимок перестаёт что-либо сторожить.
@@ -338,12 +341,24 @@ $(BUILD)/irmatch-android: tests/irmatch.c tests/unit.h $(COMPILE_SRC) $(MODEL_KI
 # (foprobe.c), рабочий поток имён (gaiw.c) и rtnetlink (rtnl.c). Всё, что из них полезло бы в
 # ядро или в сеть, стенд подменяет швами failover_int.h.
 FAILOVERMATCH_SRC := src/daemon/failover.c src/daemon/loop.c src/daemon/foprobe.c src/daemon/gaiw.c src/lib/rtnl.c \
-                     src/lib/nftdump.c src/lib/procscan.c
-$(BUILD)/failovermatch: tests/failovermatch.c $(FAILOVERMATCH_SRC) src/daemon/daemon.h \
+                     src/lib/nftdump.c src/lib/procscan.c src/daemon/fogroup.c src/daemon/urltest.c src/lib/nftvmap.c
+$(BUILD)/failovermatch: tests/failovermatch.c $(FAILOVERMATCH_SRC) src/daemon/daemon.h src/daemon/fogroup.h \
                         src/daemon/failover_int.h src/daemon/fostate.h src/daemon/foprobe.h src/daemon/gaiw.h \
                         src/daemon/loop.h src/lib/rtnl.h src/model/spec.h src/lib/err.c $(FAILOVERMATCH_KINDS)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/failovermatch.c $(FAILOVERMATCH_SRC) src/lib/err.c $(FAILOVERMATCH_KINDS) $(PLATFORM_SRC) -lpthread
+
+# Замер urltest (src/daemon/urltest.c): свой цикл и ответчики на 127.0.0.1 — см. шапку стенда.
+$(BUILD)/urltestmatch: tests/urltestmatch.c src/daemon/urltest.c src/daemon/urltest.h src/kinds/grpurl.c \
+                       src/kinds/grpurl.h src/daemon/loop.c src/daemon/gaiw.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/urltestmatch.c src/daemon/urltest.c src/kinds/grpurl.c src/daemon/loop.c \
+		src/daemon/gaiw.c -lpthread
+
+# Карта вердиктов balance по netlink (src/lib/nftvmap.c) — инструмент стенда tests/nftvmapmatch.sh.
+$(BUILD)/nftvmap-tool: tests/nftvmap-tool.c src/lib/nftvmap.c src/lib/nftvmap.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/nftvmap-tool.c src/lib/nftvmap.c
 
 # Зависимость выхода от чужого firewall: fw_check судит о конфигурации по тексту дампа
 # nft, и проверить эвристику можно только примерами. Стенд включает исходник движка и
@@ -513,4 +528,5 @@ clean:
 	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
 	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
 	       $(BUILD)/diagsim $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/yamlmatch $(BUILD)/libmbed-*.a \
+	       $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool \
 	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out

@@ -21,8 +21,8 @@
  *
  * ЧЕГО ДВИЖОК ЕЩЁ НЕ УМЕЕТ, разбор принимает, проверяет и хранит в модели, но спеку отвергает
  * отказом «ещё не поддерживается в этой версии движка: …» — ПОСЛЕ всех настоящих проверок, чтобы
- * ошибка в спеке называлась раньше, чем то, чего ждать выпуска: pick manual и balance, группа в
- * группе и параметры urltest (шаг 3 из 1.9); dns.cache и dns.upstreams
+ * ошибка в спеке называлась раньше, чем то, чего ждать выпуска: balance у правил на само
+ * устройство (телефон); dns.cache и dns.upstreams
  * (выпуск 1.11); транспорт туннеля (1.10); встроенные domains/prefixes у списка и app у клиента
  * (потребители читают только файлы и UID); клиенты или списки, которые нельзя свести в одного
  * клиента или один список (компилятор пока берёт у правила одного клиента и один список). Молча
@@ -37,6 +37,7 @@
 #include "spec.h"
 #include "ynode.h"
 #include "check.h"
+#include "grpurl.h"
 #include "v2.h"
 
 /* Протоколы вида `tunnel` (раздел 3: `kind: tunnel, protocol: vless`). Сегодня протокол и есть
@@ -71,6 +72,7 @@ struct v2 {
     const struct ynode *out_over[MAX_OUTPUTS];
     const struct ynode *out_members[MAX_OUTPUTS];
     const struct ynode *out_default[MAX_OUTPUTS];
+    const struct ynode *out_weights[MAX_OUTPUTS];
     struct v2_client cl[MAX_CLIENTS];
     size_t clients_named, lists_named;
 };
@@ -527,7 +529,7 @@ static const struct { const char *key; unsigned bit; const char *owner; } KIND_K
 #define KIND_KEYS_N (sizeof(KIND_KEYS) / sizeof(KIND_KEYS[0]))
 
 static const char *const GROUP_KEYS[] = { "pick", "members", "default", "tolerance", "interval",
-                                          "url", "idle_timeout", NULL };
+                                          "url", "idle_timeout", "weights", NULL };
 
 static int p_obfs(struct v2 *x, const struct ynode *n, const char *name, struct out_obfs *ob) {
     static const char *const K[] = { "mode", "server", "listen", NULL };
@@ -588,11 +590,14 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
     o.kind = kd;
     int group = out_group(&o) != NULL;
     unsigned caps = kd->caps;
+    if (group) group_cfg_init(&o.grp);
 
     struct out_keys k;
     memset(&k, 0, sizeof(k));
     k.v2 = 1;
-    int tol_set = 0;
+    /* Ключи группы, у которых свой pick: tolerance, interval, url, idle_timeout — latency; weights —
+     * balance. Какой pick, известно только после всех ключей (pick может стоять последним). */
+    const struct ynode *lat_key = NULL, *w_key = NULL;
     for (size_t i = 0; i < ynode_len(val); i++) {
         const struct ynode *kk = ynode_key_at(val, i), *v = ynode_val_at(val, i);
         const char *ks = kk->str, *sv;
@@ -644,13 +649,9 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
                 if (str_of(x, v, w, &sv)) return -1;
                 if (!strcmp(sv, "order")) o.grp.pick = PICK_ORDER;
                 else if (!strcmp(sv, "latency")) o.grp.pick = PICK_LATENCY;
-                else if (!strcmp(sv, "manual")) {
-                    o.grp.pick = PICK_MANUAL;
-                    unsup(x, v, "%s: manual — выбор члена командой select, шаг 3 из 1.9", w);
-                } else if (!strcmp(sv, "balance")) {
-                    o.grp.pick = PICK_BALANCE;
-                    unsup(x, v, "%s: balance — раздача соединений по членам, шаг 3 из 1.9", w);
-                } else return fail(x, v, "%s: «%s» — нужен order, latency, manual или balance", w, sv);
+                else if (!strcmp(sv, "manual")) o.grp.pick = PICK_MANUAL;
+                else if (!strcmp(sv, "balance")) o.grp.pick = PICK_BALANCE;
+                else return fail(x, v, "%s: «%s» — нужен order, latency, manual или balance", w, sv);
             } else if (!strcmp(ks, "members")) {
                 if (items_ok(x, v, w, MAX_MEMBERS)) return -1;
                 if (!n_items(v)) return fail(x, v, "%s: у группы нет членов", w);
@@ -661,15 +662,39 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             } else if (!strcmp(ks, "tolerance")) {
                 if (long_of(x, v, w, 0, GROUP_TOL_MAX_MS, &lv)) return -1;
                 o.grp.lat_tolerance_ms = (int)lv;
-                tol_set = 1;
+                lat_key = kk;
             } else if (!strcmp(ks, "interval")) {
                 if (long_of(x, v, w, GROUP_INT_MIN_S, GROUP_INT_MAX_S, &lv)) return -1;
                 o.grp.lat_interval_s = (int)lv;
-                tol_set = 1;
+                lat_key = kk;
+            } else if (!strcmp(ks, "url")) {
+                /* Адрес проверки urltest (docs/spec-v2.md). https — только в полном пакете: в
+                 * steer-mini нет TLS, и адрес, который замер не сможет спросить, лучше назвать
+                 * при разборе, чем молча мерить им «не измерено» у всех членов. */
+                struct urltest_url u;
+                char why[160];
+                if (str_of(x, v, w, &sv)) return -1;
+                if (urltest_url_parse(sv, &u, why, sizeof(why)) != 0)
+                    return fail(x, v, "%s: %s", w, why);
+                if (u.https && !urltest_https_ok())
+                    return fail(x, v, "%s: https:// в этой сборке нет (steer-mini без TLS) — нужен полный "
+                                "пакет steer или адрес http://", w);
+                if (copy_to(x, v, w, sv, o.grp.url, sizeof(o.grp.url))) return -1;
+                lat_key = kk;
+            } else if (!strcmp(ks, "idle_timeout")) {
+                if (long_of(x, v, w, 0, GROUP_IDLE_MAX_S, &lv)) return -1;
+                o.grp.idle_timeout_s = (int)lv;
+                lat_key = kk;
             } else {
-                /* url и idle_timeout замера urltest (docs/architecture.md, «4в»): сейчас задержка
-                 * меряется рукопожатием TCP, и адрес проверки ей не нужен. */
-                unsup(x, kk, "%s — замер urltest у pick: latency, шаг 3 из 1.9", w);
+                /* weights — число на каждого члена, по порядку members; сколько членов, станет
+                 * известно во втором проходе — там и сверяется длина. */
+                if (items_ok(x, v, w, MAX_MEMBERS)) return -1;
+                for (size_t i2 = 0; i2 < n_items(v); i2++) {
+                    if (long_of(x, item(v, i2), w, 1, GROUP_WEIGHT_MAX, &lv)) return -1;
+                    o.grp.weight[i2] = (unsigned char)lv;
+                }
+                x->out_weights[idx] = v;
+                w_key = kk;
             }
             continue;
         }
@@ -684,7 +709,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             for (size_t b = 0; b < KIND_KEYS_N && l < sizeof(list); b++)
                 if (!group && (kd->keys & KIND_KEYS[b].bit))
                     l += (size_t)snprintf(list + l, sizeof(list) - l, ", %s", KIND_KEYS[b].key);
-            for (size_t b = 0; group && b < 5 && l < sizeof(list); b++)
+            for (size_t b = 0; group && GROUP_KEYS[b] && l < sizeof(list); b++)
                 l += (size_t)snprintf(list + l, sizeof(list) - l, ", %s", GROUP_KEYS[b]);
             return fail(x, kk, "неизвестный ключ «%s» в %s (есть: %s)", ks, where, list);
         }
@@ -726,10 +751,12 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
     }
 
     if (group) {
-        o.grp.def = -1;
         if (!x->out_members[idx]) return fail(x, val, "%s: у группы нужен members", where);
-        if (tol_set && o.grp.pick != PICK_LATENCY)
-            return fail(x, val, "%s: tolerance и interval — у pick: latency", where);
+        if (lat_key && o.grp.pick != PICK_LATENCY)
+            return fail(x, lat_key, "%s: %s — замер задержки, он есть только у pick: latency", where,
+                        lat_key->str);
+        if (w_key && o.grp.pick != PICK_BALANCE)
+            return fail(x, w_key, "%s: weights — доли соединений, они есть только у pick: balance", where);
     } else {
         /* Разбор и проверка ключей — у вида (один разбор на оба формата, kind.h). */
         if (kd->parse && kd->parse(&o, &k, x->e) != 0) return wrap(x, key);
@@ -791,6 +818,10 @@ static int p_outputs_links(struct v2 *x) {
             if (o->grp.pick != PICK_MANUAL)
                 return fail(x, dn, "outputs.%s.default: default есть только у pick: manual", o->name);
         }
+        const struct ynode *wn = x->out_weights[i];
+        if (wn && n_items(wn) != o->grp.members_n)
+            return fail(x, wn, "outputs.%s.weights: весов %zu, а членов %zu — по весу на каждого члена, "
+                        "по порядку members", o->name, n_items(wn), o->grp.members_n);
     }
     int state[MAX_OUTPUTS] = {0}, path[MAX_OUTPUTS + 1], len = 0;
     for (size_t i = 0; i < s->out_n; i++) {
@@ -808,27 +839,54 @@ static int p_outputs_links(struct v2 *x) {
                         "не кончился бы никогда", p);
         }
     }
+    /* Члены без устройства — отказ с местом члена; вложенные группы проверяются так же, когда
+     * замкнутся (их устройство — устройство их членов). */
     for (size_t i = 0; i < s->out_n; i++) {
-        struct output *o = &s->out[i];
+        const struct output *o = &s->out[i];
         if (!out_group(o)) continue;
         const struct ynode *mn = x->out_members[i];
-        int nested = 0;
         for (size_t k = 0; k < o->grp.members_n; k++) {
             const struct output *m = &s->out[o->grp.members[k]];
-            if (out_group(m)) { nested = 1; continue; }
-            if (!out_has_device(m))
+            if (!out_group(m) && !out_has_device(m))
                 return fail(x, item(mn, k), "outputs.%s.members: %s — kind: %s, у него нет устройства, "
                             "выбирать группе нечего", o->name, m->name, out_kind_name(m));
         }
-        if (nested) {
-            unsup(x, mn, "outputs.%s.members: группа в группе — шаг 3 из 1.9", o->name);
-            continue;
-        }
-        if (group_seal(s, o, x->e) != 0) return wrap(x, x->out_key[i]);
-        /* Активное устройство до первого прохода сторожа — первого по предпочтению члена (так же
-         * делает перевод v1 у пула). */
-        snprintf(o->device, sizeof(o->device), "%s", s->out[o->grp.members[0]].device);
     }
+    /* ЗАМЫКАНИЕ — ПО ВЛОЖЕННОСТИ: сначала группы, у которых среди членов групп нет, потом те, чьи
+     * члены-группы уже замкнуты, и так до конца. Свойства внешней — пересечение свойств членов, и у
+     * вложенной они обязаны быть посчитаны раньше; круги отвергнуты выше, так что каждый круг
+     * этого цикла замыкает хотя бы одну группу. */
+    unsigned char sealed[MAX_OUTPUTS] = {0};
+    for (int progress = 1; progress; ) {
+        progress = 0;
+        for (size_t i = 0; i < s->out_n; i++) {
+            struct output *o = &s->out[i];
+            if (!out_group(o) || sealed[i]) continue;
+            int ready = 1;
+            for (size_t k = 0; k < o->grp.members_n; k++) {
+                size_t m = o->grp.members[k];
+                if (m < MAX_OUTPUTS && out_group(&s->out[m]) && !sealed[m]) ready = 0;
+            }
+            if (!ready) continue;
+            if (group_seal(s, o, x->e) != 0) return wrap(x, x->out_key[i]);
+            /* Активное устройство до первого прохода сторожа — лист первого по предпочтению члена
+             * (у вложенной группы — её собственное такое же, так же делает перевод v1 у пула). */
+            snprintf(o->device, sizeof(o->device), "%s", s->out[o->grp.members[0]].device);
+            sealed[i] = 1;
+            progress = 1;
+        }
+    }
+    return 0;
+}
+
+/* Есть ли среди выбора группы (сама она или вложенные по цепочке) pick: balance. */
+static int reaches_balance(const struct spec *s, const struct output *o, int depth) {
+    const struct group_cfg *g = out_group(o);
+    if (!g || depth > MAX_OUTPUTS) return 0;
+    if (g->pick == PICK_BALANCE) return 1;
+    for (size_t k = 0; k < g->members_n; k++)
+        if (g->members[k] < MAX_OUTPUTS && reaches_balance(s, &s->out[g->members[k]], depth + 1))
+            return 1;
     return 0;
 }
 
@@ -1102,6 +1160,14 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
             if (x->cl[refs[i]].local && kind_of(o)->lan_only)
                 return fail(x, outn, "правило %s: выход kind=%s работает только для клиентов раздачи — %s",
                             rn, out_kind_name(o), kind_of(o)->lan_only);
+        /* balance у правил на сам телефон: разметка там — на хуке output в цепочке type route, и
+         * на ядре 4.9 (раскладка legacy.c) перемаршрутизацию после метки члена из перехода по карте
+         * пришлось бы переносить в каждую цепочку члена. Пока — честный отказ. */
+        for (size_t i = 0; i < refs_n; i++)
+            if (x->cl[refs[i]].local && reaches_balance(s, o, 0)) {
+                unsup(x, outn, "правило %s: pick: balance для трафика самого телефона (uid, self)", rn);
+                break;
+            }
     }
     s->rule_n++;
     return 0;

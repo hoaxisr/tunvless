@@ -450,6 +450,8 @@ static const char *cert_roots(void) {
     return g_android_roots[0] ? g_android_roots : NULL;
 }
 
+const char *vless_cert_roots(void) { return cert_roots(); }
+
 /* Поднять вторую связь — под выгрузку. Тот же путь установления, что и у первой: TCP, и
  * дальше либо ничего (security=none), либо Reality, либо обычный TLS с проверкой. */
 static int up_connect(struct vless_conn *c, const struct vless_node *n, int timeout_s) {

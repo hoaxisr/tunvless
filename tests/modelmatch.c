@@ -304,6 +304,69 @@ static void t_v2(void) {
     check("… апстрим правила", 1, g_spec.rule_n == 1 && g_spec.rule[0].dns == 1);
 }
 
+/* ---- шаг 3: manual, balance, вложенность, urltest ----------------------------------------- */
+
+static void t_groups_v2(void) {
+    check("группы шага 3 разобраны", 0, load(
+        "version: 2\n"
+        "outputs:\n"
+        "  a:   { kind: interface, device: wg0 }\n"
+        "  b:   { kind: interface, device: wg1 }\n"
+        "  res: { kind: group, members: [a, b] }\n"
+        "  top: { kind: group, pick: order, members: [res, b] }\n"
+        "  man: { kind: group, pick: manual, members: [a, top], default: top }\n"
+        "  bal: { kind: group, pick: balance, members: [res, b], weights: [3, 1] }\n"
+        "  lat: { kind: group, pick: latency, members: [a, b], url: \"http://example.net:8080/x\", idle_timeout: 90 }\n"));
+    if (g_msg[0]) printf("     %s\n", g_msg);
+    const struct output *top = out_by_name(&g_spec, "top"), *man = out_by_name(&g_spec, "man");
+    const struct output *bal = out_by_name(&g_spec, "bal"), *lat = out_by_name(&g_spec, "lat");
+    check("вложенная группа — член внешней, у внешней устройство (свойство членов)", 1,
+          top && out_has_device(top) && out_needs_mark(top));
+    check_str("активное устройство внешней — лист первого члена (вложенной)", "wg0", top ? top->device : "");
+    check("manual: default — номер члена", 1, man && out_group(man)->def == 1 && group_named(out_group(man)));
+    check("balance: веса по членам", 31, bal ? out_group(bal)->weight[0] * 10 + out_group(bal)->weight[1] : 0);
+    check_str("latency: url", "http://example.net:8080/x", lat ? out_group(lat)->url : "");
+    check("latency: idle_timeout", 90, lat ? out_group(lat)->idle_timeout_s : -1);
+    check("без idle_timeout — умолчание платформы (-1)", -1, top ? out_group(top)->idle_timeout_s : 0);
+    check("состояние сторожа до прохода — «нет»", 1,
+          man && out_group(man)->cur == -1 && out_group(man)->sel == -1 && out_group(man)->lat_ms[0] == -1);
+
+    check("balance членом order — отказ", -1, load(
+        "version: 2\n"
+        "outputs:\n"
+        "  a: { kind: interface, device: wg0 }\n"
+        "  b: { kind: interface, device: wg1 }\n"
+        "  x: { kind: group, pick: balance, members: [a, b] }\n"
+        "  y: { kind: group, pick: order, members: [x, a] }\n"));
+    check("… с объяснением", 1, has("членом группы pick: order она быть не может"));
+
+    /* Слоты карты balance: по весам живых методом наибольшего остатка. */
+    struct group_cfg g;
+    group_cfg_init(&g);
+    g.members_n = 3;
+    g.weight[0] = 2;
+    unsigned char own[GROUP_BAL_SLOTS];
+    int cnt[4];
+    group_balance_slots(&g, 7u, own);
+    memset(cnt, 0, sizeof(cnt));
+    for (int s = 0; s < GROUP_BAL_SLOTS; s++) cnt[own[s] == 0xff ? 3 : own[s]]++;
+    check("слоты: веса 2:1:1 — 60/30/30", 603030, cnt[0] * 10000L + cnt[1] * 100L + cnt[2]);
+    group_balance_slots(&g, 6u, own);
+    memset(cnt, 0, sizeof(cnt));
+    for (int s = 0; s < GROUP_BAL_SLOTS; s++) cnt[own[s] == 0xff ? 3 : own[s]]++;
+    check("слоты: первый упал — 0/60/60", 6060, cnt[0] * 10000L + cnt[1] * 100L + cnt[2]);
+    g.members_n = 7;
+    memset(g.weight, 0, sizeof(g.weight));
+    group_balance_slots(&g, 0x7fu, own);
+    memset(cnt, 0, sizeof(cnt));
+    int mx = 0, mn = GROUP_BAL_SLOTS, per[7] = {0};
+    for (int s = 0; s < GROUP_BAL_SLOTS; s++) per[own[s]]++;
+    for (int k = 0; k < 7; k++) { if (per[k] > mx) mx = per[k]; if (per[k] < mn) mn = per[k]; }
+    check("слоты: семь равных — 17 или 18 у каждого", 1718, mn * 100L + mx);
+    group_balance_slots(&g, 0u, own);
+    check("слоты: живых нет — карта пуста", 0xff, own[0] == 0xff && own[GROUP_BAL_SLOTS - 1] == 0xff ? 0xff : 0);
+}
+
 /* ---- решения выбора группы --------------------------------------------------------------- */
 
 static void t_pick(void) {
@@ -339,6 +402,7 @@ int main(void) {
     t_rules();
     t_groups();
     t_v2();
+    t_groups_v2();
     t_pick();
     char cmd[320];
     snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_tmp);

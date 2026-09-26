@@ -53,6 +53,8 @@
 #include "gaiw.h"
 #include "failover_int.h"
 #include "fostate.h"
+#include "fogroup.h"
+#include "urltest.h"
 
 /* Уровень в журнале приписывается КАЖДОЙ строке — это контракт, по которому управляющий
  * слой (splify2) раскрашивает журнал, и он разбирает именно префикс, а не текст. Базовый
@@ -829,6 +831,10 @@ static void apply_failed(struct output *o, int announce) {
                 o->on_fail == FAIL_ZAPRET ? "zapret" : "direct");
 }
 
+void fo_fail_apply(struct output *o) {
+    apply_failed(o, 1);
+}
+
 /* Привязать таблицу выхода к устройству. Правило проверяется и при нужде возвращается,
  * потому что режим отказа мог его снять.
  *
@@ -1289,8 +1295,10 @@ static void lat_put(struct fo_store *st, const char *out, const struct output *c
         fclose(old);
     }
     long now = mono_now();
+    /* Ключ члена — устройство у безымянного члена пула v1 (как было) и имя у именованного члена
+     * группы v2: у вложенной группы устройство листа меняется, а член — нет (fog_lat_key). */
     for (size_t k = 0; k < n; k++)
-        if (ms[k] >= 0) fprintf(f, "%s %s %d %ld\n", out, devs[k]->device, ms[k], now);
+        if (ms[k] >= 0) fprintf(f, "%s %s %d %ld\n", out, fog_lat_key(devs[k]), ms[k], now);
     if (fclose(f) == 0) st->ops->put(st, "latency", buf, bn);
     free(buf);
 }
@@ -1386,8 +1394,12 @@ void outputs_adopt_active(struct spec *sp) {
 }
 
 void outputs_adopt_active_st(struct spec *sp, struct fo_store *st) {
-    for (size_t i = 0; i < sp->out_n; i++) {
-        struct output *o = &sp->out[i];
+    /* В порядке прохода (fog_order): у вложенной группы устройство — лист её выбора, и внешней
+     * оно нужно уже выбранным. */
+    size_t ord[MAX_OUTPUTS];
+    size_t on = fog_order(sp, ord);
+    for (size_t oi = 0; oi < on; oi++) {
+        struct output *o = &sp->out[ord[oi]];
         if (!out_has_device(o)) continue;
         char rec[32];
         active_get_st(st, o->name, rec, sizeof(rec));   /* читает три поля — см. active_get */
@@ -1410,6 +1422,8 @@ void outputs_adopt_active_st(struct spec *sp, struct fo_store *st) {
             if (device_present(m[k]->device)) pick = m[k]->device;
         if (pick) snprintf(o->device, sizeof(o->device), "%s", pick);
     }
+    /* Состояние групп (выбранный член, живые, выбор человека, замеры) — для status. */
+    fog_adopt(sp, st);
 }
 
 /* Поднять залипший туннель.
@@ -1484,9 +1498,10 @@ static const char *on_fail_name(enum on_fail of) {
 
 /* Сказать получателю о перемене, если он есть. */
 static void fo_emit(fo_event_fn ev, void *arg, enum fo_ev_kind kind, const struct output *o,
-                    const char *from, const char *to, const char *why) {
+                    const char *from, const char *to, const char *why, const char *member) {
     if (!ev) return;
-    struct fo_event e = { kind, o->name, from, to, why, on_fail_name(o->on_fail) };
+    struct fo_event e = { .kind = kind, .out = o->name, .from = from, .to = to, .why = why,
+                          .on_fail = on_fail_name(o->on_fail), .member = member };
     ev(arg, &e);
 }
 
@@ -1590,6 +1605,16 @@ struct fo_run {
     long iv;
     int ms[MAX_MEMBERS];
     int best, pick;
+    /* Группа v2 (именованные члены, group_named): здоровье члена — приговор его прохода (alive),
+     * своих проб и оживления у группы нет (fogroup.c, шапка). pk — номер выбранного члена, galive —
+     * живые члены; по выходам — для записи groups в конце прохода. */
+    int named;
+    int pk;
+    unsigned galive;
+    int grp_cur[MAX_OUTPUTS];
+    unsigned grp_alive[MAX_OUTPUTS];
+    fo_traffic_fn traffic;            /* трафик через группу — idle_timeout (fostate.h); NULL — нет */
+    void *traffic_arg;
 
     /* ---- идущая проба ---- */
     struct {
@@ -1598,6 +1623,8 @@ struct fo_run {
         int ti, best, rule;
         char src[64];
         struct foprobe *p;
+        const struct output *m;       /* замер: член группы (метка — у именованного) */
+        struct urltest *ut;           /* замер: идущий urltest */
     } hp;
 
     /* ---- идущее оживление ---- */
@@ -1705,6 +1732,24 @@ static void hp_icmp_cb(void *arg, int ok, int ms) {
     fo_step(r);
 }
 
+/* ЗАМЕР — urltest (решение владельца, docs/architecture.md, «4в»): HTTP(S)-запрос к url группы
+ * через члена, время до первого байта ответа 204/200 (src/daemon/urltest.c). Прежняя мера —
+ * рукопожатие TCP через устройство — у VLESS мерила его собственный TUN: клиент завершает TCP у
+ * себя, и «соединилось» приходило за доли миллисекунды при любом пути за туннелем. Первый байт
+ * ответа приходит только с того конца пути.
+ *
+ * Через члена — меткой именованного члена (SO_MARK: правило fwmark члена и его таблица, тот же
+ * путь, что у трафика группы и у `over`, включая TUN и цепочки подложек); у безымянного члена
+ * пула v1 метки нет — привязкой к устройству (SO_BINDTODEVICE), как мерила и прежняя проба. */
+#define URLTEST_TIMEOUT_MS 5000
+
+static void hp_url_cb(void *arg, int ms) {
+    struct fo_run *r = arg;
+    r->hp.ut = NULL;
+    r->res = ms;
+    fo_step(r);
+}
+
 /* Спросить устройство dev выхода o. Состояние, в котором продолжить, вызывающий ставит ДО
  * вызова. 1 — проба идёт (вызывающий возвращает управление циклу, продолжение — из обратного
  * вызова); 0 — ответ уже есть, в r->res (здоровье 1/0, замер — мс или -1). */
@@ -1719,14 +1764,22 @@ static int hp_start(struct fo_run *r, int kind, const struct output *o, const ch
         if (g_latency_probe) { r->res = g_latency_probe(sp, o, dev); return 0; }
         r->res = -1;
         if (!device_present(dev)) return 0;
-        o = out_for_device(sp, o, dev);
+        const struct group_cfg *g = out_group(o);
+        const struct output *m = r->hp.m;
+        uint32_t mark = m && m >= sp->out && m < sp->out + MAX_OUTPUTS ? m->mark : 0;
+        o = out_for_device(sp, m && mark ? m : o, dev);
         const struct kind_ops *k = kind_of(o);
         if (k->latency) { r->res = k->latency(sp, o, dev); return 0; }
         /* И туннель xsteer, поднятый netifd, — по тому же доводу, что у вида xsteer: мерить его
          * нечем, а число из пробы наружу означало бы не задержку туннеля, а наличие интернета у
          * хаба. */
         if (r->hs->ops->xsdev(r->hs, dev, NULL, NULL)) return 0;
-        return hp_tcp_next(r);
+        int ms = -1;
+        r->hp.ut = urltest_start(r->l, g && g->url[0] ? g->url : GROUP_URL_DEFAULT, mark,
+                                 mark ? NULL : dev, URLTEST_TIMEOUT_MS, hp_url_cb, r, &ms);
+        if (r->hp.ut) return 1;
+        r->res = ms;
+        return 0;
     }
     r->res = 0;
     if (!device_present(dev)) return 0;
@@ -1750,6 +1803,18 @@ static int hp_start(struct fo_run *r, int kind, const struct output *o, const ch
     if (!device_src(dev, r->hp.src, sizeof(r->hp.src))) return 0;
     probe_rule_set(r);
     return hp_icmp_next(r);
+}
+
+/* Здоровье кандидата k текущего выхода. У группы v2 — приговор прохода самого члена в этом же
+ * обходе (член идёт раньше группы — fog_order): проба та же, via тот же, оживление — его, и
+ * второй пробы того же устройства из-за группы нет. У пула v1 и выхода-одиночки — проба. */
+static int cand_health(struct fo_run *r, size_t k) {
+    if (r->named) {
+        size_t m = (size_t)(r->cand[k] - r->sp->out);
+        r->res = m < MAX_OUTPUTS && r->alive[m];
+        return 0;
+    }
+    return hp_start(r, HP_HEALTH, r->o, r->cand[k]->device);
 }
 
 /* ---- внешняя команда оживления --------------------------------------------------------------- */
@@ -1915,6 +1980,7 @@ static struct fo_run *run_new(struct loop *l, struct spec *sp, struct fo_store *
 
 static void run_free(struct fo_run *r) {
     if (r->hp.p) foprobe_cancel(r->hp.p);
+    if (r->hp.ut) urltest_cancel(r->hp.ut);
     probe_rule_clear(r);
     if (r->rv.sp) fospawn_cancel(r->rv.sp);
     if (r->rv.gw) gaiw_cancel(r->rv.gw);
@@ -1948,6 +2014,12 @@ void fo_pass_helpers(struct fo_run *r, struct fo_hsrc *hs) {
     if (r) r->hs = hs ? hs : &fo_hsrc_files;
 }
 
+void fo_pass_traffic(struct fo_run *r, fo_traffic_fn fn, void *arg) {
+    if (!r) return;
+    r->traffic = fn;
+    r->traffic_arg = arg;
+}
+
 /* ---- шаг выхода: действия после решения (прежний хвост тела цикла failover_pass) ----------- */
 
 static void out_finish(struct fo_run *r) {
@@ -1956,6 +2028,14 @@ static void out_finish(struct fo_run *r) {
     const char *was = r->was;
     r->streak_new[r->i] = r->new_streak;
     r->alive[r->i] = chosen != NULL;
+    /* Группа v2: выбранный член — в событие и в запись groups. */
+    const char *member = NULL;
+    const struct group_cfg *gcf = out_group(o);
+    if (r->named) {
+        r->grp_cur[r->i] = chosen ? r->pk : -1;
+        r->grp_alive[r->i] = r->galive;
+        if (chosen && r->pk >= 0 && (size_t)r->pk < r->cand_n) member = r->cand[r->pk]->name;
+    }
     /* Причину назвать надо: иначе «живых устройств нет» стоит у выхода, чьё устройство на
      * месте и чья проба, спроси её, ответила бы «да». Строка — на переходе в отказ (как и
      * объявление apply_failed) или при -v, а не на каждом проходе. */
@@ -1974,8 +2054,14 @@ static void out_finish(struct fo_run *r) {
             const char *why = !was[0] ? "start" : !strcmp(was, "-") ? "recovered"
                             : r->cur < 0 ? "spec" : r->by_latency ? "latency"
                             : r->cur_dead ? "down" : "preferred";
+            /* Группа v2: тот же член, но у него сменился лист (вложенная группа переключилась) —
+             * leaf; у manual смена члена — только выбором человека. */
+            int had = was[0] && strcmp(was, "-") != 0;
+            if (r->named && had && r->cur >= 0 && r->cur == r->pk) why = "leaf";
+            else if (r->named && had && gcf && gcf->pick == PICK_MANUAL && r->cur >= 0)
+                why = "select";
             fo_emit(r->ev, r->ev_arg, FO_EV_SWITCHED, o,
-                    was[0] && strcmp(was, "-") ? was : NULL, chosen, why);
+                    was[0] && strcmp(was, "-") ? was : NULL, chosen, why, member);
         } else {
             /* Имя устройства то же — и это НЕ значит, что маршрутизация цела.
              * Спрашиваем ядро, а не свою память: см. «сверка фактического
@@ -2030,7 +2116,7 @@ static void out_finish(struct fo_run *r) {
             apply_failed(o, 1);         /* отказ только что случился — объявляем */
             r->changed = 1;
             fo_emit(r->ev, r->ev_arg, FO_EV_FAILED, o, was[0] ? was : NULL, NULL,
-                    r->via_down ? "via" : "down");
+                    r->via_down ? "via" : "down", NULL);
         } else {
             struct route_facts f = route_facts_read(o);
             if (!f.known) {
@@ -2061,6 +2147,24 @@ static void out_finish(struct fo_run *r) {
             }
         }
     }
+    /* balance: карта раздачи в ядре — по живым членам этого прохода (fogroup.c: по факту в ядре,
+     * запись — только при расхождении). Переписана — событие balance с составом. */
+    if (r->named && gcf && gcf->pick == PICK_BALANCE &&
+        fog_balance_sync(r->sp, o, r->galive) == 1) {
+        char al[MAX_MEMBERS * 33];
+        size_t l = 0;
+        al[0] = '\0';
+        for (size_t k = 0; k < r->cand_n && l < sizeof(al); k++)
+            if ((r->galive >> k) & 1u)
+                l += (size_t)snprintf(al + l, sizeof(al) - l, "%s%s", l ? "," : "", r->cand[k]->name);
+        fprintf(stderr, LOG_I "выход %s: раздача по членам — %s\n", o->name, al[0] ? al : "никого");
+        r->changed = 1;
+        if (r->ev) {
+            struct fo_event e = { .kind = FO_EV_BALANCE, .out = o->name, .alive = al,
+                                  .on_fail = on_fail_name(o->on_fail) };
+            r->ev(r->ev_arg, &e);
+        }
+    }
 }
 
 /* ---- автомат ------------------------------------------------------------------------------ */
@@ -2088,11 +2192,16 @@ static void fo_step(struct fo_run *r) {
              *
              * Ни проб, ни таймеров ради этого не заводится — требование батареи на телефоне:
              * зависимость читается из уже известного ответа, а пробы внутреннего выхода при
-             * лежащей цели и вовсе не делаются (см. via_down ниже). */
-            r->ord_n = 0;
-            for (int depth = 0; depth <= MAX_OVER_DEPTH; depth++)
-                for (size_t i = 0; i < sp->out_n; i++)
-                    if (out_over_depth(sp, &sp->out[i]) == depth) r->ord[r->ord_n++] = i;
+             * лежащей цели и вовсе не делаются (см. via_down ниже).
+             *
+             * Та же зависимость — у группы v2 от её членов (и у вложенной группы от её членов):
+             * группа судит по их приговорам в этом же проходе, поэтому идёт после них (fog_order;
+             * для спеки без таких групп порядок тот же, что по одной глубине over). */
+            r->ord_n = fog_order(sp, r->ord);
+            for (size_t i = 0; i < MAX_OUTPUTS; i++) {
+                r->grp_cur[i] = -1;
+                r->grp_alive[i] = 0;
+            }
             r->oi = 0;
             r->s = S_OUT;
             continue;
@@ -2118,6 +2227,15 @@ static void fo_step(struct fo_run *r) {
             r->cur = -1;
             for (size_t k = 0; k < r->cand_n; k++)
                 if (!strcmp(r->cand[k]->device, r->was)) { r->cur = (int)k; break; }
+            /* Группа v2: несущий член — по записи groups (устройство листа у вложенных групп могут
+             * делить два члена, а у вложенной лист меняется, пока член тот же). */
+            r->named = group_named(out_group(o));
+            r->pk = -1;
+            r->galive = 0;
+            if (r->named) {
+                int gc = fog_groups_cur(r->st, sp, o);
+                if (gc >= 0 && strcmp(r->was, "-") != 0) r->cur = gc;
+            }
             r->first_h = -1;
             r->k = 0;
             r->s = S_SCAN;
@@ -2129,7 +2247,7 @@ static void fo_step(struct fo_run *r) {
              * запас на каждом тике. Здоровье устройств 0..first_h тем самым известно. */
             if (r->k >= r->cand_n || r->via_down) { r->s = S_LAT; continue; }
             r->s = S_SCAN_R;
-            if (hp_start(r, HP_HEALTH, o, r->cand[r->k]->device)) return;
+            if (cand_health(r, r->k)) return;
             continue;
 
         case S_SCAN_R:
@@ -2169,6 +2287,34 @@ static void fo_step(struct fo_run *r) {
              * из таких берётся самый предпочтительный. Иначе включение режима означало бы
              * «мой список больше ничего не значит». */
             const struct group_cfg *g = out_group(o);
+            /* Группа v2: живые члены — все сразу, без проб (приговоры их проходов уже есть). */
+            for (size_t k = 0; r->named && k < r->cand_n; k++) {
+                size_t m = (size_t)(r->cand[k] - sp->out);
+                if (m < MAX_OUTPUTS && r->alive[m]) r->galive |= 1u << k;
+            }
+            /* manual — член, выбранный человеком (select), или default. Не отвечает — отказ группы
+             * с её on_fail: переключиться на другого значило бы решить за человека. */
+            if (g && r->named && g->pick == PICK_MANUAL) {
+                int k = fog_manual_pick(sp, r->st, o);
+                if (k >= 0 && ((r->galive >> k) & 1u)) {
+                    r->chosen = r->cand[k]->device;
+                    r->pk = k;
+                }
+                r->s = S_FIN;
+                continue;
+            }
+            /* balance — соединения раздаёт ядро по карте живых членов (fog_balance_sync в
+             * out_finish); таблица самой группы — у первого живого члена: по ней идут сокеты с
+             * меткой группы (over на группу). Живых нет — отказ группы, карта пуста. */
+            if (g && r->named && g->pick == PICK_BALANCE) {
+                for (size_t k = 0; k < r->cand_n && !r->chosen; k++)
+                    if ((r->galive >> k) & 1u) {
+                        r->chosen = r->cand[k]->device;
+                        r->pk = (int)k;
+                    }
+                r->s = S_FIN;
+                continue;
+            }
             if (g && g->pick == PICK_LATENCY && r->first_h >= 0 && r->cand_n > 1) {
                 r->tol = g->lat_tolerance_ms > 0 ? g->lat_tolerance_ms : LAT_TOLERANCE_MS;
                 r->iv  = g->lat_interval_s  > 0 ? g->lat_interval_s  : LAT_INTERVAL_S;
@@ -2176,12 +2322,21 @@ static void fo_step(struct fo_run *r) {
                 for (size_t k = 0; k < r->cand_n; k++) {
                     long age = 0;
                     r->ms[k] = -1;
-                    if (lat_get(r->st, o->name, r->cand[k]->device, &r->ms[k], &age)) {
+                    if (lat_get(r->st, o->name, fog_lat_key(r->cand[k]), &r->ms[k], &age)) {
                         if (age > r->iv || age < 0) stale = 1;
-                    } else stale = 1;
+                    } else if (!r->named || ((r->galive >> k) & 1u)) stale = 1;
+                }
+                /* Без трафика через группу замеров нет (idle_timeout): выбор — по тому, что уже
+                 * измерено, а новый замер — когда трафик пойдёт. */
+                if (stale && fog_idle(sp, o, fog_idle_limit(o), r->traffic, r->traffic_arg)) {
+                    stale = 0;
+                    if (r->verbose)
+                        fprintf(stderr, LOG_I "%s: трафика через группу нет — замер отложен\n",
+                                o->name);
                 }
                 /* Меряем ВСЕХ, включая тех, что ниже first_h: смысл режима ровно в том, чтобы
-                 * узнать про них. */
+                 * узнать про них. У группы v2 — всех живых: мёртвому член замер не нужен, его
+                 * всё равно не выбрать. */
                 r->k = 0;
                 r->s = stale ? S_LAT_M : S_LAT_C;
                 continue;
@@ -2195,6 +2350,11 @@ static void fo_step(struct fo_run *r) {
                 r->s = S_LAT_C;
                 continue;
             }
+            if (r->named && !((r->galive >> r->k) & 1u)) {
+                r->ms[r->k++] = -1;
+                continue;
+            }
+            r->hp.m = r->cand[r->k];
             r->s = S_LAT_M_R;
             if (hp_start(r, HP_LATENCY, o, r->cand[r->k]->device)) return;
             continue;
@@ -2227,7 +2387,7 @@ static void fo_step(struct fo_run *r) {
              * уступает сразу: здоровье старше замера. */
             if (r->cur >= 0 && r->cur != pick && r->ms[r->cur] >= 0) {
                 r->s = S_LAT_CUR_R;
-                if (hp_start(r, HP_HEALTH, o, r->cand[r->cur]->device)) return;
+                if (cand_health(r, (size_t)r->cur)) return;
                 continue;
             }
             r->s = S_LAT_PICK;
@@ -2241,12 +2401,13 @@ static void fo_step(struct fo_run *r) {
 
         case S_LAT_PICK:
             r->s = S_LAT_PICK_R;
-            if (hp_start(r, HP_HEALTH, o, r->cand[r->pick]->device)) return;
+            if (cand_health(r, (size_t)r->pick)) return;
             continue;
 
         case S_LAT_PICK_R:
             if (r->res) {
                 r->chosen = r->cand[r->pick]->device;
+                r->pk = r->pick;
                 r->by_latency = 1;
                 if (r->verbose)
                     fprintf(stderr, LOG_I "%s: по замеру выбран %s (%d мс, лучший %d, "
@@ -2264,13 +2425,14 @@ static void fo_step(struct fo_run *r) {
                      * нельзя — это и есть мелькание. Держим его, пока верхнее не подтвердит
                      * здоровье STEER_FAILOVER_HYST тиков подряд. Мёртвое текущее — сразу вниз. */
                     r->s = S_HYST_R;
-                    if (hp_start(r, HP_HEALTH, o, r->cand[r->cur]->device)) return;
+                    if (cand_health(r, (size_t)r->cur)) return;
                     continue;
                 }
                 /* first_h == cur (несём лучшее доступное) либо cur < first_h (текущее мертво —
                  * first_h это уход вниз): в обоих случаях берём first_h без задержки, счётчик
                  * сбрасываем. */
                 r->chosen = r->cand[r->first_h]->device;
+                r->pk = r->first_h;
             }
             r->s = S_REV0;
             continue;
@@ -2280,6 +2442,7 @@ static void fo_step(struct fo_run *r) {
             int k = group_hysteresis(r->cur, r->first_h, r->res, r->streak, failover_hyst(),
                                      &r->new_streak);
             r->chosen = r->cand[k]->device;
+            r->pk = k;
             if (!r->res) r->cur_dead = 1;
             r->s = S_REV0;
             continue;
@@ -2287,8 +2450,9 @@ static void fo_step(struct fo_run *r) {
 
         case S_REV0:
             /* Ни одно не ответило — вот теперь можно тратить время на оживление. Порядок
-             * тот же, поэтому основной туннель получает попытку первым. */
-            if (!r->chosen && !r->via_down) {
+             * тот же, поэтому основной туннель получает попытку первым. Группа v2 своих членов
+             * не оживляет: каждый член — выход со своим проходом, и оживление — в нём. */
+            if (!r->chosen && !r->via_down && !r->named) {
                 if (r->cur >= 0) r->cur_dead = 1;   /* ни одно не ответило — и текущее тоже */
                 r->k = 0;
                 r->s = S_REV;
@@ -2305,7 +2469,8 @@ static void fo_step(struct fo_run *r) {
         case S_REV_R:
             if (r->res) {
                 r->chosen = r->cand[r->k]->device;
-                fo_emit(r->ev, r->ev_arg, FO_EV_REVIVED, o, NULL, r->chosen, NULL);
+                r->pk = (int)r->k;
+                fo_emit(r->ev, r->ev_arg, FO_EV_REVIVED, o, NULL, r->chosen, NULL, NULL);
                 r->s = S_FIN;
                 continue;
             }
@@ -2321,6 +2486,7 @@ static void fo_step(struct fo_run *r) {
 
         case S_END:
             active_save(r->st, sp, r->streak_new, r->failed);
+            fog_groups_save(r->st, sp, r->grp_cur, r->grp_alive);
             if (!r->changed && r->verbose) fprintf(stderr, LOG_I "изменений нет\n");
             /* Строки о переключении — в stdout: у долгоживущего процесса он буферизован, а
              * читают его журнал сервиса и стенды — сразу после прохода. */

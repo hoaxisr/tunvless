@@ -102,6 +102,7 @@
 #include "state.h"
 #include "fostate.h"
 #include "helpers.h"
+#include "nftdump.h"
 #include "watchd.h"
 
 #define LOG_WW "steer[warn] watch: "
@@ -168,9 +169,16 @@ static int mem_set(struct fo_mem *m, const char *name, const char *data, size_t 
     return 0;
 }
 
+/* Записи, которые живут и на диске (только при изменении): active — выбор устройств для apply,
+ * status и diag подкомандой; select — выбор человека у pick: manual, он обязан пережить перезапуск
+ * демона и перезагрузку; groups — выбранный член и живые члены групп для status подкомандой. */
+static int mem_mirrored(const char *name) {
+    return !strcmp(name, "active") || !strcmp(name, "select") || !strcmp(name, "groups");
+}
+
 static void mem_put(struct fo_store *st, const char *name, const char *data, size_t n) {
     struct fo_mem *m = (struct fo_mem *)st;
-    if (mem_set(m, name, data, n) == 0 && m->mirror && !strcmp(name, "active"))
+    if (mem_set(m, name, data, n) == 0 && m->mirror && mem_mirrored(name))
         fo_store_files.ops->put(&fo_store_files, name, data, n);
 }
 
@@ -229,7 +237,8 @@ static const struct fo_hsrc_ops hmem_ops = {
 /* Событие прохода, отложенное до его конца (см. шапку). */
 struct wev {
     enum fo_ev_kind kind;
-    char out[48], from[48], to[48], why[24], of[16];
+    char out[48], from[48], to[48], why[24], of[16], member[48];
+    char alive[MAX_MEMBERS * 33];
 };
 
 struct watchd {
@@ -328,30 +337,67 @@ static void watchd_ev(void *arg, const struct fo_event *e) {
     snprintf(q->to, sizeof(q->to), "%s", e->to ? e->to : "");
     snprintf(q->why, sizeof(q->why), "%s", e->why ? e->why : "");
     snprintf(q->of, sizeof(q->of), "%s", e->on_fail ? e->on_fail : "");
+    snprintf(q->member, sizeof(q->member), "%s", e->member ? e->member : "");
+    snprintf(q->alive, sizeof(q->alive), "%s", e->alive ? e->alive : "");
+}
+
+void steerd_fo_emit(struct steerd *d, const struct fo_event *e) {
+    char out[112], from[112], to[112], why[64], of[48], mem[112], f[2048];
+    steerd_json_str(out, sizeof(out), e->out ? e->out : "");
+    if (e->from && e->from[0]) steerd_json_str(from, sizeof(from), e->from); else strcpy(from, "null");
+    if (e->to && e->to[0]) steerd_json_str(to, sizeof(to), e->to); else strcpy(to, "null");
+    steerd_json_str(why, sizeof(why), e->why ? e->why : "");
+    steerd_json_str(of, sizeof(of), e->on_fail ? e->on_fail : "");
+    /* Поля групп v2 — только добавлены и только у них: у пула v1 событие прежнее до байта. */
+    char extra[256] = "";
+    if (e->member && e->member[0]) {
+        steerd_json_str(mem, sizeof(mem), e->member);
+        snprintf(extra, sizeof(extra), ",\"member\":%s", mem);
+    }
+    if (e->by && e->by[0]) {
+        size_t l = strlen(extra);
+        snprintf(extra + l, sizeof(extra) - l, ",\"by\":\"%s\"", e->by);
+    }
+    switch (e->kind) {
+    case FO_EV_SWITCHED:
+        snprintf(f, sizeof(f), ",\"out\":%s,\"from\":%s,\"to\":%s,\"why\":%s%s", out, from, to, why,
+                 extra);
+        steerd_emit(d, "switched", f);
+        break;
+    case FO_EV_FAILED:
+        snprintf(f, sizeof(f), ",\"out\":%s,\"from\":%s,\"on_fail\":%s,\"why\":%s%s", out, from, of,
+                 why, extra);
+        steerd_emit(d, "failed", f);
+        break;
+    case FO_EV_REVIVED:
+        snprintf(f, sizeof(f), ",\"out\":%s,\"dev\":%s", out, to);
+        steerd_emit(d, "revived", f);
+        break;
+    case FO_EV_BALANCE: {
+        /* alive — массив имён живых членов (в карте раздачи). */
+        size_t l = (size_t)snprintf(f, sizeof(f), ",\"out\":%s,\"alive\":[", out);
+        char names[MAX_MEMBERS * 33];
+        snprintf(names, sizeof(names), "%s", e->alive ? e->alive : "");
+        int first = 1;
+        for (char *tok = strtok(names, ","); tok && l < sizeof(f); tok = strtok(NULL, ",")) {
+            char js[112];
+            steerd_json_str(js, sizeof(js), tok);
+            l += (size_t)snprintf(f + l, sizeof(f) - l, "%s%s", first ? "" : ",", js);
+            first = 0;
+        }
+        if (l < sizeof(f)) snprintf(f + l, sizeof(f) - l, "]");
+        steerd_emit(d, "balance", f);
+        break;
+    }
+    }
 }
 
 /* Одно событие прохода — подписчикам (поля — docs/ctl.md). */
 static void watchd_emit(struct watchd *w, const struct wev *q) {
-    char out[112], from[112], to[112], why[64], of[48], f[640];
-    steerd_json_str(out, sizeof(out), q->out);
-    if (q->from[0]) steerd_json_str(from, sizeof(from), q->from); else strcpy(from, "null");
-    if (q->to[0]) steerd_json_str(to, sizeof(to), q->to); else strcpy(to, "null");
-    steerd_json_str(why, sizeof(why), q->why);
-    steerd_json_str(of, sizeof(of), q->of);
-    switch (q->kind) {
-    case FO_EV_SWITCHED:
-        snprintf(f, sizeof(f), ",\"out\":%s,\"from\":%s,\"to\":%s,\"why\":%s", out, from, to, why);
-        steerd_emit(w->d, "switched", f);
-        break;
-    case FO_EV_FAILED:
-        snprintf(f, sizeof(f), ",\"out\":%s,\"from\":%s,\"on_fail\":%s,\"why\":%s", out, from, of, why);
-        steerd_emit(w->d, "failed", f);
-        break;
-    case FO_EV_REVIVED:
-        snprintf(f, sizeof(f), ",\"out\":%s,\"dev\":%s", out, to);
-        steerd_emit(w->d, "revived", f);
-        break;
-    }
+    struct fo_event e = { .kind = q->kind, .out = q->out, .from = q->from, .to = q->to,
+                          .why = q->why, .on_fail = q->of, .member = q->member,
+                          .alive = q->alive };
+    steerd_fo_emit(w->d, &e);
 }
 
 static void watchd_after(struct watchd *w) {
@@ -392,6 +438,62 @@ static void watchd_kill(struct loop *l, struct loop_timer *t, void *arg) {
     watchd_after(w);
 }
 
+/* ---- трафик через группу (idle_timeout замера urltest) ---------------------------------- */
+
+/* Выбирает ли группа a (прямо или через вложенные) выход g. */
+static int group_reaches(const struct spec *sp, const struct output *a, const struct output *g,
+                         int depth) {
+    if (a == g) return 1;
+    const struct group_cfg *ga = out_group(a);
+    for (size_t k = 0; ga && k < ga->members_n && depth < MAX_OUTPUTS; k++)
+        if (ga->members[k] < MAX_OUTPUTS &&
+            group_reaches(sp, &sp->out[ga->members[k]], g, depth + 1))
+            return 1;
+    return 0;
+}
+
+struct wtraffic {
+    const struct groups *gr;
+    unsigned char want[256];          /* по номеру группы каналов: её правила — трафик группы */
+    unsigned long long pkts;
+};
+
+static void wtraffic_rule(void *arg, const char *comment, int has_counter, uint64_t packets,
+                          uint64_t bytes) {
+    (void)bytes;
+    struct wtraffic *t = arg;
+    if (!has_counter || strncmp(comment, "steer:", 6) != 0) return;
+    for (size_t i = 0; i < t->gr->n && i < sizeof(t->want); i++)
+        if (t->want[i] && !strcmp(t->gr->g[i].name, comment + 6)) t->pkts += packets;
+}
+
+/* Пакеты правил каналов, ведущих в группу g или в группу, которая выбирает g (fostate.h,
+ * fo_traffic_fn). Счётчики — у ядра по netlink (nfd_chain_rules), без процессов; группы каналов
+ * — демона (в памяти вместе со спекой). Обе цепочки разметки: раздача и сам телефон. */
+static int watchd_traffic(void *arg, const struct spec *sp, const struct output *g,
+                          unsigned long long *pkts) {
+    struct watchd *w = arg;
+    if (!w->d->have || !sp) return -1;
+    struct wtraffic t;
+    memset(&t, 0, sizeof(t));
+    t.gr = w->d->gr;
+    int any = 0;
+    for (size_t i = 0; i < t.gr->n && i < sizeof(t.want); i++) {
+        const struct output *o = NULL;
+        for (size_t k = 0; k < sp->out_n; k++)
+            if (!strcmp(sp->out[k].name, t.gr->g[i].out)) o = &sp->out[k];
+        if (o && group_reaches(sp, o, &sp->out[g - sp->out], 0)) t.want[i] = any = 1;
+    }
+    if (!any) {
+        *pkts = 0;
+        return 0;
+    }
+    static const char *const chains[] = { "prerouting_mark", "output_mark" };
+    if (nfd_chain_rules(NFD_INET, nft_table(), chains, 2, wtraffic_rule, &t) != 0) return -1;
+    *pkts = t.pkts;
+    return 0;
+}
+
 static void watchd_pass_start(struct watchd *w) {
     if (!w->sp) w->sp = malloc(sizeof(*w->sp));
     if (!w->sp) {
@@ -413,6 +515,7 @@ static void watchd_pass_start(struct watchd *w) {
     }
     /* Супервизор заводится после сторожа — спрашивается на каждый проход. */
     if (w->d->sup) fo_pass_helpers(w->run, &w->hmem.base);
+    fo_pass_traffic(w->run, watchd_traffic, w);
     loop_timer_set(w->kill_tm, WATCHD_PASS_MAX_S * 1000L);
 }
 
@@ -457,12 +560,14 @@ struct watchd *watchd_start(struct steerd *d, const struct watchd_conf *c, int o
     }
     /* Выбор устройств, оставленный прежним сторожем (или этим же демоном до перезапуска), —
      * как его увидел бы очередной `steer failover`. */
-    FILE *f = fo_store_files.ops->open_r(&fo_store_files, "active");
-    if (f) {
-        char buf[MAX_OUTPUTS * 80 + 1];
+    static const char *const kept[] = { "active", "select", "groups" };
+    for (size_t r = 0; r < sizeof(kept) / sizeof(kept[0]); r++) {
+        FILE *f = fo_store_files.ops->open_r(&fo_store_files, kept[r]);
+        if (!f) continue;
+        static char buf[MAX_OUTPUTS * 700 + 1];
         size_t n = fread(buf, 1, sizeof(buf), f);
         fclose(f);
-        if (n < sizeof(buf)) mem_set(&w->mem, "active", buf, n);
+        if (n < sizeof(buf)) mem_set(&w->mem, kept[r], buf, n);
     }
     w->mem.mirror = 1;
     /* Замеры awg — в памяти процесса, как у `failover --loop`. */
@@ -509,6 +614,18 @@ void watchd_release(struct watchd *w) {
     w->eventful = 1;
     w->settling = 0;
     loop_timer_set(w->tm, 0);
+}
+
+void watchd_preempt(struct watchd *w) {
+    if (!w || !w->run) return;
+    fo_pass_abort(w->run);
+    w->run = NULL;
+    w->ev_n = 0;
+    loop_timer_stop(w->kill_tm);
+    w->pending = 0;
+    /* Следующий проход — после успокоения (он сверит всё заново по ядру и памяти); таймер периода
+     * был снят на время прохода. */
+    watchd_settle(w);
 }
 
 void watchd_stop(struct watchd *w) {

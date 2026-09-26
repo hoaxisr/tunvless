@@ -214,6 +214,21 @@ static void output_flow(FILE *f, const struct output *o, const char (*oname)[32]
             fk(&w, "interval");
             fprintf(f, "%d", g->lat_interval_s);
         }
+        if (g->pick == PICK_LATENCY && g->url[0]) fs(&w, "url", g->url);
+        if (g->pick == PICK_LATENCY && g->idle_timeout_s >= 0) {
+            fk(&w, "idle_timeout");
+            fprintf(f, "%d", g->idle_timeout_s);
+        }
+        int weighted = 0;
+        for (size_t i = 0; i < g->members_n; i++)
+            if (g->weight[i] > 1) weighted = 1;
+        if (g->pick == PICK_BALANCE && weighted) {
+            fk(&w, "weights");
+            fputc('[', f);
+            for (size_t i = 0; i < g->members_n; i++)
+                fprintf(f, "%s%u", i ? ", " : "", g->weight[i] ? g->weight[i] : 1u);
+            fputc(']', f);
+        }
     } else {
         struct out_keys kk;
         memset(&kk, 0, sizeof(kk));

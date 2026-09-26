@@ -1,0 +1,61 @@
+/* Группы в сторожe и команда select — устройство и доводы в шапке fogroup.c. */
+#ifndef STEER_FOGROUP_H
+#define STEER_FOGROUP_H
+
+#include <stdio.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "spec.h"
+#include "fostate.h"
+
+/* Порядок обхода прохода: цель `over` и члены именованной группы — раньше того, кто от них
+ * зависит; внутри круга — порядок спеки. Для спеки без таких групп это ровно прежний порядок по
+ * глубине over. Пишет номера в ord (не больше MAX_OUTPUTS), возвращает, сколько. */
+size_t fog_order(const struct spec *sp, size_t *ord);
+
+/* Выбор человека у группы pick: manual: номер члена по записи `select` (член всё ещё в группе),
+ * иначе default, иначе первый. */
+int fog_manual_pick(const struct spec *sp, struct fo_store *st, const struct output *g);
+
+/* Сколько секунд без трафика через группу замер urltest не делается: idle_timeout спеки, а без
+ * него — умолчание платформы (телефон — 1800, роутер — 0, то есть мерить всегда). */
+int fog_idle_limit(const struct output *g);
+/* Нет ли трафика через группу дольше limit секунд — по счётчику пакетов её правил (fn; NULL —
+ * узнать нечем, и тогда трафик «есть»). Первая встреча группы берёт отсчёт и считает её
+ * незанятой: без трафика замеров нет. 1 — простаивает. */
+int fog_idle(const struct spec *sp, const struct output *g, int limit, fo_traffic_fn fn, void *arg);
+
+/* balance: привести карту группы в ядре к живым членам alive (бит на члена). По факту в ядре, а
+ * не по памяти: apply ставит карту со всеми членами, и сверка обязана это заметить. 1 — карта
+ * переписана; 0 — уже такая; -1 — карты нет или ядро отказало (сказано в журнале один раз). */
+int fog_balance_sync(const struct spec *sp, const struct output *g, unsigned alive);
+
+/* Запись `groups` прохода: по группе — выбранный член (или «-») и живые члены. Пишется только
+ * при изменении текста (тот же довод про флеш, что у active_save). cur[i] — номер члена группы
+ * sp->out[i] (-1 — нет), alive[i] — маска. */
+void fog_groups_save(struct fo_store *st, const struct spec *sp, const int *cur, const unsigned *alive);
+/* Номер члена по записи `groups` (-1 — записи нет или член больше не в группе). */
+int fog_groups_cur(struct fo_store *st, const struct spec *sp, const struct output *g);
+
+/* Состояние групп для status (cur, alive, sel, lat_ms у struct group_cfg) — из записей `groups`,
+ * `select` и `latency` хранилища st. */
+void fog_adopt(struct spec *sp, struct fo_store *st);
+
+/* Ключ замера члена в записи `latency`: имя именованного члена, устройство безымянного (v1). */
+const char *fog_lat_key(const struct output *m);
+
+/* КОМАНДА select: группа gname (pick: manual) — член mname. Выбор кладётся в запись `select`
+ * (переживает перезапуск: файл рядом с реестром меток), таблица группы тут же переписывается на
+ * лист члена — как сторож при переключении, — а упавший член даёт группе её on_fail, а не
+ * другого члена. ev — событие switched (by: select) или failed. route = 0 — только запомнить
+ * выбор (движок выключен: маршрутизацию трогать нельзя, выбор применит следующий проход после
+ * включения). Текст для человека — в out, отказы — в stderr. Код: 0 — выбор принят; 2 — отказ
+ * (нет такой группы, не manual, не член). */
+int fog_select(struct spec *sp, struct fo_store *st, const char *gname, const char *mname,
+               int route, fo_event_fn ev, void *arg, FILE *out);
+
+/* `steerd select ГРУППА ЧЛЕН` без демона: спека с диска, память сторожа — файлы. */
+int cmd_select(const char *spec, const char *group, const char *member);
+
+#endif

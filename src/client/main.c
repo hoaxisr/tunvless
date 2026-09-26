@@ -90,7 +90,8 @@ struct call {
     const char *cmd;
     int kind;
     const char *spec, *state_dir;
-    const char *pos;          /* explain */
+    const char *pos;          /* explain; select — группа */
+    const char *pos2;         /* select — член */
     int fast, dry_run;
 };
 
@@ -115,6 +116,9 @@ static int parse_call(int argc, char **argv, struct call *c) {
         st = sd = 1;
         c->kind = K_ROUTE;
     } else if (!strcmp(c->cmd, "explain")) { st = sd = 1; pos = 1; c->kind = K_ROUTE; }
+    /* select — к демону, если он есть (он держит память сторожа и шлёт события); без демона тот
+     * же выбор делает движок сам (src/daemon/fogroup.c, cmd_select). */
+    else if (!strcmp(c->cmd, "select")) { st = sd = 1; pos = 2; c->kind = K_ROUTE; }
     else if (!strcmp(c->cmd, "apply")) { st = sd = dr = 1; c->kind = K_ROUTE; }
     else if (!strcmp(c->cmd, "reload") || !strcmp(c->cmd, "subscribe")) {
         st = sd = 1;
@@ -134,15 +138,20 @@ static int parse_call(int argc, char **argv, struct call *c) {
         }
         if (fa && !strcmp(a, "--fast")) { c->fast = 1; continue; }
         if (dr && !strcmp(a, "--dry-run")) { c->dry_run = 1; continue; }
-        if (pos && a[0] != '-' && a[0] && npos == 0) { c->pos = a; npos++; continue; }
+        if (pos && a[0] != '-' && a[0] && npos < pos) {
+            if (npos++ == 0) c->pos = a;
+            else c->pos2 = a;
+            continue;
+        }
         return K_LOCAL;
     }
-    if (pos && !npos) return K_LOCAL;
+    if (pos && npos < pos) return K_LOCAL;
     /* Проверка без применения — работа компилятора, демону в ней делать нечего. */
     if (c->dry_run) return K_LOCAL;
     /* Слово идёт в строку запроса, где разделитель — пробел, а конец — перевод строки. Слово с
      * ними исказило бы запрос, а не просто получило бы отказ; такое — движку (он и откажет). */
     if (c->pos && strpbrk(c->pos, " \t\r\n")) return K_LOCAL;
+    if (c->pos2 && strpbrk(c->pos2, " \t\r\n")) return K_LOCAL;
     return c->kind;
 }
 
@@ -481,6 +490,11 @@ int main(int argc, char **argv) {
     else if (!strcmp(c.cmd, "explain")) {
         if (strlen(c.pos) > LINE_MAX_V1 - 16) run_engine();
         snprintf(line, sizeof(line), "explain %s\n", c.pos);
+    } else if (!strcmp(c.cmd, "select")) {
+        /* Имена выходов — до 31 байта; длиннее — не наши, движок откажет своими словами. */
+        if (strlen(c.pos) > 64 || strlen(c.pos2) > 64) run_engine();
+        snprintf(line, sizeof(line), "select %.64s %.64s\n", c.pos, c.pos2);
+        readonly = 0;
     } else if (!strcmp(c.cmd, "apply")) {
         /* Спеку демону — телом, как её присылает приложение: он проверит её, положит на место
          * (это тот же файл — сверено выше) и применит только изменившееся. */

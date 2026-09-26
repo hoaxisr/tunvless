@@ -424,7 +424,7 @@ check "отказ: status — up false и failed true у выхода" "1" \
       "$(printf '%s' "$stf" | grep -c '"pool":{"kind":"interface","device":"lo","up":false,"failed":true,')"
 check "отказ: у соседнего выхода failed нет" "0" \
       "$(printf '%s' "$stf" | grep -c '"loc":{[^}]*"failed"')"
-check "отказ: умение названо" "1" "$(printf '%s' "$stf" | grep -c '"failed"\]')"
+check "отказ: умение названо" "1" "$(printf '%s' "$stf" | grep -o '"features":\[[^]]*\]' | grep -c '"failed"')"
 dgf="$($DIAG diag --spec "$tmp/pool2.json" --state-dir "$tmp/state" 2>/dev/null)"
 check "отказ: diag — fail, трафик канала остановлен" "1" \
       "$(printf '%s' "$dgf" | grep -c '{"id":"output","verdict":"fail","what":"выход pool: lo не отвечает, трафик канала остановлен"')"
