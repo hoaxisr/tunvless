@@ -53,8 +53,8 @@ static unsigned long long helper_sig(const struct spec *sp, const struct output 
      * или никуда (то есть напрямую, мимо цели), до своего перезапуска. С меткой в подписи
      * сверка после такого apply перезапускает его сразу. Метку считает out_underlay_mark — ровно
      * то значение, что помощник поставит на сокет (с битом туннеля на телефоне). */
-    if (o->via[0]) {
-        kind_sig_mix(&h, o->via, strlen(o->via));
+    if (o->over[0]) {
+        kind_sig_mix(&h, o->over, strlen(o->over));
         uint32_t um = out_underlay_mark(sp, o);
         kind_sig_mix(&h, &um, sizeof(um));
     }
@@ -68,10 +68,10 @@ size_t helpers_plan(const struct spec *sp, struct helper *out, size_t max, int *
      * иначе первый подъём внутреннего перебирал бы узлы через ещё не созданное устройство и
      * уходил в паузу перезапуска. Гарантии готовности это не даёт (цель поднимается секунды),
      * но у спеки без via порядок прежний, спековый. */
-    for (int depth = 0; depth <= MAX_VIA_DEPTH; depth++) {
+    for (int depth = 0; depth <= MAX_OVER_DEPTH; depth++) {
         for (size_t i = 0; i < sp->out_n; i++) {
             const struct output *o = &sp->out[i];
-            if (out_via_depth(sp, o) != depth) continue;
+            if (out_over_depth(sp, o) != depth) continue;
             /* Какой помощник нужен выходу, говорит вид (kind_ops.helper). Вид, чьей команды в
              * этой сборке нет, помощника не называет: vless и xsteer здесь только в расширенной
              * сборке, мост tgws — там же (kinds/tgws.c). */

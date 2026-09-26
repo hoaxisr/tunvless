@@ -21,7 +21,7 @@ DEFS    := -DSTEER_VERSION='"$(VERSION)"' $(if $(REV),-DSTEER_REV='"$(REV)"',)
 # (его же читают build.sh и build/build-ext.sh). Заголовки ядра — зависимостью целиком:
 # список файлов сборки они не меняют, а пересобрать движок при их правке нужно всегда.
 include build/sources.mk
-CORE_HDR := $(wildcard $(addsuffix /*.h,$(CORE_DIRS)))
+CORE_HDR := $(wildcard $(addsuffix /*.h,$(CORE_DIRS) $(THIRD_DIRS)))
 EXT_ALL_SRC := $(sort $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(EXT_SERVER_SRC) $(EXT_TGWS_SRC))
 # Модель для стендов, которые компонуют её отдельным списком: разбор спрашивает вид у реестра, поэтому
 # вместе с моделью идут виды (src/kinds). Без awg.c: он тянет run_quiet из lib/run.c, а стенды
@@ -33,10 +33,16 @@ EXT_ALL_SRC := $(sort $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(EXT_SERVER_SRC) $(EXT
 # свой заголовок), поэтому тянуть его сюда безопасно; в irmatch он уже приходит с COMPILE_SRC,
 # и там его вычитают, чтобы не собрать дважды.
 MODEL_KINDS := $(MODEL_SRC) $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC)) src/compile/ir.c
-# -I на все каталоги слоёв — через override, чтобы `make CFLAGS=...` его не терял.
-override CFLAGS += $(addprefix -I,$(INC_DIRS))
+# -I на все каталоги слоёв — через override, чтобы `make CFLAGS=...` его не терял. Там же
+# THIRD_DEFS — определения стороннего кода (libyaml, см. build/sources.mk).
+#
+# Сторонние файлы собираются ТЕМИ ЖЕ флагами и той же командой, что движок, без отдельных
+# правил с приглушёнными предупреждениями: libyaml 0.2.5 чиста под -Wall -Wextra и у gcc 13, и
+# у clang из NDK с глобальными флагами Soong и -Werror (проверено при переносе). Появится шум у
+# новой версии компилятора — глушить его здесь флагами для LIBYAML_SRC, а не правкой upstream.
+override CFLAGS += $(addprefix -I,$(INC_DIRS)) $(THIRD_DEFS)
 
-.PHONY: all test clean ext-syntax ext-test snapshot-record print-inc
+.PHONY: all test clean ext-syntax ext-test snapshot-record print-inc ndk-check
 all: $(BUILD)/steerd $(BUILD)/steer
 
 # Два бинарника, как в пакете (docs/architecture.md, раздел 4а, «Бинарники»): build/steerd — весь
@@ -75,7 +81,7 @@ $(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_DEFAULT_PLATFORM=android -o $@ $(CORE_SRC)
 
-test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/steer-xk
+test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/snapshot.sh
@@ -97,6 +103,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@sh tests/buildmatch.sh
 	@sh tests/srsmatch.sh
 	@$(BUILD)/srsunit
+	@$(BUILD)/modelmatch
 	@sh tests/srsgen.sh
 	@sh tests/srsnft.sh
 	@sh tests/vpsfetch.sh
@@ -134,6 +141,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@$(BUILD)/irmatch
 	@$(BUILD)/irmatch-android
 	@$(BUILD)/evmatch
+	@$(BUILD)/yamlmatch
 
 # Перезапись снимка генератора (tests/snapshot.sh). Только когда ruleset меняется
 # намеренно, и в том же коммите, что и изменение: иначе снимок перестаёт что-либо сторожить.
@@ -143,6 +151,22 @@ print-inc:
 
 snapshot-record: all $(BUILD)/steer-android $(BUILD)/tgwssim
 	@sh tests/snapshot.sh record
+
+# Сборка под Android тем же NDK, что прошивка (Android.bp, bionic): ни стенды на хосте, ни
+# QEMU-роутер (musl) не видят, чего нет в bionic, — так в origin/main однажды ушёл fopencookie.
+# Гонять перед пушем. Скрипт и mbedtls живут в деревьях работы над Android-портом; нет их на
+# машине — цель пропускается, а не падает.
+NDK_BPBUILD ?= /root/der-exp/android_vendor_der/tools/ndk-check/bpbuild.py
+NDK_MBEDTLS ?= /root/der-exp/android_external_mbedtls
+ndk-check:
+	@if [ ! -f "$(NDK_BPBUILD)" ] || [ ! -d "$(NDK_MBEDTLS)" ]; then \
+		echo "ndk-check: нет $(NDK_BPBUILD) или $(NDK_MBEDTLS) — пропуск"; exit 0; fi; \
+	for a in aarch64 x86_64; do \
+		python3 "$(NDK_BPBUILD)" --static --arch $$a --out $(BUILD)/ndk/$$a . "$(NDK_MBEDTLS)" \
+			-- steerd steer > $(BUILD)/ndk-$$a.log 2>&1 || \
+			{ echo "ndk-check: $$a не собирается:"; grep -m5 'error:' $(BUILD)/ndk-$$a.log; exit 1; }; \
+		echo "ndk-check: $$a — steerd и steer собираются"; \
+	done
 
 # Мини-сборка микропакета tgws на хосте — для стенда tgwsmark: ядро движка с -DSTEER_TGWS,
 # мост заменён заглушкой (tests/tgws-stub.c), потому что настоящий тянет TLS и docker.
@@ -280,6 +304,13 @@ $(BUILD)/awgmatch-android: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/
 # src/compile/ir.c — тем же доводом, что у MODEL_KINDS: zapret_emit/tgws_emit зовут ir_* на
 # компоновке, даже когда стенд их не вызывает.
 FAILOVERMATCH_KINDS := $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC)) $(KINDS_EXT_SRC) src/compile/ir.c
+
+# Модель v2 и перевод спеки v1 (src/model/v1.c, src/kinds/group.c): каналы → правила, списки,
+# клиенты; пул devices → группа — модулями модели, без движка: см. шапку tests/modelmatch.c. С
+# awg.c — как у specmatch: перевод отвечает и за отказ пула у kind=awg.
+$(BUILD)/modelmatch: tests/modelmatch.c tests/unit.h $(MODEL_KINDS) src/kinds/awg.c $(CORE_HDR)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/modelmatch.c $(MODEL_KINDS) src/kinds/awg.c
 
 # Читатель наборов sing-box (src/model/srs.c) и раскладка канала с ними (srsplan.c) — модулями
 # модели, без движка: см. шапку tests/srsunit.c.
@@ -462,6 +493,14 @@ $(BUILD)/evmatch: tests/evmatch.c src/lib/evline.c src/lib/evline.h src/lib/json
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/evmatch.c src/lib/evline.c src/lib/jsonw.c
 
+# Дерево YAML (src/lib/ynode.c) поверх libyaml: модуль и библиотека — отдельными объектами, со
+# стендом tests/yamlmatch.c (пример спеки v2, JSON спек v1, отказы и пределы). err.c — ради
+# err_set; больше модулю ничего не нужно.
+$(BUILD)/yamlmatch: tests/yamlmatch.c tests/unit.h $(YAML_SRC) src/lib/ynode.h src/lib/err.c src/lib/err.h \
+                    $(wildcard src/third_party/libyaml/*.h)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/yamlmatch.c $(YAML_SRC) src/lib/err.c
+
 # НЕ rm -rf $(BUILD): в build/ живут отслеживаемые Dockerfile, build-ext.sh и
 # лабораторные исходники, без которых ./build.sh из свежего клона не работает —
 # .gitignore об этом прямо предупреждает, а clean их сносил (I-023). Удаляются
@@ -471,5 +510,5 @@ clean:
 	       $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch \
 	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
 	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
-	       $(BUILD)/diagsim $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/libmbed-*.a \
+	       $(BUILD)/diagsim $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/yamlmatch $(BUILD)/libmbed-*.a \
 	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out

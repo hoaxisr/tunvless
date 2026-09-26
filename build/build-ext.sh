@@ -179,10 +179,12 @@ case "$ROLE" in
 esac
 [ -n "${FILES:-}" ] || { echo "нет списка файлов для роли $ROLE" >&2; exit 2; }
 STEER_INC="$(for d in $(profile_var INC_DIRS); do printf -- '-I/src/%s ' "$d"; done)"
+# Определения стороннего кода в ядре (libyaml: -DHAVE_CONFIG_H) — см. THIRD_DEFS в sources.mk.
+THIRD_DEFS="$(profile_var THIRD_DEFS)"
 
 # shellcheck disable=SC2086
 zig cc -target "$TARGET" ${MCPU:+-mcpu=$MCPU} -static $OPT -s \
-    -I"$MBED_INC" -I"$EXT_INC" $STEER_INC $CFG $ROLEDEF -DSTEER_VERSION="\"$VERSION\"" \
+    -I"$MBED_INC" -I"$EXT_INC" $STEER_INC $THIRD_DEFS $CFG $ROLEDEF -DSTEER_VERSION="\"$VERSION\"" \
     -DSTEER_REV="\"$REV\"" \
     -o "$OUT" \
     $FILES \

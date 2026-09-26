@@ -214,7 +214,7 @@ void l4_describe(const struct l4match *m, char *dst, size_t n) {
  * правке спеки, и перенос по позиции приписал бы чужой трафик. Канал, которого в новой спеке
  * нет, свой счётчик теряет — это и правильно, его больше не существует.
  */
-#define CTR_MAX MAX_CHANNELS
+#define CTR_MAX MAX_RULES
 struct ctr { char name[32]; unsigned long pkts, bytes; };
 static struct ctr g_ctr_up[CTR_MAX], g_ctr_down[CTR_MAX];
 static size_t g_ctr_up_n, g_ctr_down_n;
@@ -631,16 +631,16 @@ static void build_dns_redirect(struct nft_table *t, const struct spec *sp) {
                                             "dstnat", 0);
     static const char *const protos[2] = { "udp", "tcp" };
     for (int k = 0; k < 2; k++) {
-        for (size_t i = 0; i < sp->from_default_n; i++) {
+        for (size_t i = 0; i < sp->lan.from_n; i++) {
             struct nft_rule *r = ir_rule(c);
             ir_rule_fam(r, 4);
-            ir_x(r, "ip saddr %s", sp->from_default[i]);
+            ir_x(r, "ip saddr %s", sp->lan.from[i]);
             ir_x(r, "%s dport 53", protos[k]);
             ir_counter(r, 0, 0);
             ir_x(r, "redirect to :%d", DNS_PORT);
         }
         struct nft_rule *r = ir_rule(c);
-        if (sp->from_default_n) ir_family(r, 6);
+        if (sp->lan.from_n) ir_family(r, 6);
         x_ifs(r, sp, 0);
         ir_x(r, "%s dport 53", protos[k]);
         ir_counter(r, 0, 0);

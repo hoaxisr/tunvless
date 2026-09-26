@@ -932,7 +932,7 @@ static int live_read(const char *ifname, const char *kind, struct awg_live *L) {
 /* Через какой выход пускать UDP туннеля — поле `via` выхода (см. «вложенные выходы» в spec.h):
  * имя или NULL. Спрашивается одним местом, чтобы остальной код awg не знал, как поле хранится. */
 static const char *awg_out_via(const struct output *o) {
-    return o->via[0] ? o->via : NULL;
+    return o->over[0] ? o->over : NULL;
 }
 
 /* Метка сокета туннеля (WGDEVICE_A_FWMARK).
@@ -950,15 +950,15 @@ static const char *awg_out_via(const struct output *o) {
  * за трафик приложений.
  *
  * Здесь остаётся только то, что out_underlay_mark не решает, — имя, которого нет: -1. Спека такое
- * отвергает (via_check), так что это страховка вызова в обход парсера (стенд awgmatch). Выход via
+ * отвергает (over_check в model/v1.c), так что это страховка вызова в обход парсера (стенд awgmatch). Выход via
  * без метки (direct; или метка ещё не выдана) означает то же, что via нет. */
 int awg_sock_mark(const struct spec *sp, const char *via, uint32_t *mark) {
     struct output t;
     memset(&t, 0, sizeof t);
     *mark = out_underlay_mark(sp, &t);
     if (!via || !*via) return 0;
-    snprintf(t.via, sizeof t.via, "%s", via);
-    if (!out_via(sp, &t)) return -1;
+    snprintf(t.over, sizeof t.over, "%s", via);
+    if (!out_over(sp, &t)) return -1;
     *mark = out_underlay_mark(sp, &t);
     return 0;
 }
@@ -1747,12 +1747,12 @@ static int awg_parse(struct output *o, const struct out_keys *k, struct err *e) 
     /* Устройство у выхода ОДНО — его создаёт этот выход. Пул из нескольких туннелей
      * собирается выходом kind=interface, в devices которого названо и это устройство;
      * список здесь означал бы устройства, которые никто не создаст. */
-    if (o->devices_n > 1 ||
-        (o->devices_n == 1 && o->device[0] && strcmp(o->device, o->devices[0]) != 0))
+    if (k->devices_n > 1 ||
+        (k->devices_n == 1 && o->device[0] && strcmp(o->device, k->devices[0]) != 0))
         return err_set(e, "outputs.%s: у kind awg одно устройство — его заводит движок; пул "
             "собирается выходом kind=interface", o->name);
-    if (o->devices_n == 1 && !o->device[0])
-        snprintf(o->device, sizeof(o->device), "%s", o->devices[0]);
+    if (k->devices_n == 1 && !o->device[0])
+        snprintf(o->device, sizeof(o->device), "%s", k->devices[0]);
     /* Имя устройства выбирает движок так, чтобы оно не выдавало туннель (см.
      * awg_default_ifname в awg.h). Названное явно обязано тому же правилу: приложение
      * видит имена интерфейсов, и «wg0» рядом с wlan0 — это ровно тот след, которого
@@ -1764,8 +1764,6 @@ static int awg_parse(struct output *o, const struct out_keys *k, struct err *e) 
             return err_set(e, "outputs.%s: имя устройства выдаёт туннель (tun, wg, awg, ppp, vpn…) — "
                 "уберите device, и движок выберет имя сам", o->name);
     } else awg_default_ifname(o->name, o->device, sizeof(o->device));
-    o->devices_n = 0;
-    snprintf(o->devices[o->devices_n++], 32, "%s", o->device);
     /* Путь к файлу — тем же порядком, что у xsteer: по умолчанию из имени выхода, иначе
      * абсолютный и годный к JSON (печатается в status и diag). */
     if (!o->awg.conf[0])

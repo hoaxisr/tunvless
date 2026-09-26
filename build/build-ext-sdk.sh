@@ -94,6 +94,8 @@ case "$ROLE" in
 esac
 [ -n "${FILES:-}" ] || { echo "нет списка файлов для роли $ROLE" >&2; exit 2; }
 STEER_INC="$(for d in $(profile_var INC_DIRS); do printf -- '-I%s/%s ' "$SRC" "$d"; done)"
+# Определения стороннего кода в ядре (libyaml: -DHAVE_CONFIG_H) — см. THIRD_DEFS в sources.mk.
+THIRD_DEFS="$(profile_var THIRD_DEFS)"
 
 # -latomic ЗДЕСЬ НЕТ, и это следствие находки того же замера. Сначала gcc его потребовал: на
 # 32-битной цели атомарная операция над 64-битным словом не выражается одной командой и уходит в
@@ -107,7 +109,7 @@ STEER_INC="$(for d in $(profile_var INC_DIRS); do printf -- '-I%s/%s ' "$SRC" "$
 # проект носит один файл на несколько выпусков. Числа и оговорки — в docs/xsteer.md.
 # shellcheck disable=SC2086
 "$CC" $OPT -w -static -s \
-    -I"$MBED/include" -I"$SRC/src/proto/tls" $STEER_INC $CFG $ROLEDEF \
+    -I"$MBED/include" -I"$SRC/src/proto/tls" $STEER_INC $THIRD_DEFS $CFG $ROLEDEF \
     -DSTEER_VERSION="\"$VERSION\"" -DSTEER_REV="\"$REV\"" \
     -o "$OUT" \
     $FILES "$WORK"/*.o -lpthread

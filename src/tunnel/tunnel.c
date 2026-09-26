@@ -2937,11 +2937,11 @@ static int load_nodes(const char *spec_path, const char *out_name, struct output
  * файла подписки) метка — обычная «мимо каналов»: её отдаёт та же функция для выхода без via. */
 static void underlay_setup(const struct output *o) {
     static const struct output none;
-    if (o && o->via[0]) {
+    if (o && o->over[0]) {
         struct err e = {0};
         if (registry_assign(&g_spec, &e) < 0) err_die(&e);
     }
-    vless_set_sock_mark(out_underlay_mark(&g_spec, o ? o : &none), o && o->via[0]);
+    vless_set_sock_mark(out_underlay_mark(&g_spec, o ? o : &none), o && o->over[0]);
 }
 
 static void node_json(const struct vless_node *n, int index) {

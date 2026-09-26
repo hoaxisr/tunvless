@@ -1,0 +1,279 @@
+/* Стенд модели v2 и перевода спеки v1 (src/model/v1.c, src/kinds/group.c; docs/architecture.md,
+ * «4в. Устройство 1.9», шаг 1).
+ *
+ * Что проверяется: спека v1 из текста превращается ровно в те правила, списки, клиенты, выходы и
+ * группы, какие обещает перевод:
+ *   - канал → правило с безымянными клиентом и списком; без своего `from` — без клиента, «кто» по
+ *     умолчанию (sp->lan, прежний from_default);
+ *   - `any` без списков — список «весь трафик», со списками ничего не значит;
+ *   - `scope: device`, `mode: realip`, `enabled: false`, proto/ports — на своих местах;
+ *   - выход с `devices` — группа pick: order (latency при `prefer: latency`) из безымянных
+ *     членов-интерфейсов по одному на устройство; имя, метка, таблица, on_fail — у группы, и
+ *     снаружи она видна прежним видом (interface); у безымянных членов меток нет;
+ *   - один `devices` — прежний выход, не группа; `via` — `over`;
+ *   - то, что перевод отвергает (пул с obfs, `kind: group` в v1, пулов больше MAX_ANON), и
+ *     решения выбора группы (замер с допуском, гистерезис).
+ * Что НЕ проверяется здесь: что v1 через модель даёт тот же ruleset — это снимок генератора
+ * (tests/snapshot.sh), 118 вызовов apply --dry-run байт в байт.
+ *
+ * Модель линкуется отдельными объектами (MODEL_KINDS + awg.c, как у specmatch), без #include
+ * чужого .c. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "spec.h"
+#include "unit.h"
+
+static char g_tmp[256];
+static struct spec g_spec;
+static char g_msg[sizeof(((struct err *)0)->msg)];
+
+/* Спека из текста: «TMP» заменяется каталогом стенда. 0 — разобрана (и метки розданы), -1 —
+ * отказ, текст в g_msg. */
+static int load(const char *tmpl) {
+    char buf[16384], *o = buf;
+    for (const char *s = tmpl; *s && o < buf + sizeof(buf) - 256; ) {
+        if (!strncmp(s, "TMP", 3)) { o += sprintf(o, "%s", g_tmp); s += 3; }
+        else *o++ = *s++;
+    }
+    *o = '\0';
+    char p[512];
+    snprintf(p, sizeof(p), "%s/spec.json", g_tmp);
+    FILE *f = fopen(p, "w");
+    if (!f) { perror(p); exit(2); }
+    fputs(buf, f);
+    fclose(f);
+    struct err e = {0};
+    g_msg[0] = '\0';
+    if (load_spec(p, &g_spec, &e) < 0 || registry_assign(&g_spec, &e) < 0) {
+        snprintf(g_msg, sizeof(g_msg), "%s", e.msg);
+        return -1;
+    }
+    return 0;
+}
+
+static int has(const char *needle) { return strstr(g_msg, needle) != NULL; }
+
+/* ---- каналы → правила, списки, клиенты ------------------------------------------------ */
+
+static void t_rules(void) {
+    check("каналы v1 разобраны", 0, load(
+        "{\"schema\":2,\"from_default\":[\"192.168.1.0/24\"],"
+        "\"outputs\":{\"direct\":{\"kind\":\"direct\"},\"vpn\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
+        "\"channels\":["
+        " {\"name\":\"yt\",\"match\":{\"domains_file\":\"TMP/yt.lst\"},\"out\":\"vpn\"},"
+        " {\"name\":\"tv\",\"from\":[\"192.168.1.50\"],\"match\":{\"prefixes_files\":[\"TMP/a.lst\",\"TMP/b.lst\"],"
+        "  \"mode\":\"realip\"},\"out\":\"direct\"},"
+        " {\"name\":\"phone\",\"scope\":\"device\",\"from\":[\"aa:bb:cc:dd:ee:01\"],\"match\":{\"any\":true},\"out\":\"vpn\"},"
+        " {\"name\":\"all\",\"match\":{\"any\":true,\"allow_all\":true,\"proto\":\"udp\",\"ports\":[\"50000-65535\"]},\"out\":\"vpn\"},"
+        " {\"name\":\"off\",\"enabled\":false,\"match\":{\"any\":true,\"srs_file\":\"TMP/x.srs\"},\"out\":\"vpn\"}"
+        "]}"));
+    if (g_msg[0]) printf("     %s\n", g_msg);
+    check("правил — по каналу", 5, (long)g_spec.rule_n);
+    check("списков — по каналу", 5, (long)g_spec.list_n);
+    check("клиентов — только у каналов со своим from", 2, (long)g_spec.client_n);
+
+    const struct spec_rule *r = &g_spec.rule[0];
+    check_str("правило 0: имя канала", "yt", r->name);
+    check_str("правило 0: выход по номеру", "vpn", rule_out(&g_spec, r)->name);
+    check("правило 0: своего клиента нет", 0, (long)r->clients_n);
+    check("правило 0: «кто» — клиенты по умолчанию", 1, rule_who(&g_spec, r) == &g_spec.lan);
+    check_str("клиенты по умолчанию — from_default", "192.168.1.0/24",
+              g_spec.lan.from_n ? g_spec.lan.from[0] : "");
+    check("правило 0: один безымянный список", 1, r->lists_n == 1 && !rule_list(&g_spec, r)->name[0]);
+    check("правило 0: доменный файл в списке", 1, rule_list(&g_spec, r)->domains_n == 1 &&
+          strstr(rule_list(&g_spec, r)->domains_files[0], "yt.lst") != NULL);
+    check("правило 0: не весь трафик", 0, rule_list(&g_spec, r)->all);
+
+    r = &g_spec.rule[1];
+    check("правило 1: свой безымянный клиент", 1, r->clients_n == 1 && rule_client(&g_spec, r) &&
+          !rule_client(&g_spec, r)->name[0]);
+    check_str("правило 1: адрес клиента", "192.168.1.50", rule_who(&g_spec, r)->from[0]);
+    check("правило 1: два адресных файла", 2, (long)rule_list(&g_spec, r)->prefixes_n);
+    check("правило 1: realip", 1, r->realip);
+    check_str("правило 1: выход direct", "direct", rule_out(&g_spec, r)->name);
+
+    r = &g_spec.rule[2];
+    check("правило 2: на устройство", 1, r->dev_scope);
+    check("правило 2: any без списков — весь трафик", 1, rule_list(&g_spec, r)->all);
+
+    r = &g_spec.rule[3];
+    check("правило 3: весь трафик с сужением", 1, rule_list(&g_spec, r)->all);
+    check("правило 3: сужение udp", CH_PROTO_UDP, rule_list(&g_spec, r)->l4.proto);
+    check("правило 3: порты 50000-65535", 1, rule_list(&g_spec, r)->l4.ports_n == 1 &&
+          rule_list(&g_spec, r)->l4.ports[0].lo == 50000 &&
+          rule_list(&g_spec, r)->l4.ports[0].hi == 65535);
+
+    r = &g_spec.rule[4];
+    check("правило 4: выключено", 1, r->disabled);
+    check("правило 4: any рядом с набором — не весь трафик", 0, rule_list(&g_spec, r)->all);
+    check("правило 4: набор .srs в списке", 1, (long)rule_list(&g_spec, r)->srs_n);
+
+    /* Имена наборов считаются по правилам: клиенты по умолчанию — без суффикса, свой клиент —
+     * номер различного списка клиентов в порядке правил (у tv — второй, c1). */
+    char n0[64], n1[64];
+    group_set_name(&g_spec, n0, sizeof(n0), "vpn", "dom", g_spec.lan.from, g_spec.lan.from_n, 0, NULL);
+    check_str("имя набора правила без своих клиентов", "vpn_dom", n0);
+    const struct spec_client *tv = rule_who(&g_spec, &g_spec.rule[1]);
+    group_set_name(&g_spec, n1, sizeof(n1), "direct", "ip", tv->from, tv->from_n, 0, NULL);
+    check_str("имя набора правила со своим клиентом", "direct_ip_c1", n1);
+
+    check("allow_all спеки v1 по-прежнему нужен", -1, load(
+        "{\"schema\":1,\"from_default\":[\"192.168.1.0/24\"],"
+        "\"outputs\":{\"vpn\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
+        "\"channels\":[{\"name\":\"all\",\"match\":{\"any\":true},\"out\":\"vpn\"}]}"));
+    check("… с прежним текстом", 1, has("allow_all"));
+}
+
+/* ---- выходы: пул → группа, via → over --------------------------------------------------- */
+
+static void t_groups(void) {
+    check("пул устройств разобран", 0, load(
+        "{\"schema\":1,\"from_default\":[\"192.168.1.0/24\"],"
+        "\"outputs\":{\"direct\":{\"kind\":\"direct\"},"
+        " \"pool\":{\"kind\":\"interface\",\"devices\":[\"wg0\",\"wg1\"],\"on_fail\":\"direct\"},"
+        " \"one\":{\"kind\":\"interface\",\"devices\":[\"wg2\"]},"
+        " \"fast\":{\"kind\":\"interface\",\"devices\":[\"wg3\",\"wg4\",\"wg5\"],\"prefer\":\"latency\","
+        "  \"latency_tolerance_ms\":20,\"latency_interval_s\":60},"
+        " \"odd\":{\"kind\":\"interface\",\"device\":\"wg6\",\"devices\":[\"wg7\"]}},"
+        "\"channels\":[{\"name\":\"c\",\"match\":{\"prefixes_file\":\"TMP/a.lst\"},\"out\":\"pool\"}]}"));
+    if (g_msg[0]) printf("     %s\n", g_msg);
+    check("именованных выходов — как в спеке", 5, (long)g_spec.out_n);
+    check("безымянных членов — по устройству в пулах", 6, (long)g_spec.anon_n);
+
+    struct output *p = &g_spec.out[1];
+    const struct group_cfg *g = out_group(p);
+    check_str("имя группы — прежнее имя выхода", "pool", p->name);
+    check("пул стал группой", 1, g != NULL);
+    check_str("снаружи — прежний вид", "interface", out_kind_name(p));
+    check("pick: order", PICK_ORDER, g ? (long)g->pick : -1);
+    check("членов два", 2, g ? (long)g->members_n : -1);
+    const struct output *m[MAX_MEMBERS];
+    size_t mn = out_members(&g_spec, p, m, MAX_MEMBERS);
+    check("кандидаты группы — её члены", 2, (long)mn);
+    check_str("член 0 — устройство wg0", "wg0", mn > 0 ? m[0]->device : "");
+    check_str("член 1 — устройство wg1", "wg1", mn > 1 ? m[1]->device : "");
+    check("члены безымянные", 1, mn == 2 && !m[0]->name[0] && !m[1]->name[0]);
+    check_str("члены — интерфейсы", "interface", mn ? out_kind_name(m[0]) : "");
+    check("члены лежат за именованными", 1, mn == 2 && m[0] >= &g_spec.out[MAX_OUTPUTS]);
+    check_str("активное до сторожа — первое устройство", "wg0", p->device);
+    check("on_fail — у группы", FAIL_DIRECT, p->on_fail);
+    check("у группы есть устройство (свойство членов)", 1, out_has_device(p));
+    check("у группы метка", 1, out_needs_mark(p) && p->mark != 0);
+    check("у группы таблица", 1, p->table != 0);
+    check("у безымянных членов меток нет", 1, mn == 2 && !m[0]->mark && !m[1]->mark);
+    check("своего сокета наверх у группы нет", 0, out_over_capable(p));
+    check("процесса у группы нет", 0, out_engine_managed(p));
+    check("выход по имени — группа", 1, out_by_name(&g_spec, "pool") == p);
+
+    struct output *one = &g_spec.out[2];
+    check("один devices — не группа", 1, out_group(one) == NULL);
+    check_str("… устройство из devices", "wg2", one->device);
+    mn = out_members(&g_spec, one, m, MAX_MEMBERS);
+    check("… кандидат — он сам", 1, mn == 1 && m[0] == one);
+
+    const struct group_cfg *f = out_group(&g_spec.out[3]);
+    check("prefer: latency — pick: latency", PICK_LATENCY, f ? (long)f->pick : -1);
+    check("… допуск", 20, f ? f->lat_tolerance_ms : -1);
+    check("… интервал", 60, f ? f->lat_interval_s : -1);
+    check("… членов три", 3, f ? (long)f->members_n : -1);
+
+    struct output *odd = &g_spec.out[4];
+    check("device и другое devices — группа", 1, out_group(odd) != NULL);
+    check_str("… активное — названное device", "wg6", odd->device);
+    mn = out_members(&g_spec, odd, m, MAX_MEMBERS);
+    check_str("… член — из devices", "wg7", mn ? m[0]->device : "");
+
+    check("прямому выходу выбирать не из чего", 0,
+          (long)out_members(&g_spec, &g_spec.out[0], m, MAX_MEMBERS));
+
+    check("via → over", 0, load(
+        "{\"schema\":1,\"from_default\":[\"192.168.1.0/24\"],"
+        "\"outputs\":{\"wg\":{\"kind\":\"interface\",\"devices\":[\"wg0\",\"wg1\"]},"
+        " \"ob\":{\"kind\":\"interface\",\"device\":\"wg2\",\"via\":\"wg\","
+        "  \"obfs\":{\"server\":\"203.0.113.10:4567\",\"listen\":\"127.0.0.1:51820\"}}},"
+        "\"channels\":[]}"));
+    if (g_msg[0]) printf("     %s\n", g_msg);
+    check_str("… подложка названа", "wg", g_spec.out[1].over);
+    check("… и найдена: группа", 1, out_over(&g_spec, &g_spec.out[1]) == &g_spec.out[0]);
+    check("… глубина 1", 1, out_over_depth(&g_spec, &g_spec.out[1]));
+    check("… метка подложки — метка группы", 1,
+          out_underlay_mark(&g_spec, &g_spec.out[1]) == (g_spec.out[0].mark | STEER_TUNNEL_BIT));
+
+    check("дубликат устройства в пуле — отказ", -1, load(
+        "{\"schema\":1,\"outputs\":{\"p\":{\"kind\":\"interface\",\"devices\":[\"wg0\",\"wg0\"]}},"
+        "\"channels\":[]}"));
+    check("… прежним текстом", 1, has("указано дважды"));
+
+    check("пул с obfs — отказ", -1, load(
+        "{\"schema\":1,\"outputs\":{\"p\":{\"kind\":\"interface\",\"devices\":[\"wg0\",\"wg1\"],"
+        "\"obfs\":{\"server\":\"203.0.113.10:4567\",\"listen\":\"127.0.0.1:51820\"}}},"
+        "\"channels\":[]}"));
+    check("… сказано про obfs", 1, has("obfs"));
+
+    check("kind group в спеке v1 — неизвестный вид", -1, load(
+        "{\"schema\":1,\"outputs\":{\"g\":{\"kind\":\"group\"}},\"channels\":[]}"));
+    check("… прежним текстом", 1, has("неизвестный kind"));
+
+    check("awg с пулом — прежний отказ", -1, load(
+        "{\"schema\":1,\"outputs\":{\"a\":{\"kind\":\"awg\",\"devices\":[\"x0\",\"x1\"]}},"
+        "\"channels\":[]}"));
+    check("… прежним текстом", 1, has("у kind awg одно устройство"));
+
+    /* Пять пулов по шестнадцать устройств — 80 безымянных членов больше MAX_ANON (64). */
+    {
+        char big[12000], *o = big;
+        o += sprintf(o, "{\"schema\":1,\"outputs\":{");
+        for (int i = 0; i < 5; i++) {
+            o += sprintf(o, "%s\"p%d\":{\"kind\":\"interface\",\"devices\":[", i ? "," : "", i);
+            for (int k = 0; k < 16; k++) o += sprintf(o, "%s\"d%d_%d\"", k ? "," : "", i, k);
+            o += sprintf(o, "]}");
+        }
+        sprintf(o, "},\"channels\":[]}");
+        check("устройств в пулах больше MAX_ANON — отказ", -1, load(big));
+        check("… с пределом в тексте", 1, has("64"));
+    }
+}
+
+/* ---- решения выбора группы --------------------------------------------------------------- */
+
+static void t_pick(void) {
+    int best = 0;
+    int ms1[] = { 200, 20 };
+    check("замер: заметно быстрее — запас", 1, group_latency_pick(ms1, 2, 50, &best));
+    check("… лучший 20", 20, best);
+    int ms2[] = { 40, 20 };
+    check("замер: внутри допуска — порядок", 0, group_latency_pick(ms2, 2, 50, &best));
+    check("замер: свой допуск делает разницу значимой", 1, group_latency_pick(ms2, 2, 10, &best));
+    int ms3[] = { -1, -1 };
+    check("замер: никто не измерен", -1, group_latency_pick(ms3, 2, 50, &best));
+    check("… лучшего нет", -1, best);
+    int ms4[] = { -1, 30, 25 };
+    check("замер: неизмеренный пропускается", 1, group_latency_pick(ms4, 3, 50, &best));
+    check("с живого текущего — только за выигрыш больше допуска", 1, group_latency_keep(ms2, 1, 0, 50));
+    check("… а за больший — уходим", 0, group_latency_keep(ms1, 0, 1, 50));
+
+    int ns = -1;
+    check("гистерезис: держим живое текущее", 1, group_hysteresis(1, 0, 1, 0, 3, &ns));
+    check("… серия растёт", 1, ns);
+    check("… третий тик — возврат наверх", 0, group_hysteresis(1, 0, 1, 2, 3, &ns));
+    check("… серия сброшена", 0, ns);
+    check("гистерезис: мёртвое текущее — сразу вниз", 0, group_hysteresis(1, 0, 0, 1, 3, &ns));
+    check("гистерезис: без порога — сразу", 0, group_hysteresis(1, 0, 1, 0, 0, &ns));
+    check("гистерезис: несём лучшее — его и берём", 0, group_hysteresis(0, 0, 1, 5, 3, &ns));
+}
+
+int main(void) {
+    snprintf(g_tmp, sizeof(g_tmp), "/tmp/modelmatch-XXXXXX");
+    if (!mkdtemp(g_tmp)) { perror("mkdtemp"); return 2; }
+    steer_set_state_dir(g_tmp);
+    t_rules();
+    t_groups();
+    t_pick();
+    char cmd[320];
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_tmp);
+    if (system(cmd) != 0) fprintf(stderr, "modelmatch: не убран %s\n", g_tmp);
+    return unit_done("modelmatch");
+}

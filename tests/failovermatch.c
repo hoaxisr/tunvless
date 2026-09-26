@@ -294,6 +294,28 @@ static void facts_cases(void) {
 /* ---- поведение прохода ------------------------------------------------------ */
 static char g_dir[64];
 
+/* Сбросить выходы спеки — и именованные, и безымянных членов групп. */
+static void outs_reset(void) {
+    memset(g_spec.out, 0, sizeof(g_spec.out));
+    g_spec.anon_n = 0;
+}
+
+/* Пул устройств выхода — группа pick: order из безымянных членов (модель v2, «4в»), собранная тем
+ * же group_of_devices, каким её собирает перевод спеки v1 из `devices`. */
+static void out_pool(struct output *o, const char *d0, const char *d1) {
+    char devs[2][32];
+    snprintf(devs[0], sizeof(devs[0]), "%s", d0);
+    snprintf(devs[1], sizeof(devs[1]), "%s", d1);
+    struct err e = {0};
+    if (group_of_devices(&g_spec, o, (const char (*)[32])devs, 2, &e) != 0) {
+        fprintf(stderr, "out_pool: %s\n", e.msg);
+        exit(1);
+    }
+}
+
+/* Настройка группы выхода o — для правки pick и допуска в стенде. */
+static struct group_cfg *grp(struct output *o) { return &o->grp; }
+
 static void state_write(const char *name, const char *text) {
     char path[128];
     snprintf(path, sizeof(path), "%s/%s", g_dir, name);
@@ -306,13 +328,12 @@ static void state_write(const char *name, const char *text) {
 /* Выход kind=xsteer с одним устройством: здоровье такого выхода — наличие устройства,
  * поэтому ни сети, ни root стенду не нужно. */
 static void out_set(const char *dev, enum on_fail of) {
-    memset(g_spec.out, 0, sizeof(g_spec.out));
+    outs_reset();
     g_spec.out_n = 1;
     snprintf(g_spec.out[0].name, sizeof(g_spec.out[0].name), "%s", "vl");
     g_spec.out[0].kind = OUT_XSTEER;
     g_spec.out[0].on_fail = of;
-    snprintf(g_spec.out[0].devices[0], sizeof(g_spec.out[0].devices[0]), "%s", dev);
-    g_spec.out[0].devices_n = 1;
+    snprintf(g_spec.out[0].device, sizeof(g_spec.out[0].device), "%s", dev);
     g_spec.out[0].mark = 0x100000;
     g_spec.out[0].table = 300;
 }
@@ -326,14 +347,13 @@ static void out_set(const char *dev, enum on_fail of) {
  * бы владелец шёл первым, он забирал бы попытку себе — проверка ниже проходила бы, ничего
  * не проверяя. */
 static void out_set_pool(const char *dev) {
-    memset(g_spec.out, 0, sizeof(g_spec.out));
+    outs_reset();
     g_spec.out_n = 2;
 
     snprintf(g_spec.out[0].name, sizeof(g_spec.out[0].name), "%s", "pool");
     g_spec.out[0].kind = OUT_INTERFACE;
     g_spec.out[0].on_fail = FAIL_DROP;
-    snprintf(g_spec.out[0].devices[0], sizeof(g_spec.out[0].devices[0]), "%s", dev);
-    g_spec.out[0].devices_n = 1;
+    snprintf(g_spec.out[0].device, sizeof(g_spec.out[0].device), "%s", dev);
     g_spec.out[0].mark = 0x200000;
     g_spec.out[0].table = 301;
 
@@ -341,8 +361,6 @@ static void out_set_pool(const char *dev) {
     g_spec.out[1].kind = OUT_XSTEER;
     g_spec.out[1].on_fail = FAIL_DROP;
     snprintf(g_spec.out[1].device, sizeof(g_spec.out[1].device), "%s", dev);
-    snprintf(g_spec.out[1].devices[0], sizeof(g_spec.out[1].devices[0]), "%s", dev);
-    g_spec.out[1].devices_n = 1;
     g_spec.out[1].mark = 0x100000;
     g_spec.out[1].table = 300;
 }
@@ -386,36 +404,32 @@ static int via_health(const struct spec *sp, const struct output *o, const char 
     return 0;
 }
 static void out_set_via(void) {
-    memset(g_spec.out, 0, sizeof(g_spec.out));
+    outs_reset();
     g_spec.out_n = 2;
     snprintf(g_spec.out[0].name, sizeof(g_spec.out[0].name), "%s", "in");
     g_spec.out[0].kind = OUT_XSTEER;
     g_spec.out[0].on_fail = FAIL_DROP;
-    snprintf(g_spec.out[0].via, sizeof(g_spec.out[0].via), "%s", "outer");
-    snprintf(g_spec.out[0].devices[0], sizeof(g_spec.out[0].devices[0]), "%s", "vin");
-    g_spec.out[0].devices_n = 1;
+    snprintf(g_spec.out[0].over, sizeof(g_spec.out[0].over), "%s", "outer");
+    snprintf(g_spec.out[0].device, sizeof(g_spec.out[0].device), "%s", "vin");
     g_spec.out[0].mark = 0x100000;
     g_spec.out[0].table = 300;
     snprintf(g_spec.out[1].name, sizeof(g_spec.out[1].name), "%s", "outer");
     g_spec.out[1].kind = OUT_INTERFACE;
     g_spec.out[1].on_fail = FAIL_DIRECT;
-    snprintf(g_spec.out[1].devices[0], sizeof(g_spec.out[1].devices[0]), "%s", "vout");
-    g_spec.out[1].devices_n = 1;
+    snprintf(g_spec.out[1].device, sizeof(g_spec.out[1].device), "%s", "vout");
     g_spec.out[1].mark = 0x200000;
     g_spec.out[1].table = 301;
 }
 
 static void out_set_two(void) {
-    memset(g_spec.out, 0, sizeof(g_spec.out));
+    outs_reset();
     g_spec.out_n = 1;
     snprintf(g_spec.out[0].name, sizeof(g_spec.out[0].name), "%s", "vl");
     g_spec.out[0].kind = OUT_INTERFACE;
     g_spec.out[0].on_fail = FAIL_DROP;
-    snprintf(g_spec.out[0].devices[0], sizeof(g_spec.out[0].devices[0]), "%s", "vpref");
-    snprintf(g_spec.out[0].devices[1], sizeof(g_spec.out[0].devices[1]), "%s", "vspare");
-    g_spec.out[0].devices_n = 2;
     g_spec.out[0].mark = 0x100000;
     g_spec.out[0].table = 300;
+    out_pool(&g_spec.out[0], "vpref", "vspare");
 }
 /* Что записано активным устройством после прохода. */
 static void active_dev(char *buf, size_t n) { active_get("vl", buf, n); }
@@ -824,16 +838,14 @@ int main(void) {
      * Проверяется здесь именно порядок ответа, потому что ошибиться можно в каждой из трёх
      * ступеней по отдельности. */
     {
-        memset(g_spec.out, 0, sizeof(g_spec.out));
+        outs_reset();
         g_spec.out_n = 1;
         snprintf(g_spec.out[0].name, sizeof(g_spec.out[0].name), "%s", "pool");
         g_spec.out[0].kind = OUT_INTERFACE;
         g_spec.out[0].on_fail = FAIL_DROP;
-        snprintf(g_spec.out[0].devices[0], sizeof(g_spec.out[0].devices[0]), "%s", "nodev0");
-        snprintf(g_spec.out[0].devices[1], sizeof(g_spec.out[0].devices[1]), "%s", "lo");
-        g_spec.out[0].devices_n = 2;
         g_spec.out[0].mark = 0x100000;
         g_spec.out[0].table = 300;
+        out_pool(&g_spec.out[0], "nodev0", "lo");
 
         /* Запись сторожа названа кандидатом и устройство на месте — берётся она. */
         snprintf(g_spec.out[0].device, sizeof(g_spec.out[0].device), "%s", "nodev0");
@@ -866,7 +878,10 @@ int main(void) {
         /* Отказ выхода записан как «-»: активного устройства нет. Существующих кандидатов
          * тоже нет — оставляем как было, и apply честно доложит отказ, а при on_fail=drop
          * поставит запрет. Гадать тут нечем и незачем. */
-        snprintf(g_spec.out[0].devices[1], sizeof(g_spec.out[0].devices[1]), "%s", "nodev1");
+        {
+            struct output *m1 = &g_spec.out[grp(&g_spec.out[0])->members[1]];
+            snprintf(m1->device, sizeof(m1->device), "%s", "nodev1");
+        }
         snprintf(g_spec.out[0].device, sizeof(g_spec.out[0].device), "%s", "nodev0");
         state_write("active", "pool -\n");
         outputs_adopt_active(&g_spec);
@@ -1066,8 +1081,7 @@ int main(void) {
         snprintf(o.name, sizeof(o.name), "wg0");
         o.kind = OUT_INTERFACE;         /* ровно так splify2 и описывает такой туннель */
         o.on_fail = FAIL_DROP;
-        snprintf(o.devices[0], sizeof(o.devices[0]), "lo");
-        o.devices_n = 1;
+        snprintf(o.device, sizeof(o.device), "lo");
         o.mark = 0x100000;
         o.table = 300;
 
@@ -1159,7 +1173,7 @@ int main(void) {
         g_latency_probe = lat_probe;
         g_h_first = g_h_second = 1;
         out_set_two();
-        g_spec.out[0].prefer_latency = 1;
+        grp(&g_spec.out[0])->pick = PICK_LATENCY;
         snprintf(g_dir, sizeof(g_dir), "/tmp/failovermatch-lat-XXXXXX");
         if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
         steer_set_state_dir(g_dir);
@@ -1186,12 +1200,12 @@ int main(void) {
         active_dev(dev, sizeof(dev));
         check("замер: разница внутри допуска решается порядком", !strcmp(dev, "vpref"), 1);
 
-        g_spec.out[0].lat_tolerance_ms = 10;
+        grp(&g_spec.out[0])->lat_tolerance_ms = 10;
         unlink_lat();
         cmd_failover(NULL, 0);
         active_dev(dev, sizeof(dev));
         check("замер: свой допуск делает ту же разницу значимой", !strcmp(dev, "vspare"), 1);
-        g_spec.out[0].lat_tolerance_ms = 0;
+        grp(&g_spec.out[0])->lat_tolerance_ms = 0;
 
         /* И ОБРАТНАЯ СТОРОНА ДОПУСКА: с текущего не уходим ради выигрыша внутри него.
          *
@@ -1240,7 +1254,7 @@ int main(void) {
         active_dev(dev, sizeof(dev));
         check("замер: без замеров выбор по порядку", !strcmp(dev, "vpref"), 1);
 
-        g_spec.out[0].prefer_latency = 0;
+        grp(&g_spec.out[0])->pick = PICK_ORDER;
         g_ms_first = 500; g_ms_second = 5;
         unlink_lat();
         cmd_failover(NULL, 0);

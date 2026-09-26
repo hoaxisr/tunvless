@@ -439,28 +439,34 @@ static void t_l4(void) {
 
 static struct spec g_sp;
 
-static struct channel *chan(const char *srs, const char *l4) {
+/* Канал спеки v1 в модели v2 — правило «discord» → выход «vpn» с одним безымянным списком. */
+static struct spec_rule *chan(const char *srs, const char *l4) {
     memset(&g_sp, 0, sizeof(g_sp));
-    struct channel *c = &g_sp.ch[0];
-    g_sp.ch_n = 1;
+    g_sp.out_n = 1;
+    snprintf(g_sp.out[0].name, sizeof(g_sp.out[0].name), "vpn");
+    struct spec_rule *c = &g_sp.rule[0];
+    g_sp.rule_n = 1;
     snprintf(c->name, sizeof(c->name), "discord");
-    snprintf(c->out, sizeof(c->out), "vpn");
-    c->srs_files[0] = srs;
-    c->srs_n = 1;
-    if (l4) l4_from_text(l4, strlen(l4), &c->l4);
+    c->out = 0;
+    struct spec_list *l = &g_sp.list[0];
+    g_sp.list_n = 1;
+    c->lists[c->lists_n++] = 0;
+    l->srs_files[0] = srs;
+    l->srs_n = 1;
+    if (l4) l4_from_text(l4, strlen(l4), &l->l4);
     return c;
 }
 
 static void t_plan(void) {
     struct srs_plan pl;
     struct err e = {0};
-    struct channel *c = chan(FIX "discord.srs", NULL);
-    check("discord, ядро с составными наборами: разложен", 0, srs_plan_channel(&g_sp, c, 1, &pl, &e));
+    struct spec_rule *c = chan(FIX "discord.srs", NULL);
+    check("discord, ядро с составными наборами: разложен", 0, srs_plan_rule(&g_sp, c, 1, &pl, &e));
     check("… одной составной частью", 1, pl.n == 1 && pl.p[0].kind == SP_COMPOSITE);
     check("… с именами и подсетями", 1, pl.n && pl.p[0].has_dom && pl.p[0].has_v4);
     check("… подсетей 9", 9, pl.n ? (long)pl.p[0].n_v4 : -1);
     srs_plan_free(&pl);
-    check("discord, без составных: разложен", 0, srs_plan_channel(&g_sp, c, 0, &pl, &e));
+    check("discord, без составных: разложен", 0, srs_plan_rule(&g_sp, c, 0, &pl, &e));
     check("… на три части", 3, (long)pl.n);
     char t[80] = "";
     if (pl.n == 3) l4_to_text(&pl.p[1].l4, t, sizeof(t));
@@ -469,21 +475,21 @@ static void t_plan(void) {
     srs_plan_free(&pl);
     c = chan(FIX "discord.srs", "tcp");
     memset(&e, 0, sizeof(e));
-    check("канал tcp + набор udp: отказ", -1, srs_plan_channel(&g_sp, c, 1, &pl, &e));
+    check("канал tcp + набор udp: отказ", -1, srs_plan_rule(&g_sp, c, 1, &pl, &e));
     check("… и сказано, что не пересекаются", 1, strstr(e.msg, "не пересекаются") != NULL);
     c = chan(FIX "uniform.srs", NULL);
     memset(&e, 0, sizeof(e));
-    check("одно сужение у всего набора: разложен", 0, srs_plan_channel(&g_sp, c, 1, &pl, &e));
+    check("одно сужение у всего набора: разложен", 0, srs_plan_rule(&g_sp, c, 1, &pl, &e));
     check("… обычной частью, не составной", 1, pl.n == 1 && pl.p[0].kind == SP_PLAIN);
     if (pl.n) l4_to_text(&pl.p[0].l4, t, sizeof(t));
     check_str("… с сужением набора", "udp/50000-65535", t);
     srs_plan_free(&pl);
     c = chan(FIX "uniform.srs", "udp/50000-65535");
-    check("то же сужение и у канала: разложен", 0, srs_plan_channel(&g_sp, c, 1, &pl, &e));
-    check("… сужение части — канала (одно и то же)", 1, pl.n == 1 && l4match_same(&pl.p[0].l4, &c->l4));
+    check("то же сужение и у канала: разложен", 0, srs_plan_rule(&g_sp, c, 1, &pl, &e));
+    check("… сужение части — канала (одно и то же)", 1, pl.n == 1 && l4match_same(&pl.p[0].l4, &rule_list(&g_sp, c)->l4));
     srs_plan_free(&pl);
     c = chan(FIX "logic.srs", NULL);
-    check("логика на роутере: разложен", 0, srs_plan_channel(&g_sp, c, 1, &pl, &e));
+    check("логика на роутере: разложен", 0, srs_plan_rule(&g_sp, c, 1, &pl, &e));
     int extra_src = 0, extra_x = 0;
     for (size_t i = 0; i < pl.n; i++) {
         if (pl.p[i].kind == SP_EXTRA && pl.p[i].src_n) extra_src = 1;
@@ -494,11 +500,11 @@ static void t_plan(void) {
     check("приложения на роутере сняты с предупреждением", 1, strstr(pl.warn, "приложения") != NULL);
     srs_plan_free(&pl);
     c = chan(FIX "v6.srs", NULL);
-    check("IPv6: разложен", 0, srs_plan_channel(&g_sp, c, 1, &pl, &e));
+    check("IPv6: разложен", 0, srs_plan_rule(&g_sp, c, 1, &pl, &e));
     check("… и сказано, что v6 пропущены", 1, strstr(pl.warn, "IPv6") != NULL);
     srs_plan_free(&pl);
     c = chan("/nonexistent/x.srs", NULL);
-    check("нет файла: не отказ спеке", 0, srs_plan_channel(&g_sp, c, 1, &pl, &e));
+    check("нет файла: не отказ спеке", 0, srs_plan_rule(&g_sp, c, 1, &pl, &e));
     check("… а предупреждение и пустая часть", 1, pl.n == 1 && strstr(pl.warn, "x.srs") != NULL);
     srs_plan_free(&pl);
 }

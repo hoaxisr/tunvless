@@ -25,7 +25,18 @@ CORE_DIRS := src/lib src/model src/platform src/compile src/daemon src/kinds src
 EXT_DIRS  := src/tunnel src/proto/tls src/proto/vless src/proto/xsteer src/proto/tgws
 # Клиент сокета `steer` (src/client) — отдельный бинарник, не профиль движка: CLIENT_SRC ниже.
 CLIENT_DIRS := src/client
-INC_DIRS  := $(CORE_DIRS) $(EXT_DIRS) $(CLIENT_DIRS)
+# Сторонний код (src/third_party) — не слой движка: файлы в нём не правятся (см. UPSTREAM в
+# каталоге библиотеки), а собираются вместе с ядром. libyaml подключает свой заголовок как
+# <yaml.h>, поэтому её каталог — в -I у всех; обёртка движка над ней называется ynode.h, а не
+# yaml.h, ровно чтобы имена заголовков оставались уникальными (tests/buildmatch.sh).
+THIRD_DIRS := src/third_party/libyaml
+INC_DIRS  := $(CORE_DIRS) $(EXT_DIRS) $(CLIENT_DIRS) $(THIRD_DIRS)
+# Определения, которых ждёт сторонний код: yaml_private.h подключает config.h (номер версии
+# libyaml) только при HAVE_CONFIG_H. Ключ идёт во ВСЕ пути сборки движка — Makefile, build.sh,
+# build/build-ext*.sh (там он читается отсюда), в Android.bp — флагом библиотеки libsteer_yaml;
+# забытый в одном из них, он роняет компиляцию api.c, а не тихо меняет поведение, и всё равно
+# сверяется стендом tests/buildmatch.sh. Движку ключ ничего не значит.
+THIRD_DEFS := -DHAVE_CONFIG_H
 
 # Модель спеки — то, во что нарезан прежний src/model/spec.c (docs/architecture.md, «Слои и
 # каталоги»): JSON-ридер, сам разбор спеки, реестр меток/таблиц, ход перебора узлов подписки и
@@ -46,7 +57,7 @@ PLATFORM_SRC := src/platform/platform.c src/platform/openwrt.c src/platform/andr
 # без процессов: их задают status и diag, но и виды (interface — маршрут к серверу обфускации и
 # живость обфускатора, zapret — живость обработчика очереди) и nftcompat (раскладка по ядру), а
 # виды идут со всякой моделью. Поэтому здесь, а не в CORE_SRC.
-MODEL_SRC := $(PLATFORM_SRC) src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c \
+MODEL_SRC := $(PLATFORM_SRC) src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/v1.c src/model/registry.c \
              src/model/probe.c src/compile/nftcompat.c src/lib/puff.c src/model/srs.c src/model/srsplan.c \
              src/lib/nftdump.c src/lib/rtnl.c src/lib/procscan.c
 
@@ -78,9 +89,18 @@ DNSD_SRC := src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c \
 # которым нужны TLS и клиенты туннелей, — только в полном пакете (PROFILE_extended и android).
 # tgws — базовый: правила перехвата пишет любой движок, мост живёт своей программой (полный
 # пакет, микропакет stgws). Состав проверяет tests/buildmatch.sh.
-KINDS_BASE_SRC := src/kinds/kind.c src/kinds/direct.c src/kinds/interface.c src/kinds/zapret.c \
+KINDS_BASE_SRC := src/kinds/kind.c src/kinds/direct.c src/kinds/group.c src/kinds/interface.c src/kinds/zapret.c \
                   src/kinds/tgws.c src/kinds/awg.c
 KINDS_EXT_SRC  := src/kinds/vless.c src/kinds/xsteer.c
+
+# Чтение YAML (docs/architecture.md, «4в. Устройство 1.9», шаг 2): событийный парсер libyaml 0.2.5
+# (src/third_party/libyaml, MIT; только разбор — без загрузчика и эмиттера) и обёртка движка
+# src/lib/ynode.c, которая строит из событий дерево с пределами и отказом на алиасах. В ядре, а
+# не в полном пакете: спеку v2 читает и мини-движок, и полный. JSON спеки v1 читается тем же
+# парсером (стенд tests/yamlmatch.c).
+LIBYAML_SRC := src/third_party/libyaml/api.c src/third_party/libyaml/reader.c \
+               src/third_party/libyaml/scanner.c src/third_party/libyaml/parser.c
+YAML_SRC := src/lib/ynode.c $(LIBYAML_SRC)
 
 # src/daemon/steer.c нарезан на модули (docs/architecture.md, раздел 2, «Слои и каталоги»):
 # компиляция спеки в правила — в src/compile, остальное ядро — в src/daemon, порядок ниже
@@ -91,7 +111,7 @@ CORE_SRC := src/lib/run.c src/lib/jsonw.c src/lib/evline.c src/compile/groups.c 
             $(MODEL_SRC) $(DNSD_SRC) src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
             src/cli/cli.c src/tools/srsread.c src/tools/hwid.c src/daemon/ctl.c \
             src/daemon/conns.c src/daemon/loop.c src/daemon/state.c src/daemon/watchd.c src/daemon/recon.c src/daemon/rulewd.c \
-            src/daemon/foprobe.c src/daemon/gaiw.c $(KINDS_BASE_SRC)
+            src/daemon/foprobe.c src/daemon/gaiw.c $(KINDS_BASE_SRC) $(YAML_SRC)
 
 # Общее для обеих ролей: формат кадра, конфигурация, маршрутизация, рукопожатие, соединение
 # и то, на чём они стоят (TLS-записи, примитивы Reality, TUN). Расходиться на проводе этим
