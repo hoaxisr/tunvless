@@ -12,6 +12,7 @@
  * сокета), — nft_emit_output_mark, nft_emit_output_dns и local_who; их заберёт platform_ops. */
 #define _GNU_SOURCE
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,7 @@
 #include "spec.h"
 #include "generate.h"
 #include "srs.h"
+#include "nftdump.h"
 
 /* Короткий строковый буфер для выражений-перечней («ip saddr { a, b }», «th dport { … }»).
  * 4 КБ с запасом: самый длинный перечень — MAX_FROM (32) адресов или устройств по 63 символа,
@@ -217,67 +219,62 @@ struct ctr { char name[32]; unsigned long pkts, bytes; };
 static struct ctr g_ctr_up[CTR_MAX], g_ctr_down[CTR_MAX];
 static size_t g_ctr_up_n, g_ctr_down_n;
 
-/* Разбор вывода nft — ОДИН на apply и status. Раздельные разошлись бы в понимании одного и
- * того же текста, а расхождение здесь означало бы, что перенесённое и показанное — разные
- * числа. */
+/* Чтение счётчиков — ОДНО на apply и status. Раздельные разошлись бы в понимании одного и того
+ * же, а расхождение здесь означало бы, что перенесённое и показанное — разные числа.
+ *
+ * Спрашивается ядро по netlink (src/lib/nftdump.c), а не `nft -a list chain`: status интерфейс
+ * опрашивает раз в несколько секунд, и запуск `sh -c nft …` на каждый вызов был половиной его
+ * цены в процессах (docs/architecture.md, «Замечания проверки 1.8»). Имя канала — в комментарии
+ * правила (userdata, как его пишет nft), число — в выражении counter того же правила. */
+static void ctr_take(void *arg, const char *comment, int has_counter,
+                     uint64_t packets, uint64_t bytes) {
+    (void)arg;
+    /* Встречный вид проверяется первым: «steer:» — начало и «steer-down:». */
+    int down = 0;
+    const char *c;
+    if (!strncmp(comment, "steer-down:", 11)) { c = comment + 11; down = 1; }
+    else if (!strncmp(comment, "steer:", 6)) c = comment + 6;
+    else return;
+    unsigned long p = has_counter ? (unsigned long)packets : 0;
+    unsigned long b = has_counter ? (unsigned long)bytes : 0;
+    struct ctr *arr = down ? g_ctr_down : g_ctr_up;
+    size_t *n = down ? &g_ctr_down_n : &g_ctr_up_n;
+    /* Одно имя — одно число. В современной раскладке имена в цепочке уникальны и эта ветка не
+     * срабатывает; в старой у доменной группы с префиксами правил два (по одному на половину
+     * набора, см. legacy.c), и объём канала — их сумма. */
+    size_t k = 0;
+    while (k < *n && strcmp(arr[k].name, c) != 0) k++;
+    if (k < *n) {
+        arr[k].pkts += p;
+        arr[k].bytes += b;
+        return;
+    }
+    if (*n < CTR_MAX) {
+        snprintf(arr[*n].name, sizeof(arr[*n].name), "%s", c);
+        arr[*n].pkts = p;
+        arr[*n].bytes = b;
+        (*n)++;
+    }
+}
+
 void counters_load(void) {
     g_ctr_up_n = g_ctr_down_n = 0;
-    /* Обе цепочки за один вызов: раздельные popen дали бы счётчики, снятые в разные моменты,
-     * и «отдано больше, чем скачано» на глазах у человека объяснялось бы не маршрутизацией,
-     * а нашей ленью. */
-    /* Таблица — своя у каждой сборки (nft_table): у мини-сборки моста это inet stgws, и с
-     * жёстким «inet steer» её счётчики через apply не переносились. */
-    /* Каналы на сам телефон считаются в своих цепочках: отданное — в output_mark (правило
+    /* Все цепочки одним дампом: счётчики, снятые в разные моменты, дали бы «отдано больше,
+     * чем скачано» на глазах у человека.
+     *
+     * Таблица — своя у каждой сборки (nft_table): у мини-сборки моста это inet stgws, и с
+     * жёстким «inet steer» её счётчики через apply не переносились.
+     *
+     * Каналы на сам телефон считаются в своих цепочках: отданное — в output_mark (правило
      * разметки на хуке output), скачанное — в input_down (см. nft_emit_output_mark). Без них
-     * status не отдавал для таких каналов ни одного байта, и экран приложения показывал
-     * пустой «трафик по правилам» при живом туннеле. На роутере этих цепочек нет, и nft
-     * просто молчит об отсутствующей. */
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "nft -a list chain inet %s prerouting_mark 2>/dev/null; "
-             "nft -a list chain inet %s postrouting_down 2>/dev/null; "
-             "nft -a list chain inet %s output_mark 2>/dev/null; "
-             "nft -a list chain inet %s input_down 2>/dev/null",
-             nft_table(), nft_table(), nft_table(), nft_table());
-    FILE *nft = popen(cmd, "r");
-    if (!nft) return;
-    char line[1024];
-    while (fgets(line, sizeof(line), nft)) {
-        /* Встречный вид проверяется первым: «steer:» нашлось бы и внутри «steer-down:». */
-        int down = 0;
-        char *c = strstr(line, "comment \"steer-down:");
-        if (c) { c += strlen("comment \"steer-down:"); down = 1; }
-        else {
-            c = strstr(line, "comment \"steer:");
-            if (!c) continue;
-            c += strlen("comment \"steer:");
-        }
-        char *e = strchr(c, '"');
-        if (!e) continue;
-        *e = '\0';
-        unsigned long p = 0, b = 0;
-        char *pc = strstr(line, "packets ");
-        if (pc) sscanf(pc, "packets %lu bytes %lu", &p, &b);
-        struct ctr *arr = down ? g_ctr_down : g_ctr_up;
-        size_t *n = down ? &g_ctr_down_n : &g_ctr_up_n;
-        /* Одно имя — одно число. В современной раскладке имена в цепочке уникальны и эта
-         * ветка не срабатывает; в старой у доменной группы с префиксами правил два (по одному
-         * на половину набора, см. legacy.c), и объём канала — их сумма. */
-        size_t k = 0;
-        while (k < *n && strcmp(arr[k].name, c) != 0) k++;
-        if (k < *n) {
-            arr[k].pkts += p;
-            arr[k].bytes += b;
-            continue;
-        }
-        if (*n < CTR_MAX) {
-            snprintf(arr[*n].name, sizeof(arr[*n].name), "%s", c);
-            arr[*n].pkts = p;
-            arr[*n].bytes = b;
-            (*n)++;
-        }
-    }
-    pclose(nft);
+     * status не отдавал для таких каналов ни одного байта, и экран приложения показывал пустой
+     * «трафик по правилам» при живом туннеле. На роутере этих цепочек нет, и ядро просто
+     * отвечает, что их нет. */
+    static const char *const chains[] = {
+        "prerouting_mark", "postrouting_down", "output_mark", "input_down",
+    };
+    nfd_chain_rules(NFD_INET, nft_table(), chains, sizeof(chains) / sizeof(chains[0]),
+                    ctr_take, NULL);
 }
 
 /* Найти прежнее значение. -1 — канала в ядре не было (первый apply или новый канал). */

@@ -1,16 +1,31 @@
 #!/bin/sh
-# Диагностика (`steer diag`) на фикстурах: без роутера, без nft, без сети.
+# Диагностика (`steer diag`) на фикстурах: без роутера, в своих пространствах имён.
 #
-# Почему стенд шелловый, а не на C. diag — единственная подкоманда, которая почти целиком
-# состоит из обращений к системе: nft, pgrep, ip. Проверять её по функциям нечего, зато
-# подменить эти три команды в PATH и посмотреть на JSON — ровно то, что делает человек,
-# когда читает вывод diag на роутере. Тот же приём, что в splify2/tests/listsmatch.sh.
+# Почему стенд шелловый, а не на C. diag — подкоманда, которая почти целиком состоит из вопросов
+# к системе: таблица и наборы nf_tables, маршрут IPv6, живые процессы. Проверять её по функциям
+# нечего, зато поставить ядру нужное состояние и посмотреть на JSON — ровно то, что делает
+# человек, когда читает вывод diag на роутере.
+#
+# Раньше состояние подставлялось подменой nft, pgrep и ip в PATH. Теперь diag этих команд не
+# запускает вовсе (ядро — по netlink, процессы — обходом /proc), поэтому стенд живёт в своём
+# сетевом пространстве (набор правил и маршруты заводят настоящие nft и ip) и в своём
+# пространстве PID со своим /proc (резолвер «запущен» ровно тогда, когда его запустил стенд).
+# Нужны root, unshare и nft; без них стенд пропускается.
 #
 # Бинарник отдельный (build/diagsim): спека с `kind: vless` отвергается парсером базовой
 # сборки, а именно VLESS-выход интересен диагностике — см. tests/vless-stub.c.
 set -u
 DIAG="${DIAG:-./build/diagsim}"
 [ -x "$DIAG" ] || { echo "not built: $DIAG (make test)"; exit 2; }
+if [ "${DIAGMATCH_INNER:-}" != 1 ]; then
+    if [ "$(id -u)" = 0 ] && command -v nft >/dev/null 2>&1 &&
+       unshare -n -p -f -m --mount-proc true 2>/dev/null; then
+        DIAGMATCH_INNER=1 exec unshare -n -p -f -m --mount-proc sh "$0" "$@"
+    fi
+    echo "diagmatch: нет root, nft или своих пространств имён — пропущен"
+    exit 0
+fi
+ip link set lo up
 
 pass=0 fail=0
 tmp="$(mktemp -d)"
@@ -25,24 +40,14 @@ check() {
     fi
 }
 
-# ---- окружение: nft/pgrep/ip подменены, всё остальное настоящее -------------
-mkdir -p "$tmp/bin"
-cat > "$tmp/bin/nft" <<'EOF'
-#!/bin/sh
-# Таблица на месте, встречная цепочка тоже: так проверки 1-2 дают ok и не шумят
-# в выводе, а интересующие нас проверки остаются единственными находками.
-echo "table inet steer {"
-echo "  chain prerouting_mark { }"
-echo "  chain postrouting_down { }"
-echo "}"
-EOF
-# Резолвер не запущен и IPv6 наружу нет: обе проверки при этом молчат либо ругаются
-# предсказуемо, а от них здесь ничего не зависит.
-printf '#!/bin/sh\nexit 1\n' > "$tmp/bin/pgrep"
-printf '#!/bin/sh\nexit 1\n' > "$tmp/bin/ip"
-chmod +x "$tmp/bin/nft" "$tmp/bin/pgrep" "$tmp/bin/ip"
-PATH="$tmp/bin:$PATH"
-export PATH
+# ---- окружение: таблица движка в ядре своего пространства --------------------
+# Таблица на месте, встречная цепочка тоже: так проверки 1-2 дают ok и не шумят в выводе, а
+# интересующие нас проверки остаются единственными находками. Наборы каналов пусты. Резолвер не
+# запущен и IPv6 наружу нет: обе проверки при этом молчат либо ругаются предсказуемо.
+{ nft add table inet steer &&
+  nft add set inet steer vpn_ip '{ type ipv4_addr; flags interval; }' &&
+  nft add chain inet steer prerouting_mark &&
+  nft add chain inet steer postrouting_down; } || { echo "diagmatch: nft не прошёл"; exit 1; }
 
 # spec NAME KIND — конфигурация с одним адресным каналом в выход указанного вида.
 #
@@ -335,17 +340,10 @@ check "мусор в файле: молчим" "" "$(dgb "$tmp/brnf" | verdict b
 # устройства нет в /sys/class/net. Поэтому и туннель, и пул смотрят в `lo`, а фаервол
 # подменён так, чтобы устройство было в зоне и masquerade у него НЕ БЫЛО, — иначе проверка
 # уходила бы в ветку «NAT есть» и не значила бы ничего. Блок последний в файле: подменённый
-# nft здесь другой, и восстанавливать его больше некому.
-cat > "$tmp/bin/nft" <<'EOF'
-#!/bin/sh
-echo "table inet steer {"
-echo "  chain prerouting_mark { }"
-echo "  chain postrouting_down { }"
-echo "}"
-echo "table inet fw4 {"
-echo "  chain forward_lan { oifname \"lo\" accept }"
-echo "}"
-EOF
+# набор правил здесь другой, и восстанавливать его больше некому.
+nft add table inet fw4
+nft add chain inet fw4 forward_lan
+nft add rule inet fw4 forward_lan oifname '"lo"' accept
 cat > "$tmp/pool.json" <<EOF
 {
   "schema": 1,
@@ -409,6 +407,53 @@ rm -f "$tmp/state/active"
 outp3="$($DIAG diag --spec "$tmp/pool2.json" --state-dir "$tmp/state" 2>/dev/null)"
 check "пул без записи сторожа: первый существующий кандидат" "1" \
       "$(printf '%s' "$outp3" | grep -c '"what":"выход pool: устройство lo в зоне"')"
+
+# ---- выход в отказе: сторож поставил on_fail --------------------------------------
+#
+# Запись «-» в active — сторож не нашёл живого устройства и поставил on_fail. Устройство при этом
+# может быть на месте и поднято (lo здесь — «поднято»), и раньше status отдавал `up: true`, а diag
+# — «устройство в зоне»: интерфейс рисовал живым выход, чей трафик стоит.
+printf 'pool - 0\n' > "$tmp/state/active"
+stf="$($DIAG status --spec "$tmp/pool2.json" --state-dir "$tmp/state" 2>/dev/null)"
+check "отказ: status — up false и failed true у выхода" "1" \
+      "$(printf '%s' "$stf" | grep -c '"pool":{"kind":"interface","device":"lo","up":false,"failed":true,')"
+check "отказ: у соседнего выхода failed нет" "0" \
+      "$(printf '%s' "$stf" | grep -c '"loc":{[^}]*"failed"')"
+check "отказ: умение названо" "1" "$(printf '%s' "$stf" | grep -c '"failed"\]')"
+dgf="$($DIAG diag --spec "$tmp/pool2.json" --state-dir "$tmp/state" 2>/dev/null)"
+check "отказ: diag — fail, трафик канала остановлен" "1" \
+      "$(printf '%s' "$dgf" | grep -c '{"id":"output","verdict":"fail","what":"выход pool: lo не отвечает, трафик канала остановлен"')"
+rm -f "$tmp/state/active"
+check "без отказа: failed нет" "0" \
+      "$($DIAG status --spec "$tmp/pool2.json" --state-dir "$tmp/state" 2>/dev/null | grep -c '"failed":true')"
+
+# ---- число адресов в наборе — у ядра, столько же, сколько у nft ---------------------
+nft add element inet steer vpn_ip '{ 104.16.0.0/13, 1.1.1.0/24, 9.9.9.9 }'
+want="$(nft list set inet steer vpn_ip | tr ',' '\n' | grep -c '[0-9]\.[0-9]')"
+check "набор: адресов в ядре — столько, сколько элементов печатает nft" "1" \
+      "$($DIAG diag --spec "$tmp/iface.json" 2>/dev/null | grep -c "\"verdict\":\"ok\",\"what\":\"канал vpn_ip: адресов в ядре $want\"")"
+
+# ---- резолвер жив — по /proc своего пространства PID -----------------------------
+check "резолвера нет — fail" "fail" "$($DIAG diag --spec "$tmp/vless-dom.json" 2>/dev/null | verdict dnsd)"
+mkdir -p "$tmp/fake"
+printf '#!/bin/sh\nsleep 30\n' > "$tmp/fake/steer"
+chmod +x "$tmp/fake/steer"
+"$tmp/fake/steer" dnsd &
+FPID=$!
+sleep 0.2
+check "процесс «…/steer dnsd» есть — ok" "ok" "$($DIAG diag --spec "$tmp/vless-dom.json" 2>/dev/null | verdict dnsd)"
+kill "$FPID" 2>/dev/null
+wait "$FPID" 2>/dev/null
+
+# ---- IPv6 наружу — маршрут по умолчанию в таблице main -------------------------
+check "маршрута IPv6 нет — проверки нет" "" "$($DIAG diag --spec "$tmp/iface.json" 2>/dev/null | verdict ipv6)"
+if ip link add d6 type dummy 2>/dev/null && ip link set d6 up && ip -6 route add default dev d6 2>/dev/null; then
+    check "маршрут IPv6 есть, выход с drop — fail" "fail" \
+          "$($DIAG diag --spec "$tmp/iface.json" 2>/dev/null | verdict ipv6)"
+    ip link del d6
+else
+    echo "diagmatch: dummy-устройства или IPv6 нет — проверка IPv6 пропущена"
+fi
 
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi

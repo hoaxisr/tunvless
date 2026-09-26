@@ -9,8 +9,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 #include "spec.h"
+#include "nftdump.h"
+#include "procscan.h"
+#include "rtnl.h"
 
 const struct out_obfs *iface_obfs(const struct output *o) {
     return kind_of(o) == &kind_interface && o->iface.obfs.on ? &o->iface.obfs : NULL;
@@ -35,8 +40,9 @@ static unsigned iface_caps_of(const struct output *o) {
 
 /* Обфускация — поле, а не отдельный вид выхода, поэтому и в статусе она
  * поле. Признак живости здесь не печатается намеренно: status опрашивают
- * раз в пять секунд, а pgrep — это запуск процесса; приговор о живости
- * даёт diag, который спрашивают по нажатию. */
+ * раз в пять секунд, а живость — это обход /proc на каждый опрос ради поля,
+ * которое дублирует diag; приговор о живости даёт diag, который спрашивают
+ * по нажатию. */
 static void iface_status(FILE *out, const struct spec *sp, const struct output *o) {
     (void)sp;
     const struct out_obfs *ob = &o->iface.obfs;
@@ -62,27 +68,15 @@ static int dev_mtu(const char *dev) {
 /* Через какое устройство ядро отправит пакет к адресу и каков MTU этого устройства.
  * Возвращает MTU (или -1) и пишет имя устройства в dev.
  *
- * Адрес попадает в командную строку, поэтому обязан быть проверен ДО вызова: здесь он
- * приходит из спеки, где парсер уже отверг всё, что не является литералом IPv4
- * (inet_pton). Это то же требование, из-за которого в explain появилась проверка
- * формы: подстановка непроверенной строки в вызов однажды уже была дырой. */
+ * Спрашивается ядро по rtnetlink (`ip route get` без процесса, src/lib/rtnl.c). Адрес приходит из
+ * спеки, где парсер уже отверг всё, что не является литералом IPv4 (inet_pton), — и в командную
+ * строку он больше не попадает вовсе: подстановка непроверенной строки в вызов однажды уже была
+ * дырой (см. explain). */
 static int route_egress(const char *addr, char *dev, size_t devn) {
     dev[0] = '\0';
-    char cmd[160];
-    snprintf(cmd, sizeof(cmd), "ip route get %.45s 2>/dev/null", addr);
-    FILE *p = popen(cmd, "r");
-    if (!p) return -1;
-    char line[512];
-    if (fgets(line, sizeof(line), p)) {
-        char *d = strstr(line, " dev ");
-        if (d) {
-            d += 5;
-            size_t k = 0;
-            while (d[k] && d[k] != ' ' && d[k] != '\n' && k + 1 < devn) { dev[k] = d[k]; k++; }
-            dev[k] = '\0';
-        }
-    }
-    pclose(p);
+    struct in_addr a;
+    if (inet_pton(AF_INET, addr, &a) != 1) return -1;
+    if (rtnl_route_dev(a, dev, devn) != 0) return -1;
     return dev[0] ? dev_mtu(dev) : -1;
 }
 
@@ -97,17 +91,21 @@ static void iface_diag(kind_diag_fn *diag, const struct spec *sp, const struct o
     (void)sp;
     const struct out_obfs *ob = &o->iface.obfs;
     if (!ob->on) return;
-    char what[200], why[400], cmdline[128];
+    char what[200], why[400];
 
-    snprintf(cmdline, sizeof(cmdline), "pgrep -f 'steer obfs %.32s' >/dev/null 2>&1", o->name);
-    int alive = system(cmdline) == 0;
+    /* Обходом /proc (src/lib/procscan.c): у демона обфускатор — его ребёнок с argv[0] «…/steer»,
+     * без демона — экземпляр procd с той же строкой. */
+    char needle[64];
+    snprintf(needle, sizeof(needle), "steer obfs %.32s", o->name);
+    int alive = proc_cmdline_find(needle, 0);
     snprintf(what, sizeof(what), "выход %.40s: обфускатор %s", o->name, alive ? "работает" : "не запущен");
     diag("obfs", alive ? "ok" : "fail", what,
          alive ? "" : "перезапустите движок: /etc/init.d/steer restart");
 
-    /* nft_has смотрит в таблицу steer, здесь нужна соседняя — поэтому свой вызов. */
-    snprintf(cmdline, sizeof(cmdline), "nft list chain inet steer_obfs o_%.32s >/dev/null 2>&1", o->name);
-    int guard = system(cmdline) == 0;
+    /* Правило живёт в соседней таблице steer_obfs, цепочкой o_<выход>. */
+    char chain[48];
+    snprintf(chain, sizeof(chain), "o_%.32s", o->name);
+    int guard = nfd_chain_exists(NFD_INET, "steer_obfs", chain);
     if (!guard) {
         snprintf(what, sizeof(what), "выход %.40s: правила против RST нет", o->name);
         diag("obfs", "warn", what,

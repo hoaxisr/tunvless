@@ -42,6 +42,10 @@
 #define NFTC_IP6NAT 2   /* при NFTC_LEGACY: ядро принимает nat в ip6 (заворот DNS по IPv6) */
 #define NFTC_NOTRACK 4  /* при NFTC_LEGACY: ядро знает выражение notrack (Debian перенёс его в 4.9) */
 int nft_compat(void);
+/* Раскладка, которая СТОИТ в ядре, — для тех, кто ядро только читает (diag, explain): старая —
+ * если есть таблица ip движка (nat старой раскладки живёт там). Без проб `nft -c`: они решают,
+ * что применять, а читателю нужно то, что применено. STEER_NFT_COMPAT — как у nft_compat. */
+int nft_compat_seen(void);
 /* Примет ли ядро составной интервальный набор ipv4_addr . inet_proto . inet_service — для
  * каналов со смешанным сужением списка (см. nftcompat.c). 1 — да, 0 — делить по группам. */
 int nft_concat_ok(void);

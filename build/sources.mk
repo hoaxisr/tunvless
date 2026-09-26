@@ -52,8 +52,14 @@ THIRD_DEFS := -DHAVE_CONFIG_H
 # метки), пути состояния. Стенды, компонующие модель, получают платформу тем же списком.
 PLATFORM_SRC := src/platform/platform.c src/platform/openwrt.c src/platform/android.c
 
+#
+# lib/nftdump.c, lib/rtnl.c, lib/procscan.c — вопросы к ядру (nf_tables и rtnetlink) и обход /proc
+# без процессов: их задают status и diag, но и виды (interface — маршрут к серверу обфускации и
+# живость обфускатора, zapret — живость обработчика очереди) и nftcompat (раскладка по ядру), а
+# виды идут со всякой моделью. Поэтому здесь, а не в CORE_SRC.
 MODEL_SRC := $(PLATFORM_SRC) src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/v1.c src/model/registry.c \
-             src/model/probe.c src/compile/nftcompat.c src/lib/puff.c src/model/srs.c src/model/srsplan.c
+             src/model/probe.c src/compile/nftcompat.c src/lib/puff.c src/model/srs.c src/model/srsplan.c \
+             src/lib/nftdump.c src/lib/rtnl.c src/lib/procscan.c
 
 # Резолвер: src/dnsd/dnsd.c был один файл, теперь — DNSD_SRC. lib/sindex.c, lib/nftnl.c,
 # lib/ctnl.c родились из того же файла (хеш-индекс строк, транзакции nf_tables по netlink,
@@ -105,7 +111,7 @@ CORE_SRC := src/lib/run.c src/lib/jsonw.c src/lib/evline.c src/compile/groups.c 
             $(MODEL_SRC) $(DNSD_SRC) src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
             src/cli/cli.c src/tools/srsread.c src/tools/hwid.c src/daemon/ctl.c \
             src/daemon/conns.c src/daemon/loop.c src/daemon/state.c src/daemon/watchd.c src/daemon/recon.c src/daemon/rulewd.c \
-            src/lib/rtnl.c src/daemon/foprobe.c src/daemon/gaiw.c $(KINDS_BASE_SRC) $(YAML_SRC)
+            src/daemon/foprobe.c src/daemon/gaiw.c $(KINDS_BASE_SRC) $(YAML_SRC)
 
 # Общее для обеих ролей: формат кадра, конфигурация, маршрутизация, рукопожатие, соединение
 # и то, на чём они стоят (TLS-записи, примитивы Reality, TUN). Расходиться на проводе этим

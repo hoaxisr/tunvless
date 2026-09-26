@@ -27,66 +27,30 @@
 #include "ctl.h"
 #include "nftquery.h"
 #include "generate.h"
+#include "legacy.h"
+#include "nftdump.h"
 
 /* Сколько элементов в наборе по мнению ядра. -1 — набора нет.
  *
- * Имя проверяется по составу, а не просто обрезается: оно уходит в командную строку через
- * popen. Имя набора собирается из имени выхода, а то приходит из спеки — то есть снаружи.
- * В этом файле такую дыру уже находили однажды, в explain, где адрес подставлялся в
- * system(); повторять не будем. */
+ * Прежде — `nft list set` через popen и счёт запятых в выводе; теперь дамп элементов по netlink
+ * (src/lib/nftdump.c): ни процесса, ни второй копии списка в памяти ради одного числа, а имя
+ * набора в командную строку больше не попадает вовсе. */
 long set_count(const char *name) {
-    for (const char *q = name; *q; q++)
-        if (!((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') ||
-              (*q >= '0' && *q <= '9') || *q == '_' || *q == '-' || *q == '.'))
-            return -1;
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "nft list set inet %s %.64s 2>/dev/null", nft_table(), name);
-    FILE *p = popen(cmd, "r");
-    if (!p) return -1;
-    long n = -1;
-    char line[4096];
-    int seen = 0;
-    while (fgets(line, sizeof(line), p)) {
-        seen = 1;
-        char *e = strstr(line, "elements = {");
-        if (!e) continue;
-        n = 0;
-        /* Считаем запятые, а не разбираем элементы: их бывают десятки тысяч, и разбор
-         * ради одного числа значил бы держать в памяти весь список второй раз. */
-        for (char *q = e; *q; q++) if (*q == ',') n++;
-        /* Элементов на одну больше, чем запятых; продолжение приезжает следующими
-         * строками, поэтому дальше просто добавляем. */
-        n++;
-        while (fgets(line, sizeof(line), p)) {
-            for (char *q = line; *q; q++) if (*q == ',') n++;
-            if (strchr(line, '}')) break;
-        }
-        break;
-    }
-    pclose(p);
-    if (!seen) return -1;
-    return n < 0 ? 0 : n;
+    return nfd_set_count(NFD_INET, nft_table(), name);
 }
 
-int nft_has(const char *what) {
-    char cmd[512];
-    /* --terse: ищутся цепочки, элементы наборов не нужны — а их дамп на большом
-     * наборе стоит дороже всех остальных проверок diag вместе взятых. */
-    /* В старой раскладке nat живёт в таблице ip (legacy.c, шаг 4), и искать заворот DNS
-     * только в inet значило бы объявить его пропавшим на исправном телефоне. */
-    if (NFT_LEGACY)
-        snprintf(cmd, sizeof(cmd),
-                 "{ nft -t list table inet %s 2>/dev/null || "
-                 "nft list table inet %s 2>/dev/null; "
-                 "nft -t list table ip %s 2>/dev/null || "
-                 "nft list table ip %s 2>/dev/null; } | grep -qF '%s'",
-                 nft_table(), nft_table(), nft_table(), nft_table(), what);
-    else
-        snprintf(cmd, sizeof(cmd),
-                 "{ nft -t list table inet %s 2>/dev/null || "
-                 "nft list table inet %s 2>/dev/null; } | grep -qF '%s'",
-                 nft_table(), nft_table(), what);
-    return system(cmd) == 0;
+/* Есть ли цепочка движка в ядре. В старой раскладке nat живёт в таблице ip (legacy.c, шаг 4), и
+ * искать только в inet значило бы объявить пропавшим то, что стоит на исправном телефоне. */
+int nft_chain_here(const char *chain) {
+    if (nfd_chain_exists(NFD_INET, nft_table(), chain)) return 1;
+    return NFT_LEGACY && nfd_chain_exists(NFD_IP, nft_table(), chain);
+}
+
+/* Есть ли правило `redirect to :PORT` — заворот DNS старой раскладки: там у него нет своей
+ * цепочки, он правило общей цепочки nat, и узнаётся по самому правилу. */
+int nft_redirect_here(uint16_t port) {
+    return nfd_has_redirect(NFD_INET, nft_table(), port) ||
+           nfd_has_redirect(NFD_IP, nft_table(), port);
 }
 
 /* "A.B.C.D[/N]" → сеть и маска. 0, если строка не префикс.

@@ -1222,14 +1222,20 @@ void outputs_adopt_active(struct spec *sp) {
 void outputs_adopt_active_st(struct spec *sp, struct fo_store *st) {
     for (size_t i = 0; i < sp->out_n; i++) {
         struct output *o = &sp->out[i];
+        if (!out_has_device(o)) continue;
+        char rec[32];
+        active_get_st(st, o->name, rec, sizeof(rec));   /* читает три поля — см. active_get */
+        /* «-» — сторож признал выход неработающим и поставил on_fail (out_finish): и у группы, и
+         * у выхода с одним устройством. Устройство ниже всё равно выбирается — о нём и говорят
+         * поля status, — но трафик через него не идёт, и status с diag обязаны это сказать, а не
+         * рисовать живым поднятое устройство. */
+        o->failed = !strcmp(rec, "-");
         /* Выбирать есть из чего только у группы: у выхода с одним устройством кандидат — он
          * сам, и ответ всегда его устройство. */
         if (!out_group(o)) continue;
 
         const struct output *m[MAX_MEMBERS];
         size_t mn = out_members(sp, o, m, MAX_MEMBERS);
-        char rec[32];
-        active_get_st(st, o->name, rec, sizeof(rec));   /* читает три поля — см. active_get */
         const char *pick = NULL;
         if (rec[0] && strcmp(rec, "-") != 0 && device_present(rec))
             for (size_t k = 0; k < mn && !pick; k++)

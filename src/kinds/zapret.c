@@ -26,11 +26,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <dirent.h>
-#include <ctype.h>
 
 #include "spec.h"
 #include "ir.h"
+#include "procscan.h"
 
 static int zapret_parse(struct output *o, const struct out_keys *k, struct err *e) {
     /* На телефоне zapret нет (решение владельца: «zapret не надо», plat()->zapret) — см.
@@ -68,55 +67,7 @@ static int zapret_check(const struct spec *sp, const struct output *o, struct er
     return 0;
 }
 
-/* Есть ли в системе процесс, командная строка которого содержит NEEDLE.
- *
- * Один обход /proc на двух спрашивающих — системный обход (zapret_running) и выход kind=zapret,
- * которому нужен не «работает ли обход вообще», а «жив ли обработчик МОЕЙ очереди». Два обхода
- * /proc с двумя копиями разбора cmdline разошлись бы на первой же правке (буфер, замена нулей,
- * пропуск не-цифр).
- *
- * Почему вообще /proc, а не вопрос ядру: списка «кто слушает очередь nfqueue N» ядро не
- * отдаёт ни через netlink, ни через /proc/net/netfilter/nfnetlink_queue (там номер очереди
- * и pid, но только для очередей, через которые уже прошёл пакет, — то есть у поднятого и
- * ещё не нагруженного обработчика запись отсутствует). Командная строка с --qnum=N
- * отвечает на тот же вопрос и отвечает всегда.
- *
- * digit_end — требовать, чтобы сразу за NEEDLE не стояла цифра: так «--qnum=830» перестаёт
- * находиться в «--qnum=8300». */
-static int cmdline_find(const char *needle, int digit_end) {
-    DIR *d = opendir("/proc");
-    if (!d) return 0;
-    struct dirent *dir;
-    int found = 0;
-    char path[300];
-    char buf[512];
-
-    while ((dir = readdir(d)) != NULL && !found) {
-        if (!isdigit(dir->d_name[0])) continue;
-        snprintf(path, sizeof(path), "/proc/%s/cmdline", dir->d_name);
-        int fd = open(path, O_RDONLY | O_CLOEXEC);
-        if (fd >= 0) {
-            ssize_t n = read(fd, buf, sizeof(buf) - 1);
-            if (n > 0) {
-                buf[n] = '\0';
-                for (ssize_t i = 0; i < n; i++) {
-                    if (buf[i] == '\0') buf[i] = ' ';
-                }
-                for (const char *q = strstr(buf, needle); q; q = strstr(q + 1, needle)) {
-                    char after = q[strlen(needle)];
-                    if (digit_end && after >= '0' && after <= '9') continue;
-                    found = 1;
-                    break;
-                }
-            }
-            close(fd);
-        }
-    }
-    closedir(d);
-    return found;
-}
-
-int zapret_running(void) { return cmdline_find("nfqws", 0); }
+int zapret_running(void) { return proc_cmdline_find("nfqws", 0); }
 
 /* Жив ли обработчик ИМЕННО ЭТОЙ очереди.
  *
@@ -126,7 +77,7 @@ int zapret_running(void) { return cmdline_find("nfqws", 0); }
 int nfqws_on_queue(int queue) {
     char needle[32];
     snprintf(needle, sizeof(needle), "--qnum=%d", queue);
-    return cmdline_find(needle, 1);
+    return proc_cmdline_find(needle, 1);
 }
 
 /* Устройства нет, поэтому и поля свои. Печатается всё, что о выходе вообще можно знать снаружи,
@@ -143,7 +94,7 @@ int nfqws_on_queue(int queue) {
  *                  --qnum=N в командной строке отвечает на тот же вопрос точно.
  *
  * Признак живости здесь всё же печатается, в отличие от obfs, и разница
- * оправданна: у obfs он стоил бы pgrep на каждый круг опроса ради поля, которое
+ * оправданна: у obfs он стоил бы обход /proc на каждый круг опроса ради поля, которое
  * дублирует diag; здесь без него у выхода не было бы вообще НИ ОДНОГО признака
  * работы — устройства нет, счётчик канала растёт одинаково при живом и мёртвом
  * обходе (пакеты уходят и так, разница в том, доходят ли они). */

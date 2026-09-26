@@ -335,7 +335,8 @@ $(BUILD)/irmatch-android: tests/irmatch.c tests/unit.h $(COMPILE_SRC) $(MODEL_KI
 # Проход сторожа — автомат на цикле событий: с ним компонуются цикл (loop.c), ожидания
 # (foprobe.c), рабочий поток имён (gaiw.c) и rtnetlink (rtnl.c). Всё, что из них полезло бы в
 # ядро или в сеть, стенд подменяет швами failover_int.h.
-FAILOVERMATCH_SRC := src/daemon/failover.c src/daemon/loop.c src/daemon/foprobe.c src/daemon/gaiw.c src/lib/rtnl.c
+FAILOVERMATCH_SRC := src/daemon/failover.c src/daemon/loop.c src/daemon/foprobe.c src/daemon/gaiw.c src/lib/rtnl.c \
+                     src/lib/nftdump.c src/lib/procscan.c
 $(BUILD)/failovermatch: tests/failovermatch.c $(FAILOVERMATCH_SRC) src/daemon/daemon.h \
                         src/daemon/failover_int.h src/daemon/fostate.h src/daemon/foprobe.h src/daemon/gaiw.h \
                         src/daemon/loop.h src/lib/rtnl.h src/model/spec.h src/lib/err.c $(FAILOVERMATCH_KINDS)
