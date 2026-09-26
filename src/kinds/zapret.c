@@ -42,7 +42,7 @@ static int zapret_parse(struct output *o, const struct out_keys *k, struct err *
      * только то, ЧТО с ним по дороге сделает nfqws. Названное устройство здесь —
      * почти наверняка описка (человек копировал выход-туннель), и принять его
      * молча значило бы обещать маршрутизацию, которой не будет. */
-    if (o->device[0] || o->devices_n)
+    if (o->device[0] || k->devices_n)
         return err_set(e, "outputs.%s: у kind zapret нет устройства — трафик идёт обычным путём",
             o->name);
     /* Путь выводится из имени выхода — тот же довод, что у conf у xsteer: два

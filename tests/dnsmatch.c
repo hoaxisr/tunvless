@@ -461,12 +461,12 @@ int main(void) {
                 /* Снимок ровно того, что tabfmt_build напечатала (dch_build уже отработал
                  * внутри неё), — «дч_build по спеке» из требования стенда. */
                 struct { char set[64], out[32], chan[32]; int realip; size_t rules_n;
-                         char rules_path[MAX_FILES][256]; } snap[MAX_CHANNELS];
+                         char rules_path[MAX_FILES][256]; } snap[MAX_RULES];
                 size_t snap_n = g_dch_n;
                 for (size_t i = 0; i < snap_n; i++) {
                     /* memcpy целиком, а не snprintf("%s", ...): поля snap зеркалят размер
                      * g_dch (set[64]/out[32]/chan[32]) один в один, а gcc иначе не может
-                     * доказать границу источника внутри массива структур g_dch[MAX_CHANNELS]
+                     * доказать границу источника внутри массива структур g_dch[MAX_RULES]
                      * и завышает её до размера всего массива (-Wformat-truncation). */
                     memcpy(snap[i].set, g_dch[i].set, sizeof(snap[i].set));
                     memcpy(snap[i].out, g_dch[i].out, sizeof(snap[i].out));

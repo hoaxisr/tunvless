@@ -75,7 +75,7 @@ static int sup_list(const char *spec, struct helper *out, size_t *n) {
          * расходится с назначением, — как у помощников при старте). */
         int marks = 0, need = 0;
         for (size_t i = 0; i < cfg.out_n; i++)
-            if (cfg.out[i].via[0]) { if (registry_assign(&cfg, &e) < 0) err_die(&e); marks = 1; break; }
+            if (cfg.out[i].over[0]) { if (registry_assign(&cfg, &e) < 0) err_die(&e); marks = 1; break; }
         size_t k = helpers_plan(&cfg, h, HELPERS_MAX, &need);
         if (need && !marks) {
             if (registry_assign(&cfg, &e) < 0) err_die(&e);

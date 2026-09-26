@@ -111,7 +111,7 @@ int tabfmt_parse(const char *buf, size_t len) {
     field_copy(digits, sizeof(digits), buf, nl);
     char *end = NULL;
     long want = strtol(digits, &end, 10);
-    if (end == digits || *end != '\0' || want < 0 || (size_t)want > MAX_CHANNELS) return -1;
+    if (end == digits || *end != '\0' || want < 0 || (size_t)want > MAX_RULES) return -1;
 
     tabfmt_release_current();
 
@@ -171,7 +171,7 @@ int tabfmt_feed(struct tabfmt_feed *st, const char *data, size_t n) {
     field_copy(digits, sizeof(digits), st->buf, nl);
     char *end = NULL;
     long want = strtol(digits, &end, 10);
-    if (end == digits || *end != '\0' || want < 0 || (size_t)want > MAX_CHANNELS) return -1;
+    if (end == digits || *end != '\0' || want < 0 || (size_t)want > MAX_RULES) return -1;
 
     size_t pos = nl + 1;
     for (long i = 0; i < want; i++) {

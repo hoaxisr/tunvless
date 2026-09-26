@@ -370,13 +370,13 @@ int main(int argc, char **argv) {
             die("--kind: нужен interface, vless, xsteer, zapret или direct, а не %s", a.kind);
         if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
         for (size_t i = 0; i < cfg.out_n; i++) {
-            const char *k = kind_of(&cfg.out[i])->name;
+            const char *k = out_kind_name(&cfg.out[i]);
             if (a.kind && strcmp(a.kind, k) != 0) continue;
             /* --obfs — отдельный признак, а не вид: обфускация есть свойство выхода,
              * и init-скрипту нужен именно список тех, кому поднимать процесс. */
             if (a.obfs && !iface_obfs(&cfg.out[i])) continue;
             if (a.via) {
-                if (cfg.out[i].via[0]) printf("%s\t%s\n", cfg.out[i].name, cfg.out[i].via);
+                if (cfg.out[i].over[0]) printf("%s\t%s\n", cfg.out[i].name, cfg.out[i].over);
                 continue;
             }
             /* --devices печатает устройство, и выход без устройства (kind=direct) при этом
@@ -495,8 +495,8 @@ int main(int argc, char **argv) {
          * spec.h). При via она — метка выхода-цели, а та появляется только в реестре: без
          * registry_assign функция вернула бы ноль, то есть «напрямую», молча. Без via реестр
          * не нужен и не трогается — у этого процесса его прежде не было. */
-        if (o->via[0] && registry_assign(&cfg, &e) < 0) err_die(&e);
-        obfs_set_sock_mark(out_underlay_mark(&cfg, o), o->via[0] != 0);
+        if (o->over[0] && registry_assign(&cfg, &e) < 0) err_die(&e);
+        obfs_set_sock_mark(out_underlay_mark(&cfg, o), o->over[0] != 0);
         return obfs_client(o->name, ob->server, ob->server_port, ob->listen, ob->listen_port);
     }
     /* Серверная половина. Спека ей не нужна и не читается: сервер живёт на VPS, где

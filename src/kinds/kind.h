@@ -28,6 +28,7 @@ struct out_obfs;
 struct vless_cfg;
 struct xsteer_cfg;
 struct tgws_cfg;
+struct group_cfg;
 /* Дерево ruleset генератора. Объявлено ради поля emit ниже; определит его перевод src/compile на
  * промежуточное дерево (docs/architecture.md, «Слои и каталоги», compile/ir.c). */
 struct nft_rs;
@@ -41,7 +42,7 @@ enum kind_cap {
     KC_CTMARK       = 1 << 2,   /* метка соединения (out_needs_ctmark) */
     KC_ENGINE_OWNED = 1 << 3,   /* устройство заводит наш процесс, а не netifd (out_engine_managed) */
     KC_SELF_NAT     = 1 << 4,   /* masquerade не нужен (out_self_natting) */
-    KC_OVER         = 1 << 5,   /* свой сокет наверх — `via` имеет смысл (out_via_capable) */
+    KC_OVER         = 1 << 5,   /* свой сокет наверх — подложка `over` (v1: `via`) имеет смысл (out_over_capable) */
     KC_SKIP_ZAPRET  = 1 << 6,   /* общий обход DPI трафик не трогает (out_skips_zapret) */
     /* Здоровье устройства — рукопожатием TCP через него, а не ICMP: туннель завершает TCP у
      * себя, и пинг наружу через его устройство не проходит никогда (failover.c). */
@@ -69,6 +70,9 @@ enum kind_key {
     KK_OPTS   = 1 << 2,
     KK_DOMAIN = 1 << 3,
     KK_NODES  = 1 << 4,
+    /* `devices` спеки v1 — пул кандидатов. Принимает его только interface: пул устройств — это
+     * группа (kind: group), и собирает её перевод v1 (model/v1.c) из безымянных интерфейсов. */
+    KK_DEVICES = 1 << 5,
 };
 
 /* Помощник выхода — процесс, который поднимает супервизор (daemon/helpers.c: `steer supervise` и
@@ -200,9 +204,15 @@ void kind_sig_mix(unsigned long long *h, const void *p, size_t n);
 void kind_emit_all(struct nft_rs *rs, const struct spec *sp);
 
 /* Записи видов. Определены в src/kinds/<вид>.c; реестр ссылается на них слабо (kind.c), поэтому
- * вид, файла которого нет в сборке, у реестра есть — записью отказа. */
+ * вид, файла которого нет в сборке, у реестра есть — записью отказа.
+ *
+ * group в реестр НЕ входит. Реестр — это виды из профиля: по нему ищет вид разбор спеки v1, по
+ * его порядку ложатся правила видов (kind_emit_all) и проверки diag. Группа — часть модели v2:
+ * спека v1 её не знает (`"kind": "group"` в v1 обязан остаться неизвестным видом, иначе спека,
+ * принятая с ним, значила бы то, чего v1 не обещал), своих правил и проверок у неё нет, а
+ * собирает её перевод v1 (model/v1.c) напрямую. Разбор v2 (шаг 2 из 1.9) найдёт её сам. */
 extern const struct kind_ops kind_direct, kind_interface, kind_vless, kind_xsteer, kind_zapret,
-                             kind_tgws, kind_awg;
+                             kind_tgws, kind_awg, kind_group;
 
 /* Вид обнулённого выхода (kind == NULL; так их собирают стенды) — direct, как у нулевого
  * значения прежнего перечня видов. Читает его kind_of в spec.h. */
@@ -220,11 +230,51 @@ extern const struct kind_ops kind_direct, kind_interface, kind_vless, kind_xstee
 #define OUT_ZAPRET    (&kind_zapret)
 #define OUT_TGWS      (&kind_tgws)
 #define OUT_AWG       (&kind_awg)
+#define OUT_GROUP     (&kind_group)
 
 /* ---- вопросы к отдельным видам ------------------------------------------------------------
  *
  * Помощнику вида (клиенту vless, xsteer, мосту tgws) нужна настройка своего выхода, и спросить
  * её он должен у вида: «это мой выход?» — NULL, если выход другого вида. */
+
+/* Вид, которым выход виден снаружи: в status, в `steer outputs --kind`, в подписях сверки и в
+ * отказах разбора. У группы из перевода v1 — вид прежнего выхода (interface), см.
+ * group_cfg.shown в spec.h; у остальных — свой. */
+const struct kind_ops *out_kind_shown(const struct output *o);
+const char *out_kind_name(const struct output *o);
+
+/* ---- группа (src/kinds/group.c) ---- */
+/* Настройка группы или NULL, если выход не группа. */
+const struct group_cfg *out_group(const struct output *o);
+/* КАНДИДАТЫ ВЫХОДА — из чего сторож выбирает устройство: у группы — её члены по порядку, у
+ * выхода с устройством — он сам, единственным кандидатом, у остальных — никого. Одна функция на
+ * всех, кому нужен «пул» (сторож, status, apply, сверка), — чтобы группа и одиночный выход не
+ * расходились в ответе на один и тот же вопрос. Пишет не больше max, возвращает, сколько. */
+size_t out_members(const struct spec *sp, const struct output *o, const struct output **dst,
+                   size_t max);
+/* Сделать выход o группой pick: order из безымянных выходов-членов, по одному на устройство devs
+ * (того же вида, каким был o), — так перевод v1 превращает пул `devices` в группу (model/v1.c), и
+ * так же собирают пул стенды. Имя, активное устройство, over, on_fail, метка и таблица остаются
+ * у группы: снаружи это прежний выход. Члены ложатся в безымянную часть sp->out (struct spec).
+ * 0 — готово; -1 — отказ в e. */
+int group_of_devices(struct spec *sp, struct output *o, const char (*devs)[32], size_t n,
+                     struct err *e);
+/* Замкнуть группу, когда её члены известны: свойства группы — пересечение свойств членов
+ * (group_cfg.caps). 0 — годится; -1 — отказ (членов нет, член не годится), текст в e. */
+int group_seal(struct spec *sp, struct output *g, struct err *e);
+/* ВЫБОР ПО ЗАМЕРУ (pick: latency): ms — задержки членов по порядку (-1 — не измерено). Лучший —
+ * наименьшая задержка; из тех, кто хуже лучшего не больше чем на tol, берётся самый
+ * предпочтительный (первый по порядку): порядок человека решает при равенстве. Возврат — номер
+ * выбранного или -1, если не измерен никто; *best — лучшая задержка. */
+int group_latency_pick(const int *ms, size_t n, int tol, int *best);
+/* Уходить ли с живого текущего cur на выбранный замером pick: только если выигрыш больше
+ * допуска. 1 — остаться на cur. */
+int group_latency_keep(const int *ms, int cur, int pick, int tol);
+/* ГИСТЕРЕЗИС ВОЗВРАТА (pick: order): трафик на менее предпочтительном cur, более
+ * предпочтительное first ожило. Живое текущее держится, пока верхнее не подтвердит здоровье hyst
+ * тиков подряд. streak — сколько тиков подряд оно уже было здорово до этого прохода, cur_alive —
+ * жив ли текущий. Возврат — номер выбранного; *new_streak — серия, которую запомнить. */
+int group_hysteresis(int cur, int first, int cur_alive, int streak, int hyst, int *new_streak);
 
 /* interface: обфускация транспорта или NULL, если её нет (или выход не interface). */
 const struct out_obfs *iface_obfs(const struct output *o);

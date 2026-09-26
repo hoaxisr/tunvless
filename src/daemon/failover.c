@@ -6,9 +6,11 @@
  * (watch.c) или демон с --watch (watchd.c). Где лежит память между проходами — файлы или
  * память демона, — решает тот же вызывающий, см. fostate.h.
  *
- * Порядок devices — приоритет. Первое здоровое устройство побеждает, поэтому
- * восстановление наверх происходит само: как только основной туннель ожил, он
- * снова оказывается первым здоровым, и следующий проход вернётся на него.
+ * Кандидаты выхода — у группы (kind: group, src/kinds/group.c) её члены по порядку, у выхода с
+ * устройством — он сам (out_members). Порядок — приоритет: у pick: order первое здоровое
+ * устройство побеждает, поэтому восстановление наверх происходит само: как только основной
+ * туннель ожил, он снова оказывается первым здоровым, и следующий проход вернётся на него.
+ * Решения выбора (по замеру, гистерезис) — функции группы; здесь — пробы и их порядок.
  *
  * Проверка НЕ трогает живой путь. Пинг уходит через отдельную таблицу с правилом
  * по адресу источника кандидата — иначе, чтобы проверить запасной туннель, пришлось
@@ -268,12 +270,13 @@ int (*g_latency_probe)(const struct spec *, const struct output *, const char *)
 /* Владелец устройства. Объяснение — у объявления в spec.h; там же сказано, почему функция
  * объявлена рядом со спекой, а живёт здесь (тот же случай, что bind_device). */
 const struct output *device_owner(const struct spec *sp, const char *dev) {
+    /* Устройство выхода, который его создаёт, — его собственное и единственное (у vless, xsteer
+     * и awg пула не бывает). Сторож его не стирает и при отказе (out_finish), поэтому ответ не
+     * зависит от того, прошёл ли уже этот выход в текущем проходе. */
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *c = &sp->out[i];
         if (!out_engine_managed(c)) continue;
         if (!strcmp(c->device, dev)) return c;
-        for (size_t k = 0; k < c->devices_n; k++)
-            if (!strcmp(c->devices[k], dev)) return c;
     }
     return NULL;
 }
@@ -1105,7 +1108,8 @@ static int lat_get(struct fo_store *st, const char *out, const char *dev, int *m
 
 /* Записать замеры выхода, оставив записи остальных на месте. Заменой целиком (у файлов —
  * временный файл и rename, см. files_put): обрыв на середине оставил бы половину строк. */
-static void lat_put(struct fo_store *st, const char *out, char devs[][32], int *ms, size_t n) {
+static void lat_put(struct fo_store *st, const char *out, const struct output *const *devs,
+                    int *ms, size_t n) {
     char *buf = NULL;
     size_t bn = 0;
     FILE *old = st->ops->open_r(st, "latency");
@@ -1120,7 +1124,7 @@ static void lat_put(struct fo_store *st, const char *out, char devs[][32], int *
     }
     long now = mono_now();
     for (size_t k = 0; k < n; k++)
-        if (ms[k] >= 0) fprintf(f, "%s %s %d %ld\n", out, devs[k], ms[k], now);
+        if (ms[k] >= 0) fprintf(f, "%s %s %d %ld\n", out, devs[k]->device, ms[k], now);
     if (fclose(f) == 0) st->ops->put(st, "latency", buf, bn);
     free(buf);
 }
@@ -1166,13 +1170,14 @@ void active_get(const char *out, char *dev, size_t n) {
  *
  * Заменой целиком (у файлов — через временный файл и rename, см. files_put): status и apply
  * читают этот файл в любой момент. */
-static void active_save(struct fo_store *st, const struct spec *sp, const int *streak) {
+static void active_save(struct fo_store *st, const struct spec *sp, const int *streak,
+                        const int *failed) {
     char want[MAX_OUTPUTS * 80 + 1];
     size_t wn = 0;
     for (size_t i = 0; i < sp->out_n; i++) {
         if (!out_has_device(&sp->out[i])) continue;
         int w = snprintf(want + wn, sizeof(want) - wn, "%s %s %d\n", sp->out[i].name,
-                         sp->out[i].device[0] ? sp->out[i].device : "-", streak[i]);
+                         !failed[i] && sp->out[i].device[0] ? sp->out[i].device : "-", streak[i]);
         if (w < 0 || (size_t)w >= sizeof(want) - wn) break;
         wn += (size_t)w;
     }
@@ -1217,16 +1222,20 @@ void outputs_adopt_active(struct spec *sp) {
 void outputs_adopt_active_st(struct spec *sp, struct fo_store *st) {
     for (size_t i = 0; i < sp->out_n; i++) {
         struct output *o = &sp->out[i];
-        if (!out_has_device(o)) continue;
+        /* Выбирать есть из чего только у группы: у выхода с одним устройством кандидат — он
+         * сам, и ответ всегда его устройство. */
+        if (!out_group(o)) continue;
 
+        const struct output *m[MAX_MEMBERS];
+        size_t mn = out_members(sp, o, m, MAX_MEMBERS);
         char rec[32];
         active_get_st(st, o->name, rec, sizeof(rec));   /* читает три поля — см. active_get */
         const char *pick = NULL;
         if (rec[0] && strcmp(rec, "-") != 0 && device_present(rec))
-            for (size_t k = 0; k < o->devices_n && !pick; k++)
-                if (!strcmp(o->devices[k], rec)) pick = o->devices[k];
-        for (size_t k = 0; k < o->devices_n && !pick; k++)
-            if (device_present(o->devices[k])) pick = o->devices[k];
+            for (size_t k = 0; k < mn && !pick; k++)
+                if (!strcmp(m[k]->device, rec)) pick = m[k]->device;
+        for (size_t k = 0; k < mn && !pick; k++)
+            if (device_present(m[k]->device)) pick = m[k]->device;
         if (pick) snprintf(o->device, sizeof(o->device), "%s", pick);
     }
 }
@@ -1388,9 +1397,16 @@ struct fo_run {
     int changed;
     int streak_new[MAX_OUTPUTS];
     int alive[MAX_OUTPUTS];           /* кто в ЭТОМ проходе нашёл живое устройство */
+    /* Кто в этом проходе остался без живого устройства — в файл active он ложится «-». Отдельно
+     * от device: устройство выхода проход не стирает (см. out_finish), иначе выход, чьё
+     * устройство названо членом группы ниже по спеке, перестал бы быть его владельцем. */
+    int failed[MAX_OUTPUTS];
     size_t ord[MAX_OUTPUTS], ord_n, oi;
     size_t i;
     struct output *o;
+    /* Кандидаты текущего выхода: члены группы или он сам (out_members). */
+    const struct output *cand[MAX_MEMBERS];
+    size_t cand_n;
     const struct output *via;
     int via_down;
     char was[32];
@@ -1400,7 +1416,7 @@ struct fo_run {
     int streak, new_streak, by_latency, cur_dead;
     int tol;
     long iv;
-    int ms[MAX_DEVICES];
+    int ms[MAX_MEMBERS];
     int best, pick;
 
     /* ---- идущая проба ---- */
@@ -1776,7 +1792,8 @@ static void out_finish(struct fo_run *r) {
                         "считается нерабочим\n", o->name, r->via->name);
 
     if (chosen) {
-        snprintf(o->device, sizeof(o->device), "%s", chosen);
+        /* У выхода-одиночки кандидат — он сам, и chosen указывает в его же device. */
+        if (chosen != o->device) snprintf(o->device, sizeof(o->device), "%s", chosen);
         if (strcmp(was, chosen) != 0) {
             bind_device(o, chosen);
             printf("steer: выход %s -> %s%s\n", o->name, chosen,
@@ -1815,7 +1832,8 @@ static void out_finish(struct fo_run *r) {
             }
         }
     } else {
-        o->device[0] = '\0';
+        /* Устройство выхода не стирается — отказ записывает failed (в active он «-»). */
+        r->failed[r->i] = 1;
         /* Тоже по факту, а не по записи в active. Запись «-» говорит лишь о том, что
          * об отказе уже сообщали, а не о том, что заявленный on_fail всё ещё стоит в
          * ядре: клиент туннеля мог с тех пор подняться и привязать таблицу к
@@ -1865,8 +1883,8 @@ static void fo_step(struct fo_run *r) {
              * жив только пока жива его цель: соединение внутреннего туннеля с сервером едет в
              * устройство цели. Ответ «цель жива» сторож и так получает в этом же проходе —
              * нужно лишь спросить цель ПЕРВОЙ. Поэтому сначала выходы без via, затем те, чья
-             * цель без via, и так до MAX_VIA_DEPTH: спека круги и цепочки длиннее не
-             * пропускает (via_check в spec.c), так что каждый выход получает место ровно один
+             * цель без via, и так до MAX_OVER_DEPTH: спека круги и цепочки длиннее не
+             * пропускает (over_check в model/v1.c), так что каждый выход получает место ровно один
              * раз. Порядок внутри одного слоя — прежний, спековый: у спек без via обход тот
              * же, что был, до последнего прохода.
              *
@@ -1874,9 +1892,9 @@ static void fo_step(struct fo_run *r) {
              * зависимость читается из уже известного ответа, а пробы внутреннего выхода при
              * лежащей цели и вовсе не делаются (см. via_down ниже). */
             r->ord_n = 0;
-            for (int depth = 0; depth <= MAX_VIA_DEPTH; depth++)
+            for (int depth = 0; depth <= MAX_OVER_DEPTH; depth++)
                 for (size_t i = 0; i < sp->out_n; i++)
-                    if (out_via_depth(sp, &sp->out[i]) == depth) r->ord[r->ord_n++] = i;
+                    if (out_over_depth(sp, &sp->out[i]) == depth) r->ord[r->ord_n++] = i;
             r->oi = 0;
             r->s = S_OUT;
             continue;
@@ -1892,15 +1910,16 @@ static void fo_step(struct fo_run *r) {
              * пробовать, и оживлять его бесполезно — поэтому ни того, ни другого, сразу ветка
              * отказа с ЕГО on_fail: каналы внутреннего выхода получают то, что человек для
              * них выбрал. */
-            r->via = out_via(sp, o);
+            r->via = out_over(sp, o);
             r->via_down = r->via && !r->alive[r->via - sp->out];
             active_get_st(r->st, o->name, r->was, sizeof(r->was));
+            r->cand_n = out_members(sp, o, r->cand, MAX_MEMBERS);
             /* Где в списке предпочтения стоит несущее трафик сейчас. -1 — записи нет или её
              * устройство больше не кандидат: тогда гистерезису не за что держаться, берём
              * лучшее здоровое сразу. */
             r->cur = -1;
-            for (size_t k = 0; k < o->devices_n; k++)
-                if (!strcmp(o->devices[k], r->was)) { r->cur = (int)k; break; }
+            for (size_t k = 0; k < r->cand_n; k++)
+                if (!strcmp(r->cand[k]->device, r->was)) { r->cur = (int)k; break; }
             r->first_h = -1;
             r->k = 0;
             r->s = S_SCAN;
@@ -1910,15 +1929,15 @@ static void fo_step(struct fo_run *r) {
             /* Первое здоровое по предпочтению. Пробуем по порядку и ОСТАНАВЛИВАЕМСЯ на нём —
              * пробить пробой каждое устройство значило бы платить таймаут за каждый мёртвый
              * запас на каждом тике. Здоровье устройств 0..first_h тем самым известно. */
-            if (r->k >= o->devices_n || r->via_down) { r->s = S_LAT; continue; }
+            if (r->k >= r->cand_n || r->via_down) { r->s = S_LAT; continue; }
             r->s = S_SCAN_R;
-            if (hp_start(r, HP_HEALTH, o, o->devices[r->k])) return;
+            if (hp_start(r, HP_HEALTH, o, r->cand[r->k]->device)) return;
             continue;
 
         case S_SCAN_R:
             if (r->res) { r->first_h = (int)r->k; r->s = S_LAT; continue; }
             if (r->verbose)
-                fprintf(stderr, LOG_W "%s: %s не отвечает\n", o->name, o->devices[r->k]);
+                fprintf(stderr, LOG_W "%s: %s не отвечает\n", o->name, r->cand[r->k]->device);
             r->k++;
             r->s = S_SCAN;
             continue;
@@ -1951,14 +1970,15 @@ static void fo_step(struct fo_run *r) {
              * равенстве: кандидат, чей замер не хуже лучшего на допуск, считается равным, и
              * из таких берётся самый предпочтительный. Иначе включение режима означало бы
              * «мой список больше ничего не значит». */
-            if (o->prefer_latency && r->first_h >= 0 && o->devices_n > 1) {
-                r->tol = o->lat_tolerance_ms > 0 ? o->lat_tolerance_ms : LAT_TOLERANCE_MS;
-                r->iv  = o->lat_interval_s  > 0 ? o->lat_interval_s  : LAT_INTERVAL_S;
+            const struct group_cfg *g = out_group(o);
+            if (g && g->pick == PICK_LATENCY && r->first_h >= 0 && r->cand_n > 1) {
+                r->tol = g->lat_tolerance_ms > 0 ? g->lat_tolerance_ms : LAT_TOLERANCE_MS;
+                r->iv  = g->lat_interval_s  > 0 ? g->lat_interval_s  : LAT_INTERVAL_S;
                 int stale = 0;
-                for (size_t k = 0; k < o->devices_n; k++) {
+                for (size_t k = 0; k < r->cand_n; k++) {
                     long age = 0;
                     r->ms[k] = -1;
-                    if (lat_get(r->st, o->name, o->devices[k], &r->ms[k], &age)) {
+                    if (lat_get(r->st, o->name, r->cand[k]->device, &r->ms[k], &age)) {
                         if (age > r->iv || age < 0) stale = 1;
                     } else stale = 1;
                 }
@@ -1972,13 +1992,13 @@ static void fo_step(struct fo_run *r) {
             continue;
 
         case S_LAT_M:
-            if (r->k >= o->devices_n) {
-                lat_put(r->st, o->name, o->devices, r->ms, o->devices_n);
+            if (r->k >= r->cand_n) {
+                lat_put(r->st, o->name, r->cand, r->ms, r->cand_n);
                 r->s = S_LAT_C;
                 continue;
             }
             r->s = S_LAT_M_R;
-            if (hp_start(r, HP_LATENCY, o, o->devices[r->k])) return;
+            if (hp_start(r, HP_LATENCY, o, r->cand[r->k]->device)) return;
             continue;
 
         case S_LAT_M_R:
@@ -1988,9 +2008,11 @@ static void fo_step(struct fo_run *r) {
             continue;
 
         case S_LAT_C: {
-            int have = 0;
-            for (size_t k = 0; k < o->devices_n; k++) if (r->ms[k] >= 0) have++;
-            if (have == 0) {
+            /* Лучший по замеру с допуском, при равенстве — самый предпочтительный
+             * (group_latency_pick). Не измерен никто — выбор по порядку. */
+            int best = -1;
+            int pick = group_latency_pick(r->ms, r->cand_n, r->tol, &best);
+            if (best < 0) {
                 /* Ни один замер не удался — режим молча становится прежним. Сказать надо:
                  * иначе человек думает, что выбор идёт по задержке, а он идёт по списку.
                  * Так бывает у выхода kind=xsteer, который не меряется никогда. */
@@ -2000,12 +2022,6 @@ static void fo_step(struct fo_run *r) {
                 r->s = S_HYST;
                 continue;
             }
-            int best = -1;
-            for (size_t k = 0; k < o->devices_n; k++)
-                if (r->ms[k] >= 0 && (best < 0 || r->ms[k] < best)) best = r->ms[k];
-            int pick = -1;
-            for (size_t k = 0; k < o->devices_n; k++)
-                if (r->ms[k] >= 0 && r->ms[k] - best <= r->tol) { pick = (int)k; break; }
             r->best = best;
             r->pick = pick;
             if (pick < 0) { r->s = S_HYST; continue; }
@@ -2013,7 +2029,7 @@ static void fo_step(struct fo_run *r) {
              * уступает сразу: здоровье старше замера. */
             if (r->cur >= 0 && r->cur != pick && r->ms[r->cur] >= 0) {
                 r->s = S_LAT_CUR_R;
-                if (hp_start(r, HP_HEALTH, o, o->devices[r->cur])) return;
+                if (hp_start(r, HP_HEALTH, o, r->cand[r->cur]->device)) return;
                 continue;
             }
             r->s = S_LAT_PICK;
@@ -2021,23 +2037,23 @@ static void fo_step(struct fo_run *r) {
         }
 
         case S_LAT_CUR_R:
-            if (r->res && r->ms[r->cur] - r->ms[r->pick] <= r->tol) r->pick = r->cur;
+            if (r->res && group_latency_keep(r->ms, r->cur, r->pick, r->tol)) r->pick = r->cur;
             r->s = S_LAT_PICK;
             continue;
 
         case S_LAT_PICK:
             r->s = S_LAT_PICK_R;
-            if (hp_start(r, HP_HEALTH, o, o->devices[r->pick])) return;
+            if (hp_start(r, HP_HEALTH, o, r->cand[r->pick]->device)) return;
             continue;
 
         case S_LAT_PICK_R:
             if (r->res) {
-                r->chosen = o->devices[r->pick];
+                r->chosen = r->cand[r->pick]->device;
                 r->by_latency = 1;
                 if (r->verbose)
                     fprintf(stderr, LOG_I "%s: по замеру выбран %s (%d мс, лучший %d, "
                                     "допуск %d)\n",
-                            o->name, o->devices[r->pick], r->ms[r->pick], r->best, r->tol);
+                            o->name, r->cand[r->pick]->device, r->ms[r->pick], r->best, r->tol);
             }
             r->s = S_HYST;
             continue;
@@ -2050,27 +2066,23 @@ static void fo_step(struct fo_run *r) {
                      * нельзя — это и есть мелькание. Держим его, пока верхнее не подтвердит
                      * здоровье STEER_FAILOVER_HYST тиков подряд. Мёртвое текущее — сразу вниз. */
                     r->s = S_HYST_R;
-                    if (hp_start(r, HP_HEALTH, o, o->devices[r->cur])) return;
+                    if (hp_start(r, HP_HEALTH, o, r->cand[r->cur]->device)) return;
                     continue;
                 }
                 /* first_h == cur (несём лучшее доступное) либо cur < first_h (текущее мертво —
                  * first_h это уход вниз): в обоих случаях берём first_h без задержки, счётчик
                  * сбрасываем. */
-                r->chosen = o->devices[r->first_h];
+                r->chosen = r->cand[r->first_h]->device;
             }
             r->s = S_REV0;
             continue;
 
         case S_HYST_R: {
-            int hyst = failover_hyst();
-            if (r->res) {
-                int s = r->streak + 1;
-                if (hyst > 0 && s < hyst) { r->chosen = o->devices[r->cur]; r->new_streak = s; }
-                else r->chosen = o->devices[r->first_h];
-            } else {
-                r->chosen = o->devices[r->first_h];
-                r->cur_dead = 1;
-            }
+            /* Гистерезис возврата — решение группы (group_hysteresis); проба текущего — здесь. */
+            int k = group_hysteresis(r->cur, r->first_h, r->res, r->streak, failover_hyst(),
+                                     &r->new_streak);
+            r->chosen = r->cand[k]->device;
+            if (!r->res) r->cur_dead = 1;
             r->s = S_REV0;
             continue;
         }
@@ -2088,13 +2100,13 @@ static void fo_step(struct fo_run *r) {
             continue;
 
         case S_REV:
-            if (r->k >= o->devices_n) { r->s = S_FIN; continue; }
-            rv_begin(r, o, o->devices[r->k], S_REV_R);
+            if (r->k >= r->cand_n) { r->s = S_FIN; continue; }
+            rv_begin(r, o, r->cand[r->k]->device, S_REV_R);
             continue;
 
         case S_REV_R:
             if (r->res) {
-                r->chosen = o->devices[r->k];
+                r->chosen = r->cand[r->k]->device;
                 fo_emit(r->ev, r->ev_arg, FO_EV_REVIVED, o, NULL, r->chosen, NULL);
                 r->s = S_FIN;
                 continue;
@@ -2110,7 +2122,7 @@ static void fo_step(struct fo_run *r) {
             continue;
 
         case S_END:
-            active_save(r->st, sp, r->streak_new);
+            active_save(r->st, sp, r->streak_new, r->failed);
             if (!r->changed && r->verbose) fprintf(stderr, LOG_I "изменений нет\n");
             /* Строки о переключении — в stdout: у долгоживущего процесса он буферизован, а
              * читают его журнал сервиса и стенды — сразу после прохода. */

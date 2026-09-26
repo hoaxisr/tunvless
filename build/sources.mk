@@ -41,7 +41,7 @@ INC_DIRS  := $(CORE_DIRS) $(EXT_DIRS) $(CLIENT_DIRS)
 # метки), пути состояния. Стенды, компонующие модель, получают платформу тем же списком.
 PLATFORM_SRC := src/platform/platform.c src/platform/openwrt.c src/platform/android.c
 
-MODEL_SRC := $(PLATFORM_SRC) src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c \
+MODEL_SRC := $(PLATFORM_SRC) src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/v1.c src/model/registry.c \
              src/model/probe.c src/compile/nftcompat.c src/lib/puff.c src/model/srs.c src/model/srsplan.c
 
 # Резолвер: src/dnsd/dnsd.c был один файл, теперь — DNSD_SRC. lib/sindex.c, lib/nftnl.c,
@@ -72,7 +72,7 @@ DNSD_SRC := src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c \
 # которым нужны TLS и клиенты туннелей, — только в полном пакете (PROFILE_extended и android).
 # tgws — базовый: правила перехвата пишет любой движок, мост живёт своей программой (полный
 # пакет, микропакет stgws). Состав проверяет tests/buildmatch.sh.
-KINDS_BASE_SRC := src/kinds/kind.c src/kinds/direct.c src/kinds/interface.c src/kinds/zapret.c \
+KINDS_BASE_SRC := src/kinds/kind.c src/kinds/direct.c src/kinds/group.c src/kinds/interface.c src/kinds/zapret.c \
                   src/kinds/tgws.c src/kinds/awg.c
 KINDS_EXT_SRC  := src/kinds/vless.c src/kinds/xsteer.c
 

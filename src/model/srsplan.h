@@ -1,4 +1,4 @@
-/* Канал с наборами sing-box (`srs_files`): на какие группы он ложится (см. srsplan.c).
+/* Правило с наборами sing-box (`srs_files` списка): на какие группы оно ложится (см. srsplan.c).
  *
  * Раскладку спрашивают двое, и ответ у них обязан совпадать: компилятор (build_groups — какие
  * наборы и правила) и резолвер (dch_build — в какой набор класть адрес имени и с каким
@@ -53,20 +53,20 @@ struct srs_plan {
     char warn[1024];            /* что снято при раскладке — печатает apply (check_address_lists) */
 };
 
-/* Разложить канал c. concat — примет ли ядро составной набор: 1, 0 (смешанное сужение делится
+/* Разложить правило r (его список — файлы и наборы, его клиенты — приложения наборов). concat — примет ли ядро составной набор: 1, 0 (смешанное сужение делится
  * по группам) или -1 — спросить, когда понадобится (srs_concat_override, иначе nft_concat_ok).
  * 0 — готово; -1 — отказ спеке (err): сужение канала и набора не пересекаются. Непрочитанный файл отказом не считается — он снимается с предупреждением, как
  * непрочитанный адресный список. */
-int srs_plan_channel(const struct spec *sp, const struct channel *c, int concat,
-                     struct srs_plan *out, struct err *e);
+int srs_plan_rule(const struct spec *sp, const struct spec_rule *r, int concat,
+                  struct srs_plan *out, struct err *e);
 void srs_plan_free(struct srs_plan *pl);
 /* Ответ «примет ли ядро составной набор» для всего процесса: -1 — спрашивать ядро (умолчание),
  * 0 или 1 — задан (стенды, раскладка, выбранная вызывающим). */
 extern int srs_concat_override;
 
-/* Сужения клауз канала (с учётом сужения канала) в порядке файлов и клауз — для нумерации
+/* Сужения клауз списка (с учётом сужения списка) в порядке файлов и клауз — для нумерации
  * сужений в именах наборов (group_set_name): cb зовётся на каждое непустое. */
-void srs_chan_l4_each(const struct channel *c, void (*cb)(void *ctx, const struct l4match *m),
+void srs_list_l4_each(const struct spec_list *c, void (*cb)(void *ctx, const struct l4match *m),
                       void *ctx);
 
 #endif
