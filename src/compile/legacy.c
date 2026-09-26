@@ -58,17 +58,40 @@ static int has_ip(const struct spec *sp, int nftc) {
 #endif
 }
 
-static int has_ip6(int nftc) {
+/* Метит ли спека IPv6 самого устройства (каналы на телефон, ведущие в выход с IPv6, —
+ * docs/architecture.md, «4б»). Тогда в старой раскладке нужна цепочка route в таблице ip6: бит
+ * перемаршрутизации (шаг 2) на пакете IPv6 снимает только она, и без неё помеченный пакет
+ * приложения ушёл бы прежним маршрутом, мимо туннеля. Вопрос к спеке, а не к дереву: его задаёт
+ * и шапка файла в apply (добавить-и-удалить таблицу ip6) до того, как дерево построено. Набор ли
+ * у правила с подсетями IPv6, здесь не узнать (списки не читаются) — достаточно того, что такой
+ * трафик может быть: лишняя цепочка из одного правила ничего не стоит. */
+#ifndef STEER_TGWS
+static int local_v6_marking(const struct spec *sp) {
+    if (!plat()->local_channels || !STEER_REROUTE_BIT) return 0;
+    for (size_t i = 0; i < sp->rule_n; i++) {
+        const struct spec_rule *r = &sp->rule[i];
+        const struct spec_client *w = rule_who(sp, r);
+        if (r->disabled || !w->from_n || !from_is_local(w->from[0])) continue;
+        const struct output *o = rule_out(sp, r);
+        if (out_needs_mark(o) && out_has_cap(o, KC_IPV6)) return 1;
+    }
+    return 0;
+}
+#endif
+
+static int has_ip6(const struct spec *sp, int nftc) {
 #ifdef STEER_TGWS
+    (void)sp;
     (void)nftc;
     return 0;
 #else
-    return (nftc & NFTC_LEGACY) && (nftc & NFTC_IP6NAT);
+    if (!(nftc & NFTC_LEGACY)) return 0;
+    return (nftc & NFTC_IP6NAT) || local_v6_marking(sp);
 #endif
 }
 
 int legacy_has_ip(const struct spec *sp) { return has_ip(sp, g_nftc); }
-int legacy_has_ip6(void) { return has_ip6(g_nftc); }
+int legacy_has_ip6(const struct spec *sp) { return has_ip6(sp, g_nftc); }
 
 /* Для читателей ядра — diag и explain. Они списков не разбирают (addrs считает только
  * check_address_lists в apply), поэтому спрашивают вторую половину у всякой доменной группы с
@@ -149,6 +172,9 @@ static void split_timeout_sets(struct nft_table *t) {
  * цепочка output_reroute в таблице ip (шаг 4), и маршрут пересматривается там (подробно — у
  * STEER_REROUTE_BIT в marks.h). Бит ставится ПОСЛЕ метки соединения, прямо перед счётчиком: в
  * conntrack ему не место, он живёт на пакете до цепочки route в таблице ip. */
+/* Возвращает биты: 1 — цепочки route были (перемаршрутизация IPv4, как прежде), 2 — среди их
+ * правил разметки есть правила для IPv6 (v6-двойники каналов телефона, 1.9): им нужна своя
+ * цепочка route в таблице ip6. */
 static int route_to_filter(struct nft_table *t) {
     int any = 0;
     /* Бит есть только там, где цепочки route строятся (каналы на сам телефон,
@@ -158,9 +184,10 @@ static int route_to_filter(struct nft_table *t) {
         struct nft_chain *c = ir_obj_chain(o);
         if (!c || !c->type || strcmp(c->type, "route") != 0) continue;
         c->type = "filter";
-        any = 1;
+        any |= 1;
         for (struct nft_rule *r = c->rules; r; r = r->next) {
             if (!ir_expr_find(r, NFT_X_MARKSET)) continue;
+            if (r->fam != 4) any |= 2;
             ir_expr_insert(r, ir_expr_find(r, NFT_X_COUNTER), NFT_X_MARKSET,
                            ir_printf(t->rs, "meta mark set mark or 0x%08x", STEER_REROUTE_BIT),
                            NULL);
@@ -304,11 +331,29 @@ static int hook_has_nat(const struct nft_table *in, const char *hook) {
     return 0;
 }
 
+/* Снятие бита перемаршрутизации (шаг 2) — см. STEER_REROUTE_BIT в marks.h. mangle + 2: сразу
+ * после разметки (output_mark в inet, mangle + 1) и до nat на выходе. Цепочка route своя у
+ * каждого семейства: в ip — для IPv4, в ip6 — для IPv6 каналов телефона (1.9). */
+static void reroute_chain(struct nft_table *t) {
+    struct nft_rule *r = ir_rule(ir_base_chain_add(t, "output_reroute", "route", "output",
+                                                   "mangle", 2));
+    ir_x(r, "meta mark and 0x%08x == 0x%08x", STEER_REROUTE_BIT, STEER_REROUTE_BIT);
+    ir_markset(r, "meta mark set mark and 0x%08x", ~STEER_REROUTE_BIT);
+    ir_counter(r, 0, 0);
+    ir_comment(r, "steer-reroute");
+}
+
+/* nat — ставить ли цепочки nat (в ip6 — только при NFTC_IP6NAT: без него ядро отвергло бы всю
+ * транзакцию из-за одной таблицы, и таблица ip6 тогда держит одну цепочку перемаршрутизации). */
 static void build_family(struct nft_rs *rs, struct nft_table *in, enum nft_family famk,
-                         int reroute) {
+                         int reroute, int nat) {
     int fam = famk == NFT_FAM_IP ? 4 : 6;
     struct nft_table *t = ir_table_add(rs, famk, in->name);
     if (!t) return;
+    if (!nat) {
+        if (reroute && STEER_REROUTE_BIT) reroute_chain(t);
+        return;
+    }
     /* Карты, в которые смотрят правила dnat этого семейства, переезжают вместе с ними. */
     if (fam == 4)
         for (struct nft_obj *o = in->objs; o; o = o->next) {
@@ -328,16 +373,8 @@ static void build_family(struct nft_rs *rs, struct nft_table *in, enum nft_famil
     if (hook_has_nat(in, "output"))
         merge_nat(in, "output",
                   ir_base_chain_add(t, "output_nat", "nat", "output", "dstnat", -1), fam);
-    /* Снятие бита перемаршрутизации (шаг 2) — см. STEER_REROUTE_BIT в marks.h. mangle + 2:
-     * сразу после разметки (output_mark в inet, mangle + 1) и до nat на выходе. */
-    if (reroute && fam == 4 && STEER_REROUTE_BIT) {
-        struct nft_rule *r = ir_rule(ir_base_chain_add(t, "output_reroute", "route", "output",
-                                                       "mangle", 2));
-        ir_x(r, "meta mark and 0x%08x == 0x%08x", STEER_REROUTE_BIT, STEER_REROUTE_BIT);
-        ir_markset(r, "meta mark set mark and 0x%08x", ~STEER_REROUTE_BIT);
-        ir_counter(r, 0, 0);
-        ir_comment(r, "steer-reroute");
-    }
+    /* Снятие бита перемаршрутизации (шаг 2) — см. STEER_REROUTE_BIT в marks.h. */
+    if (reroute && STEER_REROUTE_BIT) reroute_chain(t);
     merge_nat(in, "postrouting",
               ir_base_chain_add(t, "postrouting_nat", "nat", "postrouting", "srcnat", 1), fam);
 }
@@ -370,8 +407,9 @@ int legacy_rewrite(struct nft_rs *rs, const struct spec *sp, int nftc, struct er
     int reroute = route_to_filter(in);
     if (nftc & NFTC_NOTRACK) frag6_compat(in);
     else drop_notrack(in);
-    if (has_ip(sp, nftc)) build_family(rs, in, NFT_FAM_IP, reroute);
-    if (has_ip6(nftc)) build_family(rs, in, NFT_FAM_IP6, reroute);
+    if (has_ip(sp, nftc)) build_family(rs, in, NFT_FAM_IP, reroute & 1, 1);
+    if (has_ip6(sp, nftc))
+        build_family(rs, in, NFT_FAM_IP6, reroute & 2, (nftc & NFTC_IP6NAT) != 0);
     drop_nat(in);
     if (rs->oom) return err_set(e, "out of memory building the ruleset", NULL);
     return 0;

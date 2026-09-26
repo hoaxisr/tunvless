@@ -22,7 +22,7 @@
  * ЧЕГО ДВИЖОК ЕЩЁ НЕ УМЕЕТ, разбор принимает, проверяет и хранит в модели, но спеку отвергает
  * отказом «ещё не поддерживается в этой версии движка: …» — ПОСЛЕ всех настоящих проверок, чтобы
  * ошибка в спеке называлась раньше, чем то, чего ждать выпуска: pick manual и balance, группа в
- * группе и параметры urltest (шаг 3 из 1.9); адреса IPv6 (шаг «IPv6»); dns.cache и dns.upstreams
+ * группе и параметры urltest (шаг 3 из 1.9); dns.cache и dns.upstreams
  * (выпуск 1.11); транспорт туннеля (1.10); встроенные domains/prefixes у списка и app у клиента
  * (потребители читают только файлы и UID); клиенты или списки, которые нельзя свести в одного
  * клиента или один список (компилятор пока берёт у правила одного клиента и один список). Молча
@@ -244,15 +244,12 @@ static int mac_ok(const char *s) {
     return 1;
 }
 
-/* Адрес, подсеть или диапазон IPv4 клиента. IPv6 разбирается и хранится, но спека отвергается
- * «ещё не поддерживается» (компилятор ведёт клиентов только по IPv4). */
+/* Адрес, подсеть или диапазон клиента — IPv4 или IPv6. С 1.9 адреса IPv6 законны
+ * (docs/architecture.md, «4б»): правило IPv4 берёт записи IPv4, его v6-двойник — записи IPv6, и
+ * смесь семейств в одном клиенте допустима. */
 static int addr_check(struct v2 *x, const struct ynode *n, const char *where, const char *v) {
-    if (strchr(v, ':')) {
-        unsup(x, n, "адреса IPv6 в %s («%s») — шаг «IPv6» из 1.9", where, v);
-        return 0;
-    }
     if (!spec_line_is_addr(v))
-        return fail(x, n, "%s: «%s» — не адрес IPv4, не подсеть и не диапазон", where, v);
+        return fail(x, n, "%s: «%s» — не адрес IPv4 или IPv6, не подсеть и не диапазон", where, v);
     return 0;
 }
 
@@ -461,7 +458,7 @@ static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val
         if (items_ok(x, n, w, 65536)) return -1;
         for (size_t i = 0; i < n_items(n); i++) {
             const struct ynode *it = item(n, i);
-            if (a == 1 && !strchr(it->str, ':') && !spec_line_is_addr(it->str))
+            if (a == 1 && !spec_line_is_addr(it->str))
                 return fail(x, it, "%s: «%s» — не адрес, не подсеть и не диапазон", w, it->str);
             if (a == 0 && spec_line_is_addr(it->str))
                 return fail(x, it, "%s: «%s» — адрес, а не домен; ему место в prefixes", w, it->str);

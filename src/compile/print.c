@@ -23,7 +23,9 @@
 /* Elements come straight from the list files: the fitter (steer-aggregate) has
  * already decided what fits, and re-parsing them here would only add a second place
  * for the two to disagree. */
-static size_t emit_elements(FILE *f, const char *path, size_t already) {
+/* fam — семейство набора (4 — ipv4_addr, 6 — парный ipv6_addr, docs/architecture.md, «4б»):
+ * строки другого семейства из того же файла идут в другой набор, здесь они пропускаются. */
+static size_t emit_elements(FILE *f, const char *path, size_t already, int fam) {
     FILE *in = fopen(path, "r");
     /* Не die: читаемость всех файлов уже проверена (check_address_lists), и попасть сюда
      * можно только гонкой — список удалили между проверкой и генерацией. Ронять из-за неё
@@ -44,7 +46,7 @@ static size_t emit_elements(FILE *f, const char *path, size_t already) {
         if (!*p || *p == '#' || *p == ';') continue;
         /* Не-адреса пропускаем молча: про них уже сказал check_address_lists, а nft на
          * них отвергает ВЕСЬ набор, а не одну строку. */
-        if (!spec_line_is_addr(p)) continue;
+        if (spec_line_family(p) != fam) continue;
         /* fputs, а не fprintf: на списке в сотни тысяч элементов разбор
          * форматной строки на каждый — это заметная доля времени apply. */
         if (n) fputs(", ", f);
@@ -58,24 +60,30 @@ static size_t emit_elements(FILE *f, const char *path, size_t already) {
 /* ---- подсети набора .srs (NFT_EL_SRS) -------------------------------------------------------
  * Потоком, как адресный список: читатель отдаёт префиксы по одному (srs_walk), и в памяти не
  * лежит ничего, кроме окна распаковки. Имена набора не читаются вовсе — их берёт резолвер. */
-struct srs_pr { FILE *f; size_t n; int excl; };
+struct srs_pr { FILE *f; size_t n; int excl; int fam; };
 
 static int srs_pr_cb(void *ctx, const struct srs_elem *el) {
     struct srs_pr *p = ctx;
-    if (el->kind != SRS_EL_CIDR || el->family != 4 || el->excl != p->excl) return 0;
+    if (el->kind != SRS_EL_CIDR || el->family != p->fam || el->excl != p->excl) return 0;
     /* Та же запись, что у srs-read: набор, подключённый ключом, и набор, разложенный в списки,
-     * дают один и тот же текст. */
-    char b[24];
-    snprintf(b, sizeof(b), "%u.%u.%u.%u/%d", el->addr[0], el->addr[1], el->addr[2],
-             el->addr[3], el->plen);
+     * дают один и тот же текст. IPv6 — каноническая запись inet_ntop. */
+    char b[64];
+    if (p->fam == 6) {
+        char a[INET6_ADDRSTRLEN];
+        if (!inet_ntop(AF_INET6, el->addr, a, sizeof(a))) return 0;
+        snprintf(b, sizeof(b), "%s/%d", a, el->plen);
+    } else
+        snprintf(b, sizeof(b), "%u.%u.%u.%u/%d", el->addr[0], el->addr[1], el->addr[2],
+                 el->addr[3], el->plen);
     if (p->n) fputs(", ", p->f);
     fputs(b, p->f);
     p->n++;
     return 0;
 }
 
-static size_t emit_srs(FILE *f, const char *path, const struct ir_srs *src, size_t already) {
-    struct srs_pr p = { f, already, src->excl };
+static size_t emit_srs(FILE *f, const char *path, const struct ir_srs *src, size_t already,
+                       int fam) {
+    struct srs_pr p = { f, already, src->excl, fam };
     struct err e = {0};
     /* Не отказ: разбор набора уже прошёл (check_address_lists), и сюда попадают только гонкой —
      * файл заменили между проверкой и печатью. Пропадут подсети одного набора, про это сказано. */
@@ -234,7 +242,7 @@ static void emit_mixed(FILE *f, const struct ir_mixed *mix) {
             if (nl) *nl = '\0';
             char *p = line;
             while (*p == ' ' || *p == '\t') p++;
-            if (!*p || *p == '#' || *p == ';' || !spec_line_is_addr(p)) continue;
+            if (!*p || *p == '#' || *p == ';' || spec_line_family(p) != 4) continue;
             uint32_t lo, hi;
             if (line_range(p, &lo, &hi) && mx_add(&m, lo, hi, l4) != 0) break;
         }
@@ -270,6 +278,227 @@ static void emit_mixed(FILE *f, const struct ir_mixed *mix) {
         prev = pos;
     }
     if (pend.have) mx_print(f, &m, pend.lo, pend.hi, pend.act, &written);
+    if (written) fprintf(f, " }\n");
+    free(m.ev);
+}
+
+/* ---- составной набор IPv6 (ipv6_addr . inet_proto . inet_service) ----------------------------
+ *
+ * Та же раскладка, что у emit_mixed выше, на 128-битной оси адресов: парный набор составной
+ * группы (docs/architecture.md, «4б»). Отдельной копией, а не общим кодом с IPv4: на роутерах
+ * mips и arm нет __int128, и ось IPv4 пришлось бы тоже перевести на пару слов — ради того,
+ * чтобы текст IPv4 остался прежним до байта, её не трогаем. Позиция конца отрезка — hi + 1, и у
+ * последнего адреса оси она «за краем» (inf). */
+struct a128 { uint64_t hi, lo; };
+struct mx6_ev { struct a128 pos; uint8_t inf; uint16_t l4; int16_t d; };
+struct mx6 { struct mx6_ev *ev; size_t n, cap; struct mx lm; };
+
+static int a128_cmp(struct a128 a, struct a128 b) {
+    if (a.hi != b.hi) return a.hi < b.hi ? -1 : 1;
+    return a.lo < b.lo ? -1 : a.lo > b.lo;
+}
+
+static struct a128 a128_from(const uint8_t *b) {
+    struct a128 a = { 0, 0 };
+    for (int i = 0; i < 8; i++) a.hi = (a.hi << 8) | b[i];
+    for (int i = 8; i < 16; i++) a.lo = (a.lo << 8) | b[i];
+    return a;
+}
+
+static void a128_bytes(struct a128 a, uint8_t *b) {
+    for (int i = 7; i >= 0; i--) { b[i] = (uint8_t)a.hi; a.hi >>= 8; }
+    for (int i = 15; i >= 8; i--) { b[i] = (uint8_t)a.lo; a.lo >>= 8; }
+}
+
+/* Маска хвоста префикса длины plen: биты, которые у сети — нули, а у последнего адреса — единицы. */
+static struct a128 a128_span(int plen) {
+    struct a128 s = { 0, 0 };
+    if (plen <= 0) { s.hi = s.lo = ~0ULL; return s; }
+    if (plen >= 128) return s;
+    if (plen < 64) { s.hi = ~0ULL >> plen; s.lo = ~0ULL; }
+    else s.lo = plen == 64 ? ~0ULL : ~0ULL >> (plen - 64);
+    return s;
+}
+
+static int mx6_add(struct mx6 *m, struct a128 lo, struct a128 hi, int l4) {
+    if (l4 < 0) return 0;
+    if (m->n + 2 > m->cap) {
+        size_t cap = m->cap ? m->cap * 2 : 256;
+        struct mx6_ev *e = realloc(m->ev, cap * sizeof(*e));
+        if (!e) return -1;
+        m->ev = e;
+        m->cap = cap;
+    }
+    struct a128 end = hi;
+    uint8_t inf = 0;
+    if (++end.lo == 0 && ++end.hi == 0) inf = 1;
+    m->ev[m->n++] = (struct mx6_ev){ lo, 0, (uint16_t)l4, 1 };
+    m->ev[m->n++] = (struct mx6_ev){ end, inf, (uint16_t)l4, -1 };
+    return 0;
+}
+
+struct mx6_srs { struct mx6 *m; const struct l4match *eff; };
+static int mx6_srs_cb(void *ctx, const struct srs_elem *el) {
+    struct mx6_srs *c = ctx;
+    if (el->kind != SRS_EL_CIDR || el->family != 6 || el->excl) return 0;
+    struct a128 a = a128_from(el->addr), s = a128_span(el->plen);
+    a.hi &= ~s.hi;
+    a.lo &= ~s.lo;
+    struct a128 b = { a.hi | s.hi, a.lo | s.lo };
+    return mx6_add(c->m, a, b, mx_l4(&c->m->lm, &c->eff[el->clause])) ? -1 : 0;
+}
+
+/* Строка IPv6 списка → диапазон: «адрес», «адрес/длина», «a-b». 0 — не адрес IPv6. */
+static int line_range6(const char *p, struct a128 *lo, struct a128 *hi) {
+    char buf[96];
+    size_t n = strcspn(p, " \t");
+    if (n >= sizeof(buf)) return 0;
+    memcpy(buf, p, n);
+    buf[n] = '\0';
+    char *dash = strchr(buf, '-'), *slash = strchr(buf, '/');
+    uint8_t a[16], b[16];
+    if (dash) {
+        *dash = '\0';
+        if (inet_pton(AF_INET6, buf, a) != 1 || inet_pton(AF_INET6, dash + 1, b) != 1) return 0;
+        *lo = a128_from(a);
+        *hi = a128_from(b);
+        return a128_cmp(*lo, *hi) <= 0;
+    }
+    int plen = 128;
+    if (slash) {
+        *slash = '\0';
+        char *end = NULL;
+        long v = strtol(slash + 1, &end, 10);
+        if (!end || *end || v < 0 || v > 128) return 0;
+        plen = (int)v;
+    }
+    if (inet_pton(AF_INET6, buf, a) != 1) return 0;
+    struct a128 s = a128_span(plen);
+    *lo = a128_from(a);
+    lo->hi &= ~s.hi;
+    lo->lo &= ~s.lo;
+    hi->hi = lo->hi | s.hi;
+    hi->lo = lo->lo | s.lo;
+    return 1;
+}
+
+static int ev6_cmp(const void *x, const void *y) {
+    const struct mx6_ev *a = x, *b = y;
+    if (a->inf != b->inf) return a->inf ? 1 : -1;
+    return a128_cmp(a->pos, b->pos);
+}
+
+/* Отрезок [lo, hi] текстом: префикс, если он выровнен, иначе «lo-hi». */
+static void addr6_text(struct a128 lo, struct a128 hi, char *dst, size_t n) {
+    for (int plen = 0; plen <= 128; plen++) {
+        struct a128 s = a128_span(plen);
+        if ((lo.hi & s.hi) || (lo.lo & s.lo)) continue;
+        if ((lo.hi | s.hi) != hi.hi || (lo.lo | s.lo) != hi.lo) continue;
+        uint8_t b[16];
+        char t[INET6_ADDRSTRLEN];
+        a128_bytes(lo, b);
+        inet_ntop(AF_INET6, b, t, sizeof(t));
+        if (plen == 128) snprintf(dst, n, "%s", t);
+        else snprintf(dst, n, "%s/%d", t, plen);
+        return;
+    }
+    uint8_t b1[16], b2[16];
+    char t1[INET6_ADDRSTRLEN], t2[INET6_ADDRSTRLEN];
+    a128_bytes(lo, b1);
+    a128_bytes(hi, b2);
+    inet_ntop(AF_INET6, b1, t1, sizeof(t1));
+    inet_ntop(AF_INET6, b2, t2, sizeof(t2));
+    snprintf(dst, n, "%s-%s", t1, t2);
+}
+
+static void mx6_print(FILE *f, const struct mx *lm, struct a128 lo, struct a128 hi, uint64_t act,
+                      size_t *written) {
+    const struct l4match *ms[64];
+    size_t k = 0;
+    for (size_t b = 0; b < lm->nl4; b++) if (act & (1ULL << b)) ms[k++] = lm->l4s[b];
+    struct l4box box[L4BOX_MAX];
+    size_t nb = l4_union_boxes(ms, k, box);
+    char at[2 * INET6_ADDRSTRLEN + 8], bt[48];
+    addr6_text(lo, hi, at, sizeof(at));
+    for (size_t j = 0; j < nb; j++) {
+        l4_box_text(&box[j], bt, sizeof(bt));
+        fprintf(f, (*written)++ ? ", %s . %s" : "        elements = { %s . %s", at, bt);
+    }
+}
+
+static void emit_mixed6(FILE *f, const struct ir_mixed *mix) {
+    struct mx6 m;
+    memset(&m, 0, sizeof(m));
+    for (size_t i = 0; i < mix->n; i++) {
+        const struct ir_mixed_src *s = &mix->v[i];
+        if (s->set) {
+            struct mx6_srs c = { &m, s->eff };
+            struct err e = {0};
+            if (srs_walk(s->set, SRS_EL_CIDR, s->sel, mx6_srs_cb, &c, &e) != 0)
+                fprintf(stderr, LOG_W "%s — его подсети в набор правил не попали\n",
+                        e.msg[0] ? e.msg : s->path);
+            continue;
+        }
+        FILE *in = fopen(s->path, "r");
+        if (!in) {
+            fprintf(stderr, LOG_W "%s: список исчез во время сборки набора правил\n", s->path);
+            continue;
+        }
+        int l4 = mx_l4(&m.lm, s->l4);
+        char line[512];
+        while (fgets(line, sizeof(line), in)) {
+            char *nl = strpbrk(line, "\r\n");
+            if (nl) *nl = '\0';
+            char *p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            if (!*p || *p == '#' || *p == ';' || spec_line_family(p) != 6) continue;
+            struct a128 lo, hi;
+            if (line_range6(p, &lo, &hi) && mx6_add(&m, lo, hi, l4) != 0) break;
+        }
+        fclose(in);
+    }
+    if (m.lm.over)
+        fprintf(stderr, LOG_W "составной набор: вариантов сужения больше 64 — лишние не вошли\n");
+    qsort(m.ev, m.n, sizeof(m.ev[0]), ev6_cmp);
+    int cnt[64] = {0};
+    uint64_t act = 0;
+    struct a128 prev = { 0, 0 };
+    struct { struct a128 lo, hi; uint64_t act; int have; } pend;
+    memset(&pend, 0, sizeof(pend));
+    size_t written = 0;
+    for (size_t i = 0; i <= m.n; ) {
+        /* Позиция следующего события; за последним — край оси (inf). */
+        int inf = i == m.n || m.ev[i].inf;
+        struct a128 pos = i < m.n ? m.ev[i].pos : prev;
+        if (act && (inf || a128_cmp(pos, prev) > 0)) {
+            /* Отрезок [prev, pos) — его последний адрес pos - 1 (у края оси — все единицы). */
+            struct a128 last;
+            if (inf) last.hi = last.lo = ~0ULL;
+            else { last = pos; if (last.lo-- == 0) last.hi--; }
+            struct a128 nx = pend.hi;
+            int adj = pend.have && !(++nx.lo == 0 && ++nx.hi == 0) && !a128_cmp(nx, prev);
+            if (pend.have && pend.act == act && adj) {
+                pend.hi = last;
+            } else {
+                if (pend.have) mx6_print(f, &m.lm, pend.lo, pend.hi, pend.act, &written);
+                pend.lo = prev;
+                pend.hi = last;
+                pend.act = act;
+                pend.have = 1;
+            }
+        }
+        if (i == m.n) break;
+        size_t j = i;
+        for (; j < m.n && m.ev[j].inf == m.ev[i].inf && !a128_cmp(m.ev[j].pos, m.ev[i].pos); j++) {
+            int l = m.ev[j].l4;
+            cnt[l] += m.ev[j].d;
+            if (cnt[l] > 0) act |= 1ULL << l; else act &= ~(1ULL << l);
+        }
+        if (inf) break;          /* событие на краю оси — дальше отрезков нет */
+        prev = pos;
+        i = j;
+    }
+    if (pend.have) mx6_print(f, &m.lm, pend.lo, pend.hi, pend.act, &written);
     if (written) fprintf(f, " }\n");
     free(m.ev);
 }
@@ -343,18 +572,24 @@ static void emit_fakeip_elements(FILE *f, const char *path) {
  * в них адреса, и пустым набор здесь выйдет лишь гонкой (список исчез после проверки) —
  * ровно как у прежнего генератора. */
 static void print_elements(FILE *f, const struct nft_set *s) {
+    /* Семейство набора — по его типу: парный набор IPv6 («<группа>6», docs/architecture.md,
+     * «4б») берёт из тех же файлов и наборов .srs строки IPv6, обычный — IPv4. */
+    int fam = s->key && !strncmp(s->key, "ipv6_addr", 9) ? 6 : 4;
     int list = 0;
     for (const struct nft_elsrc *e = s->els; e; e = e->next) {
         if (e->k == NFT_EL_FAKEIP_STATE) emit_fakeip_elements(f, e->s);
-        else if (e->k == NFT_EL_MIXED) emit_mixed(f, e->p);
+        else if (e->k == NFT_EL_MIXED) {
+            if (fam == 6) emit_mixed6(f, e->p);
+            else emit_mixed(f, e->p);
+        }
         else list = 1;
     }
     if (!list) return;
     fprintf(f, "        elements = { ");
     size_t written = 0;
     for (const struct nft_elsrc *e = s->els; e; e = e->next) {
-        if (e->k == NFT_EL_ADDR_FILE) written += emit_elements(f, e->s, written);
-        else if (e->k == NFT_EL_SRS) written += emit_srs(f, e->s, e->p, written);
+        if (e->k == NFT_EL_ADDR_FILE) written += emit_elements(f, e->s, written, fam);
+        else if (e->k == NFT_EL_SRS) written += emit_srs(f, e->s, e->p, written, fam);
         else if (e->k == NFT_EL_VALUE) {
             if (written++) fputs(", ", f);
             fputs(e->s, f);

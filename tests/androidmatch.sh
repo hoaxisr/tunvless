@@ -119,10 +119,13 @@ check "приложения списком и диапазоном — в фиг
     "$(c "$m2" 'meta skuid { 10123, 1010200-1010300 } ct direction original')"
 check "современная раскладка: output_mark — цепочка route прямо в inet" "1" \
     "$(c "$m2" 'type route hook output priority mangle + 1')"
-check "старая раскладка: бит 21 ставится после метки соединения — у всех трёх групп" "3" \
+check "старая раскладка: бит 21 ставится после метки соединения — у трёх групп и двойника IPv6" "4" \
     "$(c "$l2" 'ct mark set mark meta mark set mark or 0x00200000')"
-check "отказ IPv6 у «весь трафик» — с тем же сужением, мимо своей сети" "1" \
-    "$(c "$m2" 'meta nfproto ipv6 meta l4proto udp th dport 50000-65535 oifname != "lo" ip6 daddr != { fe80::/10, fc00::/7, ff00::/8 } counter reject')"
+# Выход interface несёт IPv6 (1.9): IPv6 «весь трафик» не отвергается, а уводится двойником — с
+# тем же сужением и мимо своей сети.
+check "IPv6 «весь трафик» — двойник в выход с IPv6, с тем же сужением, мимо своей сети" "1" \
+    "$(c "$m2" 'meta nfproto ipv6 meta l4proto udp th dport 50000-65535 oifname != "lo" ip6 daddr != { ::1, fe80::/10, fc00::/7, ff00::/8 } meta mark set')"
+check "  отказа IPv6 у выхода с IPv6 нет" "0" "$(c "$m2" 'counter reject')"
 check "«весь трафик» — не в свою сеть (RFC 1918, link-local, мультикаст)" "1" \
     "$(c "$m2" 'meta nfproto ipv4 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 }')"
 # Метка пакета — в метку соединения (ct mark set mark): по ней резолвер переспрашивает с меткой
@@ -136,7 +139,11 @@ check "  без ограничения семейством" "0" "$(c "$m2" "nfp
 # переменная) проверяет tests/local49.sh на ядре 4.9.
 check "  на старой раскладке — в таблице ip" "1" \
     "$(printf '%s\n' "$l2" | sed -n '/^table ip steer/,/^}/p' | grep -c -- "$dnsrule")"
-check "  без nat в ip6 таблицы ip6 нет" "0" "$(c "$l2" '^table ip6')"
+# Таблица ip6 без nat в ip6 теперь есть — в ней одна цепочка перемаршрутизации IPv6 приложений
+# (двойник «весь трафик» метит IPv6), а nat в ней нет.
+ip6t="$(printf '%s\n' "$l2" | sed -n '/^table ip6 steer/,/^}/p')"
+check "  без nat в ip6 в таблице ip6 — только перемаршрутизация" "1 1 0" \
+    "$(c "$ip6t" 'chain ') $(c "$ip6t" 'chain output_reroute') $(c "$ip6t" 'type nat')"
 # TCP/53 — рядом с UDP/53, тем же правилом (метка движка, ct mark set mark, оба семейства).
 tcprule='meta mark and 0x0fc00000 != 0x0fc00000 tcp dport 53 ct mark set mark counter redirect to :5300'
 check "DNS телефона по TCP/53 — рядом с UDP, с тем же исключением метки движка" "1" \

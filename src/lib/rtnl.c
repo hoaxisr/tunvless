@@ -19,6 +19,14 @@
 #include "rtnl.h"
 
 static uint32_t g_rtnl_seq;
+/* Семейство дампа правил и маршрутов: AF_INET (прежние rtnl_*_text) или AF_INET6 (…_text6,
+ * маршрутизация IPv6 выходов с 1.9). Переменной, а не параметром колбэков: вызов синхронный и
+ * однопоточный (см. rtnl.h), и так печатник у обоих семейств один. */
+static int g_fam = AF_INET;
+
+/* Адрес семейства g_fam текстом; полная длина префикса — 32 или 128. */
+static int fam_alen(void) { return g_fam == AF_INET6 ? 16 : 4; }
+static unsigned fam_full(void) { return g_fam == AF_INET6 ? 128u : 32u; }
 
 static int rtnl_open(void) {
     int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
@@ -136,21 +144,21 @@ static void rule_cb(const struct nlmsghdr *h, void *ctx) {
     if (h->nlmsg_type != RTM_NEWRULE) return;
     const struct fib_rule_hdr *fr = NLMSG_DATA(h);
     size_t hl = NLMSG_ALIGN(sizeof(*fr));
-    if (h->nlmsg_len < NLMSG_HDRLEN + hl || fr->family != AF_INET) return;
+    if (h->nlmsg_len < NLMSG_HDRLEN + hl || fr->family != g_fam) return;
     const struct rtattr *tb[FRA_MAX + 1];
     attrs_parse((const uint8_t *)fr + hl, h->nlmsg_len - NLMSG_HDRLEN - hl, tb, FRA_MAX);
-    char line[512], a[INET_ADDRSTRLEN], tn[16];
+    char line[512], a[INET6_ADDRSTRLEN], tn[16];
     size_t k = 0;
 #define PUT(...) do { int w_ = snprintf(line + k, sizeof(line) - k, __VA_ARGS__); \
                       if (w_ > 0) k += (size_t)w_ < sizeof(line) - k ? (size_t)w_ : sizeof(line) - k - 1; } while (0)
     PUT("%u:\tfrom ", tb[FRA_PRIORITY] ? rta_u32(tb[FRA_PRIORITY]) : 0u);
-    if (fr->src_len && tb[FRA_SRC] && RTA_PAYLOAD(tb[FRA_SRC]) >= 4) {
-        inet_ntop(AF_INET, RTA_DATA(tb[FRA_SRC]), a, sizeof(a));
-        if (fr->src_len != 32) PUT("%s/%u", a, fr->src_len); else PUT("%s", a);
+    if (fr->src_len && tb[FRA_SRC] && RTA_PAYLOAD(tb[FRA_SRC]) >= (size_t)fam_alen()) {
+        inet_ntop(g_fam, RTA_DATA(tb[FRA_SRC]), a, sizeof(a));
+        if (fr->src_len != fam_full()) PUT("%s/%u", a, fr->src_len); else PUT("%s", a);
     } else PUT("all");
-    if (fr->dst_len && tb[FRA_DST] && RTA_PAYLOAD(tb[FRA_DST]) >= 4) {
-        inet_ntop(AF_INET, RTA_DATA(tb[FRA_DST]), a, sizeof(a));
-        if (fr->dst_len != 32) PUT(" to %s/%u", a, fr->dst_len); else PUT(" to %s", a);
+    if (fr->dst_len && tb[FRA_DST] && RTA_PAYLOAD(tb[FRA_DST]) >= (size_t)fam_alen()) {
+        inet_ntop(g_fam, RTA_DATA(tb[FRA_DST]), a, sizeof(a));
+        if (fr->dst_len != fam_full()) PUT(" to %s/%u", a, fr->dst_len); else PUT(" to %s", a);
     }
     /* Метка — как у iproute2: маска печатается, только если она не 0xffffffff. Этим
      * отличается прежняя форма правила без маски, и разбор на это рассчитывает. */
@@ -184,12 +192,19 @@ int rtnl_rules_text(char *out, size_t n) {
     struct nlbuf b;
     struct fib_rule_hdr fr;
     memset(&fr, 0, sizeof(fr));
-    fr.family = AF_INET;
+    fr.family = (uint8_t)g_fam;
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_GETRULE,
                                     NLM_F_REQUEST | NLM_F_DUMP, &fr, sizeof(fr));
     struct textbuf t = { out, n, 0, 0 };
     if (rtnl_talk(buf, msg_end(&b, nh), rule_cb, &t) != 0) { out[0] = '\0'; return -1; }
     return 0;
+}
+
+int rtnl_rules_text6(char *out, size_t n) {
+    g_fam = AF_INET6;
+    int rc = rtnl_rules_text(out, n);
+    g_fam = AF_INET;
+    return rc;
 }
 
 struct route_ctx {
@@ -221,7 +236,7 @@ static void route_cb(const struct nlmsghdr *h, void *ctx) {
     if (h->nlmsg_type != RTM_NEWROUTE) return;
     const struct rtmsg *rt = NLMSG_DATA(h);
     size_t hl = NLMSG_ALIGN(sizeof(*rt));
-    if (h->nlmsg_len < NLMSG_HDRLEN + hl || rt->rtm_family != AF_INET) return;
+    if (h->nlmsg_len < NLMSG_HDRLEN + hl || rt->rtm_family != g_fam) return;
     if (rt->rtm_flags & RTM_F_CLONED) return;
     const struct rtattr *tb[RTA_MAX + 1];
     attrs_parse((const uint8_t *)rt + hl, h->nlmsg_len - NLMSG_HDRLEN - hl, tb, RTA_MAX);
@@ -234,22 +249,29 @@ static void route_cb(const struct nlmsghdr *h, void *ctx) {
         }
         return;
     }
-    char line[512], a[INET_ADDRSTRLEN], dev[IF_NAMESIZE];
+    char line[512], a[INET6_ADDRSTRLEN], dev[IF_NAMESIZE];
     size_t k = 0;
 #define PUT(...) do { int w_ = snprintf(line + k, sizeof(line) - k, __VA_ARGS__); \
                       if (w_ > 0) k += (size_t)w_ < sizeof(line) - k ? (size_t)w_ : sizeof(line) - k - 1; } while (0)
     const char *type = rt_type_name(rt->rtm_type);
+    size_t al = (size_t)fam_alen();
     if (type) PUT("%s ", type);
     if (!rt->rtm_dst_len) PUT("default");
-    else if (tb[RTA_DST] && RTA_PAYLOAD(tb[RTA_DST]) >= 4) {
-        inet_ntop(AF_INET, RTA_DATA(tb[RTA_DST]), a, sizeof(a));
-        if (rt->rtm_dst_len != 32) PUT("%s/%u", a, rt->rtm_dst_len); else PUT("%s", a);
-    } else PUT("0.0.0.0/%u", rt->rtm_dst_len);
-    if (tb[RTA_GATEWAY] && RTA_PAYLOAD(tb[RTA_GATEWAY]) >= 4) {
-        inet_ntop(AF_INET, RTA_DATA(tb[RTA_GATEWAY]), a, sizeof(a));
+    else if (tb[RTA_DST] && RTA_PAYLOAD(tb[RTA_DST]) >= al) {
+        inet_ntop(g_fam, RTA_DATA(tb[RTA_DST]), a, sizeof(a));
+        if (rt->rtm_dst_len != fam_full()) PUT("%s/%u", a, rt->rtm_dst_len); else PUT("%s", a);
+    } else PUT("%s/%u", g_fam == AF_INET6 ? "::" : "0.0.0.0", rt->rtm_dst_len);
+    if (tb[RTA_GATEWAY] && RTA_PAYLOAD(tb[RTA_GATEWAY]) >= al) {
+        inet_ntop(g_fam, RTA_DATA(tb[RTA_GATEWAY]), a, sizeof(a));
         PUT(" via %s", a);
     }
-    if (tb[RTA_OIF]) {
+    /* Запрет в IPv6 ядро держит на петле (dev lo) — `ip -6 route` печатает его так же, но для
+     * разбора и снятия по ключу (table_prune в failover.c) устройство у запрета лишнее: снять
+     * `blackhole default dev lo` по такому ключу ядро не всегда соглашается. */
+    int v6_reject = g_fam == AF_INET6 && type &&
+                    (rt->rtm_type == RTN_BLACKHOLE || rt->rtm_type == RTN_UNREACHABLE ||
+                     rt->rtm_type == RTN_PROHIBIT);
+    if (tb[RTA_OIF] && !v6_reject) {
         unsigned idx = rta_u32(tb[RTA_OIF]);
         if (if_indextoname(idx, dev)) PUT(" dev %s", dev);
         else PUT(" dev if%u", idx);
@@ -257,8 +279,8 @@ static void route_cb(const struct nlmsghdr *h, void *ctx) {
     if (rt->rtm_protocol == RTPROT_KERNEL) PUT(" proto kernel");
     if (rt->rtm_scope == RT_SCOPE_LINK) PUT(" scope link");
     else if (rt->rtm_scope == RT_SCOPE_HOST) PUT(" scope host");
-    if (tb[RTA_PREFSRC] && RTA_PAYLOAD(tb[RTA_PREFSRC]) >= 4) {
-        inet_ntop(AF_INET, RTA_DATA(tb[RTA_PREFSRC]), a, sizeof(a));
+    if (tb[RTA_PREFSRC] && RTA_PAYLOAD(tb[RTA_PREFSRC]) >= al) {
+        inet_ntop(g_fam, RTA_DATA(tb[RTA_PREFSRC]), a, sizeof(a));
         PUT(" src %s", a);
     }
     if (tb[RTA_PRIORITY]) PUT(" metric %u", rta_u32(tb[RTA_PRIORITY]));
@@ -272,7 +294,7 @@ static int routes_dump(struct route_ctx *c) {
     struct nlbuf b;
     struct rtmsg rt;
     memset(&rt, 0, sizeof(rt));
-    rt.rtm_family = AF_INET;
+    rt.rtm_family = (uint8_t)g_fam;
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_GETROUTE,
                                     NLM_F_REQUEST | NLM_F_DUMP, &rt, sizeof(rt));
     return rtnl_talk(buf, msg_end(&b, nh), route_cb, c);
@@ -288,6 +310,13 @@ int rtnl_routes_text(int table, char *out, size_t n) {
     c.t.n = n;
     if (routes_dump(&c) != 0) { out[0] = '\0'; return -1; }
     return 0;
+}
+
+int rtnl_routes_text6(int table, char *out, size_t n) {
+    g_fam = AF_INET6;
+    int rc = rtnl_routes_text(table, out, n);
+    g_fam = AF_INET;
+    return rc;
 }
 
 int rtnl_table_flush(int table) {

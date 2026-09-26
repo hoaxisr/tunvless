@@ -408,6 +408,31 @@ static int addr_half_ok(const char *s, const char *end) {
     return digits > 0 && dots == 3 && slash <= 1;
 }
 
+/* Половина IPv6: адрес с необязательной длиной префикса «/0-128» (with_len), без длины — у
+ * половин диапазона «a-b». Здесь, в отличие от IPv4, проверка НЕ по форме, а разбором
+ * (inet_pton): запись IPv6 со сжатием «::» и хвостом в точечной записи форме «цифры и
+ * двоеточия» не опишешь без второго разборщика, а строк IPv6 в списках на порядки меньше, чем
+ * IPv4, — цена разбора не заметна. Двоеточие обязательно: MAC («aa:bb:cc:dd:ee:ff») адресом
+ * IPv6 не разбирается (шесть групп без «::»), и спутать их нельзя. */
+static int addr6_half_ok(const char *s, const char *end, int with_len) {
+    char buf[64];
+    size_t n = (size_t)(end - s);
+    if (n == 0 || n >= sizeof(buf)) return 0;
+    memcpy(buf, s, n);
+    buf[n] = '\0';
+    if (!strchr(buf, ':')) return 0;
+    char *sl = strchr(buf, '/');
+    if (sl) {
+        if (!with_len) return 0;
+        *sl = '\0';
+        char *e = NULL;
+        long len = strtol(sl + 1, &e, 10);
+        if (e == sl + 1 || *e || len < 0 || len > 128) return 0;
+    }
+    struct in6_addr a;
+    return inet_pton(AF_INET6, buf, &a) == 1;
+}
+
 /* Диапазон здесь обязателен, и это не расширение ради полноты: `steer fit` сам ВЫДАЁТ
  * диапазоны — два соседних адреса, не складывающихся в выровненный префикс, объединяются
  * именно так (emit_range в aggregate.c). Раньше дефис отвергался, поэтому подогнанный
@@ -420,9 +445,15 @@ static int addr_half_ok(const char *s, const char *end) {
  * же причине, что у spec_line_is_addr ниже. */
 int spec_one_host(const char *s) {
     if (!s || !*s) return 0;
-    /* MAC: шесть пар шестнадцатеричных через двоеточие. Точную форму проверяет is_mac в
-     * генераторе; здесь достаточно отличить его от адреса — двоеточие в IPv4 не бывает. */
-    if (strchr(s, ':')) return 1;
+    /* MAC: шесть пар шестнадцатеричных через двоеточие. */
+    if (spec_is_mac(s)) return 1;
+    /* IPv6 (с 1.9): адрес без длины или /128. Раньше любое двоеточие считалось MAC-ом, и
+     * подсеть IPv6 проходила бы здесь как одиночный хозяин. */
+    if (strchr(s, ':')) {
+        if (spec_line_family(s) != 6 || strchr(s, '-')) return 0;
+        const char *l = strchr(s, '/');
+        return !l || !strcmp(l, "/128");
+    }
     const char *sl = strchr(s, '/');
     if (sl && strcmp(sl, "/32") != 0) return 0;
     char buf[64];
@@ -458,11 +489,40 @@ int from_uid_range(const char *s, unsigned *lo, unsigned *hi) {
     return 0;
 }
 
-int spec_line_is_addr(const char *s) {
+/* Семейство адресной строки (docs/architecture.md, «4б»): 4 — IPv4 (адрес, подсеть, диапазон),
+ * 6 — IPv6 (то же), 0 — не адрес (доменное правило, мусор). До 1.9 строки IPv6 адресами не
+ * считались вовсе: компилятор их пропускал, а резолвер брал доменным правилом, которое не
+ * совпадало ни с чем. Теперь они идут в парный набор ipv6_addr, а резолвер их не трогает. */
+int spec_line_family(const char *s) {
     const char *dash = strchr(s, '-');
     const char *end = s + strlen(s);
-    if (!dash) return addr_half_ok(s, end);
-    /* Ровно один дефис, и обе половины — адреса. */
+    if (!dash) return addr_half_ok(s, end) ? 4 : addr6_half_ok(s, end, 1) ? 6 : 0;
+    /* Ровно один дефис, и обе половины — адреса одного семейства. */
     if (strchr(dash + 1, '-')) return 0;
-    return addr_half_ok(s, dash) && addr_half_ok(dash + 1, end);
+    if (addr_half_ok(s, dash) && addr_half_ok(dash + 1, end)) return 4;
+    if (addr6_half_ok(s, dash, 0) && addr6_half_ok(dash + 1, end, 0)) return 6;
+    return 0;
+}
+
+int spec_line_is_addr(const char *s) {
+    return spec_line_family(s) != 0;
+}
+
+/* MAC-адрес: шесть групп по одной-две шестнадцатеричные цифры через двоеточие. Группы
+ * проверяются на длину — иначе «a::b:c:d:e» (пять двоеточий, законный IPv6) сошёл бы за MAC. */
+int spec_is_mac(const char *s) {
+    int groups = 0, len = 0;
+    for (const char *p = s; ; p++) {
+        if (*p == ':' || *p == '\0') {
+            if (len < 1 || len > 2) return 0;
+            groups++;
+            len = 0;
+            if (!*p) break;
+            continue;
+        }
+        if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')))
+            return 0;
+        len++;
+    }
+    return groups == 6;
 }

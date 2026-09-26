@@ -501,7 +501,9 @@ static void t_plan(void) {
     srs_plan_free(&pl);
     c = chan(FIX "v6.srs", NULL);
     check("IPv6: разложен", 0, srs_plan_rule(&g_sp, c, 1, &pl, &e));
-    check("… и сказано, что v6 пропущены", 1, strstr(pl.warn, "IPv6") != NULL);
+    /* С 1.9 подсети IPv6 не снимаются — они в той же части, для парного набора <группа>6. */
+    check("… подсети IPv6 — в той же части", 1, pl.n == 1 && pl.p[0].has_v6 && pl.p[0].has_v4);
+    check("… без предупреждения", 0, strstr(pl.warn, "IPv6") != NULL);
     srs_plan_free(&pl);
     c = chan("/nonexistent/x.srs", NULL);
     check("нет файла: не отказ спеке", 0, srs_plan_rule(&g_sp, c, 1, &pl, &e));

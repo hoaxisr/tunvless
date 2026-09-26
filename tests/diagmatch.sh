@@ -148,8 +148,13 @@ check "список без резолверов: молчим" "" "$(printf '%s'
 # проверок у них ОДИНАКОВ — то есть vless больше не порождает заметок про самого себя.
 check "отчёт с vless разбираем" "1" \
       "$([ "$(printf '%s' "$outv" | count)" -gt 0 ] && echo 1 || echo 0)"
-check "vless не добавляет своих заметок" \
-      "$(printf '%s' "$out" | count)" "$(printf '%s' "$outv" | count)"
+# Единственное, что у vless своё, — заметка ipv6_output (1.9): IPv6 его правил отбрасывается, а не
+# идёт напрямую. Это свойство вида, а не заметка про самого себя, и она совет (note), а не warn.
+check "vless не добавляет своих заметок (кроме ipv6_output)" \
+      "$(printf '%s' "$out" | count)" "$(($(printf '%s' "$outv" | count) - 1))"
+check "  ipv6_output у vless — совет, а не предупреждение" "note" \
+      "$(printf '%s' "$outv" | verdict ipv6_output)"
+check "  у интерфейса (IPv6 есть) её нет" "" "$(printf '%s' "$out" | verdict ipv6_output)"
 
 # ---- подъём выхода vless: перебор узлов больше не выглядит отказом (I-100) ----
 # Устройство туннеля vless появляется только ПОСЛЕ выбора узла, а при `node: -1` выбор — это
@@ -448,7 +453,9 @@ wait "$FPID" 2>/dev/null
 # ---- IPv6 наружу — маршрут по умолчанию в таблице main -------------------------
 check "маршрута IPv6 нет — проверки нет" "" "$($DIAG diag --spec "$tmp/iface.json" 2>/dev/null | verdict ipv6)"
 if ip link add d6 type dummy 2>/dev/null && ip link set d6 up && ip -6 route add default dev d6 2>/dev/null; then
-    check "маршрут IPv6 есть, выход с drop — fail" "fail" \
+    # С 1.9 правила разбирают IPv6 сами (выход с IPv6 ведёт его своей таблицей, on_fail=drop
+    # действует на оба семейства) — прежний fail «каналы IPv6 не разбирают» снят.
+    check "маршрут IPv6 есть — ok, правила его разбирают" "ok" \
           "$($DIAG diag --spec "$tmp/iface.json" 2>/dev/null | verdict ipv6)"
     ip link del d6
 else

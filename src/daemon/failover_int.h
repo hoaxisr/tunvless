@@ -85,6 +85,13 @@ void failover_hyst_reset_for_test(void);
  *   g_revive_step — длительность шага ожидания подъёма, мс (в бою — секунда): стенд считает
  *                   шаги и не ждёт их. */
 extern int (*g_ip_show)(int table, char *out, size_t n);
+/* То же для IPv6 (`ip -6 rule show`, `ip -6 route show table N`). Стенд, подменивший g_ip_show и
+ * не подменивший этот, получает для IPv6 «состояние не прочитать» — и сверка IPv6 ничего не
+ * трогает, а не читает ядро машины, на которой стенд идёт. */
+extern int (*g_ip6_show)(int table, char *out, size_t n);
+/* Годится ли состояние IPv6 живому выходу через dev: правило и маршрут в dev — или только
+ * запасной запрет, если у dev IPv6 выключен (dev_v6 == 0). Чистая функция — стенд. */
+int routing6_live_ok(const struct route_facts *f, const char *dev, int dev_v6);
 extern int (*g_icmp_probe)(const char *dev);
 extern int (*g_cmd_hook)(const char *const argv[]);
 extern long (*g_revive_step)(void);

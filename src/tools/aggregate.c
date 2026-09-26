@@ -35,6 +35,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <errno.h>
+#include <arpa/inet.h>
 
 /* An inclusive address range. Everything downstream of parsing works in ranges
  * rather than prefixes: an nftables interval set stores one element per range, so
@@ -396,13 +397,109 @@ static void emit_range(FILE *f, uint32_t lo, uint32_t hi) {
     g_outbuf_n = (size_t)(p - g_outbuf);
 }
 
-static void read_file(const char *path, struct list *l, unsigned long *bad) {
+/* ---- строки IPv6: мимо подгонки, но не мимо вывода (docs/architecture.md, «4б») -------------
+ *
+ * До 1.9 строка IPv6 считалась испорченной («malformed») и из вывода пропадала: список, где
+ * рядом подсети IPv4 и IPv6, выходил из подгонки без своей половины IPv6, а раз IPv6 ничем не
+ * маршрутизировался, пропажу не замечал никто. С 1.9 строки IPv6 идут в парный набор ipv6_addr, и
+ * терять их нельзя.
+ *
+ * РЕШЕНИЕ: строки IPv6 проходят сквозь подгонку как есть — не сливаются, не укрупняются и в бюджет
+ * не входят. Бюджет считает элементы набора IPv4, ради памяти которого подгонка и заведена (список
+ * РКН — десятки тысяч подсетей IPv4); у IPv6 свой набор, и подсетей IPv6 в тех же списках — единицы
+ * и десятки: лестница укрупнения, подобранная по плотности IPv4 (/24 при двух адресах и выше),
+ * к ним неприменима, а своя ради десятка строк не окупится. Одно правило соблюдается и для них:
+ * строка IPv6, задевающая исключение IPv6 из --exclude, в вывод не идёт (исключение обязано не
+ * попасть в результат) и считается отдельно. В отчёте — "v6" (прошло) и "v6_excluded". */
+struct v6r { uint64_t lh, ll, hh, hl; };     /* [lo, hi] — старшее и младшее слово каждого */
+struct v6list { char **s; struct v6r *r; size_t n, cap; };
+static struct v6list g_v6, g_v6_excl;
+static unsigned long g_v6_dropped;
+
+/* Строка IPv6: «адрес», «адрес/длина», «a-b». 0 — разобрана, диапазон в *r. */
+static int parse_v6(const char *p, struct v6r *r) {
+    char buf[128];
+    size_t n = strcspn(p, " \t\r\n");
+    if (!n || n >= sizeof(buf) || !memchr(p, ':', n)) return -1;
+    memcpy(buf, p, n);
+    buf[n] = '\0';
+    unsigned char a[16], b[16];
+    char *dash = strchr(buf, '-'), *sl = strchr(buf, '/');
+    int plen = 128;
+    if (dash) {
+        *dash = '\0';
+        if (inet_pton(AF_INET6, buf, a) != 1 || inet_pton(AF_INET6, dash + 1, b) != 1) return -1;
+    } else {
+        if (sl) {
+            *sl = '\0';
+            char *e = NULL;
+            long v = strtol(sl + 1, &e, 10);
+            if (e == sl + 1 || *e || v < 0 || v > 128) return -1;
+            plen = (int)v;
+        }
+        if (inet_pton(AF_INET6, buf, a) != 1) return -1;
+        memcpy(b, a, 16);
+        for (int i = 0; i < 16; i++) {
+            int keep = plen - i * 8;
+            unsigned char m = keep >= 8 ? 0xff : keep <= 0 ? 0 : (unsigned char)(0xff << (8 - keep));
+            a[i] &= m;
+            b[i] |= (unsigned char)~m;
+        }
+    }
+    uint64_t w[4] = { 0, 0, 0, 0 };
+    for (int i = 0; i < 8; i++) {
+        w[0] = (w[0] << 8) | a[i];
+        w[1] = (w[1] << 8) | a[8 + i];
+        w[2] = (w[2] << 8) | b[i];
+        w[3] = (w[3] << 8) | b[8 + i];
+    }
+    r->lh = w[0]; r->ll = w[1]; r->hh = w[2]; r->hl = w[3];
+    if (r->lh > r->hh || (r->lh == r->hh && r->ll > r->hl)) return -1;
+    return 0;
+}
+
+static void v6_push(struct v6list *l, const char *line, const struct v6r *r) {
+    if (l->n == l->cap) {
+        size_t nc = l->cap ? l->cap * 2 : 16;
+        char **ns = realloc(l->s, nc * sizeof(*ns));
+        struct v6r *nr = realloc(l->r, nc * sizeof(*nr));
+        if (!ns || !nr) die("out of memory");
+        l->s = ns;
+        l->r = nr;
+        l->cap = nc;
+    }
+    const char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    size_t n = strcspn(p, " \t\r\n");
+    char *c = malloc(n + 1);
+    if (!c) die("out of memory");
+    memcpy(c, p, n);
+    c[n] = '\0';
+    l->s[l->n] = c;
+    l->r[l->n] = *r;
+    l->n++;
+}
+
+/* Задевает ли диапазон хоть одно исключение IPv6. Исключений — единицы: перебор. */
+static int v6_excluded(const struct v6r *r) {
+    for (size_t i = 0; i < g_v6_excl.n; i++) {
+        const struct v6r *x = &g_v6_excl.r[i];
+        int r_lo_le_x_hi = r->lh < x->hh || (r->lh == x->hh && r->ll <= x->hl);
+        int x_lo_le_r_hi = x->lh < r->hh || (x->lh == r->hh && x->ll <= r->hl);
+        if (r_lo_le_x_hi && x_lo_le_r_hi) return 1;
+    }
+    return 0;
+}
+
+static void read_file(const char *path, struct list *l, unsigned long *bad, struct v6list *v6) {
     FILE *f = strcmp(path, "-") ? fopen(path, "r") : stdin;
     if (!f) { fprintf(stderr, "steer aggregate: %s: %s\n", path, strerror(errno)); exit(2); }
     char line[256];
     while (fgets(line, sizeof(line), f)) {
         uint32_t lo, hi;
+        struct v6r r;
         if (parse_line(line, &lo, &hi) == 0) list_push(l, lo, hi);
+        else if (v6 && parse_v6(line + strspn(line, " \t"), &r) == 0) v6_push(v6, line, &r);
         else if (bad) (*bad)++;
     }
     if (f != stdin) fclose(f);
@@ -482,13 +579,13 @@ int aggregate_main(int argc, char **argv) {
 
     /* Merged and sorted, because excl_hits() binary-searches it. */
     if (excl_path) {
-        read_file(excl_path, &g_excl, NULL);
+        read_file(excl_path, &g_excl, NULL, &g_v6_excl);
         merge_lossless(&g_excl);
     }
 
     struct list l = {0};
     unsigned long bad = 0;
-    read_file(in, &l, &bad);
+    read_file(in, &l, &bad, &g_v6);
     size_t src_n = l.n;
     merge_lossless(&l);
 
@@ -549,6 +646,15 @@ int aggregate_main(int argc, char **argv) {
     /* Свой буфер обязан быть сброшен явно: он не stdio, и его никто не допишет за нас
      * ни на exit, ни на fclose. Один забытый сброс здесь — это молча урезанный список. */
     out_flush(stdout);
+    /* Строки IPv6 — после IPv4, как пришли (см. «строки IPv6» выше). */
+    size_t v6_out = 0;
+    for (size_t i = 0; i < g_v6.n; i++) {
+        if (v6_excluded(&g_v6.r[i])) { g_v6_dropped++; continue; }
+        fputs(g_v6.s[i], stdout);
+        fputc('\n', stdout);
+        v6_out++;
+    }
+    fflush(stdout);
 
     /* The ranges a collapse swallowed. The caller MUST route these ahead of the
      * fitted list, or the addresses it promised to keep direct ride the tunnel. */
@@ -570,6 +676,8 @@ int aggregate_main(int argc, char **argv) {
                 ",\"level\":%u,\"min_count\":%zu,\"malformed\":%lu,\"truncated\":%s",
             src_n, l.n, waste, used_level, min_count, bad, truncated ? "true" : "false");
     fprintf(rf, ",\"fits\":%s,\"punched\":%zu", fits ? "true" : "false", g_punch.n);
+    /* Поля IPv6 — только когда строки IPv6 были: отчёт списка из одних IPv4 прежний до байта. */
+    if (g_v6.n) fprintf(rf, ",\"v6\":%zu,\"v6_excluded\":%lu", v6_out, g_v6_dropped);
     if (truncated) {
         char a[16];
         fmt_addr(covered_through, a, sizeof(a));

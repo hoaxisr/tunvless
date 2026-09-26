@@ -1,7 +1,7 @@
 # args: apply --dry-run --spec TMP/loc2.json --state-dir TMP/state
 # exit: 0
 # env: STEER_NFT_COMPAT=legacy-min
-# stderr: steer[info] apply: ядро без nat в семействе inet — правила собраны для nftables старого ядра: таблицы inet и ip
+# stderr: steer[info] apply: ядро без nat в семействе inet — правила собраны для nftables старого ядра: таблицы inet и ip и ip6
 # stderr: steer[warn] apply: ядро не умеет nat для IPv6: запросы DNS клиентов по IPv6 идут мимо резолвера движка, и доменные каналы видят только тех, кто спрашивает по IPv4
 # stderr: steer[warn] apply: ядро не умеет nat для IPv6: запросы DNS приложений телефона по IPv6 идут мимо резолвера движка, и доменные каналы телефона их не видят
 table inet steer {
@@ -21,8 +21,8 @@ table inet steer {
 
     chain output_mark {
         type filter hook output priority mangle + 1; policy accept;
-        meta mark and 0x0fc00000 == 0x00000000 meta skuid >= 10000 ct direction original meta nfproto ipv6 meta l4proto udp th dport 50000-65535 oifname != "lo" ip6 daddr != { fe80::/10, fc00::/7, ff00::/8 } counter reject comment "steer-v6:vpn_all_c0_p1"
         meta mark and 0x0fc00000 == 0x00000000 meta skuid >= 10000 ct direction original meta nfproto ipv4 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } meta l4proto udp th dport 50000-65535 meta mark set mark and 0xf03fffff or 0x00400000 ct mark set mark meta mark set mark or 0x00200000 counter return comment "steer:vpn_all_c0_p1"
+        meta mark and 0x0fc00000 == 0x00000000 meta skuid >= 10000 ct direction original meta nfproto ipv6 meta l4proto udp th dport 50000-65535 oifname != "lo" ip6 daddr != { ::1, fe80::/10, fc00::/7, ff00::/8 } meta mark set mark and 0xf03fffff or 0x00400000 ct mark set mark meta mark set mark or 0x00200000 counter return comment "steer:vpn_all_c0_p1"
         meta mark and 0x0fc00000 == 0x00000000 meta skuid { 10123, 1010200-1010300 } ct direction original ip daddr @vpn_ip_c1 meta mark set mark and 0xf03fffff or 0x00400000 ct mark set mark meta mark set mark or 0x00200000 counter return comment "steer:vpn_ip_c1"
         meta mark and 0x0fc00000 == 0x00000000 meta skuid 10124 ct direction original ip daddr @vpn_dom_c2 meta mark set mark and 0xf03fffff or 0x00400000 ct mark set mark meta mark set mark or 0x00200000 counter return comment "steer:vpn_dom_c2"
     }
@@ -60,5 +60,11 @@ table ip steer {
     }
     chain postrouting_nat {
         type nat hook postrouting priority srcnat + 1; policy accept;
+    }
+}
+table ip6 steer {
+    chain output_reroute {
+        type route hook output priority mangle + 2; policy accept;
+        meta mark and 0x00200000 == 0x00200000 meta mark set mark and 0xffdfffff counter comment "steer-reroute"
     }
 }

@@ -97,6 +97,17 @@ static int nobjs(const struct nft_table *t, enum nft_objk k) {
 }
 
 
+/* Правило с этим комментарием для семейства fam (4 и 6 — nft_rule.fam; у правил, семейство
+ * которых задано выражением «ip …», fam 0 считается четвёркой). */
+static struct nft_rule *rule_fam(const struct nft_chain *c, const char *comment, int fam) {
+    for (struct nft_rule *r = c ? c->rules : NULL; r; r = r->next) {
+        if (!r->comment || strcmp(r->comment, comment) != 0) continue;
+        int f = r->fam ? r->fam : 4;
+        if (f == fam) return r;
+    }
+    return NULL;
+}
+
 static const char *ctype(const struct nft_chain *c) { return c && c->type ? c->type : "-"; }
 static const char *chook(const struct nft_chain *c) { return c && c->hook ? c->hook : "-"; }
 static int cprio(const struct nft_chain *c) { return c ? ir_prio_value(c) : 9999; }
@@ -363,13 +374,21 @@ static void t_phone(int nftc) {
     check_str("output_mark на хуке output", "output", chook(om));
     check_str(nftc ? "в 4.9 — filter" : "в современной — route", nftc ? "filter" : "route",
               ctype(om));
-    struct nft_rule *v6 = ir_rule_find(om, cm("steer-v6:", all->name));
-    check("«весь трафик» отказывает IPv6", 1, v6 != NULL);
-    struct nft_expr *fx = ir_expr_find(v6, NFT_X_FAMILY);
-    check("правило отказа — про IPv6", 6, fx ? fx->fam : 0);
+    /* Выход interface несёт IPv6 (KC_IPV6, 1.9): IPv6 «весь трафик» не отвергается, а метится
+     * v6-двойником правила — под тем же именем, со своей сетью мимо. */
+    check("отказа IPv6 у выхода с IPv6 нет", 0,
+          ir_rule_find(om, cm("steer-v6:", all->name)) != NULL);
+    check("у «весь трафик» два правила: IPv4 и IPv6", 2,
+          (long)ir_rule_count(om, cm("steer:", all->name)));
     struct nft_rule *r = ir_rule_find(om, cm("steer:", all->name));
+    struct nft_rule *r6 = rule_fam(om, cm("steer:", all->name), 6);
+    struct nft_expr *fx = ir_expr_find(r6, NFT_X_FAMILY);
+    check("двойник — про IPv6", 6, fx ? fx->fam : 0);
+    check("двойник метит меткой выхода", 1, r6 && ir_expr_find(r6, NFT_X_MARKSET) != NULL);
+    check("своя сеть IPv6 — мимо", 1, ir_rule_has(r6, "fe80::/10"));
     check("правило разметки группы есть", 1, r != NULL);
     check("бит перемаршрутизации — только в 4.9", !!nftc, ir_rule_has(r, "mark or 0x00200000"));
+    check("и у двойника", !!nftc, ir_rule_has(r6, "mark or 0x00200000"));
     check("скачанное — в input_down", 1,
           ir_rule_find(ir_chain_find(in, "input_down"), cm("steer-down:", all->name)) != NULL);
     struct nft_table *t4 = ir_table_find(&rs, NFT_FAM_IP, NULL);
@@ -385,12 +404,122 @@ static void t_phone(int nftc) {
         struct nft_chain *on = ir_chain_find(t4, "output_nat");
         check("output_nat в ip: udp, tcp и fakeip", 3, (long)ir_rule_count(on, NULL));
         check("output_dns в inet не осталось", 0, ir_chain_find(in, "output_dns") != NULL);
+        /* ip6 — и без nat в ip6: IPv6 приложений метится (двойник), и бит перемаршрутизации на
+         * нём снимает только цепочка route в ip6. nat там — только при NFTC_IP6NAT. */
         struct nft_table *t6 = ir_table_find(&rs, NFT_FAM_IP6, NULL);
-        check("ip6 — только при nat в ip6", !!(nftc & NFTC_IP6NAT), t6 != NULL);
-        if (t6)
-            check("output_nat в ip6 — udp и tcp, без fakeip", 2,
-                  (long)ir_rule_count(ir_chain_find(t6, "output_nat"), NULL));
+        check("ip6 есть (перемаршрутизация IPv6)", 1, t6 != NULL);
+        struct nft_chain *rr6 = ir_chain_find(t6, "output_reroute");
+        check_str("в ip6 — output_reroute типа route", "route", ctype(rr6));
+        check("output_nat в ip6 — только при nat в ip6: udp и tcp, без fakeip",
+              nftc & NFTC_IP6NAT ? 2 : 0,
+              (long)ir_rule_count(ir_chain_find(t6, "output_nat"), NULL));
+        check("цепочек nat в ip6 без nat в ip6 нет", !!(nftc & NFTC_IP6NAT),
+              ir_chain_find(t6, "prerouting_nat") != NULL);
     }
+    nft_rs_free(&rs);
+}
+
+/* ---- 3б. IPv6 правил (docs/architecture.md, «4б») --------------------------------------------
+ *
+ * Строки IPv6 списков — в парный набор «<имя>6» (ipv6_addr), у правила — v6-двойник с тем же
+ * именем; клиенты по умолчанию из подсетей IPv4 — для IPv6 по устройству; клиент с адресом IPv6 —
+ * `ip6 saddr`; direct — двойник без метки; выход без IPv6 (tgws) — двойник метит, а forward_v6
+ * отвергает IPv6 с его меткой (fail-closed); список без строк IPv6 — ни набора, ни двойника. */
+static void t_router_v6(int nftc) {
+    printf("\n-- IPv6 правил на роутере (%s) --\n", nftc ? "раскладка 4.9" : "современная");
+    put("v6a.lst", "203.0.113.0/24\n2001:db8:1::/48\n2001:db8:2::1-2001:db8:2::9\n");
+    put("v6b.lst", "198.51.100.0/24\n");
+    put("v6c.lst", "2001:db8:3::/48\n");
+    if (load("{ \"schema\": 2, \"from_default\": [\"192.168.1.0/24\"],"
+             "  \"outputs\": { \"vpn\": { \"kind\": \"interface\", \"device\": \"wg0\" },"
+             "               \"tg\": { \"kind\": \"tgws\", \"domain\": \"example.com\" },"
+             "               \"dir\": { \"kind\": \"direct\" } },"
+             "  \"channels\": ["
+             "    { \"name\": \"d\", \"match\": { \"prefixes_file\": \"TMP/v6c.lst\" }, \"out\": \"dir\" },"
+             "    { \"name\": \"a\", \"match\": { \"prefixes_file\": \"TMP/v6a.lst\" }, \"out\": \"vpn\" },"
+             "    { \"name\": \"b\", \"match\": { \"prefixes_file\": \"TMP/v6b.lst\" }, \"out\": \"vpn\","
+             "      \"from\": [\"192.168.1.7\"] },"
+             "    { \"name\": \"t\", \"match\": { \"prefixes_file\": \"TMP/v6c.lst\" }, \"out\": \"tg\","
+             "      \"from\": [\"192.168.1.9\", \"fd00::9\"] },"
+             "    { \"name\": \"all\", \"match\": { \"any\": true, \"allow_all\": true }, \"out\": \"vpn\" } ] }")) {
+        check("спека разобрана", 0, 1);
+        return;
+    }
+    struct nft_rs rs;
+    if (build(&rs, nftc)) { check("дерево построено", 0, 1); return; }
+    struct nft_table *t = ir_table_find(&rs, NFT_FAM_INET, NULL);
+    struct nft_set *s6 = ir_set_find(t, "vpn_ip6");
+    check("парный набор vpn_ip6 есть", 1, s6 != NULL);
+    check_str("  тип ipv6_addr", "ipv6_addr", s6 ? s6->key : "");
+    check("  flags interval (без timeout и в 4.9)", NFT_SET_INTERVAL, s6 ? (long)s6->flags : -1);
+    check("  элементы — тот же файл списка", NFT_EL_ADDR_FILE, s6 && s6->els ? (long)s6->els->k : -1);
+    struct nft_chain *pm = ir_chain_find(t, "prerouting_mark");
+    check("у группы vpn_ip два правила", 2, (long)ir_rule_count(pm, "steer:vpn_ip"));
+    struct nft_rule *r4 = rule_fam(pm, "steer:vpn_ip", 4), *r6 = rule_fam(pm, "steer:vpn_ip", 6);
+    check_str("  IPv4 — прежний набор", "vpn_ip", setref(r4));
+    check_str("  IPv6 — парный", "vpn_ip6", setref(r6));
+    check("  двойник: ip6 daddr", 1, ir_rule_has(r6, "ip6 daddr"));
+    check("  двойник: «кто» по устройству (from_default — подсети IPv4)", 1,
+          ir_rule_has(r6, "iifname \"br-lan\""));
+    check("  двойник метит той же меткой", 1, ir_rule_has(r6, "or 0x"));
+    const struct group *gb = NULL, *gt = NULL, *ga = NULL, *gd = NULL;
+    for (size_t i = 0; i < g_gr.n; i++) {
+        const struct group *g = &g_gr.g[i];
+        if (!strcmp(g->out, "vpn") && g->all) ga = g;
+        else if (!strcmp(g->out, "vpn") && g->from_n == 1) gb = g;
+        else if (!strcmp(g->out, "tg")) gt = g;
+        else if (!strcmp(g->out, "dir")) gd = g;
+    }
+    if (!ga || !gb || !gt || !gd) { check("группы найдены", 0, 1); nft_rs_free(&rs); return; }
+    char n6[80];
+    group_set6_name(gb, n6, sizeof(n6));
+    check("клиент из одного IPv4, список без IPv6 — одно правило", 1,
+          (long)ir_rule_count(pm, cm("steer:", gb->name)));
+    check("  и набора IPv6 нет", 0, ir_set_find(t, n6) != NULL);
+    struct nft_rule *ra6 = rule_fam(pm, cm("steer:", ga->name), 6);
+    check("«весь трафик» с from_default: двойник IPv6", 1, ra6 != NULL);
+    struct nft_expr *fx = ir_expr_find(ra6, NFT_X_FAMILY);
+    check("  двойник сужен до IPv6 (meta nfproto ipv6)", 6, fx ? fx->fam : 0);
+    check("  «кто» — по устройству", 1, ir_rule_has(ra6, "iifname \"br-lan\""));
+    struct nft_rule *rt6 = rule_fam(pm, cm("steer:", gt->name), 6);
+    check("клиент с адресом IPv6: ip6 saddr", 1, ir_rule_has(rt6, "ip6 saddr { fd00::9 }"));
+    check("  и в правиле IPv4 его нет", 0,
+          ir_rule_has(rule_fam(pm, cm("steer:", gt->name), 4), "fd00::9"));
+    struct nft_rule *rd6 = rule_fam(pm, cm("steer:", gd->name), 6);
+    check("direct: двойник есть (первое совпадение и для IPv6)", 1, rd6 != NULL);
+    check("  без метки", 0, rd6 && ir_expr_find(rd6, NFT_X_MARKSET) != NULL);
+    check("  и с return", 1, ir_rule_has(rd6, "return"));
+    struct nft_chain *pd = ir_chain_find(t, "postrouting_down");
+    check("скачанное по IPv6 — тем же именем", 2, (long)ir_rule_count(pd, "steer-down:vpn_ip"));
+    /* Выход без IPv6 (tgws): IPv6 его правила отвергается в forward, а не уходит напрямую. */
+    struct nft_chain *fw = ir_chain_find(t, "forward_v6");
+    check_str("forward_v6 — filter", "filter", ctype(fw));
+    check_str("  на хуке forward", "forward", chook(fw));
+    check("  одно правило — на выход tg", 1, (long)ir_rule_count(fw, NULL));
+    struct nft_rule *rj = ir_rule_find(fw, "steer-v6drop:tg");
+    check("  отказ, а не прямой путь", 1, ir_rule_has(rj, "reject"));
+    char mk[64];
+    snprintf(mk, sizeof(mk), "== 0x%08x", out_by_name(&g_spec, "tg")->mark);
+    check("  по метке выхода tg", 1, ir_rule_has(rj, mk));
+    struct nft_expr *jx = ir_expr_find(rj, NFT_X_FAMILY);
+    check("  только IPv6", 6, jx ? jx->fam : 0);
+    check("выходу с IPv6 отказа нет", 0, ir_rule_find(fw, "steer-v6drop:vpn") != NULL);
+    if (nftc) check("в 4.9 на роутере ip6 без nat в ip6 нет", 0,
+                    ir_table_find(&rs, NFT_FAM_IP6, NULL) != NULL);
+    nft_rs_free(&rs);
+
+    /* Спека без IPv6 и без выходов без IPv6 — ни одного объекта IPv6. */
+    if (load("{ \"schema\": 1, \"outputs\": { \"vpn\": { \"kind\": \"interface\", \"device\": \"wg0\" } },"
+             "  \"channels\": [ { \"name\": \"b\", \"match\": { \"prefixes_file\": \"TMP/v6b.lst\" }, \"out\": \"vpn\" } ] }")) {
+        check("спека без IPv6 разобрана", 0, 1);
+        return;
+    }
+    if (build(&rs, nftc)) { check("дерево построено", 0, 1); return; }
+    t = ir_table_find(&rs, NFT_FAM_INET, NULL);
+    check("без IPv6: одно правило разметки", 1,
+          (long)ir_rule_count(ir_chain_find(t, "prerouting_mark"), NULL));
+    check("  ни набора IPv6, ни forward_v6", 0,
+          ir_set_find(t, "vpn_ip6") != NULL || ir_chain_find(t, "forward_v6") != NULL);
     nft_rs_free(&rs);
 }
 
@@ -444,6 +573,8 @@ int main(void) {
         t_mixed_legacy(NFTC_LEGACY);
         t_mixed_legacy(NFTC_LEGACY | NFTC_IP6NAT | NFTC_NOTRACK);
         t_mixed_order();
+        t_router_v6(0);
+        t_router_v6(NFTC_LEGACY);
     } else {
         t_phone(0);
         t_phone(NFTC_LEGACY);
