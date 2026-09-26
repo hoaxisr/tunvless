@@ -24,8 +24,12 @@ static int vless_parse(struct output *o, const struct out_keys *k, struct err *e
     snprintf(o->vless.sub_file, sizeof(o->vless.sub_file), "%s", k->sub_file);
     memcpy(o->vless.nodes, k->nodes, sizeof(o->vless.nodes));
     o->vless.nodes_n = k->nodes_n;
-    if (!o->vless.sub_file[0])
-        return err_set(e, "outputs.%s: kind vless нужен sub_file с подпиской", o->name);
+    if (!o->vless.sub_file[0]) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "outputs.%s: kind vless нужен %s с подпиской", o->name,
+                 out_key(k, "sub_file", "subscription"));
+        return err_set(e, "%s", msg);
+    }
     /* Имя устройства выводится из имени выхода: держать его отдельным полем
      * значило бы дать двум именам расходиться, а никакой пользы от их различия
      * нет. Ограничение в 15 символов — предел IFNAMSIZ. */
@@ -37,6 +41,17 @@ static int vless_parse(struct output *o, const struct out_keys *k, struct err *e
         return err_set(e, "outputs.%s: у kind vless одно устройство — его заводит движок; пул "
             "собирается выходом kind=interface", o->name);
     return 0;
+}
+
+/* Обратное vless_parse (`steer spec convert`): подписка и узлы; устройство — если не выведено
+ * из имени. */
+static void vless_keys_of(const struct output *o, struct out_keys *k) {
+    snprintf(k->sub_file, sizeof(k->sub_file), "%s", o->vless.sub_file);
+    memcpy(k->nodes, o->vless.nodes, sizeof(k->nodes));
+    k->nodes_n = o->vless.nodes_n;
+    char dev[32];
+    snprintf(dev, sizeof(dev), "%.15s", o->name);
+    k->device_derived = !strcmp(dev, o->device);
 }
 
 /* Выбранные узлы подписки — то же, что пул устройств: список кандидатов выхода, только у vless
@@ -104,12 +119,13 @@ const struct kind_ops kind_vless = {
     .name = "vless",
     .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_ENGINE_OWNED | KC_SELF_NAT | KC_OVER |
             KC_SKIP_ZAPRET | KC_TCP_PROBE | KC_FLOW_UDP,
-    .keys = KK_NODES,
+    .keys = KK_NODES | KK_SUB,
     /* Сюда попадает выход без masquerade, которому он и не нужен, — для него это норма
      * (см. out_self_natting и проверку «output» в diag.c). */
     .selfnat_why = "masquerade не нужен: туннель завершает TCP сам, адреса клиентов "
                    "наружу не уходят",
     .parse = vless_parse,
+    .keys_of = vless_keys_of,
     .status = vless_status,
     .helper = vless_helper,
 };

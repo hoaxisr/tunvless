@@ -45,6 +45,11 @@ static int tgws_parse(struct output *o, const struct out_keys *k, struct err *e)
  * правило nat, оно стоит в ядре всегда; когда моста нет, ядро отвечает отказом на
  * соединение, то есть ведёт себя как drop, и никаким полем это не переключить.
  * Обещать direct и не сделать его хуже, чем отказать сразу. */
+/* Обратное tgws_parse (`steer spec convert`). */
+static void tgws_keys_of(const struct output *o, struct out_keys *k) {
+    snprintf(k->domain, sizeof(k->domain), "%s", o->tg.domain);
+}
+
 static int tgws_check(const struct spec *sp, const struct output *o, struct err *e) {
     (void)sp;
     if (o->on_fail != FAIL_DROP)
@@ -140,6 +145,7 @@ const struct kind_ops kind_tgws = {
      * такого заворота нет, и канал «приложение → tgws» стоял бы применённым, не делая ничего. */
     .lan_only = "у трафика самого телефона моста нет",
     .parse = tgws_parse,
+    .keys_of = tgws_keys_of,
     .check = tgws_check,
     .emit = tgws_emit,
     .helper = TGWS_HELPER,

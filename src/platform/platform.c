@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "platform.h"
 
 /* Прежний ключ сборки телефона. Код его больше не читает, и сборка с ним молча стала бы
@@ -98,4 +99,22 @@ void steer_set_rt_tables_dir(const char *dir) { g_rt_override = dir; }
 const char *plat_etc_path(char *buf, size_t n, const char *name) {
     snprintf(buf, n, "%s/%s", plat()->etc_dir, name);
     return buf;
+}
+
+/* spec.yaml рядом с spec.json: тот же путь с другим окончанием. Выводится из spec_path, а не
+ * пишется второй строкой в таблицу платформы — две строки разошлись бы. */
+const char *plat_spec_yaml(void) {
+    static char buf[256];
+    const char *js = plat()->spec_path;
+    size_t n = strlen(js);
+    if (n > 5 && !strcmp(js + n - 5, ".json") && n < sizeof(buf))
+        snprintf(buf, sizeof(buf), "%.*s.yaml", (int)(n - 5), js);
+    else
+        snprintf(buf, sizeof(buf), "%s.yaml", js);
+    return buf;
+}
+
+const char *plat_spec_default(void) {
+    const char *js = plat()->spec_path, *ym = plat_spec_yaml();
+    return access(js, F_OK) != 0 && access(ym, F_OK) == 0 ? ym : js;
 }

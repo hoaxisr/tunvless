@@ -265,9 +265,9 @@ struct group_cfg {
 };
 
 /* Что спека написала в ключах видов — до того, как известен вид (ключ `kind` может стоять в
- * объекте последним). Разбирает их parse.c для всех видов сразу, вид получает готовые значения
- * (kind_ops.parse) и решает, что они значат; общий разбор по битам kind_ops.keys отказывает
- * ключу чужого вида. */
+ * объекте последним). Заполняет их читатель формата — model/v1.c из JSON, model/v2.c из дерева
+ * YAML, — вид получает готовые значения (kind_ops.parse) и решает, что они значат; общий разбор
+ * по битам kind_ops.keys отказывает ключу чужого вида. */
 struct out_keys {
     struct out_obfs obfs;       /* obfs.on — ключ задан и разобран */
     char sub_file[256];
@@ -284,7 +284,15 @@ struct out_keys {
      * решает, принимает ли он такой список вообще (KK_DEVICES — у interface). */
     char devices[MAX_MEMBERS][32];
     size_t devices_n;
+    /* Ключи записаны спекой v2 (model/v2.c): отказ вида называет ключ именем v2 (out_key). */
+    int v2;
+    /* keys_of: устройство выхода — то, что parse вывел бы сам (из имени), писать его незачем. */
+    int device_derived;
 };
+/* Имя ключа для отказа вида: у v1 и v2 оно местами разное (`opts_file`/`strategy`). */
+static inline const char *out_key(const struct out_keys *k, const char *v1, const char *v2) {
+    return k->v2 ? v2 : v1;
+}
 
 struct output {
     /* Пусто — безымянный выход, член группы, рождённый переводом v1 из `devices` (лежит в
@@ -419,6 +427,24 @@ struct spec_rule {
      *  Умолчание — включено: в спеке v1 поле называется `enabled` и проверяется на `false`, а
      *  внутри хранится обратное — так поле, которого нет, даёт нуль и означает «работает». */
     int disabled;
+    /* Апстрим DNS правила (`dns` правила v2): номер в sp->dns.up плюс один; 0 — общий. */
+    unsigned char dns;
+};
+
+/* DNS спеки v2 (раздел `dns`, docs/spec-v2.md): кэш ответов и апстримы у правил через выход.
+ * Разбор v2 их читает и хранит, но резолвер их ещё не умеет (выпуск 1.11, docs/architecture.md),
+ * поэтому спека с ними сейчас отвергается «ещё не поддерживается» — не молча. Режим по умолчанию
+ * (`dns.mode`) в модель отдельным полем не идёт: он уже разложен в realip каждого правила. */
+#define MAX_DNS_UP 8
+struct spec_dns_up {
+    char name[32];
+    char url[256];
+    int out;                        /* выход запроса — номер в sp->out; -1 — напрямую */
+};
+struct spec_dns {
+    long cache;                     /* записей кэша; 0 — кэша нет */
+    struct spec_dns_up up[MAX_DNS_UP];
+    size_t up_n;
 };
 
 /* СПЕКА — ЗНАЧЕНИЕ, А НЕ ГЛОБАЛЫ (docs/architecture.md, раздел 2, правило 6).
@@ -479,6 +505,7 @@ struct spec {
     char lan_dev[MAX_LAN_DEV][64];
     size_t lan_dev_n;
     int traceroute_hops;
+    struct spec_dns dns;
 };
 /* Каталог состояния (steer_state_dir) и каталог имён таблиц iproute2 (steer_rt_tables_dir) —
  * пути платформы со швом переопределения: src/platform/platform.h. */

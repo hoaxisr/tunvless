@@ -42,6 +42,7 @@
 #include "ctl.h"
 #include "daemon.h"
 #include "groups.h"
+#include "v2.h"
 
 /* Уровень в журнале — см. одноимённые макросы в failover.c и obfs.c. Метка подсистемы
  * здесь «apply»: все строки ниже пишутся при компиляции и применении спеки. Отказы
@@ -344,6 +345,15 @@ int main(int argc, char **argv) {
         fprintf(stderr, "steer: команду %s исполняет демон движка (steerd daemon), а посылает "
                         "ему клиент steer\n", cmd);
         return 2;
+    }
+    /* Перевод спеки в v2 (docs/spec-v2.md): разбор тем же load_spec, что у всех, и печать модели
+     * спекой v2 (src/model/v2print.c). Спеку на диске не трогает. */
+    if (!strcmp(cmd, "spec")) {
+        if (strcmp(arg, "convert") != 0)
+            die("steer spec понимает только convert, а не «%s»", arg);
+        if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
+        if (spec_print_v2(stdout, &cfg, &e) < 0) err_die(&e);
+        return fflush(stdout) == 0 ? 0 : 1;
     }
     if (!strcmp(cmd, "status")) return cmd_status(spec, a.fast);
     if (!strcmp(cmd, "diag")) return cmd_diag(spec);

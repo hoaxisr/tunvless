@@ -31,6 +31,11 @@ static int iface_parse(struct output *o, const struct out_keys *k, struct err *e
     return 0;
 }
 
+/* Обратное iface_parse (`steer spec convert`): своё у вида — только обфускация. */
+static void iface_keys_of(const struct output *o, struct out_keys *k) {
+    k->obfs = o->iface.obfs;
+}
+
 /* Обычный interface — без своего сокета наверх: его открывает ядро WireGuard по настройке
  * netifd, и метку ему ставить не нам. С obfs сокет к серверу обфускации открывает наш помощник,
  * и `via` у такого выхода есть (см. out_over_capable в spec.h). */
@@ -161,6 +166,7 @@ const struct kind_ops kind_interface = {
     .caps_of = iface_caps_of,
     .novia = "interface без obfs",
     .parse = iface_parse,
+    .keys_of = iface_keys_of,
     .status = iface_status,
     .diag = iface_diag,
     .helper = iface_helper,

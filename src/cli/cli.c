@@ -48,7 +48,7 @@ struct cli_flag {
 };
 
 static const struct cli_flag FLAGS[] = {
-    {"--spec",      NULL, "ФАЙЛ",       "спека каналов (по умолчанию {etc}/spec.json)"},
+    {"--spec",      NULL, "ФАЙЛ",       "спека (по умолчанию {etc}/spec.json или {etc}/spec.yaml)"},
     {"--state-dir", NULL, "КАТАЛОГ",    "каталог состояния (по умолчанию {state})"},
     {"--dry-run",   NULL, NULL,         "напечатать готовый ruleset и ничего не применять"},
     {"--verbose",   "-v", NULL,         "рассказывать по шагам, что проверяется"},
@@ -162,6 +162,14 @@ static const struct cli_cmd CMDS[] = {
  "steer ctl put-file ИМЯ ФАЙЛ («-» — стандартный ввод). Печатает ответ сервера как\n"
  "есть, одной строкой JSON; код 0 — команда выполнилась с кодом 0.",
  "", 0, 1, 0, 0, 0},
+
+{"spec", "Маршрутизация", "convert",
+ "перевести спеку в формат v2 и напечатать",
+ "steer spec convert читает спеку (v1 — JSON со schema, или уже v2) и печатает её\n"
+ "спекой v2 (YAML, docs/spec-v2.md). Напечатанное даёт тот же набор правил, что и\n"
+ "исходная спека. Файл спеки не меняется: вывод можно положить в {etc}/spec.yaml\n"
+ "вместо {etc}/spec.json — обе сразу движок не читает.",
+ "--spec", 1, 0, 0, 0, 0},
 
 {"status", "Диагностика", "",
  "применённое состояние движка, JSON",
@@ -790,7 +798,7 @@ static int cli_int(const char *flag, const char *s, int lo, int hi) {
 void cli_parse(const struct cli_cmd *cmd, int argc, char **argv, int from,
                struct cli_args *out) {
     memset(out, 0, sizeof *out);
-    out->spec = plat()->spec_path;
+    out->spec = plat_spec_default();
     /* Умолчание по узлу — «до первого рабочего»: то же решение, что принимает подъём
      * выхода, поэтому проверка отвечает на вопрос «что будет, если применить». */
     out->node = -1;

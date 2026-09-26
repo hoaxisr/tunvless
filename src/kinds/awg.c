@@ -1773,6 +1773,17 @@ static int awg_parse(struct output *o, const struct out_keys *k, struct err *e) 
     return 0;
 }
 
+/* Обратное awg_parse (`steer spec convert`): путь и имя устройства, выведенные из имени выхода,
+ * не пишутся. */
+static void awg_keys_of(const struct output *o, struct out_keys *k) {
+    char def[256];
+    snprintf(def, sizeof(def), "%s/awg/%.200s.conf", plat()->etc_dir, o->name);
+    if (strcmp(def, o->awg.conf) != 0) snprintf(k->conf, sizeof(k->conf), "%s", o->awg.conf);
+    char dev[32];
+    awg_default_ifname(o->name, dev, sizeof(dev));
+    k->device_derived = !strcmp(dev, o->device);
+}
+
 /* Мера — свежесть рукопожатия и счётчики пира, которые ядро и так ведёт, без единого пакета от
  * нас. Ни ping, ни проба TCP: и то и другое будило бы радио телефона ради вопроса, на который
  * ответ уже лежит в ядре, — см. awg_healthy выше, там же почему старое рукопожатие само по себе
@@ -1791,7 +1802,9 @@ static void awg_status(FILE *out, const struct spec *sp, const struct output *o)
 const struct kind_ops kind_awg = {
     .name = "awg",
     .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_ENGINE_OWNED | KC_OVER | KC_SKIP_ZAPRET | KC_IPV6,
+    .keys = KK_CONF,
     .parse = awg_parse,
+    .keys_of = awg_keys_of,
     .health = awg_health,
     /* Чинится не ожиданием: процесса, который поднял бы туннель заново, нет — устройство живёт в
      * ядре. Лечится то же, что у netifd лечит ifdown/ifup: см. awg_revive выше. */
