@@ -133,7 +133,7 @@ struct fakeip_entry {
      * правил, который человек видит и меняет стрелками. Это и есть «победитель —
      * который выше» (решение владельца), а не «нижнее правило отбрасываем».
      *
-     * Бит на канал влезает точно: доменных каналов не больше MAX_CHANNELS = 64.
+     * Бит на канал влезает точно: доменных каналов не больше MAX_RULES = 64.
      *
      * NOT persisted to the state file: it is re-derived on (re)query and on the
      * rehydrate pass, so the 2-field/3-field formats on disk stay unchanged. The
@@ -226,7 +226,7 @@ extern struct sindex g_fakeip_idx;
 extern size_t g_fakeip_next;
 
 /* каналы: таблица «канал → набор» (table.c) */
-extern struct dchan g_dch[MAX_CHANNELS];
+extern struct dchan g_dch[MAX_RULES];
 extern size_t g_dch_n;
 
 /* proxy: адрес назначения из conntrack, метка соединения, контекст TCP (proxy.c) */

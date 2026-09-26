@@ -209,7 +209,8 @@ check "в src/model, src/compile и src/lib (кроме err.c) нет die()/exit
 # для стендов, которые собирают выход конкретного вида в обход разбора спеки), записи видов по
 # имени (kind_direct… — сравнение указателя с ними и есть сравнение вида) и сравнение поля kind
 # с адресом (`->kind == &…`). Имя вида строкой в strcmp рядом с kind_of — та же проверка в
-# другой одежде. Комментарии не в счёт.
+# другой одежде. Группа (kind_group, OUT_GROUP) — тоже вид: «это группа?» спрашивают out_group
+# (src/kinds/group.c), а перевод v1 собирает её group_of_devices. Комментарии не в счёт.
 #
 # src/compile здесь наравне с остальным движком: построители видов (zapret, tgws) переехали в
 # kind_ops.emit (src/kinds), а has_zapret/has_tgws — в zapret_present/tgws_present там же;
@@ -218,7 +219,7 @@ kindbad=""
 for f in $(find src -name '*.c' -o -name '*.h' | sort); do
     case "$f" in src/kinds/*) continue ;; esac
     n=$(grep -vE '^[[:space:]]*(\*|//|/\*)' "$f" |
-        grep -cE '\<OUT_(DIRECT|INTERFACE|VLESS|XSTEER|ZAPRET|TGWS|AWG)\>|\<kind_(direct|interface|vless|xsteer|zapret|tgws|awg)\>|(->|\.)kind *[!=]= *&|kind_of\([^)]*\)->name *, *"|"(direct|interface|vless|xsteer|zapret|tgws|awg)" *, *kind_of')
+        grep -cE '\<OUT_(DIRECT|INTERFACE|VLESS|XSTEER|ZAPRET|TGWS|AWG|GROUP)\>|\<kind_(direct|interface|vless|xsteer|zapret|tgws|awg|group)\>|(->|\.)kind *[!=]= *&|kind_of\([^)]*\)->name *, *"|"(direct|interface|vless|xsteer|zapret|tgws|awg|group)" *, *kind_of')
     [ -n "$n" ] || n=0
     [ "$n" -gt 0 ] && kindbad="$kindbad$f:$n "
 done

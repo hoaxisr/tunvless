@@ -45,7 +45,7 @@ struct group {
     /* ТОЛЬКО адресные файлы: их элементы уходят в набор при компиляции. Доменные читает
      * резолвер сам, из спеки, поэтому здесь их держать незачем — а держали, и из-за этого
      * группа не могла быть смешанной. */
-    /* Адресные списки группы. Вектор, а не массив на MAX_CHANNELS*MAX_FILES: с пределом в
+    /* Адресные списки группы. Вектор, а не массив на MAX_RULES*MAX_FILES: с пределом в
      * шестьдесят четыре файла на правило такой массив стоил бы 32 КБ на группу и два
      * мегабайта на все — при том, что обычная группа держит один-два файла. */
     const char **files;
@@ -69,7 +69,7 @@ struct group {
      * набор правил — то есть один такой список снимал бы маршрутизацию целиком. */
     size_t addrs;
     /* Which channels fed it — reported so a counter still has names behind it. */
-    const char *members[MAX_CHANNELS];
+    const char *members[MAX_RULES];
     size_t members_n;
 
     /* ---- наборы sing-box (srs_files, раскладка — src/model/srsplan.c) ---------------------
@@ -114,11 +114,11 @@ static inline int group_has_set(const struct group *g) {
  * build_groups сам отдаёт прежние, поэтому экземпляр до первого вызова обязан быть нулевым
  * (static или `= {0}`). */
 struct groups {
-    struct group g[MAX_CHANNELS];
+    struct group g[MAX_RULES];
     size_t n;
     /* Раскладки каналов с наборами sing-box: группы указывают в них (l4, srs), поэтому они
      * живут столько же, сколько группы, и отдаются groups_free. */
-    struct srs_plan plans[MAX_CHANNELS];
+    struct srs_plan plans[MAX_RULES];
     size_t plans_n;
 };
 

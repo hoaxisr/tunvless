@@ -83,7 +83,7 @@ static long pkg_uid(const char *name) {
 }
 
 /* UID приложений клаузы, которые покрывает «кому» канала на телефоне. */
-static size_t uids_for(const struct channel *c, const struct srs_clause *cl, char (*out)[64],
+static size_t uids_for(const struct spec_client *c, const struct srs_clause *cl, char (*out)[64],
                        size_t max, int *unknown) {
     size_t n = 0;
     for (size_t i = 0; i < cl->pkg_n && n < max; i++) {
@@ -130,7 +130,7 @@ static int extra_same(const struct item *a, const struct item *b) {
 }
 
 /* Адресных строк в собственных списках канала — для предела составного набора. */
-static size_t count_addr_lines(const struct channel *c) {
+static size_t count_addr_lines(const struct spec_list *c) {
     size_t n = 0;
     for (size_t f = 0; f < c->prefixes_n; f++) {
         FILE *in = fopen(c->prefixes_files[f], "r");
@@ -215,12 +215,14 @@ static int part_take(struct srs_part *p, const struct item *it, const char *path
     return 0;
 }
 
-int srs_plan_channel(const struct spec *sp, const struct channel *c, int concat,
-                     struct srs_plan *pl, struct err *e) {
-    (void)sp;
+int srs_plan_rule(const struct spec *sp, const struct spec_rule *r, int concat,
+                  struct srs_plan *pl, struct err *e) {
     memset(pl, 0, sizeof(*pl));
+    /* Что правила: его список; кто — его клиенты (приложения набора сверяются с ними). */
+    const struct spec_list *c = rule_list(sp, r);
+    const struct spec_client *w = rule_who(sp, r);
     const struct l4match *E = &c->l4;
-    int local = c->from_n && from_is_local(c->from[0]);
+    int local = w->from_n && from_is_local(w->from[0]);
     const struct srs_set *sets[MAX_FILES];
     size_t nitems = 0, cap = 0;
     struct item *items = NULL;
@@ -236,7 +238,7 @@ int srs_plan_channel(const struct spec *sp, const struct channel *c, int concat,
         struct err fe = {0};
         sets[fi] = NULL;
         if (srs_open(c->srs_files[fi], &sets[fi], &fe) != 0) {
-            warn_add(pl, "%s — его элементы в канал «%s» не попадут", fe.msg, c->name);
+            warn_add(pl, "%s — его элементы в канал «%s» не попадут", fe.msg, r->name);
             continue;
         }
         const struct srs_set *s = sets[fi];
@@ -260,13 +262,13 @@ int srs_plan_channel(const struct spec *sp, const struct channel *c, int concat,
                 snprintf(msg, sizeof(msg), "канал %.40s: сужение канала (%s) и правила набора "
                          "%.160s (%s) не пересекаются — из набора канал не поймал бы ничего. "
                          "Сужение набора применяется само: уберите proto и ports из канала",
-                         c->name, a, c->srs_files[fi], b);
+                         r->name, a, c->srs_files[fi], b);
                 err_set(e, "%s", msg);
                 goto out;
             }
             if (cl->pkg_n) {
                 if (!local) { pkg_far = 1; continue; }
-                tmp.uid_n = uids_for(c, cl, tmp.uid, SRS_MAX_PKG, &pkg_unknown);
+                tmp.uid_n = uids_for(w, cl, tmp.uid, SRS_MAX_PKG, &pkg_unknown);
                 if (!tmp.uid_n) continue;
                 tmp.extra = 1;
             }
@@ -286,10 +288,10 @@ int srs_plan_channel(const struct spec *sp, const struct channel *c, int concat,
                          c->srs_files[fi]);
         if (nitems == before && !v6 && !pkg_far && !pkg_unknown && !src_local)
             warn_add(pl, "srs: %s: в наборе нет ни имён, ни подсетей — канал «%s» из него ничего "
-                     "не поймает", c->srs_files[fi], c->name);
+                     "не поймает", c->srs_files[fi], r->name);
         if (pkg_far)
             warn_add(pl, "srs: %s: правила про приложения сняты — канал «%s» не на само "
-                     "устройство, у пакетов его клиентов приложения нет", c->srs_files[fi], c->name);
+                     "устройство, у пакетов его клиентов приложения нет", c->srs_files[fi], r->name);
         if (pkg_unknown)
             warn_add(pl, "srs: %s: приложений из набора на устройстве нет (%d) — их правила не "
                      "действуют", c->srs_files[fi], pkg_unknown);
@@ -330,7 +332,7 @@ int srs_plan_channel(const struct spec *sp, const struct channel *c, int concat,
         }
         if (n > SRS_MIXED_MAX) {
             warn_add(pl, "канал «%s»: у списка смешанное сужение, но элементов %zu (больше %d) — "
-                     "вместо одного составного набора канал поделён по сужению", c->name, n,
+                     "вместо одного составного набора канал поделён по сужению", r->name, n,
                      SRS_MIXED_MAX);
             concat = 0;
         }
@@ -363,7 +365,7 @@ int srs_plan_channel(const struct spec *sp, const struct channel *c, int concat,
     }
 
     /* Доп. группы: по одной на набор условий и сужение. */
-    size_t ci_idx = (size_t)(c - sp->ch);
+    size_t ci_idx = (size_t)(r - sp->rule);
     unsigned next_id = 1;
     for (size_t i = 0; i < nitems; i++) {
         struct item *it = &items[i];
@@ -386,7 +388,7 @@ int srs_plan_channel(const struct spec *sp, const struct channel *c, int concat,
         if (k == pl->n) {
             if (next_id >= 100) {
                 warn_add(pl, "канал «%s»: правил с особыми условиями больше 99 — остальные сняты",
-                         c->name);
+                         r->name);
                 continue;
             }
             struct srs_part *p = part_new(pl, SP_EXTRA);
@@ -417,14 +419,14 @@ int srs_plan_channel(const struct spec *sp, const struct channel *c, int concat,
     rc = 0;
     goto out;
 oom:
-    err_set(e, "канал %s: не хватило памяти на раскладку наборов", c->name);
+    err_set(e, "канал %s: не хватило памяти на раскладку наборов", r->name);
 out:
     free(items);
     if (rc != 0) srs_plan_free(pl);
     return rc;
 }
 
-void srs_chan_l4_each(const struct channel *c, void (*cb)(void *ctx, const struct l4match *m),
+void srs_list_l4_each(const struct spec_list *c, void (*cb)(void *ctx, const struct l4match *m),
                       void *ctx) {
     for (size_t fi = 0; fi < c->srs_n; fi++) {
         const struct srs_set *s;

@@ -195,17 +195,21 @@ void iptables_masq_ensure(const struct spec *sp) {
         if (!out_has_device(o) || out_self_natting(o)) continue;
         char mk[32];
         snprintf(mk, sizeof(mk), "0x%x/0x%x", o->mark, STEER_MARK_MASK);
-        for (size_t k = 0; k < o->devices_n; k++) {
+        /* На каждое устройство, в которое выход может увести трафик: у группы — устройства
+         * членов, у выхода с устройством — его собственное (out_members). */
+        const struct output *m[MAX_MEMBERS];
+        size_t mn = out_members(sp, o, m, MAX_MEMBERS);
+        for (size_t k = 0; k < mn; k++) {
             const char *chk[] = { "iptables", "-w", "-t", "nat", "-C", "POSTROUTING",
-                                  "-o", o->devices[k], "-m", "mark", "--mark", mk,
+                                  "-o", m[k]->device, "-m", "mark", "--mark", mk,
                                   "-j", "MASQUERADE", NULL };
             if (run(chk) == 0) continue;
             const char *add[] = { "iptables", "-w", "-t", "nat", "-I", "POSTROUTING", "1",
-                                  "-o", o->devices[k], "-m", "mark", "--mark", mk,
+                                  "-o", m[k]->device, "-m", "mark", "--mark", mk,
                                   "-j", "MASQUERADE", NULL };
             if (run(add) == 0)
                 fprintf(stderr, "steer[info] failover: masquerade на %s возвращён\n",
-                        o->devices[k]);
+                        m[k]->device);
         }
     }
 }
@@ -217,13 +221,15 @@ static void iptables_masq_sync(const struct spec *sp) {
         if (!out_has_device(o) || out_self_natting(o)) continue;
         char mk[32];
         snprintf(mk, sizeof(mk), "0x%x/0x%x", o->mark, STEER_MARK_MASK);
-        for (size_t k = 0; k < o->devices_n; k++) {
+        const struct output *m[MAX_MEMBERS];
+        size_t mn = out_members(sp, o, m, MAX_MEMBERS);
+        for (size_t k = 0; k < mn; k++) {
             const char *add[] = { "iptables", "-w", "-t", "nat", "-I", "POSTROUTING", "1",
-                                  "-o", o->devices[k], "-m", "mark", "--mark", mk,
+                                  "-o", m[k]->device, "-m", "mark", "--mark", mk,
                                   "-j", "MASQUERADE", NULL };
             if (run(add) != 0)
                 fprintf(stderr, LOG_W "output %s: masquerade на %s не встал (iptables)\n",
-                        o->name, o->devices[k]);
+                        o->name, m[k]->device);
         }
     }
 }
@@ -551,12 +557,12 @@ static void apply_done_reports(const struct spec *cfg) {
         report_traceroute_dep(cfg);
     }
     report_mark_overlap();
-    printf("steer: applied %zu channel(s), %zu output(s)\n", cfg->ch_n, cfg->out_n);
+    printf("steer: applied %zu channel(s), %zu output(s)\n", cfg->rule_n, cfg->out_n);
 }
 
 int cmd_apply(const char *spec, int dry) {
     /* Спека — значение, а не глобалы (правило 6): свой экземпляр у точки входа, static —
-     * держать struct spec на стеке нельзя, он большой (g_ch один под 200 КБ). */
+     * держать struct spec на стеке нельзя, он большой (правила, списки и клиенты — под 250 КБ). */
     static struct spec cfg;
     static struct groups gr;
     struct err e = {0};
@@ -655,20 +661,23 @@ static int fnv_write_bsd(void *c, const char *buf, int n) {
 #endif
 
 /* Подпись маршрутизации выхода — то, что apply ставит в ip rule и таблицу выхода и что
- * настраивает у выхода kind=awg: вид, метка, таблица, режим отказа, пул устройств (не выбранное
- * сторожем устройство: его смену сторож и так уже поставил в ядро), файл awg целиком. Изменилась
- * — выход привязывается заново; нет — его правило и таблица не трогаются. */
-static unsigned long long out_route_sig(const struct output *o, int *awg) {
+ * настраивает у выхода kind=awg: вид (каким он виден снаружи — у группы из пула v1 это
+ * interface), метка, таблица, режим отказа, устройства кандидатов (у группы — членов; не
+ * выбранное сторожем устройство: его смену сторож и так уже поставил в ядро), файл awg целиком.
+ * Изменилась — выход привязывается заново; нет — его правило и таблица не трогаются. */
+static unsigned long long out_route_sig(const struct spec *sp, const struct output *o, int *awg) {
     unsigned long long h = KIND_SIG_INIT;
-    const char *kn = kind_of(o)->name;
+    const char *kn = out_kind_name(o);
     kind_sig_mix(&h, kn, strlen(kn));
     kind_sig_mix(&h, &o->mark, sizeof(o->mark));
     kind_sig_mix(&h, &o->table, sizeof(o->table));
     int of = (int)o->on_fail;
     kind_sig_mix(&h, &of, sizeof(of));
-    for (size_t k = 0; k < o->devices_n; k++)
-        kind_sig_mix(&h, o->devices[k], strlen(o->devices[k]));
-    if (!o->devices_n) kind_sig_mix(&h, o->device, strlen(o->device));
+    const struct output *m[MAX_MEMBERS];
+    size_t mn = out_members(sp, o, m, MAX_MEMBERS);
+    for (size_t k = 0; k < mn; k++)
+        kind_sig_mix(&h, m[k]->device, strlen(m[k]->device));
+    if (!mn) kind_sig_mix(&h, o->device, strlen(o->device));
     *awg = !strcmp(kn, "awg");
     if (*awg) {
         /* Ключи и адреса — в файле, не в спеке: новый файл под тем же именем — тоже смена. */
@@ -687,11 +696,12 @@ static unsigned long long out_route_sig(const struct output *o, int *awg) {
 }
 
 /* Подпись того, что читает сторож (кроме помощника — его подпись сверяет супервизор): маршрут,
- * цель via, выбор по задержке. Изменилась — сторожу внеочередной проход. */
+ * подложка over, выбор группы (pick и его числа). Изменилась — сторожу внеочередной проход. */
 static unsigned long long out_watch_sig(const struct output *o, unsigned long long rsig) {
     unsigned long long h = rsig;
-    kind_sig_mix(&h, o->via, strlen(o->via));
-    int lat[3] = { o->prefer_latency, o->lat_tolerance_ms, o->lat_interval_s };
+    kind_sig_mix(&h, o->over, strlen(o->over));
+    const struct group_cfg *g = out_group(o);
+    int lat[3] = { g ? (int)g->pick : 0, g ? g->lat_tolerance_ms : 0, g ? g->lat_interval_s : 0 };
     kind_sig_mix(&h, lat, sizeof(lat));
     return h;
 }
@@ -729,11 +739,11 @@ int cmd_apply_plan(int argc, char **argv) {
     setvbuf(f, buf, _IOFBF, sizeof(buf));
     if (generate(&cfg, &gr, f, &e) < 0) err_die(&e);
     fclose(f);
-    printf("nftc %d\nruleset %016llx\ncounts %zu %zu\n", g_nftc, h, cfg.ch_n, cfg.out_n);
+    printf("nftc %d\nruleset %016llx\ncounts %zu %zu\n", g_nftc, h, cfg.rule_n, cfg.out_n);
     for (size_t i = 0; i < cfg.out_n; i++) {
         const struct output *o = &cfg.out[i];
         int awg = 0;
-        unsigned long long rs = out_route_sig(o, &awg);
+        unsigned long long rs = out_route_sig(&cfg, o, &awg);
         printf("out %s %x %d %d %d %016llx %016llx\n", o->name, o->mark, o->table,
                out_has_device(o), awg, rs, out_watch_sig(o, rs));
     }

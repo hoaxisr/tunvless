@@ -712,7 +712,7 @@ static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const ch
     /* Метка соединения с хабом — out_underlay_mark: метка выхода-цели при `via`, иначе обычное
      * «мимо каналов» (см. «вложенные выходы» в spec.h). После registry_assign — у цели метка
      * появляется там. Ставят её obfs_raw_open (поддельный TCP) и stream_dial (поток). */
-    obfs_set_sock_mark(out_underlay_mark(&cfg, o), o->via[0] != 0);
+    obfs_set_sock_mark(out_underlay_mark(&cfg, o), o->over[0] != 0);
 
     static struct spoke s;
     s.out_name = o->name;

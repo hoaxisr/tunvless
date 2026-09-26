@@ -147,13 +147,15 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
                 fclose(df);
             }
         }
+        /* Вид — каким выход виден снаружи: группа из пула `devices` спеки v1 — interface, как
+         * была (контракт со splify2 меняется в паре, шаг 3 из 1.9). */
         fprintf(out, "%s\"%s\":{\"kind\":\"%s\"", i ? "," : "", sp->out[i].name,
-               kind_of(&sp->out[i])->name);
+               out_kind_name(&sp->out[i]));
         /* Через какой выход идёт туннель этого выхода (`via`, см. «вложенные выходы» в
          * spec.h). Поля нет, когда туннель идёт напрямую, — как в спеке. Живость цели здесь не
          * повторяется: она видна у самой цели в этом же ответе, а второй источник того же
          * ответа однажды разошёлся бы с первым. */
-        if (sp->out[i].via[0]) fprintf(out, ",\"via\":\"%s\"", sp->out[i].via);
+        if (sp->out[i].over[0]) fprintf(out, ",\"via\":\"%s\"", sp->out[i].over);
         if (out_has_device(&sp->out[i])) {
             struct fwcheck c = fw_check(sp->out[i].device);
             fprintf(out, ",\"device\":\"%s\",\"up\":%s,\"mark\":\"0x%08x\",\"table\":%d"
@@ -186,9 +188,12 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
                     fprintf(out, ",\"probe\":{\"state\":\"no_such_node\",\"node\":%d"
                                  ",\"total\":%d}", pr.node, pr.total);
             }
+            /* Кандидаты: у группы — устройства членов по порядку, у выхода — его устройство. */
+            const struct output *m[MAX_MEMBERS];
+            size_t mn = out_members(sp, &sp->out[i], m, MAX_MEMBERS);
             fprintf(out, ",\"devices\":[");
-            for (size_t d = 0; d < sp->out[i].devices_n; d++)
-                fprintf(out, "%s\"%s\"", d ? "," : "", sp->out[i].devices[d]);
+            for (size_t d = 0; d < mn; d++)
+                fprintf(out, "%s\"%s\"", d ? "," : "", m[d]->device);
             fprintf(out, "],\"on_fail\":\"%s\"",
                    sp->out[i].on_fail == FAIL_DROP ? "drop" :
                    sp->out[i].on_fail == FAIL_ZAPRET ? "zapret" : "direct");
