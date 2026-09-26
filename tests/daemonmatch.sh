@@ -403,6 +403,75 @@ check "steer-tools: команда движка — отказ" "2" "$?"
 check "steer-tools fit — инструмент работает" "10.0.0.0/23" \
     "$(printf '10.0.0.0/24\n10.0.1.0/24\n' | "$tmp/steer-tools" fit 2>/dev/null)"
 
+# ---- status и diag без процессов; выход в отказе ----
+# Демон со сторожем, супервизором (резолвер — его ребёнок) и чужим фаерволом в ядре — в своём
+# пространстве PID: номера процессов там идут подряд, и по ним видно, запускал ли он кого-нибудь,
+# пока отвечал на status и diag. Раньше status стоил двух `sh -c nft …` (≈7 процессов), diag —
+# ребёнка `steerd diag` и ещё около двадцати (nft, pgrep, ip, пробы `nft -c`).
+mkdir -p "$tmp/st4"
+ip link set sw1 up
+printf '{"schema":2,"from_default":["192.168.1.0/24"],"outputs":{"vpn":{"kind":"interface","device":"sw1","on_fail":"drop"}},'\
+'"channels":[{"name":"p","match":{"prefixes_files":["%s"]},"out":"vpn"},'\
+'{"name":"d","match":{"domains_files":["%s"]},"out":"vpn"}]}\n' "$tmp/p1.lst" "$tmp/d1.lst" > "$tmp/spec4.json"
+"$real_nft" add table inet fw4
+"$real_nft" add chain inet fw4 srcnat '{ type nat hook postrouting priority srcnat; policy accept; }'
+"$real_nft" add chain inet fw4 srcnat_vpn
+"$real_nft" add rule inet fw4 srcnat oifname '"sw1"' jump srcnat_vpn
+"$real_nft" add rule inet fw4 srcnat_vpn meta nfproto ipv4 masquerade
+S4="--spec $tmp/spec4.json --state-dir $tmp/st4"
+STEER_SUPERVISE_EXE="$tmp/helper" unshare -m -p -f sh -c "mount -t sysfs sysfs /sys && exec \"$BIN\" \
+    daemon --watch --watch-period 3 --supervise --apply --socket \"$tmp/s4.sock\" $S4 \
+    --dnsd-flag --listen-port --dnsd-flag $LPORT --dnsd-flag --upstream-port --dnsd-flag $UPORT" \
+    >"$tmp/d4.out" 2>"$tmp/d4.err" &
+DU=$!
+wait_for '[ -S "$tmp/s4.sock" ] && grep -q "watch: первый проход" "$tmp/d4.err" && grep -q "supervise: dnsd запущен" "$tmp/d4.err"' 10
+D="$(cat "/proc/$DU/task/$DU/children" 2>/dev/null | tr -d ' ')"
+[ -n "$D" ] || D="$(pgrep -P "$DU" | head -n 1)"
+c4() { STEER_SOCKET="$tmp/s4.sock" STEER_ENGINE=/bin/false "$BIN" "$@" $S4; }
+nspid() { nsenter -t "$D" -p sh -c 'echo $$'; }
+wait_for 'grep -q "^vpn sw1 0$" "$tmp/st4/active" 2>/dev/null' 10
+sleep 1
+p0=$(nspid)
+i=0
+while [ $i -lt 10 ]; do c4 status >/dev/null 2>&1; i=$((i + 1)); done
+c4 diag > "$tmp/diag4.d" 2>/dev/null
+p1=$(nspid)
+check "демон: 10 status и diag — ни одного процесса (новых PID в его пространстве, кроме своих)" "0" \
+    "$((p1 - p0 - 1))"
+check "  status демона видит чужой фаервол: sw1 в зоне, masquerade есть" "True True" \
+    "$(c4 status | j outputs.vpn.in_firewall) $(c4 status | j outputs.vpn.nat)"
+check "  и счётчик канала — из ядра (правило канала на месте)" "True" \
+    "$(c4 status | python3 -c 'import json,sys; print(all(c["live"] for c in json.loads(sys.stdin.read())["channels"]))')"
+local4() { STEER_SOCKET="$tmp/nobody.sock" unshare -m sh -c "mount -t sysfs sysfs /sys && exec \"$BIN\" $1 $S4"; }
+check "  diag демона — тот же, что у движка без демона" "$(local4 diag 2>/dev/null)" "$(cat "$tmp/diag4.d")"
+check "  status демона — тот же, что у движка без демона" \
+    "$(local4 status 2>/dev/null | nostamp)" "$(c4 status | nostamp)"
+check "  резолвер жив (обход /proc), таблица на месте" "ok ok" \
+    "$(python3 -c 'import json,sys
+d = json.load(open(sys.argv[1]))
+v = {c["id"]: c["verdict"] for c in d["checks"]}
+print(v.get("dnsd"), v.get("table"))' "$tmp/diag4.d")"
+
+# Выход в отказе: устройство поднято (operstate up), но трафик не несёт — адреса у него нет, и
+# проба отвечает «нет» сразу (молчащий адресат стоил бы шесть секунд на каждый из десяти шагов
+# ожидания подъёма). Сторож ставит on_fail=drop. До правки status отдавал здесь `up: true`, и
+# интерфейс рисовал живым выход, чей трафик стоит.
+ip addr flush dev sw1
+wait_for 'grep -q "^vpn - " "$tmp/st4/active" 2>/dev/null' 40
+check "отказ: сторож поставил on_fail (запись «-»)" "1" "$(grep -c '^vpn - ' "$tmp/st4/active")"
+check "  устройство при этом поднято" "1" "$(ip -o link show sw1 | grep -c 'state UP')"
+check "  status: устройство то же, up false, failed true" "sw1 False True" \
+    "$(c4 status | j outputs.vpn.device) $(c4 status | j outputs.vpn.up) $(c4 status | j outputs.vpn.failed)"
+check "  diag: выход — fail, трафик канала остановлен" "1" \
+    "$(c4 diag 2>/dev/null | grep -c '"verdict":"fail","what":"выход vpn: sw1 не отвечает, трафик канала остановлен"')"
+ip addr add 10.9.1.1/24 dev sw1
+wait_for 'grep -q "^vpn sw1 " "$tmp/st4/active" 2>/dev/null' 20
+check "  адрес вернули, проба ответила — failed снят, up true" "- True" \
+    "$(c4 status | j outputs.vpn.failed) $(c4 status | j outputs.vpn.up)"
+kill "$D"; wait "$DU" 2>/dev/null; D=""
+"$BIN" down --state-dir "$tmp/st4" >/dev/null 2>&1
+"$real_nft" delete table inet fw4
+
 # ---- выключенный движок: ноль пробуждений ----
 # Свой выход на sw1 и своё состояние; выключатель — файл (шов стенда вместо свойства телефона).
 mkdir -p "$tmp/st3"

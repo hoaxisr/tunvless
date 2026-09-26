@@ -13,6 +13,12 @@
 set -u
 BIN="${DIAG:-./build/diagsim}"
 [ -x "$BIN" ] || { echo "not built: $BIN (make test)"; exit 2; }
+# Счётчики каналов и признаки фаервола status берёт у ядра по netlink, а не у nft: в пространстве
+# хоста он увидел бы чужие таблицы. Поэтому — своё сетевое пространство (с root), пустое; без root
+# ядро на вопросы не отвечает, и ответ тот же, что в пустом пространстве.
+if [ "${STATUSMATCH_INNER:-}" != 1 ] && [ "$(id -u)" = 0 ] && unshare -n true 2>/dev/null; then
+    STATUSMATCH_INNER=1 exec unshare -n sh "$0" "$@"
+fi
 
 pass=0 fail=0
 tmp="$(mktemp -d)"
@@ -26,13 +32,8 @@ check() {
     fi
 }
 
-# nft не запущен: счётчики каналов при этом не читаются, а верхний уровень ответа от них не
-# зависит вовсе — ровно то, что здесь проверяется.
-mkdir -p "$tmp/bin"
-printf '#!/bin/sh\nexit 1\n' > "$tmp/bin/nft"
-chmod +x "$tmp/bin/nft"
-PATH="$tmp/bin:$PATH"
-export PATH
+# Таблицы движка в ядре нет: счётчики каналов при этом не читаются, а верхний уровень ответа от
+# них не зависит вовсе — ровно то, что здесь проверяется.
 
 cat > "$tmp/spec.json" <<EOF
 {

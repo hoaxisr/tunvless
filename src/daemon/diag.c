@@ -29,6 +29,9 @@
 #include "groups.h"
 #include "generate.h"
 #include "nftquery.h"
+#include "nftcompat.h"
+#include "procscan.h"
+#include "rtnl.h"
 
 /* ---- explain -------------------------------------------------------------- */
 /* An address from the command line ends up in an nft invocation, so it is checked
@@ -73,15 +76,19 @@ int addr_ok(const char *a) {
  * Поэтому в счётчики note не идёт: он не отвечает на «всё ли в порядке», он отвечает на «что
  * ещё стоит знать».
  */
+/* Состояние одного отчёта. Сбрасывается в начале diag_emit: демон собирает отчёт в своём
+ * процессе раз за разом, и счётчики прошлого ответа не должны доехать до следующего. Поток —
+ * тоже здесь, а не параметром: проверки видов (kind_ops.diag) получают только эту функцию. */
 static int g_diag_first = 1;
 static int g_diag_warn, g_diag_fail;
+static FILE *g_diag_out;
 
 static void diag(const char *id, const char *verdict, const char *what, const char *why) {
     /* note намеренно не считается: см. пояснение выше. */
     if (!strcmp(verdict, "warn")) g_diag_warn++;
     if (!strcmp(verdict, "fail")) g_diag_fail++;
-    printf("%s{\"id\":\"%s\",\"verdict\":\"%s\",\"what\":\"%s\",\"why\":\"%s\"}",
-           g_diag_first ? "" : ",", id, verdict, what, why);
+    fprintf(g_diag_out, "%s{\"id\":\"%s\",\"verdict\":\"%s\",\"what\":\"%s\",\"why\":\"%s\"}",
+            g_diag_first ? "" : ",", id, verdict, what, why);
     g_diag_first = 0;
 }
 
@@ -224,7 +231,6 @@ static void diag_v6_note(void *ctx, const char *id, const char *verdict, const c
 int cmd_diag(const char *spec) {
     static struct spec cfg;
     static struct groups gr;
-    const struct spec *sp = &cfg;
     /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
      * die() изнутри load_spec/build_groups. */
     struct err e = {0};
@@ -234,12 +240,30 @@ int cmd_diag(const char *spec) {
     /* Приговор выносится тому устройству, которое несёт трафик, — тому же, о котором
      * рассказывает status и к которому привязал таблицу apply (outputs_adopt_active). */
     outputs_adopt_active(&cfg);
-    /* Раскладка — чтобы искать правила там, где их ставит apply (nft_has, наборы ниже). */
-    g_nftc = nft_compat();
-    printf("{\"schema\":1,\"checks\":[");
+    return diag_emit(&cfg, &gr, stdout);
+}
+
+/* Сам отчёт — в поток out, по спеке и группам вызывающего: подкоманда читает спеку сама, демон
+ * отдаёт свою из памяти (ctl.c, mem_diag) — тем же кодом, байт в байт. Код — тот, с которым
+ * кончается подкоманда.
+ *
+ * НИ ОДНОГО ПРОЦЕССА. Раньше отчёт стоил около двадцати: nft на каждую проверку наборов и
+ * цепочек, pgrep резолвера и обфускатора, ip на маршрут IPv6 и на путь к серверу обфускации, пробы
+ * раскладки `nft -c` — и всё это ещё и ребёнком демона. Теперь ядро спрашивается по netlink
+ * (nftquery.c, src/lib/nftdump.c, src/lib/rtnl.c), а процессы — обходом /proc
+ * (src/lib/procscan.c), и демон отвечает в своём процессе. */
+int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
+    g_diag_out = out;
+    g_diag_first = 1;
+    g_diag_warn = g_diag_fail = 0;
+    /* Раскладка — та, что стоит в ядре: искать правила там, где их поставил apply (цепочки и
+     * наборы ниже). Проба `nft -c`, которой её узнаёт компилятор, здесь не нужна: отчёт читает
+     * применённое, а не решает, что применять. */
+    g_nftc = nft_compat_seen();
+    fprintf(out, "{\"schema\":1,\"checks\":[");
 
     /* 1. Таблица. Без неё всё остальное бессмысленно: apply не применялся или его снесли. */
-    int table = nft_has("chain prerouting_mark");
+    int table = nft_chain_here("prerouting_mark");
     diag("table", table ? "ok" : "fail",
          table ? "правила движка в ядре" : "правил движка в ядре нет",
          table ? "" : "apply не применялся или таблицу снесли — нажмите «Применить»");
@@ -247,7 +271,7 @@ int cmd_diag(const char *spec) {
     /* 2. Встречная цепочка. Её отсутствие не ломает маршрутизацию, но объёмы «внутрь»
      *    будут пустыми, и это надо назвать, а не показывать нули. */
     if (table) {
-        int down = nft_has("chain postrouting_down");
+        int down = nft_chain_here("postrouting_down");
         diag("down_chain", down ? "ok" : "warn",
              down ? "скачанное считается" : "скачанное не считается",
              down ? "" : "правила от старой версии движка — примените настройку заново");
@@ -255,8 +279,8 @@ int cmd_diag(const char *spec) {
 
     /* 3. Наборы. Пустой набор при непустом списке — самая частая настоящая поломка:
      *    правило на месте, трафик мимо, и по status этого не видно. */
-    for (size_t i = 0; i < gr.n; i++) {
-        struct group *g = &gr.g[i];
+    for (size_t i = 0; i < gr->n; i++) {
+        const struct group *g = &gr->g[i];
         if (!g->files_n && !g->srs_n && !g->domains) continue;
         long n = set_count(g->name);
         /* Старая раскладка: префиксы доменной группы лежат во второй половине набора (<имя>_n,
@@ -364,17 +388,17 @@ int cmd_diag(const char *spec) {
 
     /* 4. Резолвер и редирект. Доменные каналы держатся на обоих: без редиректа клиент
      *    спрашивает не нас, без процесса спрашивать некого. */
-    if (has_domains(&gr)) {
+    if (has_domains(gr)) {
         /* В старой раскладке у заворота нет своей цепочки — он правило общей цепочки nat
          * (legacy.c, шаг 4), и узнаётся по самому правилу. */
-        char redir_rule[40];
-        snprintf(redir_rule, sizeof(redir_rule), "redirect to :%d", DNS_PORT);
-        int redir = nft_has(NFT_LEGACY ? redir_rule : "chain prerouting_dns");
+        int redir = NFT_LEGACY ? nft_redirect_here(DNS_PORT) : nft_chain_here("prerouting_dns");
         diag("dns_redirect", redir ? "ok" : "fail",
              redir ? "запросы DNS заворачиваются на движок"
                    : "запросы DNS на движок не заворачиваются",
              redir ? "" : "доменные каналы без этого не работают вовсе — примените настройку");
-        int alive = system("pgrep -f 'steer dnsd' >/dev/null 2>&1") == 0;
+        /* Обходом /proc, а не pgrep: у демона резолвер — его ребёнок с argv[0] «…/steer»
+         * (docs/architecture.md, «4а»), без демона — экземпляр procd с той же строкой. */
+        int alive = proc_cmdline_find("steer dnsd", 0);
         diag("dnsd", alive ? "ok" : "fail",
              alive ? "резолвер доменных каналов работает" : "резолвер доменных каналов не запущен",
              alive ? "" : "запустите: /etc/init.d/steer restart");
@@ -391,9 +415,9 @@ int cmd_diag(const char *spec) {
      *    списков — в парных наборах, выход с IPv6 ведёт его своей таблицей (и on_fail=drop
      *    останавливает оба семейства), выход без IPv6 его отвергает, доменные каналы прикрыты
      *    подавлением AAAA. Что остаётся назвать — выходы без IPv6 и клиентов, которых по IPv6 не
-     *    узнать, — говорит проверка 9 (v6_notes). Здесь — только факт, что IPv6 наружу есть. */
-    int v6 = system("ip -6 route show default 2>/dev/null | grep -q .") == 0;
-    if (v6)
+     *    узнать, — говорит проверка 9 (v6_notes). Здесь — только факт, что IPv6 наружу есть
+     *    (маршрут по умолчанию — по rtnetlink, без процесса). */
+    if (rtnl_default6() == 1)
         diag("ipv6", "ok", "IPv6 наружу работает, правила его разбирают", "");
 
     /* 6. Публичный резолвер внутри списка канала на выходе VLESS.
@@ -420,23 +444,23 @@ int cmd_diag(const char *spec) {
      *    xsteer несёт сырой IP, как wireguard, никаких потоков к узлу у него нет, и цены
      *    тоже нет. Скопировать заметку на xsteer значило бы напечатать постоянную заметку
      *    без причины — ровно то, из-за чего была убрана проверка `udp`. */
-    for (size_t i = 0; i < gr.n; i++) {
-        struct output *o = out_by_name(sp, gr.g[i].out);
+    for (size_t i = 0; i < gr->n; i++) {
+        struct output *o = out_by_name(sp, gr->g[i].out);
         if (!o || !out_has_cap(o, KC_FLOW_UDP)) continue;
         char found[64];
         const char *who = NULL;
-        for (size_t k = 0; k < gr.g[i].files_n && !who; k++)
-            who = list_finds_resolver(gr.g[i].files[k], found, sizeof(found));
-        for (size_t k = 0; k < gr.g[i].srs_n && !who; k++)
-            who = srs_finds_resolver(gr.g[i].srs[k], found, sizeof(found));
+        for (size_t k = 0; k < gr->g[i].files_n && !who; k++)
+            who = list_finds_resolver(gr->g[i].files[k], found, sizeof(found));
+        for (size_t k = 0; k < gr->g[i].srs_n && !who; k++)
+            who = srs_finds_resolver(gr->g[i].srs[k], found, sizeof(found));
         if (!who) continue;
         /* Буферы с запасом: строки русские, в UTF-8 это два байта на букву, и обрезка по
          * границе буфера разрубила бы букву посередине. Ровно этим ломался вывод при первом
          * прогоне стенда — недобитый байт делал JSON неразбираемым (см. I-029). */
         char what[256], why[512];
         snprintf(what, sizeof(what), "канал %.40s: в списке %.20s — это %.40s",
-                 gr.g[i].members_n ? gr.g[i].members[0] : gr.g[i].name, found, who);
-        if (has_domains(&gr))
+                 gr->g[i].members_n ? gr->g[i].members[0] : gr->g[i].name, found, who);
+        if (has_domains(gr))
             snprintf(why, sizeof(why),
                      "запросы DNS уйдут в туннель, а там на каждый запрос свой поток к узлу "
                      "со своим рукопожатием: имена разрешатся, но медленнее. Клиентов из "
@@ -538,6 +562,20 @@ int cmd_diag(const char *spec) {
             diag("output", "fail", what, why);
             continue;
         }
+        /* Устройство есть, но сторож признал выход неработающим (ни одно устройство не
+         * ответило на пробу) и поставил on_fail. Зона и NAT здесь ничего не объясняют: трафик
+         * через устройство не идёт вовсе. До этой ветки отчёт говорил «устройство в зоне, NAT
+         * есть» — ok на выходе, чей трафик стоит. */
+        if (sp->out[i].failed) {
+            snprintf(what, sizeof(what), "выход %.40s: %.24s не отвечает, трафик канала %s",
+                     sp->out[i].name, sp->out[i].device,
+                     sp->out[i].on_fail == FAIL_DROP ? "остановлен" :
+                     sp->out[i].on_fail == FAIL_ZAPRET ? "идёт через обход" : "идёт напрямую");
+            snprintf(why, sizeof(why), "выход вернётся сам, как только устройство ответит; "
+                     "проверьте туннель и его сервер");
+            diag("output", "fail", what, why);
+            continue;
+        }
         struct fwcheck c = fw_check(sp->out[i].device);
         /* Нужен ли masquerade — свойство УСТРОЙСТВА, а не выхода, который его назвал: в пуле
          * kind=interface активным бывает устройство VLESS-туннеля или хаба xsteer, и вопрос
@@ -595,9 +633,9 @@ int cmd_diag(const char *spec) {
     }
 
     /* 9. IPv6 правил: выходы без IPv6 и клиенты, которых по IPv6 не узнать. */
-    v6_notes(sp, &gr, diag_v6_note, NULL);
+    v6_notes(sp, gr, diag_v6_note, NULL);
 
-    printf("],\"warn\":%d,\"fail\":%d}\n", g_diag_warn, g_diag_fail);
+    fprintf(out, "],\"warn\":%d,\"fail\":%d}\n", g_diag_warn, g_diag_fail);
     /* Код возврата — чтобы это годилось в скрипт, а не только глазам. */
     return g_diag_fail ? 1 : 0;
 }

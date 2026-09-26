@@ -54,6 +54,19 @@ static int xsteer_parse(struct output *o, const struct out_keys *k, struct err *
     return 0;
 }
 
+/* Обратное xsteer_parse (`steer spec convert`): выведенные из имени путь и устройство не
+ * пишутся. */
+static void xsteer_keys_of(const struct output *o, struct out_keys *k) {
+    char def[256];
+    snprintf(def, sizeof(def), "%s/xsteer/%.200s.conf", plat()->etc_dir, o->name);
+    if (strcmp(def, o->xs.conf) != 0) snprintf(k->conf, sizeof(k->conf), "%s", o->xs.conf);
+    k->stream = o->xs.stream;
+    k->stream_port = o->xs.stream_port;
+    char dev[32];
+    snprintf(dev, sizeof(dev), "%.15s", o->name);
+    k->device_derived = !strcmp(dev, o->device);
+}
+
 /* xsteer НЕ проверяется ни PROBE_TARGETS, ни пробой TCP, и это не недоделка.
  *
  * PROBE_TARGETS — публичные адреса, то есть проверка интернета У ХАБА. Хаб полной
@@ -98,12 +111,13 @@ const struct kind_ops kind_xsteer = {
     .name = "xsteer",
     .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_ENGINE_OWNED | KC_SELF_NAT | KC_OVER |
             KC_SKIP_ZAPRET,
-    .keys = KK_STREAM,
+    .keys = KK_STREAM | KK_CONF,
     /* Текст свой, а не общий с vless: формулировка vless («туннель завершает TCP сам, адреса
      * клиентов наружу не уходят») для xsteer неверна — адреса уходят, к хабу. */
     .selfnat_why = "masquerade не нужен и вреден: адреса клиентов уходят к хабу, а NAT "
                    "скрыл бы, от какой пира пришёл пакет",
     .parse = xsteer_parse,
+    .keys_of = xsteer_keys_of,
     .health = xsteer_health,
     .latency = xsteer_latency,
     .helper = xsteer_helper,

@@ -139,8 +139,24 @@ check "  счётчик правила IPv6 канала a растёт" "yes" \
 check "клиент: адрес списка, известный только провайдеру, напрямую не ушёл" "нет" \
     "$(ping6c 2001:db8:1::77)"
 
+# Счётчик канала — одно число: сумма правила IPv4 и его v6-двойника (одно имя в комментарии,
+# counters_load складывает), и через apply он переносится.
+pk_nft() {
+    nft list chain inet steer prerouting_mark | grep 'comment "steer:wg_ip"' |
+        sed -n 's/.*counter packets \([0-9]*\).*/\1/p' | awk '{ s += $1 } END { print s + 0 }'
+}
+pk_status() {
+    "$BIN" status $S 2>/dev/null | grep -o '"name":"wg_ip"[^]]*' |
+        sed -n 's/.*"packets":\([0-9]*\).*/\1/p' | head -n 1
+}
+check "  у канала a два правила разметки (IPv4 и IPv6)" "2" \
+    "$(nft list chain inet steer prerouting_mark | grep -c 'comment "steer:wg_ip"')"
+p_nft=$(pk_nft)
+check "status: пакеты канала = сумма правил IPv4 и IPv6" "$p_nft" "$(pk_status)"
+
 "$BIN" apply $S >/dev/null 2>&1
 check "повторный apply — правило IPv6 одной копией" "1" "$(ours6)"
+check "  счётчик канала перенесён через apply" "$p_nft" "$(pk_status)"
 
 # У устройства выхода выключили IPv6: маршрута в него нет, и таблица IPv6 держит запрет — IPv6
 # списка стоит, а не уходит напрямую.

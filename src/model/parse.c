@@ -3,18 +3,22 @@
  * на самом телефоне, поиск выхода по имени и точка входа load_spec.
  *
  * Разбор ФОРМАТА — не здесь. Спека v1 (JSON со `schema: 1` или `2`, до 2.0.0) разбирается и
- * переводится в модель v2 в model/v1.c; спека v2 (YAML, `version: 2`) — шаг 2 из 1.9
- * (docs/architecture.md, «4в»). load_spec читает файл и отдаёт текст нужному разборщику, а всё
- * остальное в движке видит только модель: правила, списки, клиенты, выходы и группы. */
+ * переводится в модель v2 в model/v1.c; спека v2 (YAML или JSON с `version: 2`) — в model/v2.c
+ * (docs/spec-v2.md). load_spec читает файл, узнаёт формат по содержимому и отдаёт текст нужному
+ * разборщику, а всё остальное в движке видит только модель: правила, списки, клиенты, выходы и
+ * группы. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 #include "spec.h"
 #include "srsplan.h"
 #include "obfs.h"
+#include "ynode.h"
 #include "v1.h"
+#include "v2.h"
 
 /* Список правила без списков — весь трафик (rule_list в spec.h). Один на процесс: правило
  * ссылается на него, а не держит свой, и сужения у него нет. */
@@ -257,13 +261,76 @@ int obfs_split_hostport(const char *s, char *host, size_t hn, int *port) {
     return 0;
 }
 
+/* Есть ли на верхнем уровне JSON-объекта ключ key. Читается только верхний уровень (значения
+ * пропускаются js_skip), до первой неувязки: на битом тексте ответ — «что успели увидеть». Нужна
+ * выбору формата, и дешевле разбора в дерево: v1 читают на каждый status. */
+static int json_top_key(const char *text, const char *key) {
+    struct err scratch = {0};
+    struct js j = { text };
+    if (js_lit(&j, '{') != 0) return 0;
+    js_ws(&j);
+    while (*j.p && *j.p != '}') {
+        char k[64];
+        if (js_str(&j, k, sizeof(k), &scratch) != 0 || js_lit(&j, ':') != 0) return 0;
+        if (!strcmp(k, key)) return 1;
+        if (js_skip(&j, &scratch) != 0) return 0;
+        js_ws(&j);
+        if (*j.p != ',') return 0;
+        j.p++;
+        js_ws(&j);
+    }
+    return 0;
+}
+
+static void spec_defaults(struct spec *s) {
+    memset(s, 0, sizeof(*s));
+    snprintf(s->lan_dev[0], sizeof(s->lan_dev[0]), "br-lan");
+    s->lan_dev_n = 1;
+}
+
+/* Спека v2 из текста: дерево YAML (JSON читается им же) и разбор v2. */
+static int load_v2(const char *buf, size_t n, const char *name, struct spec *s, struct err *e) {
+    struct ydoc *d = ydoc_parse_buf(buf, n, name, e);
+    if (!d) return -1;
+    const struct ynode *root = ydoc_root(d);
+    int rc;
+    if (root && root->kind == YN_MAP && !ynode_get(root, "version") && ynode_get(root, "schema"))
+        rc = ynode_err(e, d, ynode_get(root, "schema"), "%s", "спека v1 пишется JSON-объектом "
+                       "({\"schema\": 1, …}); спека YAML — это v2, и начинается она с version: 2");
+    else if (root && root->kind == YN_MAP && !ynode_get(root, "version"))
+        rc = ynode_err(e, d, root, "%s", "нет version: 2 — спека YAML — это спека v2 "
+                       "(docs/spec-v2.md); спека v1 — JSON-объект со schema");
+    else
+        rc = spec_parse_v2(d, s, e);
+    ydoc_free(d);
+    return rc;
+}
+
+/* ФАЙЛ СПЕКИ ПО УМОЛЧАНИЮ: spec.json или spec.yaml рядом (plat_spec_default). Обе сразу — отказ,
+ * а не правило старшинства: какая из двух настоящая, знает только тот, кто их положил, и
+ * молча читать одну значило бы, что правки во второй не действуют, а понять это нечем. Так же
+ * устроены device/devices и lan_device/lan_devices в v1. Путь, названный явно (--spec), кроме
+ * этих двух, читается как есть. */
+static int spec_pick_default(const char **path, struct err *e) {
+    const char *js = plat()->spec_path, *ym = plat_spec_yaml();
+    if (strcmp(*path, js) != 0 && strcmp(*path, ym) != 0) return 0;
+    int hj = access(js, F_OK) == 0, hy = access(ym, F_OK) == 0;
+    if (hj && hy) {
+        char msg[640];
+        snprintf(msg, sizeof(msg), "две спеки: %.255s и %.255s — движок не выбирает между ними, "
+                 "оставьте одну", js, ym);
+        return err_set(e, "%s", msg);
+    }
+    if (!strcmp(*path, js) && !hj && hy) *path = ym;
+    return 0;
+}
+
 int load_spec(const char *path, struct spec *s, struct err *e) {
     /* Спека — значение (правило 6): экземпляр обнуляется здесь, а не оставляется на
      * совести вызывающего, и получает те же умолчания, что раньше стояли инициализаторами
      * глобалов — один br-lan клиентским устройством, всё остальное пусто/нуль. */
-    memset(s, 0, sizeof(*s));
-    snprintf(s->lan_dev[0], sizeof(s->lan_dev[0]), "br-lan");
-    s->lan_dev_n = 1;
+    spec_defaults(s);
+    if (spec_pick_default(&path, e) != 0) return -1;
     FILE *f = strcmp(path, "-") ? fopen(path, "r") : stdin;
     if (!f) return err_set(e, "%s: cannot open", path);
     static char buf[262144];
@@ -277,8 +344,32 @@ int load_spec(const char *path, struct spec *s, struct err *e) {
     }
     buf[n] = '\0';
     if (f != stdin) fclose(f);
-    /* Формат v2 (YAML, `version: 2`) — шаг 2 из 1.9. Сейчас всё, что пришло, — спека v1. */
-    return spec_parse_v1(buf, s, e);
+    /* ФОРМАТ — ПО СОДЕРЖИМОМУ, а не по имени файла: ctl apply кладёт тело в тот файл, который
+     * сейчас спека, каким бы форматом тело ни было записано.
+     *
+     *   - текст начинается с `{` (JSON-объект) или пуст: ключ `version` наверху — спека v2
+     *     (JSON тоже YAML); иначе — спека v1, с прежними отказами разбора v1 слово в слово
+     *     (их сверяет снимок генератора). И `version`, и `schema` — отказ: это два формата;
+     *   - всё остальное — YAML, то есть спека v2.
+     * Одна поблажка: потоковый YAML `{version: 2, …}` (ключи без кавычек) начинается со скобки,
+     * а JSON-разбор его не прочтёт. Если v1 отказал, `schema` наверху нет, а слово version в
+     * тексте есть, — ответ даёт разбор v2. */
+    const char *p = buf;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    const char *name = strcmp(path, "-") ? path : "stdin";
+    if (*p == '{' || !*p) {
+        int ver = json_top_key(p, "version"), sch = json_top_key(p, "schema");
+        if (ver && sch)
+            return err_set(e, "в спеке и version, и schema — это два формата (version: 2 — спека v2, "
+                           "schema — v1); оставьте одно", NULL);
+        if (!ver) {
+            int rc = spec_parse_v1(buf, s, e);
+            if (rc == 0 || sch || !strstr(buf, "version")) return rc;
+            spec_defaults(s);
+            e->msg[0] = '\0';
+        }
+    }
+    return load_v2(buf, n, name, s, e);
 }
 
 struct output *out_by_name(const struct spec *sp, const char *n) {

@@ -59,12 +59,18 @@ cc_defaults {
         "src/platform/android.c",
         "src/model/parse.c",
         "src/model/v1.c",
+        "src/model/check.c",
+        "src/model/v2.c",
+        "src/model/v2print.c",
         "src/model/registry.c",
         "src/model/probe.c",
         "src/compile/nftcompat.c",
         "src/lib/puff.c",
         "src/model/srs.c",
         "src/model/srsplan.c",
+        "src/lib/nftdump.c",
+        "src/lib/rtnl.c",
+        "src/lib/procscan.c",
         "src/lib/sindex.c",
         "src/lib/nftnl.c",
         "src/lib/ctnl.c",
@@ -90,7 +96,6 @@ cc_defaults {
         "src/daemon/watchd.c",
         "src/daemon/recon.c",
         "src/daemon/rulewd.c",
-        "src/lib/rtnl.c",
         "src/daemon/foprobe.c",
         "src/daemon/gaiw.c",
         "src/kinds/kind.c",
@@ -100,7 +105,11 @@ cc_defaults {
         "src/kinds/zapret.c",
         "src/kinds/tgws.c",
         "src/kinds/awg.c",
+        // YAML_SRC in build/sources.mk: the engine's wrapper here, libyaml itself in
+        // libsteer_yaml below (its own flags, like mbedtls).
+        "src/lib/ynode.c",
     ],
+    static_libs: ["libsteer_yaml"],
     // Каталоги слоёв — те же, что INC_DIRS в build/sources.mk (сверяет tests/buildmatch.sh).
     local_include_dirs: [
         "src/lib",
@@ -119,6 +128,7 @@ cc_defaults {
         "src/proto/xsteer",
         "src/proto/tgws",
         "src/client",
+        "src/third_party/libyaml",
     ],
     cflags: [
         "-DSTEER_DEFAULT_PLATFORM=android",
@@ -139,6 +149,25 @@ cc_binary {
     name: "steer_base",
     defaults: ["steer_defaults"],
     installable: false,
+}
+
+// libyaml 0.2.5, the event parser only (src/third_party/libyaml, MIT; see UPSTREAM there):
+// LIBYAML_SRC in build/sources.mk, checked by tests/buildmatch.sh. A library of its own, as
+// mbedtls, so that its flags stay its own: -DHAVE_CONFIG_H (THIRD_DEFS in sources.mk) makes
+// yaml_private.h include config.h with the version numbers. The sources are upstream's and are
+// not edited; today they build clean under Soong's warnings with -Werror, and if a compiler
+// update ever makes them noisy, the warning is turned off here in cflags, not fixed there.
+cc_library_static {
+    name: "libsteer_yaml",
+    srcs: [
+        "src/third_party/libyaml/api.c",
+        "src/third_party/libyaml/reader.c",
+        "src/third_party/libyaml/scanner.c",
+        "src/third_party/libyaml/parser.c",
+    ],
+    local_include_dirs: ["src/third_party/libyaml"],
+    export_include_dirs: ["src/third_party/libyaml"],
+    cflags: ["-DHAVE_CONFIG_H"],
 }
 
 // mbedtls with the engine's own configuration (src/proto/tls/steer_mbedtls_config.h): the sources

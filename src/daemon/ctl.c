@@ -563,6 +563,7 @@ struct ctl_srv {
 
 static void mem_version(struct conn *c, struct cbuf *r);
 static void mem_status(struct conn *c, struct cbuf *r);
+static void mem_diag(struct conn *c, struct cbuf *r);
 static void mem_explain(struct conn *c, struct cbuf *r);
 static void mem_conns(struct conn *c, struct cbuf *r);
 static void mem_dns_log(struct conn *c, struct cbuf *r);
@@ -589,13 +590,12 @@ static void st_repair(struct conn *c);
  * с каталогом, которую делает сам демон, и подкоманда ради неё была бы вторым путём записи в
  * каталог, которым никто, кроме сервера, не пользуется.
  *
- * Сроки детей: diag — вдвое дороже status (30 с с запасом на медленное хранилище телефона);
- * vless-probe без номера узла перебирает узлы подписки по очереди, каждый со своим --timeout;
+ * Сроки детей: vless-probe без номера узла перебирает узлы подписки по очереди, каждый со своим --timeout;
  * check и apply — свои (см. st_check, st_apply). */
 static const struct ctl_cmd CTL_CMDS[] = {
     {"version",     NULL, mem_version, NULL, 0, 0, 0, {{0}}, 0, 0, 0},
     {"status",      NULL, mem_status, NULL, 0, 0, 1, {{CA_LIT, "--fast", "fast", 0, 0}}, 0, 0, 0},
-    {"diag",        "diag", NULL, NULL, 0, 0, 0, {{0}}, 30, 1, 0},
+    {"diag",        NULL, mem_diag, NULL, 0, 0, 0, {{0}}, 0, 0, 0},
     {"explain",     NULL, mem_explain, NULL, 0, 1, 1, {{CA_TARGET, NULL, NULL, 0, 0}}, 0, 0, 0},
     {"vless-nodes", "vless-nodes", NULL, NULL, 0, 1, 1, {{CA_NAME, NULL, NULL, 0, 0}}, 15, 1, 0},
     {"vless-probe", "vless-probe", NULL, NULL, 0, 1, 3,
@@ -877,7 +877,7 @@ static int job_start(struct conn *c, char *const argv[], int timeout_s, size_t o
     if (!j->tm && !(j->tm = loop_timer_new(s->l, job_timer, c))) return -1;
     int po[2], pe[2];
     /* Ход перебора узлов vless из памяти супервизора (--supervise) — ребёнку в окружение: клиенты
-     * с трубой событий файлов probe-* не пишут, а diag подкомандой спрашивает probe_read. */
+     * с трубой событий файлов probe-* не пишут, а подкоманды спрашивают probe_read. */
     char pmem[1024];
     supd_probe_env(s->d.sup, pmem, sizeof(pmem));
     if (pipe2(po, O_CLOEXEC) != 0) return -1;
@@ -1050,6 +1050,28 @@ static void mem_status(struct conn *c, struct cbuf *r) {
          * всё время, и дамп берётся заново на каждый ответ. */
         fwcheck_reset_cache();
         status_answer(d->view, d->gr, f);
+    }
+    mem_end(&m, r, code);
+}
+
+/* diag из памяти — тем же кодом, что подкоманда (diag_emit), и без единого процесса: прежде это
+ * был ребёнок `steerd diag`, а он сам запускал около двадцати (nft, pgrep, ip, пробы `nft -c`).
+ * Спека и группы — демона, устройство — по выбору сторожа, как у status. Цикл на время отчёта
+ * занят: проверки — вопросы ядру по netlink, обход /proc и чтение файлов списков (публичный
+ * резолвер в списке канала vless), то есть миллисекунды, а не секунды пробы. */
+static void mem_diag(struct conn *c, struct cbuf *r) {
+    struct steerd *d = &c->srv->d;
+    struct mem_run m;
+    FILE *f = mem_begin(&m);
+    if (!f) { resp_error(r, "internal", "нет памяти под ответ"); return; }
+    int code;
+    if (!d->have) {
+        code = mem_no_spec(d);
+    } else {
+        memcpy(d->view, d->sp, sizeof(*d->view));
+        outputs_adopt_active_st(d->view, d->outs ? d->outs : &fo_store_files);
+        fwcheck_reset_cache();
+        code = diag_emit(d->view, d->gr, f);
     }
     mem_end(&m, r, code);
 }
@@ -2558,7 +2580,9 @@ int ctl_serve_main(int argc, char **argv) {
     static struct ctl_srv S;
     struct ctl_conf *cf = &S.cf;
     cf->sock = plat()->ctl_sock;
-    cf->spec = plat()->spec_path;
+    /* spec.json или spec.yaml — какая из двух лежит (plat_spec_default); apply кладёт тело в неё
+     * же, какого бы формата тело ни было: формат load_spec узнаёт по содержимому. */
+    cf->spec = plat_spec_default();
     cf->lists_dir = plat()->lists_dir;
     cf->allow_domain = plat()->ctl_allow_domain;
     for (int i = 0; i < argc; i++) {

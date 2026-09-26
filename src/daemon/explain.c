@@ -281,7 +281,7 @@ int cmd_explain(const char *spec, const char *what) {
 /* Сам ответ — в поток out, по спеке и группам вызывающего: подкоманда читает спеку сама,
  * демон отдаёт свою из памяти. Код — тот, с которым кончается подкоманда. */
 int explain_emit(const struct spec *cfg, const struct groups *gr, const char *what, FILE *out) {
-    g_nftc = nft_compat();
+    g_nftc = nft_compat_seen();
 
     /* Имя сначала превращаем в адрес — и печатаем, во что именно. Без этой строки человек
      * видел бы вердикт по адресу, которого не спрашивал, и не мог бы понять, тот ли это

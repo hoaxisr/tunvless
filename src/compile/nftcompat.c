@@ -7,6 +7,7 @@
 #include "spec.h"
 #include "tmpfile.h"
 #include "nftcompat.h"
+#include "nftdump.h"
 
 /* Примет ли ядро этот текст: `nft -c -f` над временным файлом. 1 — принял, 0 — отверг,
  * -1 — спросить не удалось (нет nft, нет прав, не создать файл).
@@ -111,6 +112,17 @@ int nft_compat(void) {
     }
     cached = r;
     return r;
+}
+
+/* Раскладка, которую поставил apply, — по ядру (объяснение у объявления). Таблица ip движка есть
+ * только в старой раскладке: современная держит всё в inet. Она же и единственное, что читателю
+ * от раскладки нужно, — где искать nat и вторую половину доменного набора. Одиночный запрос
+ * таблицы по netlink вместо двух `nft -c`: diag и explain демон собирает в своём процессе, и
+ * процессов у них быть не должно (docs/architecture.md, «Замечания проверки 1.8»). */
+int nft_compat_seen(void) {
+    const char *e = getenv("STEER_NFT_COMPAT");
+    if (e && *e) return nft_compat();
+    return nfd_table_exists(NFD_IP, nft_table()) ? NFTC_LEGACY : 0;
 }
 
 /* Составной интервальный набор (ipv4_addr . inet_proto . inet_service, flags interval,timeout):

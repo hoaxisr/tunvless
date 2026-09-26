@@ -12,15 +12,26 @@
  * скопированы, включая то, что имя ЗОНЫ и имя УСТРОЙСТВА — разные вещи, совпадающие лишь
  * по привычке называть зону как интерфейс.
  *
- * Дотянуться до fw_check иначе нельзя: данные она берёт из popen(). fwcheck.c/explain.c
- * линкуются отдельными объектами (docs/architecture.md, раздел 4), поэтому подмена popen —
- * не макрос (тот виден только внутри своей единицы трансляции), а функция с именем и
- * подписью из <stdio.h>: сильный символ в объекте стенда перекрывает слабый из libc при
- * компоновке, и вызовы из fwcheck.o приходят сюда, а не в ядро. Проверяется настоящая
- * функция, а не её копия, и ради теста в движок не добавляется ни строки. */
+ * Текст fw_check берёт у ядра по netlink (src/lib/nftdump.c печатает его в форме `nft -t list
+ * ruleset`), поэтому стенд проверяет две вещи порознь:
+ *
+ *   1. разбор — fw_check_dump на дословных дампах fw4 (ниже, RS_*): эвристика проверяется только
+ *      примерами;
+ *   2. печать — в своём сетевом пространстве (нужен root): те же дампы и набор правил,
+ *      похожий на полный fw4 (безымянные наборы устройств, карта вердиктов, flowtable), грузятся
+ *      настоящим `nft -f`, и fw_check по тексту от ядра обязан ответить то же, что разбор по
+ *      тексту самого `nft -t list ruleset`, — и то, что ожидается.
+ *
+ * Предупреждения apply (соседи на битах 16-23) по-прежнему читают текст `nft`: popen подменён
+ * функцией с именем и подписью из <stdio.h> — сильный символ в объекте стенда перекрывает слабый
+ * из libc при компоновке, и вызовы из fwcheck.o приходят сюда. Проверяется настоящая функция, а
+ * не её копия, и ради теста в движок не добавляется ни строки. */
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
+#include <sched.h>
 
 #include "spec.h"
 #include "daemon.h"
@@ -34,6 +45,7 @@ FILE *popen(const char *cmd, const char *mode) {
 int pclose(FILE *f) { return fclose(f); }
 
 static int g_fail;
+static int g_kernel_n;    /* сколько проб печати от ядра прошло */
 
 static void check(const char *what, int got, int want) {
     if (got == want) return;
@@ -44,12 +56,7 @@ static void check(const char *what, int got, int want) {
 static void probe(const char *what, const char *ruleset, const char *device,
                   int want_in_firewall, int want_masq) {
     char label[256];
-    g_ruleset = ruleset;
-    /* Дамп кэшируется на процесс (см. ruleset_dump в fwcheck.c), а каждая проба
-     * изображает ОТДЕЛЬНЫЙ запуск движка со своим набором правил — поэтому кэш
-     * сбрасывается перед каждой. */
-    fwcheck_reset_cache();
-    struct fwcheck r = fw_check(device);
+    struct fwcheck r = fw_check_dump(ruleset, device);
     snprintf(label, sizeof(label), "%s — устройство в firewall", what);
     check(label, r.in_firewall, want_in_firewall);
     snprintf(label, sizeof(label), "%s — masquerade", what);
@@ -142,6 +149,177 @@ static const char RS_ONLY_STEER[] =
 "		meta l4proto tcp oifname \"warp0\" masquerade\n"
 "	}\n"
 "}\n";
+
+/* Похоже на полный fw4 25.12: безымянные наборы устройств зоны, карта вердиктов ct state, flowtable
+ * на устройстве, карта вердиктов по устройству (так пишут руками), маска имени, oif по номеру,
+ * fib и префикс log. Нужно только для второй части стенда — печати набора правил от ядра. */
+static const char RS_FW4_FULL[] =
+"table inet fw4 {\n"
+"	flowtable ft {\n"
+"		hook ingress priority filter\n"
+"		devices = { fwm0 }\n"
+"	}\n"
+"	set lan_devs {\n"
+"		type ifname\n"
+"		elements = { \"br-lan\" }\n"
+"	}\n"
+"	chain input {\n"
+"		type filter hook input priority filter; policy drop;\n"
+"		iifname \"lo\" accept comment \"!fw4: Accept traffic from loopback\"\n"
+"		ct state vmap { established : accept, related : accept, invalid : drop } comment \"!fw4: Handle inbound flows\"\n"
+"		iifname \"br-lan\" jump input_lan comment \"!fw4: Handle lan IPv4/IPv6 input traffic\"\n"
+"		iifname { \"eth1\", \"pppoe-wan\" } jump input_wan comment \"!fw4: Handle wan IPv4/IPv6 input traffic\"\n"
+"		iifname @lan_devs counter drop\n"
+"		fib saddr . iif oif missing drop\n"
+"	}\n"
+"	chain input_lan {\n"
+"		accept\n"
+"	}\n"
+"	chain input_wan {\n"
+"		log prefix \"drop wanlog0 in: \" drop\n"
+"	}\n"
+"	chain forward {\n"
+"		type filter hook forward priority filter; policy drop;\n"
+"		meta l4proto { tcp, udp } flow add @ft\n"
+"		iifname \"br-lan\" jump forward_lan\n"
+"		oifname \"eth*\" accept\n"
+"		oif \"lo\" accept\n"
+"	}\n"
+"	chain forward_lan {\n"
+"		jump accept_to_tun\n"
+"	}\n"
+"	chain accept_to_tun {\n"
+"		meta nfproto ipv4 oifname \"tun0\" counter accept\n"
+"	}\n"
+"	chain srcnat {\n"
+"		type nat hook postrouting priority srcnat; policy accept;\n"
+"		oifname { \"eth1\", \"pppoe-wan\" } jump srcnat_wan\n"
+"		oifname vmap { \"wg0\" : jump srcnat_vpn, \"wg1\" : goto srcnat_vpn }\n"
+"	}\n"
+"	chain srcnat_wan {\n"
+"		meta nfproto ipv4 masquerade\n"
+"	}\n"
+"	chain srcnat_vpn {\n"
+"		meta nfproto ipv4 masquerade\n"
+"	}\n"
+"	chain dstnat {\n"
+"		type nat hook prerouting priority dstnat; policy accept;\n"
+"		iifname \"br-lan\" ct status dnat accept\n"
+"		ip daddr 10.0.0.1 tcp dport 80 dnat ip to 192.168.1.2\n"
+"	}\n"
+"}\n"
+"table inet steer {\n"
+"	chain forward {\n"
+"		oifname \"warp0\" counter accept\n"
+"		meta l4proto tcp oifname \"warp0\" masquerade\n"
+"	}\n"
+"}\n";
+
+/* ---- печать набора правил от ядра ------------------------------------------------------------
+ *
+ * Набор загружается настоящим nft в своё сетевое пространство; fw_check (текст от ядра по
+ * netlink) сверяется с разбором текста самого `nft -t list ruleset` и, где задано, с ожиданием. */
+static char *slurp(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    size_t cap = 65536, n = 0;
+    char *b = malloc(cap);
+    size_t r;
+    while (b && (r = fread(b + n, 1, cap - n - 1, f)) > 0) {
+        n += r;
+        if (n + 1 >= cap) { char *nb = realloc(b, cap *= 2); if (!nb) { free(b); b = NULL; break; } b = nb; }
+    }
+    fclose(f);
+    if (b) b[n] = '\0';
+    return b;
+}
+
+static int kernel_load(const char *rs, const char *dir) {
+    char path[256], cmd[600];
+    snprintf(path, sizeof(path), "%s/rs.nft", dir);
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fputs(rs, f);
+    fclose(f);
+    snprintf(cmd, sizeof(cmd), "nft flush ruleset && nft -f %s", path);
+    return system(cmd) == 0 ? 0 : -1;
+}
+
+static void kernel_probe(const char *what, const char *rs, const char *dir,
+                         const char *device, int want_in_firewall, int want_masq) {
+    char label[256], cmd[400], path[256];
+    snprintf(path, sizeof(path), "%s/list.txt", dir);
+    snprintf(cmd, sizeof(cmd), "nft -t list ruleset > %s", path);
+    if (system(cmd) != 0) { fprintf(stderr, "fwmatch: %s: nft list не прошёл\n", what); g_fail++; return; }
+    char *text = slurp(path);
+    if (!text) { g_fail++; return; }
+    fwcheck_reset_cache();
+    struct fwcheck k = fw_check(device);
+    struct fwcheck t = fw_check_dump(text, device);
+    free(text);
+    (void)rs;
+    snprintf(label, sizeof(label), "%s — %s в firewall: ядро и nft", what, device);
+    check(label, k.in_firewall, t.in_firewall);
+    snprintf(label, sizeof(label), "%s — %s masquerade: ядро и nft", what, device);
+    check(label, k.masqueraded, t.masqueraded);
+    if (want_in_firewall >= 0) {
+        snprintf(label, sizeof(label), "%s — %s в firewall (ядро)", what, device);
+        check(label, k.in_firewall, want_in_firewall);
+        snprintf(label, sizeof(label), "%s — %s masquerade (ядро)", what, device);
+        check(label, k.masqueraded, want_masq);
+    }
+    g_kernel_n++;
+}
+
+static void kernel_part(void) {
+    if (geteuid() != 0 || unshare(CLONE_NEWNET) != 0 || system("nft list ruleset >/dev/null 2>&1") != 0) {
+        printf("fwmatch: нет root, своего сетевого пространства или nft — печать от ядра не проверена\n");
+        return;
+    }
+    char dir[] = "/tmp/fwmatch-XXXXXX";
+    if (!mkdtemp(dir)) { g_fail++; return; }
+    /* Устройство под flowtable: ядро не примет flowtable на несуществующем. */
+    if (system("ip link add fwm0 type dummy 2>/dev/null") != 0)
+        fprintf(stderr, "fwmatch: dummy-устройства нет — flowtable не проверен\n");
+    static const char *const devs[] = {
+        "warp0", "warp", "br-lan", "wan", "tun0", "proton_nl", "eth1", "pppoe-wan", "eth0",
+        "wg0", "wg1", "fwm0", "lo", "wanlog0",
+    };
+    const struct { const char *what, *rs; } sets[] = {
+        { "зона = устройство", RS_ZONE_EQ_DEVICE }, { "зона переименована", RS_ZONE_RENAMED },
+        { "зона без masquerade", RS_ZONE_NO_MASQ }, { "snat", RS_SNAT_RENAMED },
+        { "только steer", RS_ONLY_STEER }, { "полный fw4", RS_FW4_FULL },
+    };
+    for (size_t i = 0; i < sizeof(sets) / sizeof(sets[0]); i++) {
+        const char *rs = sets[i].rs;
+        if (rs == RS_FW4_FULL && system("ip link show fwm0 >/dev/null 2>&1") != 0) continue;
+        if (kernel_load(rs, dir) != 0) {
+            fprintf(stderr, "fwmatch: %s: nft -f не принял набор\n", sets[i].what);
+            g_fail++;
+            continue;
+        }
+        for (size_t d = 0; d < sizeof(devs) / sizeof(devs[0]); d++)
+            kernel_probe(sets[i].what, rs, dir, devs[d], -1, -1);
+    }
+    /* Ожидания на полном fw4 — то, ради чего печать и нужна: устройство в безымянном наборе
+     * уходит в цепочку с masquerade; устройство одной flowtable в зоне (так судит и разбор
+     * текста nft); префикс log называет устройство целиком. Карта вердиктов по устройству
+     * masquerade НЕ даёт: первый переход в её строке печатается с запятой («jump srcnat_vpn,»),
+     * и разбор имени цепочки его не узнаёт — так судит и разбор текста самого nft, и печать от
+     * ядра обязана повторить даже это (порядок элементов — как у nft). */
+    if (system("ip link show fwm0 >/dev/null 2>&1") == 0 && kernel_load(RS_FW4_FULL, dir) == 0) {
+        kernel_probe("полный fw4", RS_FW4_FULL, dir, "eth1", 1, 1);
+        kernel_probe("полный fw4", RS_FW4_FULL, dir, "pppoe-wan", 1, 1);
+        kernel_probe("полный fw4", RS_FW4_FULL, dir, "wg0", 1, 0);
+        kernel_probe("полный fw4", RS_FW4_FULL, dir, "tun0", 1, 0);
+        kernel_probe("полный fw4", RS_FW4_FULL, dir, "fwm0", 1, 0);
+        kernel_probe("полный fw4", RS_FW4_FULL, dir, "warp0", 0, 0);
+        kernel_probe("полный fw4", RS_FW4_FULL, dir, "wanlog0", 1, 0);
+    }
+    char cmd[300];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
+    if (system(cmd) != 0) { /* временный каталог остался — не повод проваливать стенд */ }
+}
 
 int main(void) {
     /* 1. Зона = имя устройства: и раньше засчитывалось, и обязано засчитываться дальше. */
@@ -256,10 +434,13 @@ int main(void) {
         }
     }
 
+    kernel_part();
+
     if (g_fail) {
         fprintf(stderr, "fwmatch: провалено проверок: %d\n", g_fail);
         return 1;
     }
-    printf("fwmatch: 16/16 проверок пройдено плюс 7 про объяснение совпадения и 3 про соседей на битах 16-23\n");
+    printf("fwmatch: 16/16 проверок пройдено плюс 7 про объяснение совпадения, 3 про соседей на битах "
+           "16-23 и %d проб печати набора правил от ядра\n", g_kernel_n);
     return 0;
 }

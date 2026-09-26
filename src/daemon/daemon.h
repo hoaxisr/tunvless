@@ -18,9 +18,12 @@ struct groups;
 struct fwcheck { int in_firewall, masqueraded; };
 
 struct fwcheck fw_check(const char *device);
+/* То же по готовому тексту набора правил в форме `nft -t list ruleset` — разбор, которым fw_check
+ * судит текст от ядра (fwcheck.c); отдельно ради стенда tests/fwmatch.c (дампы с живого fw4). */
+struct fwcheck fw_check_dump(const char *dump, const char *device);
 int report_mark_overlap(void);
-/* Сброс кэша дампа ruleset (fwcheck.c) — только для tests/fwmatch.c: изображает свежий
- * процесс на каждую пробу, как в бою (короткоживущий CLI). */
+/* Сброс кэшей дампа ruleset (fwcheck.c): стенд tests/fwmatch.c изображает им свежий процесс на
+ * каждую пробу, демон — свежий ответ на каждый status и diag. */
 void fwcheck_reset_cache(void);
 /* Чем объяснять совпадение адреса — доменным списком, адресным или обоими (explain.c);
  * отдельной функцией ради стенда tests/fwmatch.c, см. её шапку там же. */
@@ -57,6 +60,8 @@ int cmd_apply_plan(int argc, char **argv);
 int cmd_apply_commit(int argc, char **argv);
 int cmd_status(const char *spec, int fast);
 int cmd_diag(const char *spec);
+/* Отчёт diag по готовой спеке и группам — в поток out; код подкоманды (diag.c). */
+int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out);
 int cmd_down(void);
 int cmd_supervise(const char *spec);
 /* Поднимать ли резолвер (ответ needs-dnsd; supd.c) — им же решает супервизор демона (supd.c). */

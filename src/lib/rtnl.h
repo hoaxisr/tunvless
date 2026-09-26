@@ -54,4 +54,15 @@ int rtnl_route_default_dev(int table, int ifindex);
 /* `ip -4 route flush table TABLE`: снять всё, что в таблице лежит. 0 или errno. */
 int rtnl_table_flush(int table);
 
+/* Вопросы diag — те, что он задавал запуском `ip` (docs/architecture.md, «Замечания проверки
+ * 1.8»: diag стоил около двадцати процессов).
+ *
+ * Есть ли маршрут IPv6 по умолчанию в таблице main — `ip -6 route show default | grep -q .`:
+ * 1 — есть, 0 — нет, -1 — спросить не вышло. */
+int rtnl_default6(void);
+
+/* Через какое устройство ядро отправит пакет к dst — `ip route get dst`, поле dev (с учётом
+ * правил, как и у iproute2). 0 — имя в dev; иначе errno, dev пуст. */
+int rtnl_route_dev(struct in_addr dst, char *dev, size_t n);
+
 #endif

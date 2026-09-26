@@ -104,4 +104,11 @@ void steer_set_rt_tables_dir(const char *dir);    /* NULL — вернуть п�
 /* "<etc_dir>/<name>" в buf; возвращает buf. */
 const char *plat_etc_path(char *buf, size_t n, const char *name);
 
+/* СПЕКА ПО УМОЛЧАНИЮ — spec.json или spec.yaml рядом (docs/spec-v2.md, «Файл спеки»).
+ * plat_spec_yaml — путь spec.yaml рядом с spec_path. plat_spec_default — какую из двух читать:
+ * spec.yaml, если есть только она, иначе spec_path (и когда нет ни одной — прежний путь, в
+ * который пишет управляющий слой). Обе сразу — отказ «две спеки» у load_spec, а не выбор. */
+const char *plat_spec_yaml(void);
+const char *plat_spec_default(void);
+
 #endif

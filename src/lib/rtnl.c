@@ -377,3 +377,64 @@ int rtnl_route_default_dev(int table, int ifindex) {
     nlbuf_put_u32(&b, RTA_OIF, (uint32_t)ifindex);
     return rtnl_talk(buf, msg_end(&b, nh), NULL, NULL);
 }
+
+/* ---- вопросы diag ------------------------------------------------------------------------ */
+
+static void default6_cb(const struct nlmsghdr *h, void *ctx) {
+    int *found = ctx;
+    if (h->nlmsg_type != RTM_NEWROUTE) return;
+    const struct rtmsg *rt = NLMSG_DATA(h);
+    size_t hl = NLMSG_ALIGN(sizeof(*rt));
+    if (h->nlmsg_len < NLMSG_HDRLEN + hl || rt->rtm_family != AF_INET6) return;
+    if ((rt->rtm_flags & RTM_F_CLONED) || rt->rtm_dst_len != 0) return;
+    const struct rtattr *tb[RTA_MAX + 1];
+    attrs_parse((const uint8_t *)rt + hl, h->nlmsg_len - NLMSG_HDRLEN - hl, tb, RTA_MAX);
+    uint32_t table = tb[RTA_TABLE] ? rta_u32(tb[RTA_TABLE]) : rt->rtm_table;
+    if (table == RT_TABLE_MAIN) *found = 1;
+}
+
+int rtnl_default6(void) {
+    uint8_t buf[64];
+    struct nlbuf b;
+    struct rtmsg rt;
+    memset(&rt, 0, sizeof(rt));
+    rt.rtm_family = AF_INET6;
+    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_GETROUTE,
+                                    NLM_F_REQUEST | NLM_F_DUMP, &rt, sizeof(rt));
+    int found = 0;
+    if (rtnl_talk(buf, msg_end(&b, nh), default6_cb, &found) != 0) return -1;
+    return found;
+}
+
+struct route_dev_ctx { char *dev; size_t n; };
+
+static void route_dev_cb(const struct nlmsghdr *h, void *ctx) {
+    struct route_dev_ctx *c = ctx;
+    if (h->nlmsg_type != RTM_NEWROUTE) return;
+    const struct rtmsg *rt = NLMSG_DATA(h);
+    size_t hl = NLMSG_ALIGN(sizeof(*rt));
+    if (h->nlmsg_len < NLMSG_HDRLEN + hl) return;
+    const struct rtattr *tb[RTA_MAX + 1];
+    attrs_parse((const uint8_t *)rt + hl, h->nlmsg_len - NLMSG_HDRLEN - hl, tb, RTA_MAX);
+    char name[IF_NAMESIZE];
+    if (tb[RTA_OIF] && if_indextoname(rta_u32(tb[RTA_OIF]), name))
+        snprintf(c->dev, c->n, "%s", name);
+}
+
+int rtnl_route_dev(struct in_addr dst, char *dev, size_t n) {
+    if (!n) return EINVAL;
+    dev[0] = '\0';
+    uint8_t buf[128];
+    struct nlbuf b;
+    struct rtmsg rt;
+    memset(&rt, 0, sizeof(rt));
+    rt.rtm_family = AF_INET;
+    rt.rtm_dst_len = 32;
+    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_GETROUTE,
+                                    NLM_F_REQUEST | NLM_F_ACK, &rt, sizeof(rt));
+    nlbuf_put_data(&b, RTA_DST, &dst, 4);
+    struct route_dev_ctx c = { dev, n };
+    int rc = rtnl_talk(buf, msg_end(&b, nh), route_dev_cb, &c);
+    if (rc == 0 && !dev[0]) rc = ENOENT;
+    return rc;
+}

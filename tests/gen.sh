@@ -139,29 +139,28 @@ check "и не выносит вердиктов" "0" \
 # каждый apply обнуляет объёмы. Само по себе незаметно, но обновление списков вызывает apply
 # по расписанию, раз в сутки: объёмы в интерфейсе оказывались «с пяти утра», причём молча.
 #
-# Ядро в тестах недоступно, поэтому подставляем nft, который печатает готовое состояние. Так
-# проверяется то, что здесь и может сломаться: разбор его вывода и подстановка значений в
-# новые правила. Перенос ПО ИМЕНИ, а не по позиции: правила перетасовываются при правке
-# спеки, и перенос по номеру приписал бы каналу чужой трафик.
-mkdir -p "$tmp/bin"
-cat > "$tmp/bin/nft" <<'NFT'
-#!/bin/sh
-# Порядок нарочно обратный порядку каналов в спеке: перенос обязан идти по имени.
-case "$*" in
-*prerouting_mark*)
-    echo '  ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set meta mark & 0xf01fffff | 0x40100000 counter packets 7 bytes 700 return comment "steer:vpn_ip"'
-    echo '  ip saddr { 192.168.1.0/24 } ip daddr @direct_ip counter packets 3 bytes 300 return comment "steer:direct_ip"'
-    ;;
-esac
-case "$*" in
-*postrouting_down*)
-    echo '  ip daddr { 192.168.1.0/24 } ip saddr @vpn_ip counter packets 9 bytes 90000 comment "steer-down:vpn_ip"'
-    ;;
-esac
-exit 0
+# Счётчики движок читает у ядра по netlink (src/lib/nftdump.c), поэтому состояние ставится
+# настоящим nft в своём сетевом пространстве (нужен root) — и проверяется то, что здесь и может
+# сломаться: чтение счётчиков по комментарию правила и подстановка значений в новые правила.
+# Перенос ПО ИМЕНИ, а не по позиции: правила перетасовываются при правке спеки, и перенос по
+# номеру приписал бы каналу чужой трафик.
+cat > "$tmp/carry.nft" <<'NFT'
+table inet steer {
+  set vpn_ip { type ipv4_addr; flags interval; }
+  set direct_ip { type ipv4_addr; flags interval; }
+  # Порядок нарочно обратный порядку каналов в спеке: перенос обязан идти по имени.
+  chain prerouting_mark {
+    ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set meta mark & 0xf01fffff | 0x40100000 counter packets 7 bytes 700 return comment "steer:vpn_ip"
+    ip saddr { 192.168.1.0/24 } ip daddr @direct_ip counter packets 3 bytes 300 return comment "steer:direct_ip"
+  }
+  chain postrouting_down {
+    ip daddr { 192.168.1.0/24 } ip saddr @vpn_ip counter packets 9 bytes 90000 comment "steer-down:vpn_ip"
+  }
+}
 NFT
-chmod +x "$tmp/bin/nft"
-carried="$(PATH="$tmp/bin:$PATH" $BIN apply --dry-run --spec "$tmp/spec.json" $S 2>/dev/null)"
+if [ "$(id -u)" = 0 ] && command -v nft >/dev/null 2>&1 && unshare -n true 2>/dev/null; then
+carried="$(unshare -n sh -c 'nft -f "$1" && shift && exec "$@"' sh "$tmp/carry.nft" \
+    $BIN apply --dry-run --spec "$tmp/spec.json" $S 2>/dev/null)"
 
 check "перенос: наружу по direct_ip" "1" \
     "$(printf '%s\n' "$carried" | grep -c 'counter packets 3 bytes 300 return comment "steer:direct_ip"')"
@@ -172,6 +171,9 @@ check "перенос: внутрь по vpn_ip" "1" \
 # Канала, которого в ядре не было, переносить нечего — и выдумывать значение нельзя.
 check "чего не было, то остаётся нулём" "1" \
     "$(printf '%s\n' "$carried" | grep -c 'ip saddr @direct_ip counter comment "steer-down:direct_ip"')"
+else
+    echo "gen: нет root, nft или своего сетевого пространства — перенос счётчиков не проверен"
+fi
 # Ноль печатается коротким `counter`: иначе вывод на чистой машине менялся бы без причины.
 check "нули не пишутся числами" "0" \
     "$(printf '%s\n' "$out" | grep -c 'counter packets 0 bytes 0')"

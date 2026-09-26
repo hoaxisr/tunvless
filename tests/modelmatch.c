@@ -237,6 +237,73 @@ static void t_groups(void) {
     }
 }
 
+/* ---- спека v2 → та же модель (src/model/v2.c) --------------------------------------------- */
+
+static void t_v2(void) {
+    check("v2: разобрана", 0, load(
+        "version: 2\n"
+        "lan: { devices: [br-lan, tailscale0] }\n"
+        "clients:\n"
+        "  kids: { mac: [aa:bb:cc:dd:ee:01] }\n"
+        "  tv:   { mac: [aa:bb:cc:dd:ee:02] }\n"
+        "lists:\n"
+        "  a: { prefixes_file: TMP/a.lst }\n"
+        "  b: { prefixes_file: [TMP/b.lst], domains_file: TMP/yt.lst }\n"
+        "  v: { prefixes_file: TMP/a.lst, proto: udp, ports: [\"50000-65535\", 3478] }\n"
+        "outputs:\n"
+        "  wg0: { kind: interface, device: wg0 }\n"
+        "  wg1: { kind: interface, device: wg1, on_fail: direct }\n"
+        "  res: { kind: group, pick: latency, members: [wg1, wg0], tolerance: 70, interval: 60 }\n"
+        "dns: { mode: realip }\n"
+        "rules:\n"
+        "  - { name: two, for: [kids, tv], to: [a, b], out: res }\n"
+        "  - { to: v, out: wg0, resolve: fakeip, enabled: false }\n"
+        "  - { name: all, for: lan, to: all, out: wg1 }\n"));
+    if (g_msg[0]) printf("     %s\n", g_msg);
+    check("v2: выходы — именованные, без безымянных", 3, (long)g_spec.out_n);
+    check("v2: безымянных нет", 0, (long)g_spec.anon_n);
+    const struct output *g = out_by_name(&g_spec, "res");
+    const struct group_cfg *gc = g ? out_group(g) : NULL;
+    check("v2: res — группа", 1, gc != NULL);
+    if (gc) {
+        check("v2: pick latency", PICK_LATENCY, gc->pick);
+        check("v2: члены — именованные выходы по номеру", 1,
+              gc->members_n == 2 && gc->members[0] == 1 && gc->members[1] == 0);
+        check("v2: допуск и интервал", 1, gc->lat_tolerance_ms == 70 && gc->lat_interval_s == 60);
+        check_str("v2: видна как group", "group", out_kind_name(g));
+        check_str("v2: активное — первый член", "wg1", g->device);
+        check("v2: метка у группы", 1, g->mark != 0);
+    }
+    check("v2: lan — два устройства", 2, (long)g_spec.lan_dev_n);
+    const struct spec_rule *r = &g_spec.rule[0];
+    check("v2: два клиента одного вида сведены в один безымянный", 1,
+          r->clients_n == 1 && !rule_client(&g_spec, r)->name[0] && rule_client(&g_spec, r)->from_n == 2);
+    check("v2: два списка без сужения сведены в один", 1, r->lists_n == 1 && !rule_list(&g_spec, r)->name[0]);
+    check("v2: … файлы обоих", 1, rule_list(&g_spec, r)->prefixes_n == 2 && rule_list(&g_spec, r)->domains_n == 1);
+    check("v2: dns.mode realip — умолчание правила", 1, r->realip);
+    r = &g_spec.rule[1];
+    check_str("v2: имя по умолчанию — номер", "rule-2", r->name);
+    check("v2: resolve fakeip перекрывает dns.mode", 0, r->realip);
+    check("v2: enabled: false", 1, r->disabled);
+    check("v2: сужение списка", 1, rule_list(&g_spec, r)->l4.proto == CH_PROTO_UDP &&
+          rule_list(&g_spec, r)->l4.ports_n == 2 && rule_list(&g_spec, r)->l4.ports[1].lo == 3478);
+    r = &g_spec.rule[2];
+    check("v2: to: all — весь трафик, без списка", 1, r->lists_n == 0 && rule_list(&g_spec, r)->all);
+    check("v2: for: lan — клиенты по умолчанию", 1, r->clients_n == 0 && rule_who(&g_spec, r) == &g_spec.lan);
+
+    /* Хранится в модели и тогда, когда спека отвергнута «ещё не поддерживается». */
+    check("v2: dns.upstreams — отказ", -1, load(
+        "version: 2\n"
+        "outputs: { vpn: { kind: interface, device: wg0 } }\n"
+        "dns: { cache: 512, upstreams: { doh: { url: \"https://1.1.1.1/dns-query\", out: vpn } } }\n"
+        "rules: [ { to: all, out: vpn, dns: doh } ]\n"));
+    check("… «ещё не поддерживается»", 1, has("ещё не поддерживается в этой версии движка: dns.cache"));
+    check("… апстрим в модели", 1, g_spec.dns.up_n == 1 && g_spec.dns.up[0].out == 0 &&
+          !strcmp(g_spec.dns.up[0].name, "doh"));
+    check("… кэш в модели", 512, g_spec.dns.cache);
+    check("… апстрим правила", 1, g_spec.rule_n == 1 && g_spec.rule[0].dns == 1);
+}
+
 /* ---- решения выбора группы --------------------------------------------------------------- */
 
 static void t_pick(void) {
@@ -271,6 +338,7 @@ int main(void) {
     steer_set_state_dir(g_tmp);
     t_rules();
     t_groups();
+    t_v2();
     t_pick();
     char cmd[320];
     snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_tmp);
