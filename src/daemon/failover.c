@@ -1221,6 +1221,10 @@ void outputs_adopt_active_st(struct spec *sp, struct fo_store *st) {
 
         char rec[32];
         active_get_st(st, o->name, rec, sizeof(rec));   /* читает три поля — см. active_get */
+        /* «-» — сторож признал выход неработающим и поставил on_fail (out_finish). Устройство
+         * ниже всё равно выбирается — о нём и говорят поля status, — но трафик через него не
+         * идёт, и status с diag обязаны это сказать, а не рисовать живым поднятое устройство. */
+        o->failed = !strcmp(rec, "-");
         const char *pick = NULL;
         if (rec[0] && strcmp(rec, "-") != 0 && device_present(rec))
             for (size_t k = 0; k < o->devices_n && !pick; k++)

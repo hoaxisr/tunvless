@@ -126,7 +126,7 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
     fprintf(out, "{\"schema\":1,\"at\":%ld,"
                  "\"features\":[\"lan_devices\",\"nodes\",\"pool\",\"active_device\","
                  "\"status_cache\",\"xslink\",\"xsteer_state\",\"spec_schema2\",\"awg\","
-                 "\"via\"]",
+                 "\"via\",\"failed\"]",
             (long)time(NULL));
     /* Локальные устройства — следом: интерфейс показывает, с чего забирается трафик, и
      * без этого поля ему пришлось бы читать спеку вторым источником, то есть однажды
@@ -147,6 +147,13 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
                 fclose(df);
             }
         }
+        /* Сторож признал выход неработающим и поставил on_fail (запись «-» в `active`): трафик
+         * через устройство не идёт, даже если оно поднято. До этой правки status отдавал здесь
+         * `up: true`, и интерфейс рисовал живым выход, чей трафик стоит (on_fail=drop) или идёт
+         * мимо (direct). Теперь `up: false` и рядом `failed: true` — чем этот случай отличается
+         * от упавшего устройства (docs/contract-v1.md, §2). */
+        const int failed = out_has_device(&sp->out[i]) && sp->out[i].failed;
+        if (failed) up = 0;
         fprintf(out, "%s\"%s\":{\"kind\":\"%s\"", i ? "," : "", sp->out[i].name,
                kind_of(&sp->out[i])->name);
         /* Через какой выход идёт туннель этого выхода (`via`, см. «вложенные выходы» в
@@ -156,9 +163,10 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
         if (sp->out[i].via[0]) fprintf(out, ",\"via\":\"%s\"", sp->out[i].via);
         if (out_has_device(&sp->out[i])) {
             struct fwcheck c = fw_check(sp->out[i].device);
-            fprintf(out, ",\"device\":\"%s\",\"up\":%s,\"mark\":\"0x%08x\",\"table\":%d"
+            fprintf(out, ",\"device\":\"%s\",\"up\":%s%s,\"mark\":\"0x%08x\",\"table\":%d"
                    ",\"in_firewall\":%s,\"nat\":%s",
-                   sp->out[i].device, up ? "true" : "false", sp->out[i].mark, sp->out[i].table,
+                   sp->out[i].device, up ? "true" : "false", failed ? ",\"failed\":true" : "",
+                   sp->out[i].mark, sp->out[i].table,
                    c.in_firewall ? "true" : "false", c.masqueraded ? "true" : "false");
             /* Кандидаты и режим отказа: без них failover не виден из интерфейса, и
              * человек не может понять, почему выход вдруг ведёт в другое устройство. */

@@ -244,6 +244,11 @@ struct output {
     /* Активное устройство — то, через которое трафик идёт СЕЙЧАС. Отдельно от списка
      * кандидатов, потому что failover меняет его, не трогая настройку. */
     char device[32];
+    /* Сторож признал выход неработающим и применил on_fail: живых устройств нет (запись «-» в
+     * `active`, см. outputs_adopt_active). Трафик через device при этом НЕ идёт, даже если
+     * устройство поднято, — status и diag говорят об этом прямо (docs/contract-v1.md, `failed`).
+     * Заполняет outputs_adopt_active, разбор спеки оставляет нулём. */
+    int failed;
     char devices[MAX_DEVICES][32];
     size_t devices_n;
     enum on_fail on_fail;

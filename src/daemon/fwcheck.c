@@ -26,6 +26,7 @@
 #include "srs.h"
 #include "ctl.h"
 #include "daemon.h"
+#include "nftdump.h"
 
 /* ---- what an interface output depends on, and does not own ----------------- */
 /* steer does not touch the firewall. It has no business rewriting someone's zones
@@ -77,37 +78,55 @@ static void remember_chain(char tab[FWC_CHAINS][64], size_t *n, const char *name
     snprintf(tab[(*n)++], 64, "%s", name);
 }
 
-/* Один дамп набора правил на процесс.
+/* Два дампа набора правил, у каждого свой кэш на процесс.
  *
- * fw_check дёргается по разу на выход, report_traceroute_dep добавляет свой
- * дамп — то есть status (а его интерфейс опрашивает каждые пять секунд) и apply
- * платили sh+nft и полный обход ruleset ядром по два-пять раз за запуск, на
- * одни и те же данные. На слабом роутере это был главный фоновый расход CPU
- * всей системы. Кэш корректен ровно потому, что все читатели работают ПОСЛЕ
- * любых изменений набора правил в этом же процессе: в apply отчёты идут после
- * `nft -f`, а status/diag ruleset не трогают. Дамп по-прежнему --terse (см.
- * комментарий в fw_check), так что в памяти он занимает килобайты, а живёт до
- * конца короткоживущего CLI-процесса. */
-/* Кэш всегда либо NULL, либо получен malloc'ом: tests/fwmatch.c сбрасывает его между
+ * ТЕКСТ ОТ ЯДРА ПО NETLINK (nl_dump) — для fw_check, то есть для status и diag. status интерфейс
+ * опрашивает раз в несколько секунд, и `sh -c nft -t list ruleset` на каждый вызов — два
+ * процесса ради одного вопроса (docs/architecture.md, «Замечания проверки 1.8»). Текст
+ * собирает src/lib/nftdump.c в форме `nft -t list ruleset` — ровно в объёме того, что читает
+ * fw_check ниже, — и разбор остаётся одним: тем, что закрыт стендом fwmatch на дампах с живого
+ * fw4. Стенд же сверяет, что оба текста дают fw_check один ответ на наборе правил в ядре.
+ *
+ * ТЕКСТ ОТ `nft` (nft_dump) — для предупреждений apply (traceroute_hops, соседи на битах 16-23):
+ * им нужны числа масок и `ct state untracked` в той форме, как их печатает nft, а apply и без
+ * того работает детьми с `nft -f`. Переводить их на netlink значило бы повторить печать nft
+ * целиком ради того, что читается раз на применение.
+ *
+ * Кэш корректен потому, что все читатели работают ПОСЛЕ любых изменений набора правил в этом же
+ * процессе: в apply отчёты идут после `nft -f`, а status/diag ruleset не трогают; демон
+ * сбрасывает кэш перед каждым ответом (fwcheck_reset_cache).
+ *
+ * Кэш всегда либо NULL, либо получен malloc'ом: tests/fwmatch.c сбрасывает его между
  * пробами через fwcheck_reset_cache(), изображая свежий процесс на каждую пробу. */
-static char *g_ruleset_dump;
+static char *g_nft_dump, *g_nl_dump;
 
 /* Сброс кэша дампа — единственное, что стенду нужно от него самого, а не через fw_check().
- * g_ruleset_dump — static (правило 4, docs/architecture.md, раздел 4: только то, что
- * пересекает границу файла, выходит из static, и то функцией, а не голым указателем). */
+ * Кэши — static (правило 4, docs/architecture.md, раздел 4: только то, что пересекает границу
+ * файла, выходит из static, и то функцией, а не голым указателем). */
 void fwcheck_reset_cache(void) {
-    free(g_ruleset_dump);
-    g_ruleset_dump = NULL;
+    free(g_nft_dump);
+    g_nft_dump = NULL;
+    free(g_nl_dump);
+    g_nl_dump = NULL;
 }
 
-static const char *ruleset_dump(void) {
-    if (g_ruleset_dump) return g_ruleset_dump;
+static const char *nl_dump(void) {
+    if (g_nl_dump) return g_nl_dump;
+    g_nl_dump = nfd_ruleset_text();
+    /* Ядро не ответило (нет прав, нет nf_tables) — пустой текст, как у nft, которому нечего
+     * напечатать: обе проверки тогда честно говорят «не видно». Пустой — тоже в кэш. */
+    if (!g_nl_dump) g_nl_dump = calloc(1, 1);
+    return g_nl_dump ? g_nl_dump : "";
+}
+
+static const char *nft_dump(void) {
+    if (g_nft_dump) return g_nft_dump;
     size_t cap = 65536, n = 0;
     char *buf = malloc(cap);
     if (!buf) return ""; /* не кэшируем — следующий вызов попробует снова */
     FILE *f = popen("nft -t list ruleset 2>/dev/null || "
                     "nft list ruleset 2>/dev/null", "r");
-    if (!f) { buf[0] = '\0'; return g_ruleset_dump = buf; }
+    if (!f) { buf[0] = '\0'; return g_nft_dump = buf; }
     for (;;) {
         if (n + 4096 + 1 > cap) {
             char *nb = realloc(buf, cap *= 2);
@@ -120,7 +139,7 @@ static const char *ruleset_dump(void) {
     }
     pclose(f);
     buf[n] = '\0';
-    return g_ruleset_dump = buf;
+    return g_nft_dump = buf;
 }
 
 /* Следующая «строка» кэша с семантикой fgets: длинная строка выдаётся кусками
@@ -137,6 +156,10 @@ static const char *dump_line(const char *p, char *line, size_t cap) {
 }
 
 struct fwcheck fw_check(const char *device) {
+    return fw_check_dump(nl_dump(), device);
+}
+
+struct fwcheck fw_check_dump(const char *dump, const char *device) {
     struct fwcheck r = { 0, 0 };
     /* Зона может называться не так, как устройство, и тогда оба признака ниже молчат:
      * fw4 пишет имя ЗОНЫ и в имя цепочки (`srcnat_vpn`), и в комментарий правила
@@ -150,12 +173,10 @@ struct fwcheck fw_check(const char *device) {
      * один проход и пересекаются в конце. */
     char dev_chain[FWC_CHAINS][64], masq_chain[FWC_CHAINS][64];
     size_t dev_chain_n = 0, masq_chain_n = 0;
-    /* --terse: без содержимого наборов. Проверка смотрит на имена устройств в правилах
-     * и цепочках, а элементы наборов ей не нужны — при этом их бывают десятки тысяч, и
-     * полный дамп на слабом роутере стоил секунды НА КАЖДЫЙ ВЫЗОВ. Флаг есть в nft
-     * с 0.9.4 (OpenWrt 21+); на случай древней сборки — откат к полному дампу,
-     * медленно, но не слепо. Сам дамп берётся из ruleset_dump() — один на процесс. */
-    const char *pos = ruleset_dump();
+    /* Без содержимого именованных наборов (как у `nft -t`): проверка смотрит на имена
+     * устройств в правилах и цепочках, а элементы наборов ей не нужны — при этом их бывают
+     * десятки тысяч, и полный дамп на слабом роутере стоил секунды НА КАЖДЫЙ ВЫЗОВ. */
+    const char *pos = dump;
     char line[2048];
     char chain[128] = "";
     int in_steer = 0;
@@ -219,8 +240,8 @@ void report_traceroute_dep(const struct spec *sp) {
             return;
         }
     }
-    /* Тот же кэшированный дамп, что в fw_check: ищется правило, а не элементы. */
-    const char *pos = ruleset_dump();
+    /* Дамп nft: ищется `ct state untracked … accept` в той форме, как его печатает nft. */
+    const char *pos = nft_dump();
     int ok = 0;
     char line[2048];
     while ((pos = dump_line(pos, line, sizeof(line))) != NULL)
@@ -262,7 +283,7 @@ int report_mark_overlap(void) {
     /* Поле целиком выше бита 23 (мини-сборка моста живёт в бите 28) — с масками 16-23 оно не
      * пересекается, и говорить не о чем. */
     if (STEER_MARK_LOBIT > 23) return 0;
-    const char *pos = ruleset_dump();
+    const char *pos = nft_dump();
     char line[2048], table[96] = "", said[8][96];
     int n_said = 0;
     while ((pos = dump_line(pos, line, sizeof(line))) != NULL) {
