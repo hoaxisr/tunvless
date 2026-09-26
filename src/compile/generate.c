@@ -50,11 +50,49 @@ static struct nft_table *inet_table(struct nft_rs *rs) {
  * nft не умеет «или» внутри правила. Поэтому смешивать их в одном правиле нельзя, и это
  * проверяется при загрузке спеки: правило либо про адреса, либо про MAC-и. Молча взять только
  * половину значило бы, что часть устройств правило не касается, и понять это было бы нечем. */
+/* Семейство записи «кому»: адрес IPv6 — с двоеточием (MAC отсюда не спрашивают: у клиента
+ * либо все записи MAC, либо ни одной — это проверяет разбор). */
+static int from_fam(const char *s) {
+    return strchr(s, ':') ? 6 : 4;
+}
+
+/* Сколько в «кому» группы записей семейства fam. */
+static size_t who_count(const struct group *g, int fam) {
+    size_t n = 0;
+    for (size_t i = 0; i < g->from_n; i++) if (from_fam(g->from[i]) == fam) n++;
+    return n;
+}
+
+/* «Кто» узнаётся не адресом, а устройством или MAC — одним выражением на оба семейства. */
+static int who_any_family(const struct group *g) {
+    return !g->from_n || is_mac(g->from[0]);
+}
+
+/* С 1.9 в «кому» бывают адреса обоих семейств (docs/architecture.md, «4б»): у правила IPv4 в
+ * перечне только записи IPv4 (`ip saddr`), у его v6-двойника — только IPv6 (`ip6 saddr`, x_who6).
+ * У клиента из одних IPv4 перечень тот же, что до 1.9, до байта. MAC — одно выражение на оба. */
 static void x_who(struct nft_rule *r, const struct group *g, int reverse) {
     if (!g->from_n) return;
+    int mac = is_mac(g->from[0]);
     struct sbuf b = { .n = 0 };
-    sb_add(&b, "%s %s { ", is_mac(g->from[0]) ? "ether" : "ip", reverse ? "daddr" : "saddr");
-    for (size_t i = 0; i < g->from_n; i++) sb_add(&b, "%s%s", i ? ", " : "", g->from[i]);
+    sb_add(&b, "%s %s { ", mac ? "ether" : "ip", reverse ? "daddr" : "saddr");
+    size_t k = 0;
+    for (size_t i = 0; i < g->from_n; i++) {
+        if (!mac && from_fam(g->from[i]) != 4) continue;
+        sb_add(&b, "%s%s", k++ ? ", " : "", g->from[i]);
+    }
+    sb_add(&b, " }");
+    ir_x(r, "%s", b.s);
+}
+
+static void x_who6(struct nft_rule *r, const struct group *g, int reverse) {
+    struct sbuf b = { .n = 0 };
+    sb_add(&b, "ip6 %s { ", reverse ? "daddr" : "saddr");
+    size_t k = 0;
+    for (size_t i = 0; i < g->from_n; i++) {
+        if (from_fam(g->from[i]) != 6) continue;
+        sb_add(&b, "%s%s", k++ ? ", " : "", g->from[i]);
+    }
     sb_add(&b, " }");
     ir_x(r, "%s", b.s);
 }
@@ -98,6 +136,71 @@ static void x_from(struct nft_rule *r, const struct spec *sp, const struct group
 /* То же «кто», но на встречном пути: там наш клиент — это ПОЛУЧАТЕЛЬ. */
 static void x_to(struct nft_rule *r, const struct spec *sp, const struct group *g) {
     if (g->from_n) x_who(r, g, 1); else x_ifs(r, sp, 1);
+}
+
+/* ---- IPv6 правил (docs/architecture.md, «4б») ---------------------------------------------
+ *
+ * Правило группы в таблице inet смотрит в набор ipv4_addr, и пакет IPv6 его не касается. С 1.9
+ * у группы есть v6-двойник: то же «кто», то же сужение, поиск в парном наборе «<имя>6» (или
+ * «весь трафик»), та же метка — и тот же комментарий, поэтому счётчик канала остаётся одним
+ * числом (counters_load складывает правила с одним именем, как у половин набора старого ядра).
+ *
+ * «Кто» у двойника:
+ *   устройства (iifname) и MAC (ether saddr) — одно выражение на оба семейства. У группы «весь
+ *   трафик» с таким «кто» двойника нет вовсе: правило IPv4 и так ловит оба семейства, и так было
+ *   и до 1.9 — только маршрута IPv6 у выхода не было, и трафик уходил напрямую;
+ *   адреса — записи IPv6 из «кому» (`ip6 saddr`). У клиентов по умолчанию, заданных одними
+ *   подсетями IPv4 (from_default), — по устройствам, как у заворота DNS: стабильного префикса
+ *   IPv6 у локальной сети нет (его раздаёт провайдер и меняет), и записать его в from_default
+ *   нельзя. У своего клиента правила из одних адресов IPv4 двойника нет: его IPv6 правило не
+ *   узнаёт, и diag об этом говорит (для такого клиента нужен MAC или адрес IPv6). */
+static int who_is_lan(const struct spec *sp, const struct group *g) {
+    if (g->from_n != sp->lan.from_n) return 0;
+    for (size_t i = 0; i < g->from_n; i++)
+        if (strcmp(g->from[i], sp->lan.from[i]) != 0) return 0;
+    return 1;
+}
+
+/* Можно ли выразить «кто» для IPv6. */
+static int who6_ok(const struct spec *sp, const struct group *g) {
+    return who_any_family(g) || who_count(g, 6) || who_is_lan(sp, g);
+}
+
+/* Есть ли у группы правило IPv4: «кто» из одних адресов IPv6 его не даёт. */
+static int who4_ok(const struct group *g) {
+    return who_any_family(g) || who_count(g, 4);
+}
+
+/* Правило IPv4 группы ловит и IPv6: «кто» без адресов и назначение без набора («весь трафик»). */
+static int group_v4_agn(const struct group *g) {
+    return who_any_family(g) && !group_has_set(g) && !g->xsrc_n;
+}
+
+/* Нужен ли группе v6-двойник: есть набор IPv6 или это «весь трафик» (не доп. группа с «ip saddr»
+ * из набора — ограничение по клиенту у неё только IPv4), и правило IPv4 IPv6 не ловит. */
+static int group_needs6(const struct spec *sp, const struct group *g) {
+    if (group_v4_agn(g)) return 0;
+    if (!group_has_set6(g) && !(g->all && !g->xsrc_n)) return 0;
+    return who6_ok(sp, g);
+}
+
+/* «Кто» двойника. need_fam — у правила нет выражения, которое само сужает до IPv6 (поиска в
+ * наборе IPv6), и «кто» по устройству поймал бы и IPv4: тогда `meta nfproto ipv6`. */
+static void x_from6(struct nft_rule *r, const struct spec *sp, const struct group *g, int reverse,
+                    int need_fam) {
+    if (who_any_family(g) || !who_count(g, 6)) {
+        if (g->from_n && is_mac(g->from[0])) x_who(r, g, reverse);
+        else x_ifs(r, sp, reverse);
+        if (need_fam) ir_family(r, 6);
+        return;
+    }
+    x_who6(r, g, reverse);
+}
+
+/* Выход несёт IPv6: у него свой маршрут IPv6 (KC_IPV6) или метки нет вовсе (direct — трафик идёт
+ * обычным путём, как у IPv4). */
+static int out_v6_ok(const struct output *o) {
+    return !out_needs_mark(o) || out_has_cap(o, KC_IPV6);
 }
 
 /* «Чем и куда именно»: сужение канала по протоколу и портам назначения (схема 2).
@@ -306,14 +409,17 @@ static void x_mark(struct nft_rule *r, const struct output *o, unsigned mark) {
 /* ---- наборы групп ----------------------------------------------------------------------- */
 
 /* Подсети наборов sing-box группы — источниками элементов (печатник читает их потоком). */
-static void set_add_srs(struct nft_table *t, struct nft_set *s, const struct group *g, int excl) {
+/* fam — семейство набора: 4 — обычный, 6 — парный «<имя>6» (подсети v6 тех же клауз). */
+static void set_add_srs(struct nft_table *t, struct nft_set *s, const struct group *g, int excl,
+                        int fam) {
     for (size_t k = 0; k < g->srs_n; k++) {
         const struct srs_psel *ps = g->srs[k];
         size_t n = 0;
         for (size_t c = 0; c < ps->ncl; c++)
             if (ps->sel[c >> 3] & (1u << (c & 7))) {
                 const struct srs_clause *cl = srs_clause(ps->set, c);
-                if (cl->kind == SRS_C_CIDR) n += excl ? cl->n_xv4 : cl->n_v4;
+                if (cl->kind == SRS_C_CIDR)
+                    n += fam == 6 ? (excl ? 0 : cl->n_v6) : excl ? cl->n_xv4 : cl->n_v4;
             }
         if (!n) continue;
         struct ir_srs *src = ir_mem(t->rs, sizeof(*src));
@@ -327,20 +433,22 @@ static void set_add_srs(struct nft_table *t, struct nft_set *s, const struct gro
 
 /* Элементы составного набора: адресные списки со сужением канала и подсети наборов со своим
  * сужением у каждой клаузы. Раскладку в непересекающиеся элементы делает печатник. */
-static void set_add_mixed(struct nft_table *t, struct nft_set *s, const struct group *g) {
-    size_t n = (g->addrs ? g->files_n : 0) + (g->srs_addrs ? g->srs_n : 0);
+static void set_add_mixed(struct nft_table *t, struct nft_set *s, const struct group *g, int fam) {
+    size_t addrs = fam == 6 ? g->addrs6 : g->addrs;
+    size_t srs_addrs = fam == 6 ? g->srs_addrs6 : g->srs_addrs;
+    size_t n = (addrs ? g->files_n : 0) + (srs_addrs ? g->srs_n : 0);
     if (!n) return;
     struct ir_mixed_src *v = ir_mem(t->rs, n * sizeof(*v));
     struct ir_mixed *m = ir_mem(t->rs, sizeof(*m));
     if (!v || !m) return;
     size_t k = 0;
-    if (g->addrs)
+    if (addrs)
         for (size_t f = 0; f < g->files_n; f++) {
             v[k].path = g->files[f];
             v[k].l4 = g->files_l4[f];
             k++;
         }
-    if (g->srs_addrs)
+    if (srs_addrs)
         for (size_t f = 0; f < g->srs_n; f++) {
             v[k].path = g->srs[f]->path;
             v[k].set = g->srs[f]->set;
@@ -363,11 +471,20 @@ static void build_group_sets(struct nft_table *t, const struct groups *gr) {
          * каждого элемента оно своё (src/model/srsplan.c). Флаги те же, что у обычного; без
          * auto-merge: ядро сливает в составном ключе только точные повторы, а пересечений в нём
          * нет по построению (раскладку делает печатник). */
+        char n6[80];
+        group_set6_name(g, n6, sizeof(n6));
         if (g->composite) {
             struct nft_set *s = ir_set_add(t, g->name, "ipv4_addr . inet_proto . inet_service");
             if (!s) return;
             s->flags = NFT_SET_INTERVAL | (g->domains ? NFT_SET_TIMEOUT : 0);
-            set_add_mixed(t, s, g);
+            set_add_mixed(t, s, g, 4);
+            /* Парный составной набор IPv6: те же списки и наборы, их строки и подсети IPv6. */
+            if (group_has_set6(g)) {
+                struct nft_set *s6 = ir_set_add(t, n6, "ipv6_addr . inet_proto . inet_service");
+                if (!s6) return;
+                s6->flags = NFT_SET_INTERVAL;
+                set_add_mixed(t, s6, g, 6);
+            }
             continue;
         }
         struct nft_set *s = ir_set_add(t, g->name, "ipv4_addr");
@@ -391,7 +508,7 @@ static void build_group_sets(struct nft_table *t, const struct groups *gr) {
          * печатник потоком (ir.h, «Память»). */
         if (g->files_n && g->addrs)
             for (size_t k = 0; k < g->files_n; k++) ir_set_file(s, g->files[k]);
-        if (g->srs_addrs) set_add_srs(t, s, g, 0);
+        if (g->srs_addrs) set_add_srs(t, s, g, 0, 4);
         /* Исключения-подсети доп. группы («x.com, но не эти адреса»): свой набор рядом, и
          * правило проверяет его ПЕРЕД поиском в основном (x_dest). */
         if (g->xcidr) {
@@ -401,9 +518,36 @@ static void build_group_sets(struct nft_table *t, const struct groups *gr) {
             if (!x) return;
             x->flags = NFT_SET_INTERVAL;
             x->auto_merge = 1;
-            set_add_srs(t, x, g, 1);
+            set_add_srs(t, x, g, 1, 4);
+        }
+        /* Парный набор IPv6 (docs/architecture.md, «4б»): строки IPv6 тех же файлов и подсети
+         * IPv6 тех же наборов .srs. Флаг timeout ему не нужен: адресов резолвер в него пока не
+         * кладёт (AAAA для имён под правилом подавлены до fake-IP v6), и элементы в нём —
+         * только постоянные. */
+        if (group_has_set6(g)) {
+            struct nft_set *s6 = ir_set_add(t, n6, "ipv6_addr");
+            if (!s6) return;
+            s6->flags = NFT_SET_INTERVAL;
+            s6->auto_merge = 1;
+            if (g->addrs6)
+                for (size_t k = 0; k < g->files_n; k++) ir_set_file(s6, g->files[k]);
+            if (g->srs_addrs6) set_add_srs(t, s6, g, 0, 6);
         }
     }
+}
+
+/* Назначение v6-двойника: сужение и поиск в парном наборе (или «весь трафик» — без поиска). */
+static void x_dest6(struct nft_rule *r, const struct group *g, int reverse) {
+    char n6[80];
+    group_set6_name(g, n6, sizeof(n6));
+    if (g->composite) {
+        if (group_has_set6(g))
+            ir_setref(r, reverse ? "ip6 saddr . meta l4proto . th sport"
+                                 : "ip6 daddr . meta l4proto . th dport", n6);
+        return;
+    }
+    x_l4(r, g->l4, reverse);
+    if (group_has_set6(g)) ir_setref(r, reverse ? "ip6 saddr" : "ip6 daddr", n6);
 }
 
 /* Назначение у правила группы: сужение и поиск в наборе, а у групп каналов с наборами sing-box
@@ -444,6 +588,8 @@ static void x_dest(struct nft_rule *r, const struct group *g, int reverse, int l
  *
  * mangle + 1: the mark must exist before the routing decision, and staying one
  * step after mangle leaves room for anything that legitimately wants to run first. */
+static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const struct group *g,
+                             const struct output *o);
 static int build_prerouting_mark(struct nft_table *t, const struct spec *sp,
                                  const struct groups *gr, struct err *e) {
     struct nft_chain *c = ir_base_chain_add(t, "prerouting_mark", "filter", "prerouting",
@@ -455,7 +601,32 @@ static int build_prerouting_mark(struct nft_table *t, const struct spec *sp,
         /* Каналы на сам телефон — на хуке output, см. nft_emit_output_mark. */
         if (group_is_local(g)) continue;
         /* ПРАВИЛО У ГРУППЫ ОДНО (в старой раскладке у доменной группы с префиксами их
-         * становится два — см. legacy.c, шаг 1). */
+         * становится два — см. legacy.c, шаг 1), и с 1.9 у него бывает v6-двойник ниже.
+         * Клиент из одних адресов IPv6 правила IPv4 не даёт вовсе. */
+        int carried = 0;
+        if (who4_ok(g)) {
+            carried = 1;
+            build_mark_rule4(c, sp, g, o);
+        }
+        if (group_needs6(sp, g)) {
+            struct nft_rule *r6 = ir_rule(c);
+            ir_rule_fam(r6, 6);
+            x_from6(r6, sp, g, 0, !group_has_set6(g));
+            x_dest6(r6, g, 0);
+            x_mark(r6, o, out_skips_zapret(o) ? (o->mark | ZAPRET_SKIP_MARK) : o->mark);
+            if (carried) ir_counter(r6, 0, 0);
+            else x_counter_carried(r6, g->name, 0);
+            ir_x(r6, "return");
+            ir_comment(r6, "steer:%s", g->name);
+        }
+    }
+    return 0;
+}
+
+/* Правило IPv4 группы в prerouting_mark — прежнее, до байта (снимок tests/golden/ruleset). */
+static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const struct group *g,
+                             const struct output *o) {
+    {
         struct nft_rule *r = ir_rule(c);
         x_from(r, sp, g);
         x_dest(r, g, 0, group_has_set(g));
@@ -497,7 +668,6 @@ static int build_prerouting_mark(struct nft_table *t, const struct spec *sp,
         ir_x(r, "return");
         ir_comment(r, "steer:%s", g->name);
     }
-    return 0;
 }
 
 /* ВЫХОД УПАЛ И ПУЩЕН НАПРЯМУЮ — бит «не для zapret» снимается. Правило разметки выше
@@ -559,14 +729,73 @@ static void build_postrouting_down(struct nft_table *t, const struct spec *sp,
         /* Скачанное каналом на сам телефон этой цепочкой не считается: получатель у него —
          * сокет телефона, и пакет идёт через input, а не через postrouting. */
         if (group_is_local(g)) continue;
+        int carried = 0;
+        if (who4_ok(g)) {
+            carried = 1;
+            struct nft_rule *r = ir_rule(c);
+            x_to(r, sp, g);
+            /* Зеркало сужения: без него счётчик скачанного считал бы и тот трафик, который
+             * правило разметки не берёт, — то есть врал бы ровно на ту величину, ради которой
+             * порты и заведены. Тот же довод, что у x_to рядом. */
+            x_dest(r, g, 1, g->files_n || g->srs_n || g->domains);
+            x_counter_carried(r, g->name, 1);
+            ir_comment(r, "steer-down:%s", g->name);
+        }
+        /* Скачанное по IPv6 — зеркало v6-двойника разметки, под тем же именем. */
+        if (group_needs6(sp, g)) {
+            struct nft_rule *r = ir_rule(c);
+            ir_rule_fam(r, 6);
+            x_from6(r, sp, g, 1, !group_has_set6(g));
+            x_dest6(r, g, 1);
+            if (carried) ir_counter(r, 0, 0);
+            else x_counter_carried(r, g->name, 1);
+            ir_comment(r, "steer-down:%s", g->name);
+        }
+    }
+}
+
+/* ---- IPv6 правила, ведущего в выход без IPv6: отказ, а не прямой путь ------------------------
+ *
+ * У выходов vless, xsteer и tgws (и у группы, где такой выход — член) маршрута IPv6 нет
+ * (KC_IPV6 не стоит): туннель не несёт IPv6 или это ещё не проверено. Пакет IPv6 правила,
+ * ведущего в такой выход, метится как обычно (двойником или правилом «весь трафик», которое ловит
+ * оба семейства), но правила маршрутизации IPv6 для метки нет — и без этой цепочки он ушёл бы по
+ * таблице main, то есть напрямую, мимо туннеля. Для правила, заведённого ради туннеля, это утечка;
+ * поэтому отказ — то же «лучше не работает заметно, чем работает не туда», что у on_fail=drop.
+ *
+ * ПОЧЕМУ В forward, А НЕ В prerouting_mark. reject в prerouting ядро не принимает (только input,
+ * forward, output), а drop там задел бы и трафик к самому роутеру: правило «весь трафик» ловит
+ * и DNS клиента к адресу IPv6 роутера, и соседские сообщения ICMPv6 — без них IPv6 в локальной
+ * сети кончился бы целиком. forward видит ровно то, что ушло бы наружу. reject, а не drop: клиент
+ * с двумя стеками получает отказ сразу и переходит на IPv4 (так выбирает адрес любой клиент),
+ * а не ждёт таймаута соединения. Цепочка — только в спеке, где такой трафик вообще бывает. */
+static void build_forward_v6(struct nft_table *t, const struct spec *sp, const struct groups *gr) {
+    uint32_t marks[MAX_OUTPUTS];
+    const char *names[MAX_OUTPUTS];
+    size_t n = 0;
+    for (size_t i = 0; i < gr->n; i++) {
+        const struct group *g = &gr->g[i];
+        if (group_is_local(g)) continue;
+        const struct output *o = out_by_name(sp, g->out);
+        if (!o || out_v6_ok(o)) continue;
+        if (!group_v4_agn(g) && !group_needs6(sp, g)) continue;
+        size_t k = 0;
+        while (k < n && marks[k] != o->mark) k++;
+        if (k == n && n < MAX_OUTPUTS) {
+            marks[n] = o->mark;
+            names[n] = o->name;
+            n++;
+        }
+    }
+    if (!n) return;
+    struct nft_chain *c = ir_base_chain_add(t, "forward_v6", "filter", "forward", "mangle", 0);
+    for (size_t k = 0; k < n; k++) {
         struct nft_rule *r = ir_rule(c);
-        x_to(r, sp, g);
-        /* Зеркало сужения: без него счётчик скачанного считал бы и тот трафик, который
-         * правило разметки не берёт, — то есть врал бы ровно на ту величину, ради которой
-         * порты и заведены. Тот же довод, что у x_to рядом. */
-        x_dest(r, g, 1, g->files_n || g->srs_n || g->domains);
-        x_counter_carried(r, g->name, 1);
-        ir_comment(r, "steer-down:%s", g->name);
+        ir_family(r, 6);
+        ir_x(r, "meta mark and 0x%08x == 0x%08x", STEER_MARK_MASK, marks[k]);
+        ir_counter(r, 0, 0);
+        ir_x(r, "reject with icmpx type admin-prohibited");
+        ir_comment(r, "steer-v6drop:%s", names[k]);
     }
 }
 
@@ -633,15 +862,21 @@ static void build_dns_redirect(struct nft_table *t, const struct spec *sp) {
     struct nft_chain *c = ir_base_chain_add(t, "prerouting_dns", "nat", "prerouting",
                                             "dstnat", 0);
     static const char *const protos[2] = { "udp", "tcp" };
+    /* Подсети IPv6 в from_default (с 1.9 это законно): тогда и IPv6 забирается по адресу, а не по
+     * устройству — ровно как IPv4. Без них — прежние две формы, до байта. */
+    int lan6 = 0;
+    for (size_t i = 0; i < sp->lan.from_n; i++) if (strchr(sp->lan.from[i], ':')) lan6 = 1;
     for (int k = 0; k < 2; k++) {
         for (size_t i = 0; i < sp->lan.from_n; i++) {
+            int v6 = strchr(sp->lan.from[i], ':') != NULL;
             struct nft_rule *r = ir_rule(c);
-            ir_rule_fam(r, 4);
-            ir_x(r, "ip saddr %s", sp->lan.from[i]);
+            ir_rule_fam(r, v6 ? 6 : 4);
+            ir_x(r, "%s saddr %s", v6 ? "ip6" : "ip", sp->lan.from[i]);
             ir_x(r, "%s dport 53", protos[k]);
             ir_counter(r, 0, 0);
             ir_x(r, "redirect to :%d", DNS_PORT);
         }
+        if (lan6) continue;
         struct nft_rule *r = ir_rule(c);
         if (sp->lan.from_n) ir_family(r, 6);
         x_ifs(r, sp, 0);
@@ -833,10 +1068,10 @@ static int local_who(struct nft_rule *r, const struct group *g, struct err *e) {
  * искать маршрут заново. В старой раскладке route в inet нет — там её переделывает legacy.c
  * (шаг 2: filter и бит перемаршрутизации).
  *
- * IPv6. Наборы каналов — IPv4, и правило с набором IPv6 не касается. Но у группы «весь
- * трафик» набора нет, и её IPv6 ушёл бы мимо туннеля: маршруты выхода движок ставит только
- * для IPv4. Поэтому такой группе IPv6 отвечается отказом — приложения переходят на IPv4 (так
- * устроен выбор адреса у любого клиента с двумя стеками), и ничего не утекает напрямую. */
+ * IPv6 (docs/architecture.md, «4б»). У группы — v6-двойник: с набором IPv6 «<имя>6» или, у «весь
+ * трафик», интернет IPv6 мимо своей сети. Выход с IPv6 ведёт его своей таблицей IPv6. Выходу без
+ * IPv6 двойник отвечает отказом — приложения переходят на IPv4 (так устроен выбор адреса у
+ * любого клиента с двумя стеками), и ничего не утекает напрямую. */
 int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
                          struct err *e) {
     struct nft_table *t = inet_table(rs);
@@ -847,7 +1082,7 @@ int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp, const struct 
         if (!group_is_local(g)) continue;
         struct output *o = out_by_name(sp, g->out);
         if (!o) return err_set(e, "channel group %s points at a missing output", g->name);
-        if (g->all && out_needs_mark(o)) {
+        if (g->all && out_needs_mark(o) && !out_v6_ok(o)) {
             /* С тем же сужением по протоколу и портам, что и канал: канал «UDP 50000-65535»
              * не вправе отнимать у приложения весь IPv6. Своя сеть (петля, link-local, ULA,
              * мультикаст) — не наружу и не мимо туннеля, её не трогаем. */
@@ -864,15 +1099,44 @@ int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp, const struct 
         struct nft_rule *r = ir_rule(c);
         if (local_who(r, g, e) != 0) return -1;
         /* «Весь трафик» — это интернет, а не своя сеть: принтер, NAS и Chromecast в Wi-Fi
-         * через туннель не видны. Только IPv4 — IPv6 такой группы отвергнут правилом выше. */
+         * через туннель не видны. Только IPv4 — IPv6 такой группы отвергнут правилом выше
+         * (выход без IPv6) или уведён двойником ниже. */
         if (g->all) {
             ir_family(r, 4);
             ir_x(r, "ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, "
                     "192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 }");
+        } else {
+            ir_rule_fam(r, 4);          /* поиск в наборе IPv4 — только IPv4 */
         }
         x_dest(r, g, 0, group_has_set(g));
         x_mark(r, o, o->mark);
         x_counter_carried(r, g->name, 0);
+        ir_x(r, "return");
+        ir_comment(r, "steer:%s", g->name);
+        /* v6-двойник (docs/architecture.md, «4б»). «Весь трафик» в выход с IPv6 (или direct) —
+         * интернет IPv6 мимо своей сети, как у IPv4 выше; с набором IPv6 — поиск в нём. Выход без
+         * IPv6: у «весь трафик» отказ стоит выше, у набора — отказ здесь же, тем же текстом. */
+        int all6 = g->all && out_v6_ok(o);
+        if (!all6 && !group_has_set6(g)) continue;
+        r = ir_rule(c);
+        if (local_who(r, g, e) != 0) return -1;
+        if (all6) {
+            ir_family(r, 6);
+            x_l4(r, g->l4, 0);
+            ir_x(r, "oifname != \"lo\"");
+            ir_x(r, "ip6 daddr != { ::1, fe80::/10, fc00::/7, ff00::/8 }");
+        } else {
+            ir_rule_fam(r, 6);
+            x_dest6(r, g, 0);
+        }
+        if (!out_v6_ok(o)) {
+            ir_counter(r, 0, 0);
+            ir_x(r, "reject");
+            ir_comment(r, "steer-v6:%s", g->name);
+            continue;
+        }
+        x_mark(r, o, o->mark);
+        ir_counter(r, 0, 0);
         ir_x(r, "return");
         ir_comment(r, "steer:%s", g->name);
     }
@@ -898,8 +1162,43 @@ int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp, const struct 
         x_dest(r, g, 1, group_has_set(g));
         x_counter_carried(r, g->name, 1);
         ir_comment(r, "steer-down:%s", g->name);
+        /* Скачанное по IPv6 из парного набора — тем же именем (у «весь трафик» набора нет, и
+         * правило выше и так считает оба семейства). */
+        if (!group_has_set6(g) || !out_v6_ok(o)) continue;
+        r = ir_rule(c);
+        ir_rule_fam(r, 6);
+        ir_x(r, "ct direction reply");
+        ir_x(r, "ct mark and 0x%08x == 0x%08x", STEER_MARK_MASK, o->mark);
+        x_dest6(r, g, 1);
+        ir_counter(r, 0, 0);
+        ir_comment(r, "steer-down:%s", g->name);
     }
     return 0;
+}
+
+void v6_notes(const struct spec *sp, const struct groups *gr, v6_note_fn fn, void *ctx) {
+    char what[160], why[200];
+    /* Выход без IPv6, в который ведёт хоть одно включённое правило. */
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct output *o = &sp->out[i];
+        if (out_v6_ok(o)) continue;
+        int used = 0;
+        for (size_t k = 0; k < gr->n && !used; k++) used = !strcmp(gr->g[k].out, o->name);
+        if (!used) continue;
+        snprintf(what, sizeof(what), "выход %.40s: IPv6 не поддерживается", o->name);
+        snprintf(why, sizeof(why), "IPv6 правил этого выхода отбрасывается, а не идёт напрямую; "
+                 "сайты откроются по IPv4");
+        fn(ctx, "ipv6_output", "note", what, why);
+    }
+    /* Свой клиент правила из одних адресов IPv4: его IPv6 правилом не узнаётся. */
+    for (size_t k = 0; k < gr->n; k++) {
+        const struct group *g = &gr->g[k];
+        if (group_is_local(g) || who6_ok(sp, g)) continue;
+        snprintf(what, sizeof(what), "канал %.48s: IPv6 клиентов не маршрутизируется",
+                 g->members_n ? g->members[0] : g->name);
+        snprintf(why, sizeof(why), "клиенты заданы адресами IPv4 — добавьте их адрес IPv6 или MAC");
+        fn(ctx, "ipv6_clients", "warn", what, why);
+    }
 }
 
 /* Дерево набора правил современной раскладки. Порядок объектов — порядок печати, и он
@@ -913,6 +1212,7 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
         return -1;
     build_failopen(t, sp);
     build_postrouting_down(t, sp, gr);
+    build_forward_v6(t, sp, gr);
     /* Построители видов (kind_ops.emit): по видам, в порядке реестра, поэтому все цепочки
      * zapret в тексте стоят раньше цепочки моста, в каком бы порядке выходы ни шли в спеке
      * (kind.c: kind_emit_all). */

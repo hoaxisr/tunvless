@@ -75,6 +75,8 @@ static const char *PROBE_TARGETS[] = { "1.1.1.1", "8.8.8.8", NULL };
 /* Чтение правил и таблицы — определено ниже, у сверки состояния; нужно и привязке таблицы. */
 static void rules_show(char *out, size_t n);
 static void routes_show(int table, char *out, size_t n);
+static void rules6_show(char *out, size_t n);
+static void routes6_show(int table, char *out, size_t n);
 
 /* Адрес источника устройства: без него правило пробы не к чему привязать, а само
  * отсутствие адреса уже означает, что устройство не готово нести трафик. */
@@ -320,23 +322,48 @@ int (*g_health_probe)(const struct spec *, const struct output *, const char *);
  * правил, отказ выхода, привязка устройства), и добавление маски строками означало бы
  * четыре шанса забыть её в одном месте. Почему маска вообще — в spec.h у STEER_MARK_MASK.
  */
-void rule_add(unsigned mark, int table) {
-    char m[32], t[16];
-    snprintf(m, sizeof(m), "0x%08x/0x%08x", mark, STEER_MARK_MASK);
+/* Команда `ip [-6] rule …` правила выхода. fam 4 — прежняя команда без ключа семейства, до
+ * последнего слова (стенд failovermatch сверяет её строкой); fam 6 — `ip -6 rule` (маршрутизация
+ * IPv6, docs/architecture.md, «4б»): та же метка, тот же номер таблицы — у IPv6 свой набор таблиц,
+ * и номер не пересекается с таблицами IPv4 ничем, кроме числа. */
+static int rule_cmd(int fam, const char *verb, unsigned mark, const char *mask, int table,
+                    const char *pref) {
+    char m[40], t[16];
+    snprintf(m, sizeof(m), "0x%08x/%s", mark, mask);
     snprintf(t, sizeof(t), "%d", table);
+    const char *argv[12];
+    int k = 0;
+    argv[k++] = "ip";
+    if (fam == 6) argv[k++] = "-6";
+    argv[k++] = "rule";
+    argv[k++] = verb;
+    argv[k++] = "fwmark";
+    argv[k++] = m;
+    argv[k++] = "table";
+    argv[k++] = t;
+    if (pref) { argv[k++] = "priority"; argv[k++] = pref; }
+    argv[k] = NULL;
+    return run_quiet(argv);
+}
+
+static void rule_add_fam(int fam, unsigned mark, int table) {
+    char mk[16];
+    snprintf(mk, sizeof(mk), "0x%08x", STEER_MARK_MASK);
     /* Приоритет — только если сборка его задаёт (STEER_RULE_PREF, spec.h): на роутере его нет,
      * и команда остаётся прежней до последнего слова. rule_drop приоритета не называет и
-     * снимает правило при любом. */
+     * снимает правило при любом. На телефоне приоритет тот же у обоих семейств: netd раскладывает
+     * свои правила IPv4 и IPv6 по одним и тем же приоритетам. */
     if (STEER_RULE_PREF) {
         char pr[16];
         snprintf(pr, sizeof(pr), "%d", STEER_RULE_PREF);
-        const char *addp[] = { "ip", "rule", "add", "fwmark", m, "table", t,
-                               "priority", pr, NULL };
-        run_quiet(addp);
+        rule_cmd(fam, "add", mark, mk, table, pr);
         return;
     }
-    const char *add[] = { "ip", "rule", "add", "fwmark", m, "table", t, NULL };
-    run_quiet(add);
+    rule_cmd(fam, "add", mark, mk, table, NULL);
+}
+
+void rule_add(unsigned mark, int table) {
+    rule_add_fam(4, mark, table);
 }
 
 /* Снять установленные соединения ЭТОГО выхода.
@@ -404,6 +431,23 @@ void rule_drop(unsigned mark, int table) {
      * убрать; пока роутеры обновляются, она и есть весь механизм перехода. */
     const char *dell[] = { "ip", "rule", "del", "fwmark", legacy, "table", t, NULL };
     while (run_quiet(dell) == 0) ;
+}
+
+/* Правило IPv6 выхода — снять все копии. Прежней формы без маски у IPv6 не бывало: правила IPv6
+ * движок ставит только с 1.9, сразу с маской. */
+void rule_drop6(unsigned mark, int table) {
+    char mk[16];
+    snprintf(mk, sizeof(mk), "0x%08x", STEER_MARK_MASK);
+    for (int i = 0; i < 64 && rule_cmd(6, "del", mark, mk, table, NULL) == 0; i++) ;
+}
+
+/* `ip -6 route flush table N`: таблица IPv6 выхода пуста — трафик IPv6 выхода, если правило
+ * стоит, уходит дальше по таблицам, то есть напрямую (обещанное on_fail=direct). */
+void route6_flush(int table) {
+    char t[16];
+    snprintf(t, sizeof(t), "%d", table);
+    const char *flush[] = { "ip", "-6", "route", "flush", "table", t, NULL };
+    run_quiet(flush);
 }
 
 /* ---- таблица и правило выхода БЕЗ МГНОВЕНИЯ ПУСТОТЫ -----------------------------------
@@ -487,28 +531,29 @@ struct rule_copies rule_copies_of(const char *rules, uint32_t mark, int table) {
 
 /* Снять одну копию правила на данном приоритете. С приоритетом, а не «любую»: без него ядро
  * сняло бы первую попавшуюся, и это могла бы оказаться как раз та, что должна остаться. */
-static void rule_del_at(unsigned mark, int table, unsigned long pref) {
-    char m[32], t[16], p[24];
-    snprintf(m, sizeof(m), "0x%08x/0x%08x", mark, STEER_MARK_MASK);
-    snprintf(t, sizeof(t), "%d", table);
+static void rule_del_at(int fam, unsigned mark, int table, unsigned long pref) {
+    char mk[16], p[24];
+    snprintf(mk, sizeof(mk), "0x%08x", STEER_MARK_MASK);
     snprintf(p, sizeof(p), "%lu", pref);
-    const char *del[] = { "ip", "rule", "del", "fwmark", m, "table", t, "priority", p, NULL };
-    run_quiet(del);
+    rule_cmd(fam, "del", mark, mk, table, p);
 }
 
-void rule_ensure(unsigned mark, int table) {
+/* Правило одного семейства — ровно одной копией (см. rule_ensure ниже). */
+static void rule_ensure_fam(int fam, unsigned mark, int table) {
     /* Статический и с запасом — по той же причине, что в route_facts_read: это ВСЕ правила
      * коробки, и обрезанный дамп значил бы «нашего нет» и лишнюю копию. */
     static char rules[16384];
-    rules_show(rules, sizeof(rules));
+    if (fam == 6) rules6_show(rules, sizeof(rules));
+    else rules_show(rules, sizeof(rules));
     struct rule_copies c = rule_copies_of(rules, mark, table);
     /* Прочитать не вышло (нет ip, отказал popen) — добавляем, ничего не снимая: лишняя копия
      * того же правила ничего не меняет в маршрутизации, а снятие вслепую могло бы оставить
      * метку без правила — то есть ту самую утечку, ради которой всё это. */
-    if (!c.known || c.n == 0) rule_add(mark, table);
+    if (!c.known || c.n == 0) rule_add_fam(fam, mark, table);
     /* Верная копия есть (или только что добавлена) — теперь можно убирать лишнее. */
-    for (int k = 1; k < c.n && k < RULE_COPIES_MAX; k++) rule_del_at(mark, table, c.pref[k]);
-    for (int k = 0; k < c.wrong_n; k++) rule_del_at(mark, table, c.wrong[k]);
+    for (int k = 1; k < c.n && k < RULE_COPIES_MAX; k++) rule_del_at(fam, mark, table, c.pref[k]);
+    for (int k = 0; k < c.wrong_n; k++) rule_del_at(fam, mark, table, c.wrong[k]);
+    if (fam == 6) return;           /* прежней формы без маски у IPv6 не бывало */
     /* Прежняя форма без маски — см. rule_drop. Снимается после того, как форма с маской есть, и
      * ТОЛЬКО с явной маской 0xffffffff (так её хранит ядро) и приоритетом. `ip rule del fwmark X
      * table T` без маски на ядре 4.9 (телефон) снимает ЛЮБОЕ правило с меткой X — и с нашей
@@ -525,6 +570,14 @@ void rule_ensure(unsigned mark, int table) {
                                "priority", p, NULL };
         run_quiet(dell);
     }
+}
+
+void rule_ensure(unsigned mark, int table) {
+    rule_ensure_fam(4, mark, table);
+}
+
+void rule_ensure6(unsigned mark, int table) {
+    rule_ensure_fam(6, mark, table);
 }
 
 /* Одна строка `ip -4 route show table N`, разобранная на то, чем её можно снять точно: тип
@@ -570,11 +623,17 @@ static int rt_line_parse(const char *line, struct rt_line *r) {
  * (backstop; см. STEER_BACKSTOP_METRIC в spec.h). Снимается каждая запись по её ключу (тип,
  * назначение, устройство, метрика): «сбросить таблицу и поставить заново» здесь и есть то
  * окно, от которого эта функция избавляет. */
-static void table_prune(int table, const char *dev, int backstop) {
+/* Метрика маршрута, поставленного без неё: у IPv4 — 0, у IPv6 ядро подставляет 1024
+ * (IP6_RT_PRIO_USER) — нулевой метрики там не бывает. */
+#define RT6_METRIC_DEFAULT 1024
+
+static void table_prune_fam(int fam, int table, const char *dev, int backstop) {
     static char routes[8192];
     char t[16];
     snprintf(t, sizeof(t), "%d", table);
-    routes_show(table, routes, sizeof(routes));
+    if (fam == 6) routes6_show(table, routes, sizeof(routes));
+    else routes_show(table, routes, sizeof(routes));
+    unsigned long main_metric = fam == 6 ? RT6_METRIC_DEFAULT : 0;
     int kept = 0;
     for (const char *ln = routes; ln && *ln; ) {
         const char *end = strchr(ln, '\n');
@@ -587,7 +646,7 @@ static void table_prune(int table, const char *dev, int backstop) {
 
         struct rt_line r;
         if (!rt_line_parse(line, &r)) continue;
-        int is_main = !strcmp(r.dst, "default") && r.metric == 0 &&
+        int is_main = !strcmp(r.dst, "default") && r.metric == main_metric &&
                       (dev ? (!r.type[0] || !strcmp(r.type, "unicast")) && !strcmp(r.dev, dev)
                            : !strcmp(r.type, "blackhole"));
         if (is_main && !kept) { kept = 1; continue; }
@@ -598,7 +657,9 @@ static void table_prune(int table, const char *dev, int backstop) {
         snprintf(m, sizeof(m), "%lu", r.metric);
         const char *argv[16];
         int k = 0;
-        argv[k++] = "ip"; argv[k++] = "route"; argv[k++] = "del";
+        argv[k++] = "ip";
+        if (fam == 6) argv[k++] = "-6";
+        argv[k++] = "route"; argv[k++] = "del";
         if (r.type[0]) argv[k++] = r.type;
         argv[k++] = r.dst;
         if (r.dev[0]) { argv[k++] = "dev"; argv[k++] = r.dev; }
@@ -611,13 +672,20 @@ static void table_prune(int table, const char *dev, int backstop) {
 
 /* Поставить запасной запрет (см. STEER_BACKSTOP_METRIC в spec.h). Заменой: стоящий такой же
  * она не дублирует. */
-static void backstop_set(int table) {
+static void backstop_set_fam(int fam, int table) {
     char t[16], m[16];
     snprintf(t, sizeof(t), "%d", table);
     snprintf(m, sizeof(m), "%d", STEER_BACKSTOP_METRIC);
     const char *bs[] = { "ip", "route", "replace", "blackhole", "default", "metric", m,
                          "table", t, NULL };
-    run_quiet(bs);
+    const char *bs6[] = { "ip", "-6", "route", "replace", "blackhole", "default", "metric", m,
+                          "table", t, NULL };
+    run_quiet(fam == 6 ? bs6 : bs);
+}
+
+static void backstop_set(int table) { backstop_set_fam(4, table); }
+static void table_prune(int table, const char *dev, int backstop) {
+    table_prune_fam(4, table, dev, backstop);
 }
 
 int table_bind(const struct output *o, const char *dev) {
@@ -635,6 +703,46 @@ int table_bind(const struct output *o, const char *dev) {
      * пустая таблица у direct/zapret — обещанное «напрямую», а не утечка. */
     table_prune(o->table, dev, backstop);
     return 0;
+}
+
+/* ---- маршрутизация IPv6 выхода (docs/architecture.md, «4б») -------------------------------
+ *
+ * Выход с устройством и свойством KC_IPV6 (out_route6: interface, awg, группа из таких) получает
+ * вторую половину привязки: `ip -6 rule fwmark <метка> table <таблица>` и в таблице IPv6 с тем же
+ * номером — маршрут по умолчанию в устройство. Те же приёмы, что у IPv4 (замена без мгновения
+ * пустоты, правило ровно одной копией), с одним отличием: запасной запрет в таблице IPv6 лежит
+ * ВСЕГДА, а не только при on_fail=drop. У IPv4 пустая таблица при on_fail=direct — обещанное
+ * «напрямую», но IPv6 бывает пуст и у ЖИВОГО выхода: маршрут в устройство не встаёт, если у
+ * устройства выключен IPv6, или пропадает, когда IPv6 на нём выключили. Пустая таблица тогда
+ * уводила бы IPv6 правила напрямую при работающем туннеле — утечка, которой у IPv4 нет. Запасной
+ * запрет её закрывает: IPv6 такого выхода стоит, пока маршрута нет. При отказе с on_fail=direct
+ * правило IPv6 снимается целиком (как у IPv4), и запрет там ничего не держит. */
+static int table_bind6(const struct output *o, const char *dev) {
+    char t[16];
+    snprintf(t, sizeof(t), "%d", o->table);
+    backstop_set_fam(6, o->table);
+    const char *to_dev[] = { "ip", "-6", "route", "replace", "default", "dev", dev, "table", t,
+                             NULL };
+    const char *to_bh[] = { "ip", "-6", "route", "replace", "blackhole", "default", "table", t,
+                            NULL };
+    int rc = run_quiet(dev ? to_dev : to_bh);
+    if (rc != 0 && dev) {
+        /* Устройство IPv6 не несёт (выключен на нём IPv6) или исчезло. Прежний маршрут в
+         * другое устройство оставлять нельзя — IPv6 ушёл бы не туда; запрет на его место. */
+        if (run_quiet(to_bh) == 0) table_prune_fam(6, o->table, NULL, 1);
+        return rc;
+    }
+    if (rc != 0) return rc;
+    table_prune_fam(6, o->table, dev, 1);
+    return 0;
+}
+
+int route6_bind(const struct output *o, const char *dev) {
+    if (!out_route6(o)) return 0;
+    /* Маршрут первым, правило вторым — как у IPv4 (bind_device). */
+    int rc = table_bind6(o, dev);
+    rule_ensure6(o->mark, o->table);
+    return rc;
 }
 
 /* Пущен ли выход напрямую — отметка в наборе FAILOPEN_SET нашей таблицы. Зачем она и почему
@@ -680,6 +788,8 @@ static void apply_failed(struct output *o, int announce) {
          * перезапуская ничего. Стоящее правило не снимается (rule_ensure): снять и поставить
          * заново значило бы на миг открыть тот же путь напрямую. */
         rule_ensure(o->mark, o->table);
+        /* IPv6 выхода — тот же запрет в его таблице IPv6. */
+        route6_bind(o, NULL);
         /* Режим мог смениться с direct/zapret на drop, пока выход лежал: отметка «пущен
          * напрямую» от прежнего отказа здесь больше не правда. */
         failopen_mark(o, 0);
@@ -701,6 +811,11 @@ static void apply_failed(struct output *o, int announce) {
     rule_drop(o->mark, o->table);
     const char *flush[] = { "ip", "route", "flush", "table", tbl, NULL };
     run_quiet(flush);
+    /* IPv6 — так же: правило снято, таблица пуста, IPv6 выхода идёт напрямую, как и IPv4. */
+    if (out_route6(o)) {
+        rule_drop6(o->mark, o->table);
+        route6_flush(o->table);
+    }
     failopen_mark(o, 1);
     conntrack_evict(o->mark);
 
@@ -737,6 +852,11 @@ void bind_device(struct output *o, const char *dev) {
     failopen_mark(o, 0);
     int rc = table_bind(o, dev);
     rule_ensure(o->mark, o->table);
+    /* Половина IPv6 (выход с KC_IPV6). Не встала при живом IPv4 — у устройства выключен IPv6:
+     * в таблице IPv6 запрет, IPv6 правил выхода стоит, а не уходит напрямую. */
+    if (rc == 0 && route6_bind(o, dev) != 0)
+        fprintf(stderr, LOG_W "выход %s: маршрут IPv6 в %s не встал (IPv6 на устройстве "
+                        "выключен?) — IPv6 правил выхода остановлен\n", o->name, dev);
     /* Соединения снимаются ЗДЕСЬ, а не в сторожевом проходе целиком: bind_device зовут,
      * когда маршрут выхода действительно меняется (первая привязка, смена устройства,
      * расхождение состояния), а не каждую минуту. Снимать записи на здоровом тике значило бы
@@ -753,6 +873,7 @@ void bind_device(struct output *o, const char *dev) {
                         "устройство ещё живо?\n", o->name, tbl, dev);
         if (o->on_fail == FAIL_DROP) {
             table_bind(o, NULL);
+            route6_bind(o, NULL);
             fprintf(stderr, LOG_W "выход %s: трафик остановлен до успешной привязки "
                             "(on_fail=drop)\n", o->name);
         } else {
@@ -761,6 +882,7 @@ void bind_device(struct output *o, const char *dev) {
              * таблице могло остаться прежнее (мёртвое) устройство. */
             const char *flush[] = { "ip", "route", "flush", "table", tbl, NULL };
             run_quiet(flush);
+            if (out_route6(o)) route6_flush(o->table);
             failopen_mark(o, 1);
         }
     }
@@ -1007,6 +1129,50 @@ static void routes_show(int table, char *out, size_t n) {
     out[0] = '\0';
     if (g_ip_show) { g_ip_show(table, out, n); return; }
     rtnl_routes_text(table, out, n);
+}
+
+/* IPv6 — тем же приёмом. Стенд с g_ip_show без g_ip6_show получает пустой текст («не прочитать»). */
+int (*g_ip6_show)(int table, char *out, size_t n);
+
+static void rules6_show(char *out, size_t n) {
+    out[0] = '\0';
+    if (g_ip6_show) { g_ip6_show(-1, out, n); return; }
+    if (g_ip_show) return;
+    rtnl_rules_text6(out, n);
+}
+
+static void routes6_show(int table, char *out, size_t n) {
+    out[0] = '\0';
+    if (g_ip6_show) { g_ip6_show(table, out, n); return; }
+    if (g_ip_show) return;
+    rtnl_routes_text6(table, out, n);
+}
+
+/* Включён ли IPv6 на устройстве: /proc/sys/net/ipv6/conf/<dev>/disable_ipv6. Файла нет — IPv6 в
+ * ядре нет вовсе или устройства нет: «выключен». Чтение файла, а не процесс: зовёт сверка. */
+static int dev_v6_enabled(const char *dev) {
+    char path[128];
+    snprintf(path, sizeof(path), "/proc/sys/net/ipv6/conf/%s/disable_ipv6", dev);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int c = fgetc(f);
+    fclose(f);
+    return c == '0';
+}
+
+int routing6_live_ok(const struct route_facts *f, const char *dev, int dev_v6) {
+    if (!f->rule) return 0;
+    if (f->table == TBL_DEV && !strcmp(f->dev, dev)) return 1;
+    /* IPv6 на устройстве выключен — маршрута в него быть не может, и запрет (основной или
+     * запасной) — верное состояние: IPv6 выхода стоит, а не уходит напрямую. */
+    return !dev_v6 && (f->table == TBL_BLACKHOLE || (f->table == TBL_EMPTY && f->backstop));
+}
+
+static struct route_facts route6_facts_read(const struct output *o) {
+    static char rules[16384], routes[8192];
+    rules6_show(rules, sizeof(rules));
+    routes6_show(o->table, routes, sizeof(routes));
+    return route_facts_of(rules, routes, o->mark, o->table);
 }
 
 static struct route_facts route_facts_read(const struct output *o) {
@@ -1828,6 +1994,21 @@ static void out_finish(struct fo_run *r) {
                  * кто-то снаружи, или таблицу ставил движок до этой версии). Возвращается
                  * одной командой, без перепривязки: соединения рвать не из-за чего. */
                 if (o->on_fail == FAIL_DROP && !f.backstop) backstop_set(o->table);
+                /* Половина IPv6 — тоже по факту. Чинится одна она (route6_bind), без
+                 * перепривязки IPv4 и без снятия соединений: у IPv4 всё цело. Не прочиталось
+                 * (ядро без IPv6) — не трогаем, как и у IPv4. */
+                if (out_route6(o)) {
+                    struct route_facts f6 = route6_facts_read(o);
+                    if (f6.known && !routing6_live_ok(&f6, chosen, dev_v6_enabled(chosen))) {
+                        fprintf(stderr, LOG_W "выход %s: маршрутизация IPv6 разъехалась (%s) — "
+                                        "возвращаю маршрут\n",
+                                o->name, facts_why(&f6, chosen));
+                        route6_bind(o, chosen);
+                        r->changed = 1;
+                    } else if (f6.known && !f6.backstop) {
+                        backstop_set_fam(6, o->table);
+                    }
+                }
                 if (r->verbose) fprintf(stderr, LOG_I "%s: %s работает\n", o->name, chosen);
             }
         }
@@ -1860,6 +2041,17 @@ static void out_finish(struct fo_run *r) {
                         o->name, failed_why(&f, o->on_fail), on_fail_name(o->on_fail));
                 apply_failed(o, 0);
                 r->changed = 1;
+            } else if (out_route6(o)) {
+                /* IPv4 в порядке — сверить IPv6 тем же правилом отказа. */
+                struct route_facts f6 = route6_facts_read(o);
+                if (f6.known && !routing_failed_ok(&f6, o->on_fail)) {
+                    fprintf(stderr, LOG_W "выход %s: живых устройств по-прежнему нет, а "
+                                    "маршрутизация IPv6 разъехалась (%s) — возвращаю "
+                                    "on_fail=%s\n",
+                            o->name, failed_why(&f6, o->on_fail), on_fail_name(o->on_fail));
+                    apply_failed(o, 0);
+                    r->changed = 1;
+                }
             }
         }
     }

@@ -1232,7 +1232,9 @@ int spec_parse_v1(const char *text, struct spec *s, struct err *e) {
 
         if (cf->from_n > 1 && !local) {
             int macs = 0;
-            for (size_t k = 0; k < cf->from_n; k++) if (strchr(cf->from[k], ':')) macs++;
+            /* MAC — по форме MAC, а не по двоеточию: с 1.9 в «кому» бывают адреса IPv6, и
+             * смесь IPv4 с IPv6 законна (правило на каждое семейство своё). */
+            for (size_t k = 0; k < cf->from_n; k++) if (spec_is_mac(cf->from[k])) macs++;
             if (macs && macs != (int)cf->from_n)
                 return err_set(e, "канал %s: в «кому» смешаны адреса и MAC-адреса. nft не умеет «или» внутри "
                     "правила — разделите на два канала", c->name);

@@ -38,6 +38,12 @@ int rtnl_rules_text(char *out, size_t n);
  * пустая таблица), -1 — нет. */
 int rtnl_routes_text(int table, char *out, size_t n);
 
+/* То же для IPv6 — `ip -6 rule show` и `ip -6 route show table N` (маршрутизация IPv6 выходов,
+ * docs/architecture.md, «4б»). Запрет (blackhole, unreachable, prohibit) печатается без `dev lo`,
+ * который ядро приписывает ему в IPv6. Ядро без IPv6 — -1, «состояние не прочитать». */
+int rtnl_rules_text6(char *out, size_t n);
+int rtnl_routes_text6(int table, char *out, size_t n);
+
 /* Правило `from SRC lookup TABLE priority PRIO`: add — поставить, иначе снять. 0 или errno. */
 int rtnl_rule_from(int add, struct in_addr src, int table, int prio);
 

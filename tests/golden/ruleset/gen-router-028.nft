@@ -11,12 +11,14 @@ table inet steer {
         type filter hook prerouting priority mangle + 1; policy accept;
         ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:vpn_ip"
         ip saddr { 192.168.1.0/24 } meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:vpn_all"
+        iifname "br-lan" meta nfproto ipv6 meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:vpn_all"
     }
 
     chain postrouting_down {
         type filter hook postrouting priority srcnat + 10; policy accept;
         ip daddr { 192.168.1.0/24 } ip saddr @vpn_ip counter comment "steer-down:vpn_ip"
         ip daddr { 192.168.1.0/24 } counter comment "steer-down:vpn_all"
+        oifname "br-lan" meta nfproto ipv6 counter comment "steer-down:vpn_all"
     }
     chain prerouting_dns {
         type nat hook prerouting priority dstnat; policy accept;

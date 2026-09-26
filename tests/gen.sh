@@ -618,7 +618,11 @@ cat > "$tmp/anymix.json" <<EOF
 EOF
 amout="$("$BIN" apply --dry-run --spec "$tmp/anymix.json" --state-dir "$tmp/state-am" 2>&1)"
 check "any рядом со списком остаётся отдельным правилом" "1" \
-    "$(printf '%s\n' "$amout" | grep -c 'comment \"steer:vpn_all\"')"
+    "$(printf '%s\n' "$amout" | grep 'comment \"steer:vpn_all\"' | grep -c 'ip saddr')"
+# С 1.9 у него v6-двойник под тем же именем: клиенты по умолчанию — подсеть IPv4, и IPv6 их
+# забирается по устройству (docs/architecture.md, «4б»).
+check "  и его двойник IPv6 — по устройству" "1" \
+    "$(printf '%s\n' "$amout" | grep 'comment \"steer:vpn_all\"' | grep -c 'iifname "br-lan" meta nfproto ipv6')"
 check "и это правило безусловное — набор оно не проверяет" "0" \
     "$(printf '%s\n' "$amout" | grep 'steer:vpn_all' | grep -c 'daddr @')"
 

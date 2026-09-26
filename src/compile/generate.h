@@ -23,6 +23,15 @@ int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp, const struct 
                          struct err *e);
 void nft_emit_output_dns(struct nft_rs *rs, const struct spec *sp, const struct groups *gr);
 
+/* Замечания про IPv6 правил (docs/architecture.md, «4б») — для diag: выход без IPv6, в который
+ * ведут правила (их IPv6 отвергается, а не уходит напрямую), и правило, чьих клиентов по IPv6 не
+ * узнать (свой клиент из одних адресов IPv4). fn зовётся на каждое: id, приговор diag (note —
+ * совет: выход без IPv6 работает, клиент уходит на IPv4; warn — находка: IPv6 клиентов уходит мимо
+ * правила), что, что с этим делать. */
+typedef void (*v6_note_fn)(void *ctx, const char *id, const char *verdict, const char *what,
+                           const char *why);
+void v6_notes(const struct spec *sp, const struct groups *gr, v6_note_fn fn, void *ctx);
+
 void counters_load(void);
 int counter_find(const char *name, int down, unsigned long *p, unsigned long *b);
 void l4_describe(const struct l4match *m, char *dst, size_t n);

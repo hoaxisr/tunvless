@@ -34,7 +34,9 @@
  *
  * ЧТО СНИМАЕТСЯ С ПРЕДУПРЕЖДЕНИЕМ (набор от этого только уже): клауза про приложение у канала
  * для клиентов раздачи (у их пакетов нет приложения) или для приложения, которого на телефоне
- * нет; клауза про клиента у канала на сам телефон; подсети IPv6 (1.9). Непрочитанный или
+ * нет; клауза про клиента у канала на сам телефон; подсети IPv6 клауз с условиями (клиент,
+ * приложение, исключения — их выражение есть только для IPv4). Прочие подсети IPv6 с 1.9 идут в
+ * парный набор группы (docs/architecture.md, «4б»). Непрочитанный или
  * испорченный файл — как непрочитанный адресный список: его элементы не попадут никуда, про
  * это сказано, остальные списки канала работают. */
 #define _GNU_SOURCE
@@ -119,6 +121,7 @@ struct item {
     size_t uid_n;
     const struct srs_clause *cl;
     int part;                   /* куда попала */
+    int v6only;                 /* клауза только с подсетями IPv6 — варианта сужения не заводит */
 };
 
 static int extra_same(const struct item *a, const struct item *b) {
@@ -212,6 +215,14 @@ static int part_take(struct srs_part *p, const struct item *it, const char *path
         p->has_v4 = 1;
         p->n_v4 += it->cl->n_v4;
     }
+    /* Подсети IPv6 — в парный набор группы (docs/architecture.md, «4б»), но не у доп. части:
+     * её условия (второе «ip saddr» из source_ip_cidr, исключения-подсети — набор «_x») есть
+     * только для IPv4, и v6-двойник без них ловил бы больше, чем обещает набор. */
+    if (it->cl->kind == SRS_C_CIDR && (it->cl->flags & SRS_F_V6) && p->kind != SP_EXTRA) {
+        s->has_v6 = 1;
+        p->has_v6 = 1;
+        p->n_v6 += it->cl->n_v6;
+    }
     return 0;
 }
 
@@ -248,13 +259,21 @@ int srs_plan_rule(const struct spec *sp, const struct spec_rule *r, int concat,
         size_t before = nitems;
         for (size_t ci = 0; ci < srs_clause_n(s); ci++) {
             const struct srs_clause *cl = srs_clause(s, ci);
-            if (cl->flags & SRS_F_V6) v6 = 1;
-            if (cl->kind == SRS_C_CIDR && !(cl->flags & SRS_F_V4)) continue;   /* только v6 */
             struct item tmp;
             memset(&tmp, 0, sizeof(tmp));
             tmp.fi = fi;
             tmp.ci = ci;
             tmp.cl = cl;
+            tmp.v6only = cl->kind == SRS_C_CIDR && !(cl->flags & SRS_F_V4);
+            /* Клауза только с подсетями IPv6 (до 1.9 такие пропускались целиком) — отказов и
+             * предупреждений, которых раньше не было, она не порождает: не пересеклась с
+             * сужением канала — просто ничего не ловит; с условиями, которых нет для IPv6
+             * (клиент, приложение, исключения), — снимается с одним предупреждением ниже. */
+            if (tmp.v6only && (!l4_intersect(E, &cl->l4, &tmp.eff) || cl->pkg_n || cl->src_n ||
+                               (cl->flags & SRS_F_XCIDR))) {
+                if (cl->pkg_n || cl->src_n || (cl->flags & SRS_F_XCIDR)) v6 = 1;
+                continue;
+            }
             if (!l4_intersect(E, &cl->l4, &tmp.eff)) {
                 char a[120], b[120], msg[1000];
                 l4_to_text(E, a, sizeof(a));
@@ -280,11 +299,13 @@ int srs_plan_rule(const struct spec *sp, const struct spec_rule *r, int concat,
                 tmp.extra = 1;
             }
             if (cl->flags & SRS_F_XCIDR) tmp.xcidr = tmp.extra = 1;
+            if (tmp.extra && (cl->flags & SRS_F_V6)) v6 = 1;
             struct item *it = item_new(&items, &nitems, &cap);
             if (!it) goto oom;
             *it = tmp;
         }
-        if (v6) warn_add(pl, "srs: %s: подсети IPv6 пропущены — правила работают по IPv4",
+        if (v6) warn_add(pl, "srs: %s: подсети IPv6 правил с условиями (клиент, приложение, "
+                         "исключения) пропущены — такие правила работают по IPv4",
                          c->srs_files[fi]);
         if (nitems == before && !v6 && !pkg_far && !pkg_unknown && !src_local)
             warn_add(pl, "srs: %s: в наборе нет ни имён, ни подсетей — канал «%s» из него ничего "
@@ -307,6 +328,10 @@ int srs_plan_rule(const struct spec *sp, const struct spec_rule *r, int concat,
     for (size_t i = 0; i < nitems; i++) {
         if (items[i].extra) continue;
         if (l4_same_set(&items[i].eff, E)) { items[i].eff = *E; have_E = 1; }
+        /* Клаузы только IPv6 варианта не заводят: иначе набор, у которого прежде было одно
+         * сужение, из-за подсетей IPv6 стал бы составным, и v4-часть правил поменялась бы. Им
+         * часть подбирается ниже — с тем же сужением или своя. */
+        if (items[i].v6only) continue;
         size_t k = 0;
         while (k < nvar && !l4match_same(&var[k], &items[i].eff)) k++;
         if (k == nvar) {
@@ -345,6 +370,19 @@ int srs_plan_rule(const struct spec *sp, const struct spec_rule *r, int concat,
         }
     } else if (nvar > 1) {
         if (!part_new(pl, SP_COMPOSITE)) goto oom;
+    }
+    /* Клаузы только IPv6: к составной части (у её элементов сужение своё), к обычной с тем же
+     * сужением, а если такой нет — своей обычной частью (у неё будет только набор IPv6). */
+    for (size_t i = 0; i < nitems; i++) {
+        struct item *it = &items[i];
+        if (it->extra || it->part < 0 || !it->v6only) continue;
+        if (pl->n && pl->p[0].kind == SP_COMPOSITE) break;
+        size_t k = 0;
+        while (k < pl->n && !l4match_same(&pl->p[k].l4, &it->eff)) k++;
+        if (k < pl->n) continue;
+        struct srs_part *p = part_new(pl, SP_PLAIN);
+        if (!p) goto oom;
+        p->l4 = it->eff;
     }
     size_t nbase = pl->n;
     for (size_t i = 0; i < nitems; i++) {

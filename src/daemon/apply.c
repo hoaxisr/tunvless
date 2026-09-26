@@ -50,6 +50,14 @@ static void iptables_masq_drop_all(void);   /* ниже, у apply_routing */
  * что его устройство ещё не поднялось, значило бы обрубить туннель на ровном
  * месте. */
 struct oldreg { unsigned mark; int table; };
+
+/* Половина IPv6 выхода, которого больше нет (или всего движка при down): правило и таблица IPv6.
+ * Снимается всегда, а не только у выходов с KC_IPV6: вид удалённого выхода по реестру не узнать, а
+ * отказ `ip -6 rule del` по отсутствующему правилу ничего не значит. */
+static void routing6_drop(unsigned mark, int table) {
+    rule_drop6(mark, table);
+    route6_flush(table);
+}
 static struct oldreg g_oldreg[MAX_OUTPUTS];
 static size_t g_oldreg_n;
 
@@ -87,6 +95,7 @@ static void cleanup_stale_routing(const struct spec *sp) {
         rule_drop(g_oldreg[i].mark, g_oldreg[i].table);
         const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
         run(flush);
+        routing6_drop(g_oldreg[i].mark, g_oldreg[i].table);
     }
 }
 
@@ -125,6 +134,7 @@ int cmd_down(void) {
         rule_drop(g_oldreg[i].mark, g_oldreg[i].table);
         const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
         run(flush);
+        routing6_drop(g_oldreg[i].mark, g_oldreg[i].table);
     }
     /* Правило и таблица пробы сторожа. Сторож снимает их сам при выходе, но init Android гасит
      * сервис SIGKILL (без gentle_kill — сразу, с ним — через 200 мс), и уборка при выходе может
@@ -161,10 +171,26 @@ int cmd_down(void) {
  * здесь не нужны: их устройство обслуживает наш процесс, адреса он переводит сам. Выход
  * kind=awg — нужен, как interface: туннель в ядре несёт пакет с тем адресом источника, что
  * был, а сервер WireGuard примет только адрес из своих AllowedIPs, то есть адрес туннеля. */
-static void iptables_masq_drop_all(void) {
-    char mask[24];
+/* IPv6 (docs/architecture.md, «4б»): у выхода с маршрутом IPv6 (out_route6) — такое же правило в
+ * nat ip6tables. Смысл тот же, что у IPv4: пакет приложения или раздачи, уведённый в туннель,
+ * несёт адрес IPv6 сети Wi-Fi или сотовой, а сервер WireGuard примет только адрес туннеля. На ядре
+ * без nat в ip6tables (CONFIG_IP6_NF_NAT есть не у всех сборок) правила не встанут — тогда IPv6
+ * через туннель не пойдёт (сервер отбросит чужой адрес), но и напрямую не уйдёт; apply об этом
+ * говорит. Есть ли nat в ip6tables — спрашивается один раз на процесс. */
+static int ip6tables_nat_ok(void) {
+    static int ok = -1;
+    if (ok < 0) {
+        const char *probe[] = { "ip6tables", "-w", "-t", "nat", "-S", "POSTROUTING", NULL };
+        ok = run_quiet(probe) == 0;
+    }
+    return ok;
+}
+
+static void masq_drop_all_tool(const char *tool) {
+    char mask[24], cmd[96];
     snprintf(mask, sizeof(mask), "/0x%x ", STEER_MARK_MASK);
-    FILE *p = popen("iptables -w -t nat -S POSTROUTING 2>/dev/null", "r");
+    snprintf(cmd, sizeof(cmd), "%s -w -t nat -S POSTROUTING 2>/dev/null", tool);
+    FILE *p = popen(cmd, "r");
     if (!p) return;
     char line[512], lines[64][512];
     int n = 0;
@@ -175,7 +201,7 @@ static void iptables_masq_drop_all(void) {
     }
     pclose(p);
     for (int i = 0; i < n; i++) {
-        const char *argv[32] = { "iptables", "-w", "-t", "nat", "-D", "POSTROUTING" };
+        const char *argv[32] = { tool, "-w", "-t", "nat", "-D", "POSTROUTING" };
         int k = 6;
         for (char *t = strtok(lines[i], " \n"); t && k < 31; t = strtok(NULL, " \n"))
             argv[k++] = t;
@@ -184,32 +210,49 @@ static void iptables_masq_drop_all(void) {
     }
 }
 
+static void iptables_masq_drop_all(void) {
+    masq_drop_all_tool("iptables");
+    if (ip6tables_nat_ok()) masq_drop_all_tool("ip6tables");
+}
+
+/* Каким инструментам нужен masquerade выхода: iptables — всем с устройством, кроме тех, кто наружу
+ * ходит от своего имени (out_self_natting: у interface и awg он нужен, у vless и xsteer — нет);
+ * ip6tables — тем из них, у кого маршрут IPv6. */
+static int masq_tools(const struct output *o, const char *tools[2]) {
+    if (!out_has_device(o) || out_self_natting(o)) return 0;
+    int n = 0;
+    tools[n++] = "iptables";
+    if (out_route6(o) && ip6tables_nat_ok()) tools[n++] = "ip6tables";
+    return n;
+}
+
 /* Вернуть недостающие правила masquerade, не трогая стоящие. Зовёт сторож после каждого
  * прохода: netd при (пере)запуске перестраивает iptables и наши правила пропадают, а apply
  * после этого случится, только если его позовёт init (см. steerd.rc). */
 void iptables_masq_ensure(const struct spec *sp) {
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
-        /* masquerade — выходам с устройством, кроме тех, кто наружу ходит от своего имени
-         * (out_self_natting): у interface и awg он нужен, у vless и xsteer — нет. */
-        if (!out_has_device(o) || out_self_natting(o)) continue;
+        const char *tools[2];
+        int tn = masq_tools(o, tools);
+        if (!tn) continue;
         char mk[32];
         snprintf(mk, sizeof(mk), "0x%x/0x%x", o->mark, STEER_MARK_MASK);
         /* На каждое устройство, в которое выход может увести трафик: у группы — устройства
          * членов, у выхода с устройством — его собственное (out_members). */
         const struct output *m[MAX_MEMBERS];
         size_t mn = out_members(sp, o, m, MAX_MEMBERS);
+        for (int ti = 0; ti < tn; ti++)
         for (size_t k = 0; k < mn; k++) {
-            const char *chk[] = { "iptables", "-w", "-t", "nat", "-C", "POSTROUTING",
+            const char *chk[] = { tools[ti], "-w", "-t", "nat", "-C", "POSTROUTING",
                                   "-o", m[k]->device, "-m", "mark", "--mark", mk,
                                   "-j", "MASQUERADE", NULL };
             if (run(chk) == 0) continue;
-            const char *add[] = { "iptables", "-w", "-t", "nat", "-I", "POSTROUTING", "1",
+            const char *add[] = { tools[ti], "-w", "-t", "nat", "-I", "POSTROUTING", "1",
                                   "-o", m[k]->device, "-m", "mark", "--mark", mk,
                                   "-j", "MASQUERADE", NULL };
             if (run(add) == 0)
-                fprintf(stderr, "steer[info] failover: masquerade на %s возвращён\n",
-                        m[k]->device);
+                fprintf(stderr, "steer[info] failover: masquerade%s на %s возвращён\n",
+                        ti ? " IPv6" : "", m[k]->device);
         }
     }
 }
@@ -218,18 +261,25 @@ static void iptables_masq_sync(const struct spec *sp) {
     iptables_masq_drop_all();
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
-        if (!out_has_device(o) || out_self_natting(o)) continue;
+        const char *tools[2];
+        int tn = masq_tools(o, tools);
+        if (!tn) continue;
+        if (out_route6(o) && tn < 2)
+            fprintf(stderr, LOG_W "output %s: в ядре нет nat для ip6tables — IPv6 через туннель "
+                            "не пойдёт (сервер не примет чужой адрес), но и напрямую не "
+                            "уйдёт\n", o->name);
         char mk[32];
         snprintf(mk, sizeof(mk), "0x%x/0x%x", o->mark, STEER_MARK_MASK);
         const struct output *m[MAX_MEMBERS];
         size_t mn = out_members(sp, o, m, MAX_MEMBERS);
+        for (int ti = 0; ti < tn; ti++)
         for (size_t k = 0; k < mn; k++) {
-            const char *add[] = { "iptables", "-w", "-t", "nat", "-I", "POSTROUTING", "1",
+            const char *add[] = { tools[ti], "-w", "-t", "nat", "-I", "POSTROUTING", "1",
                                   "-o", m[k]->device, "-m", "mark", "--mark", mk,
                                   "-j", "MASQUERADE", NULL };
             if (run(add) != 0)
-                fprintf(stderr, LOG_W "output %s: masquerade на %s не встал (iptables)\n",
-                        o->name, m[k]->device);
+                fprintf(stderr, LOG_W "output %s: masquerade на %s не встал (%s)\n",
+                        o->name, m[k]->device, tools[ti]);
         }
     }
 }
@@ -248,6 +298,11 @@ static void apply_routing_one(const struct output *o) {
      * правила не было, появившееся должно найти в таблице устройство, а не пустоту. */
     int rc = table_bind(o, o->device);
     rule_ensure(o->mark, o->table);
+    /* Половина IPv6 (docs/architecture.md, «4б») — у выхода с KC_IPV6. Не встала при живом IPv4 —
+     * у устройства выключен IPv6: в таблице IPv6 запрет, и IPv6 правил выхода стоит. */
+    if (rc == 0 && route6_bind(o, o->device) != 0)
+        fprintf(stderr, LOG_W "output %s: маршрут IPv6 в %s не встал (IPv6 на устройстве "
+                        "выключен?) — IPv6 правил выхода остановлен\n", o->name, o->device);
     if (rc != 0) {
         fprintf(stderr, LOG_W "output %s: cannot route via %s — is the device up?\n",
                 o->name, o->device);
@@ -258,6 +313,7 @@ static void apply_routing_one(const struct output *o) {
          * а это хуже, чем не работает вовсе. */
         if (o->on_fail == FAIL_DROP) {
             table_bind(o, NULL);
+            route6_bind(o, NULL);
             fprintf(stderr, LOG_W "output %s: трафик остановлен до появления "
                             "рабочего устройства (on_fail=drop)\n", o->name);
         } else {
@@ -267,6 +323,11 @@ static void apply_routing_one(const struct output *o) {
              * прошла и в таблице могло остаться прежнее устройство. */
             const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
             run(flush);
+            if (out_route6(o)) {
+                /* IPv6 — тем же путём напрямую: правило на месте, таблица пуста. */
+                rule_ensure6(o->mark, o->table);
+                route6_flush(o->table);
+            }
             failopen_mark(o, 1);
         }
     }
@@ -310,7 +371,7 @@ static void report_legacy_gaps(const struct spec *sp, const struct groups *gr) {
     if (!NFT_LEGACY) return;
     fprintf(stderr, "steer[info] apply: ядро без nat в семействе inet — правила собраны для "
                     "nftables старого ядра: таблицы inet и ip%s\n",
-            legacy_has_ip6() ? " и ip6" : "");
+            legacy_has_ip6(sp) ? " и ip6" : "");
     if (zapret_present(sp) && !(g_nftc & NFTC_NOTRACK))
         fprintf(stderr, LOG_W "ядро не знает notrack: порождённые обработчиком zapret пакеты "
                         "(подделки, куски разрезанного) остаются на учёте conntrack. Где "
@@ -512,7 +573,7 @@ static int ruleset_load(const struct spec *cfg, const struct groups *gr) {
      * раскладки не было никогда, файл остаётся прежним, байт в байт. */
     {
         static const char *const fams[2] = { "ip", "ip6" };
-        int want[2] = { legacy_has_ip(cfg), legacy_has_ip6() };
+        int want[2] = { legacy_has_ip(cfg), legacy_has_ip6(cfg) };
         for (int k = 0; k < 2; k++) {
             if (want[k])
                 fprintf(f, "table %s %s\ndelete table %s %s\n",
@@ -678,6 +739,9 @@ static unsigned long long out_route_sig(const struct spec *sp, const struct outp
     for (size_t k = 0; k < mn; k++)
         kind_sig_mix(&h, m[k]->device, strlen(m[k]->device));
     if (!mn) kind_sig_mix(&h, o->device, strlen(o->device));
+    /* Маршрутизация IPv6 (out_route6): появилась или пропала — выход привязывается заново. В
+     * подпись входит только тогда, когда она есть, — у выходов без IPv6 подпись прежняя. */
+    if (out_route6(o)) kind_sig_mix(&h, "ipv6", 4);
     *awg = !strcmp(kn, "awg");
     if (*awg) {
         /* Ключи и адреса — в файле, не в спеке: новый файл под тем же именем — тоже смена. */
@@ -838,6 +902,7 @@ int cmd_apply_commit(int argc, char **argv) {
                 rule_drop(mark, table);
                 const char *flush[] = { "ip", "route", "flush", "table", t, NULL };
                 run(flush);
+                routing6_drop(mark, table);
             }
         }
         const char *e = strchr(p, ',');
@@ -846,7 +911,10 @@ int cmd_apply_commit(int argc, char **argv) {
     }
     for (size_t i = 0; i < cfg.out_n; i++) {
         const struct output *o = &cfg.out[i];
-        if (name_in_list(a.rule, o->name) && out_has_device(o)) rule_ensure(o->mark, o->table);
+        if (!name_in_list(a.rule, o->name) || !out_has_device(o)) continue;
+        rule_ensure(o->mark, o->table);
+        /* Правило IPv6 — тем же ходом (страж ловит и RTNLGRP_IPV6_RULE, см. rulewd.c). */
+        if (out_route6(o)) rule_ensure6(o->mark, o->table);
     }
     if (a.masq && plat()->iptables_masq) iptables_masq_sync(&cfg);
     else if (a.masq_ensure && plat()->iptables_masq) iptables_masq_ensure(&cfg);
