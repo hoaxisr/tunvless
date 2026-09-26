@@ -82,6 +82,7 @@ build/msgsplitmatch
 build/hwidsum
 build/warmmatch
 build/evmatch
+build/yamlmatch
 build/reconmatch
 build/platmatch
 build/ndk/

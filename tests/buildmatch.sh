@@ -30,7 +30,10 @@ names() { sed 's|.*/||' | sort -u | tr '\n' ' '; }
 # build/sources.mk): в каталоге ядра не может лежать файл, которого нет в профиле base.
 . build/sources.sh
 in_dirs() { for _d in $1; do ls "$_d"/*.c 2>/dev/null; done; }
-disk_base="$(in_dirs "$(profile_var CORE_DIRS)" | names)"
+# Сторонний код (THIRD_DIRS, сейчас libyaml) собирается в ядре целиком: из библиотеки в дерево
+# взято только то, что входит в сборку, — поэтому его каталоги сверяются вместе с каталогами
+# ядра, и лишний .c, положенный туда «на всякий случай», не пройдёт так же, как в src/lib.
+disk_base="$(in_dirs "$(profile_var CORE_DIRS) $(profile_var THIRD_DIRS)" | names)"
 disk_ext="$(in_dirs "$(profile_var EXT_DIRS)" | names)"
 
 # ---- что перечислено в манифесте -------------------------------------------
@@ -50,15 +53,41 @@ check "sources.mk: профили покрывают всю расширенну
 
 # Каталог вне манифеста: файл в нём не попадёт ни в одну сборку и ни в одну проверку выше.
 stray="$(for d in $(find src -type d); do
-    case " $(profile_var INC_DIRS) src src/proto " in *" $d "*) ;; *) printf '%s ' "$d" ;; esac
+    case " $(profile_var INC_DIRS) src src/proto src/third_party " in *" $d "*) ;; *) printf '%s ' "$d" ;; esac
 done)"
 check "каждый каталог src описан в INC_DIRS" "" "$stray"
+# Имена заголовков ниже сверяются по ВСЕМУ src, включая src/third_party: libyaml подключает свой
+# yaml.h как <yaml.h> по -I, и заголовок движка с тем же именем подменил бы его молча. Поэтому
+# исключения для стороннего каталога нет, а обёртка движка названа ynode.h.
 # Заголовки подключаются по имени из любого слоя (-I на все каталоги), поэтому два заголовка
 # с одним именем в разных каталогах молча подменяли бы друг друга порядком флагов.
 check "имена заголовков в src уникальны" "" \
     "$(find src -name '*.h' | sed 's|.*/||' | sort | uniq -d | tr '\n' ' ')"
-bp_inc="$(sed -n '/cc_defaults/,/^}/p' Android.bp | grep -oE '"src/[a-z/]+"' | tr -d '"' | tr '\n' ' ')"
+bp_inc="$(sed -n '/cc_defaults/,/^}/p' Android.bp | grep -oE '"src/[a-z_/]+"' | tr -d '"' | tr '\n' ' ')"
 check "Android.bp подключает ровно каталоги INC_DIRS" "$(profile_var INC_DIRS) " "$bp_inc"
+
+# ---- сторонний код: не правится и собирается везде одинаково -------------------------------
+# libyaml лежит в дереве байт в байт как в теге upstream (суммы — в UPSTREAM рядом): правка «на
+# месте» потерялась бы при первом же обновлении библиотеки, и узнали бы об этом по поведению.
+check "src/third_party/libyaml совпадает с суммами UPSTREAM" "" \
+    "$(cd src/third_party/libyaml && sed -n '/^sha256:/,/^$/p' UPSTREAM | grep -E '^[0-9a-f]{64}  ' |
+       sha256sum -c --quiet 2>&1 | tr '\n' ' ')"
+# Определения стороннего кода (THIRD_DEFS) обязаны дойти до каждой сборки, в которую входит ядро:
+# без -DHAVE_CONFIG_H api.c не компилируется — громко, но только на той машине, где собирают этот
+# путь (релиз, SDK, образ). Android.bp держит их во флагах libsteer_yaml, а исходники библиотеки
+# там — ровно LIBYAML_SRC, и движок с ней компонуется (static_libs в steer_defaults).
+for f in Makefile build.sh build/build-ext.sh build/build-ext-sdk.sh build/build-ext-native.sh tests/ext-test.sh; do
+    check "$f передаёт THIRD_DEFS" "1" \
+        "$([ "$(grep -v '^[[:space:]]*#' "$f" | grep -c 'THIRD_DEFS')" -ge 1 ] && echo 1 || echo 0)"
+done
+bp_yaml="$(awk '/^cc_library_static \{/ { blk = "" } { blk = blk $0 "\n" } /^\}/ { if (blk ~ /name: "libsteer_yaml",/) print blk }' Android.bp)"
+check "Android.bp: libsteer_yaml собирается ровно из LIBYAML_SRC" \
+    "$(profile_var LIBYAML_SRC | words | sort -u | tr '\n' ' ')" \
+    "$(printf '%s' "$bp_yaml" | grep -oE '"src/[a-z0-9_/]+\.c"' | tr -d '"' | sort -u | tr '\n' ' ')"
+check "Android.bp: libsteer_yaml получает THIRD_DEFS" "1" \
+    "$(printf '%s' "$bp_yaml" | grep -c "cflags: \[\"$(profile_var THIRD_DEFS)\"\]")"
+check "Android.bp: движок компонуется с libsteer_yaml" "1" \
+    "$(sed -n '/^cc_defaults/,/^}/p' Android.bp | grep -c 'static_libs: \["libsteer_yaml"\]')"
 
 # Ядро входит в КАЖДЫЙ профиль, а общая половина xsteer — в обе роли звезды: иначе хаб (или
 # пир) собрался бы без формата кадра — то есть не собрался бы вовсе.

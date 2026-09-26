@@ -123,10 +123,12 @@ case "$ROLE" in
 esac
 [ -n "${FILES:-}" ] || { echo "нет списка файлов для роли $ROLE" >&2; exit 2; }
 STEER_INC="$(for d in $(profile_var INC_DIRS); do printf -- '-I%s/%s ' "$SRC" "$d"; done)"
+# Определения стороннего кода в ядре (libyaml: -DHAVE_CONFIG_H) — см. THIRD_DEFS в sources.mk.
+THIRD_DEFS="$(profile_var THIRD_DEFS)"
 
 # shellcheck disable=SC2086
 "$CC" $OPT -w -s \
-    -I"$MBED/include" -I"$SRC/src/proto/tls" $STEER_INC $ROLEDEF \
+    -I"$MBED/include" -I"$SRC/src/proto/tls" $STEER_INC $THIRD_DEFS $ROLEDEF \
     -DSTEER_VERSION="\"$VERSION\"" -DSTEER_REV="\"$REV\"" \
     -o "$OUT" \
     $FILES -L"$WORK" -lmbedcrypto -lpthread
