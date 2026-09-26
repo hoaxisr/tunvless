@@ -44,8 +44,12 @@ S="--spec $tmp/spec.json --state-dir $tmp/state"
 
 out="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run $S 2>/dev/null)"
 check "современная раскладка собирается" "0" "$?"
+# Правило IPv4 одно; второе — его v6-двойник (доменная группа выхода с IPv6 получает пару IPv6,
+# fake-IP v6), с той же меткой.
 check "метка пишется в биты 22-27, без бита zapret" "1" \
-    "$(printf '%s\n' "$out" | grep -c 'meta mark set mark and 0xf03fffff or 0x00400000')"
+    "$(printf '%s\n' "$out" | grep 'meta mark set mark and 0xf03fffff or 0x00400000' | grep -vc 'ip6 daddr')"
+check "  и у v6-двойника — та же" "1" \
+    "$(printf '%s\n' "$out" | grep 'meta mark set mark and 0xf03fffff or 0x00400000' | grep -c 'ip6 daddr')"
 check "бита zapret 0x40000000 нет нигде" "0" "$(printf '%s\n' "$out" | grep -ci '0x4[0-9a-f]\{7\}')"
 check "набора и цепочки failopen нет" "0" "$(printf '%s\n' "$out" | grep -c 'failopen')"
 check "роутерного поля нет нигде" "0" "$(printf '%s\n' "$out" | grep -c '0x0ff00000\|0xf00fffff')"
@@ -165,7 +169,9 @@ check "раздача: TCP/53 к резолверу, старая расклад
 check "раздача: TCP/53 стоит сразу за UDP/53" "1" \
     "$(printf '%s\n' "$m2" | grep -A1 'iifname "rndis0" udp dport 53' | grep -c 'tcp dport 53')"
 check "поддельные адреса для соединений телефона переводятся на output" "1" \
-    "$(c "$m2" 'comment "steer-fakeip-local"')"
+    "$(c "$m2" 'ip daddr 198.18.0.0/15 counter dnat ip to ip daddr map @fakeip comment "steer-fakeip-local"')"
+check "  и поддельные IPv6 — картой fakeip6" "1" \
+    "$(c "$m2" 'ip6 daddr fdfe:dcba:9876::/96 counter dnat ip6 to ip6 daddr map @fakeip6 comment "steer-fakeip-local"')"
 check "masquerade — не в nft (его ставит iptables при apply)" "0" "$(c "$m2$l2" 'masquerade')"
 
 spec_bad() {   # spec_bad ИМЯ ТЕКСТ — спека из stdin отвергается и называет причину

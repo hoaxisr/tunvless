@@ -354,20 +354,21 @@ static void build_family(struct nft_rs *rs, struct nft_table *in, enum nft_famil
         if (reroute && STEER_REROUTE_BIT) reroute_chain(t);
         return;
     }
-    /* Карты, в которые смотрят правила dnat этого семейства, переезжают вместе с ними. */
-    if (fam == 4)
-        for (struct nft_obj *o = in->objs; o; o = o->next) {
-            struct nft_chain *c = ir_obj_chain(o);
-            if (!is_nat(c)) continue;
-            for (struct nft_rule *r = c->rules; r; r = r->next) {
-                struct nft_expr *x = ir_expr_find(r, NFT_X_DNAT);
-                struct nft_set *m = x ? ir_set_find(in, x->arg) : NULL;
-                if (!m || (r->fam && r->fam != fam)) continue;
-                ir_obj_unlink(&m->o);
-                m->o.gap = 0;
-                ir_obj_append(t, &m->o);
-            }
+    /* Карты, в которые смотрят правила dnat этого семейства, переезжают вместе с ними: fakeip —
+     * в ip, fakeip6 (fake-IP v6) — в ip6. Одна карта — у правил одного семейства, поэтому
+     * переезжает она один раз (второе правило на неё её в inet уже не найдёт). */
+    for (struct nft_obj *o = in->objs; o; o = o->next) {
+        struct nft_chain *c = ir_obj_chain(o);
+        if (!is_nat(c)) continue;
+        for (struct nft_rule *r = c->rules; r; r = r->next) {
+            struct nft_expr *x = ir_expr_find(r, NFT_X_DNAT);
+            struct nft_set *m = x ? ir_set_find(in, x->arg) : NULL;
+            if (!m || (r->fam && r->fam != fam)) continue;
+            ir_obj_unlink(&m->o);
+            m->o.gap = 0;
+            ir_obj_append(t, &m->o);
         }
+    }
     merge_nat(in, "prerouting",
               ir_base_chain_add(t, "prerouting_nat", "nat", "prerouting", "dstnat", -1), fam);
     if (hook_has_nat(in, "output"))

@@ -752,6 +752,26 @@ void group_set_name_mixed(const struct spec *sp, char *dst, size_t n, const char
 void group_set_name_extra(const struct spec *sp, char *dst, size_t n, const char *out,
                           const char *kind, const char (*from)[64], size_t from_n, int realip,
                           unsigned id);
+
+/* ДОМЕННЫЙ НАБОР С ПОЛОВИНОЙ IPv6 (docs/architecture.md, «4б»): получает ли доменная группа выхода
+ * o с клиентами from и режимом realip парный набор «<имя>6», v6-двойника правила и ответы AAAA от
+ * резолвера (fake-IP v6 или настоящие адреса в «<имя>6»). Нет — резолвер отвечает на AAAA имён под
+ * таким правилом пустым ответом, и клиент с двумя стеками сразу идёт по IPv4.
+ *
+ * Решают двое, и функция общая ровно поэтому (как group_set_name): компилятор заводит набор и
+ * правило (build_groups, поле dom6), резолвер кладёт туда адреса (dch_build, поле family таблицы
+ * «демон → dnsd»). Разойдись они — резолвер выдавал бы fake6 без правила, которое его заберёт, и
+ * соединение уходило бы мимо выхода. nftc — раскладка ядра (NFTC_*). */
+int dom6_ok(const struct spec *sp, const struct output *o, const char (*from)[64], size_t from_n,
+            int realip, int nftc);
+
+/* ПУЛ fake-IP v6: fdfe:dcba:9876::/96, адрес — поддельный IPv4 (198.18.0.0/15) в младших 32 битах:
+ * fdfe:dcba:9876::c612:5 — пара 198.18.0.5. Выбор и доводы — в шапке src/dnsd/fakeip.c. Префикс
+ * нужен троим: компилятору (правило dnat), резолверу (ответ AAAA) и explain (узнать поддельный). */
+#define FAKEIP6_PREFIX_BYTES 0xfd, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0, 0, 0, 0, 0, 0
+#define FAKEIP6_NET "fdfe:dcba:9876::/96"
+void fakeip6_of(uint32_t fake4_host, uint8_t out[16]);
+uint32_t fakeip6_to4(const uint8_t a[16]);
 /* Разбор спеки — правило 5 (docs/architecture.md, раздел 2): модель ошибку ВОЗВРАЩАЕТ, а не
  * завершает процесс сама. 0 — разобрано, *s заполнен (см. правило 6 у struct spec выше); -1 —
  * отказ, текст в e->msg. Завершает процесс только вызывающий, дошедший до точки входа:

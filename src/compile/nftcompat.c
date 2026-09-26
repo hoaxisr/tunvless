@@ -125,6 +125,20 @@ int nft_compat_seen(void) {
     return nfd_table_exists(NFD_IP, nft_table()) ? NFTC_LEGACY : 0;
 }
 
+/* То же, что nft_compat_seen, и ещё NFTC_IP6NAT: цепочка nat в таблице ip6 движка стоит только
+ * при нём (legacy.c, build_family). Спрашивает таблица каналов резолвера (dch_build) — от этого
+ * бита зависит fake-IP v6, а собирает её и демон в своём процессе, где проба `nft -c` была бы
+ * процессом. До первого apply ответ — «современная раскладка»; расхождение безопасно: резолвер
+ * тогда выдаёт поддельный IPv6, карты fakeip6 в ядре нет, и ответ на AAAA пустой (proxy.c), а
+ * после apply таблица собирается заново уже по стоящей раскладке. */
+int nft_compat_seen6(void) {
+    const char *e = getenv("STEER_NFT_COMPAT");
+    if (e && *e) return nft_compat();
+    if (!nfd_table_exists(NFD_IP, nft_table())) return 0;
+    return NFTC_LEGACY |
+           (nfd_chain_exists(NFD_IP6, nft_table(), "prerouting_nat") ? NFTC_IP6NAT : 0);
+}
+
 /* Составной интервальный набор (ipv4_addr . inet_proto . inet_service, flags interval,timeout):
  * примет ли его ядро. Нужен только каналам, у списка которых сужение СМЕШАННОЕ (набор .srs, где
  * часть подсетей — «udp 50000-65535», часть — без сужения, см. src/model/srsplan.c): такой

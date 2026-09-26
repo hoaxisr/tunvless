@@ -243,6 +243,40 @@ void group_set_name_extra(const struct spec *sp, char *dst, size_t n, const char
              rip ? "r" : "", id);
 }
 
+/* Доменный набор с половиной IPv6 — объяснение у объявления в spec.h. Условия — те же, по
+ * которым компилятор даёт группе v6-двойника (generate.c: out_v6_ok, who6_ok): выход несёт IPv6
+ * или метки не ставит вовсе (direct), а «кто» выражается для IPv6 — устройством, MAC, адресом
+ * IPv6, клиентами по умолчанию или владельцем сокета на телефоне («uid:N» — тоже с двоеточием,
+ * как адрес IPv6, и у generate.c считается так же). Режим fake-IP ещё требует nat в семействе
+ * IPv6: на старом ядре без NFTC_IP6NAT карты fakeip6 и её dnat поставить негде. */
+int dom6_ok(const struct spec *sp, const struct output *o, const char (*from)[64], size_t from_n,
+            int realip, int nftc) {
+    if (out_needs_mark(o) && !out_has_cap(o, KC_IPV6)) return 0;
+    int who = !from_n || spec_is_mac(from[0]) || from_same(from, from_n, sp->lan.from, sp->lan.from_n);
+    for (size_t i = 0; i < from_n && !who; i++) who = strchr(from[i], ':') != NULL;
+    if (!who) return 0;
+    if (!realip && (nftc & NFTC_LEGACY) && !(nftc & NFTC_IP6NAT)) return 0;
+    return 1;
+}
+
+/* Поддельный адрес IPv6 из поддельного IPv4: префикс пула и адрес IPv4 в младших 32 битах. */
+void fakeip6_of(uint32_t fake4_host, uint8_t out[16]) {
+    static const uint8_t pfx[12] = { FAKEIP6_PREFIX_BYTES };
+    memcpy(out, pfx, 12);
+    out[12] = (uint8_t)(fake4_host >> 24);
+    out[13] = (uint8_t)(fake4_host >> 16);
+    out[14] = (uint8_t)(fake4_host >> 8);
+    out[15] = (uint8_t)fake4_host;
+}
+
+/* Обратное: адрес IPv6 из пула — его поддельный IPv4 (0 — не из пула). */
+uint32_t fakeip6_to4(const uint8_t a[16]) {
+    static const uint8_t pfx[12] = { FAKEIP6_PREFIX_BYTES };
+    if (memcmp(a, pfx, 12) != 0) return 0;
+    uint32_t v = ((uint32_t)a[12] << 24) | ((uint32_t)a[13] << 16) | ((uint32_t)a[14] << 8) | a[15];
+    return (v & 0xfffe0000u) == 0xc6120000u ? v : 0;
+}
+
 /* «адрес:порт» → адрес и порт. Живёт здесь, а не в obfs.c, потому что нужен обоим:
  * парсеру спеки при чтении и обфускатору при разборе своих аргументов, а линкуются
  * они всегда вместе. Порт по последнему двоеточию — чтобы форма не мешала будущему

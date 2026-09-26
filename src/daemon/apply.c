@@ -386,6 +386,12 @@ static void report_legacy_gaps(const struct spec *sp, const struct groups *gr) {
                         "мимо резолвера движка, и доменные каналы видят только тех, кто "
                         "спрашивает по IPv4\n");
 #endif
+    /* fake-IP v6 держится на dnat в ip6 (карта fakeip6): без него у доменных правил fake-IP
+     * половины IPv6 нет (dom6_ok), и AAAA их имён резолвер гасит. */
+    if (!(g_nftc & NFTC_IP6NAT) && has_fakeip(gr))
+        fprintf(stderr, LOG_W "ядро не умеет nat для IPv6: у доменных правил fake-IP нет IPv6 — "
+                        "на запросы AAAA их имён ответ пустой, и клиенты ходят к этим сайтам по "
+                        "IPv4\n");
     if (plat()->local_channels && !(g_nftc & NFTC_IP6NAT) && has_local_domains(gr))
         fprintf(stderr, LOG_W "ядро не умеет nat для IPv6: запросы DNS приложений телефона по "
                         "IPv6 идут мимо резолвера движка, и доменные каналы телефона их не "
@@ -477,6 +483,10 @@ static void apply_prepare(const char *spec, struct spec *cfg, struct groups *gr,
         outputs_adopt_active(cfg);
         return;
     }
+    /* Раскладка набора правил — до генерации и до dry-run: интерфейс проверяет спеку именно
+     * dry-run'ом, и печатать ему надо то, что реально встанет на этом ядре. И до build_groups:
+     * от неё зависит половина IPv6 доменных групп (fake-IP v6 — только где есть nat в ip6). */
+    g_nftc = nftc >= 0 ? nftc : nft_compat();
     if (build_groups(cfg, gr, &e) < 0) err_die(&e);
     /* ДОМЕННЫЙ КАНАЛ В МИНИ-СБОРКЕ — ОТКАЗ, А НЕ ПРЕДУПРЕЖДЕНИЕ.
      *
@@ -503,9 +513,6 @@ static void apply_prepare(const char *spec, struct spec *cfg, struct groups *gr,
      * Значит человек узнает про не тот список сразу при сохранении, а не потом, когда
      * apply молча не подействует. */
     if (check_address_lists(gr, &e) < 0) err_die(&e);
-    /* Раскладка набора правил — до генерации и до dry-run: интерфейс проверяет спеку именно
-     * dry-run'ом, и печатать ему надо то, что реально встанет на этом ядре. */
-    g_nftc = nftc >= 0 ? nftc : nft_compat();
     if (report) report_legacy_gaps(cfg, gr);
 }
 

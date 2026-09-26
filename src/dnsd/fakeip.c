@@ -19,6 +19,27 @@
  * mihomo for this exact purpose; effectively never a real destination. */
 /* FAKEIP_POOL_BASE/SIZE — в dnsd_int.h. */
 
+/* ПУЛ fake-IP v6 (docs/architecture.md, «4б»): fdfe:dcba:9876::/96, и адрес — это поддельный IPv4
+ * той же записи в младших 32 битах (fakeip6_of, spec.h): у youtube.com с 198.18.0.5 поддельный
+ * IPv6 — fdfe:dcba:9876::c612:5.
+ *
+ * ПОЧЕМУ ТАКОЙ ПРЕФИКС. Уникальный локальный адрес (fc00::/7, RFC 4193) в интернете не
+ * маршрутизируется, то есть настоящим назначением не бывает никогда — то же свойство, ради
+ * которого у IPv4 взят 198.18.0.0/15. Сам префикс — тот же, что у mihomo (fake-ip-range6), по той
+ * же причине, по которой пул IPv4 совпадает с Clash и sing-box: это соглашение, и с настоящей
+ * сетью оно не столкнётся — локальный префикс роутера (ula_prefix OpenWrt) выбирается случайно из
+ * 2^40 вариантов. Половина fd00::/8, а не fc00::/8, как у sing-box: fc00::/8 зарезервирована под
+ * централизованную раздачу, и что с ней сделает завтрашний стек, не знает никто.
+ *
+ * ПОЧЕМУ ПАРА К IPv4, А НЕ СВОЯ ВЫДАЧА. Запись домена одна, и адресов у неё два: выдавать их
+ * отдельно — значит держать второй счётчик, вторую верхнюю отметку, второе поле «пул исчерпан» и
+ * следить, чтобы у домена не оказалось IPv6 от одной записи и IPv4 от другой. Пара выводится из
+ * адреса IPv4, поэтому хранить её не надо вовсе (в файле состояния — только настоящий IPv6), по
+ * ней explain сразу называет домен, а адреса сети и последнего у неё нет по той же причине, что у
+ * IPv4 (выдача начинается с 1 и не доходит до последнего). /96 — место под все 2^32 адресов, хотя
+ * заняты из них только 2^17 пула IPv4. */
+const char *g_fakeip6_map = "fakeip6";
+
 struct fakeip_table g_fakeip;
 const char *g_fakeip_state_path;
 
@@ -71,6 +92,11 @@ static int fakeip_table_add(struct fakeip_table *t, const char *domain, uint32_t
     t->entries[t->n].sets = 0;            /* unknown until the resolver routes it */
     t->entries[t->n].route_asserted = 0;
     t->entries[t->n].refreshed = 0;
+    memset(t->entries[t->n].real6, 0, 16);
+    t->entries[t->n].has_real6 = 0;
+    t->entries[t->n].sets6 = 0;
+    t->entries[t->n].route6_asserted = 0;
+    t->entries[t->n].refreshed6 = 0;
     t->n++;
     if (t == &g_fakeip &&
         sindex_put(&g_fakeip_idx, t, fakeip_key, t->entries[t->n - 1].domain,
@@ -98,14 +124,20 @@ static int fakeip_table_has(const struct fakeip_table *t, const char *domain) {
 /* State file format: one entry per line.
  *   domain\tfake_ip            (legacy / --fakeip CLI output)
  *   domain\tfake_ip\treal_ip   (extended: real backend, for post-restart rehydrate)
+ *   domain\tfake_ip\treal_ip\treal_ip6
+ *   domain\tfake_ip\t-\treal_ip6
+ *                              (1.9, fake-IP v6: настоящий IPv6 под элементом карты fakeip6;
+ *                               «-» — настоящий IPv4 не известен. Поддельный IPv6 не пишется —
+ *                               он выводится из fake_ip, см. шапку файла)
  * Missing file -> empty table, not an error (first run). A malformed line is
  * skipped, not fatal — the domain simply gets re-allocated (a fresh index) on
  * the next match. The legacy 2-field form is parsed identically to before, so
- * an existing state file upgrades transparently. */
+ * an existing state file upgrades transparently. Испорченное четвёртое поле строку не
+ * отвергает: пропадает только настоящий IPv6, и первый AAAA спросит его заново. */
 void fakeip_state_load(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return;
-    char line[MAX_HOSTNAME + 64];
+    char line[MAX_HOSTNAME + 128];          /* имя, два адреса IPv4, IPv6 и табуляции */
     while (fgets(line, sizeof(line), f)) {
         char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
         char *tab1 = strchr(line, '\t');
@@ -139,9 +171,17 @@ void fakeip_state_load(const char *path) {
         if (fakeip_table_add(&g_fakeip, line, ntohl(a.s_addr)) != 0) continue;
 
         if (tab2) { /* optional third field: last-seen real backend */
+            char *real_s = tab2 + 1;
+            char *tab3 = strchr(real_s, '\t');
+            if (tab3) *tab3 = '\0';
             struct in_addr r;
-            if (inet_aton(tab2 + 1, &r) != 0)
+            if (inet_aton(real_s, &r) != 0)
                 g_fakeip.entries[g_fakeip.n - 1].real_host = ntohl(r.s_addr);
+            uint8_t r6[16];
+            if (tab3 && inet_pton(AF_INET6, tab3 + 1, r6) == 1) {
+                memcpy(g_fakeip.entries[g_fakeip.n - 1].real6, r6, 16);
+                g_fakeip.entries[g_fakeip.n - 1].has_real6 = 1;
+            }
         }
     }
     fclose(f);
@@ -173,19 +213,26 @@ void fakeip_state_rewrite(void) {
     FILE *f = fopen(tmp, "w");
     if (!f) return;
     for (size_t i = 0; i < g_fakeip.n; i++) {
-        struct in_addr fa; fa.s_addr = htonl(g_fakeip.entries[i].addr);
+        const struct fakeip_entry *en = &g_fakeip.entries[i];
+        struct in_addr fa; fa.s_addr = htonl(en->addr);
         char fstr[INET_ADDRSTRLEN];
         if (!inet_ntop(AF_INET, &fa, fstr, sizeof(fstr))) continue;
-        if (g_fakeip.entries[i].real_host) {
-            struct in_addr ra; ra.s_addr = htonl(g_fakeip.entries[i].real_host);
-            char rstr[INET_ADDRSTRLEN];
-            if (inet_ntop(AF_INET, &ra, rstr, sizeof(rstr)))
-                fprintf(f, "%s\t%s\t%s\n", g_fakeip.entries[i].domain, fstr, rstr);
-            else
-                fprintf(f, "%s\t%s\n", g_fakeip.entries[i].domain, fstr);
-        } else {
-            fprintf(f, "%s\t%s\n", g_fakeip.entries[i].domain, fstr);
+        char rstr[INET_ADDRSTRLEN] = "";
+        if (en->real_host) {
+            struct in_addr ra; ra.s_addr = htonl(en->real_host);
+            if (!inet_ntop(AF_INET, &ra, rstr, sizeof(rstr))) rstr[0] = '\0';
         }
+        char r6str[INET6_ADDRSTRLEN] = "";
+        if (en->has_real6 && !inet_ntop(AF_INET6, en->real6, r6str, sizeof(r6str)))
+            r6str[0] = '\0';
+        /* Строка без IPv6 — прежней формы до байта: файл, который пишет движок без IPv6 в
+         * доменных правилах, не меняется. */
+        if (r6str[0])
+            fprintf(f, "%s\t%s\t%s\t%s\n", en->domain, fstr, rstr[0] ? rstr : "-", r6str);
+        else if (rstr[0])
+            fprintf(f, "%s\t%s\t%s\n", en->domain, fstr, rstr);
+        else
+            fprintf(f, "%s\t%s\n", en->domain, fstr);
     }
     /* Данные должны лечь на носитель ДО rename: иначе отключение питания между
      * rename и фактической записью оставляет пустой state-файл — ровно ту
@@ -252,6 +299,22 @@ void fakeip_entry_set_real(const char *domain, uint32_t real_host) {
     if (at < 0) return;
     if (g_fakeip.entries[at].real_host == real_host) return;
     g_fakeip.entries[at].real_host = real_host;
+    g_fakeip_dirty = 1;
+}
+
+/* Половина IPv6: то же для карты fakeip6 — только после ack ядра (как real_host). */
+const uint8_t *fakeip_entry_get_real6(const char *domain) {
+    long at = fakeip_find(domain);
+    return at >= 0 && g_fakeip.entries[at].has_real6 ? g_fakeip.entries[at].real6 : NULL;
+}
+
+void fakeip_entry_set_real6(const char *domain, const uint8_t real6[16]) {
+    long at = fakeip_find(domain);
+    if (at < 0) return;
+    struct fakeip_entry *e = &g_fakeip.entries[at];
+    if (e->has_real6 && !memcmp(e->real6, real6, 16)) return;
+    memcpy(e->real6, real6, 16);
+    e->has_real6 = 1;
     g_fakeip_dirty = 1;
 }
 
@@ -332,6 +395,39 @@ void dch_del(size_t i, const char *domain, uint32_t addr_host) {
     for (size_t j = 0; j < n; j++) nft_concat_element(0, g_dch[i].set, addr_host, &b[j], 0);
 }
 
+/* Адрес IPv6 — в парный набор «<set>6» (компилятор заводит его доменной группе с dom6, тем же
+ * именем, что group_set6_name). Сужение составного набора — то же, что у IPv4 (dch_boxes). */
+static void dch_set6_name(size_t i, char *dst, size_t n) {
+    snprintf(dst, n, "%.62s6", g_dch[i].set);
+}
+
+int dch_add6(size_t i, const char *domain, const uint8_t addr[16], uint32_t ttl) {
+    char s6[80];
+    dch_set6_name(i, s6, sizeof(s6));
+    if (!g_dch[i].composite) return nft_add_element6(s6, addr, ttl);
+    struct nftlk_box b[L4BOX_MAX];
+    size_t n = dch_boxes(i, domain, b);
+    int rc = 0;
+    for (size_t j = 0; j < n; j++)
+        if (nft_concat_element6(1, s6, addr, &b[j], ttl) != 0) rc = -1;
+    return rc;
+}
+
+void dch_del6(size_t i, const char *domain, const uint8_t addr[16]) {
+    char s6[80];
+    dch_set6_name(i, s6, sizeof(s6));
+    if (!g_dch[i].composite) {
+        int drc = nftlk_elem_msg6(NFT_MSG_DELSETELEM, g_nft_table, s6, addr,
+                                  g_nft_sets_interval, NULL, 0);
+        if (drc != 0 && drc != -ENOENT && dbg())
+            fprintf(stderr, "nftlk: channel-move delete from %s rc=%d\n", s6, drc);
+        return;
+    }
+    struct nftlk_box b[L4BOX_MAX];
+    size_t n = dch_boxes(i, domain, b);
+    for (size_t j = 0; j < n; j++) nft_concat_element6(0, s6, addr, &b[j], 0);
+}
+
 void fakeip_route_set(const char *domain, uint64_t want) {
     long at = fakeip_find(domain);
     if (at < 0) return;
@@ -376,6 +472,36 @@ void fakeip_route_set(const char *domain, uint64_t want) {
     g_fakeip.entries[at].route_asserted = time(NULL);
 }
 
+/* То же для поддельного IPv6 — постоянный элемент в «<канал>6» каждого канала из want, с тем же
+ * дросселем переутверждения и тем же переездом между каналами. want — только каналы с DCH_V6:
+ * у остальных набора IPv6 нет (и AAAA им адресом не отвечают — dch_all_v6). */
+void fakeip_route_set6(const char *domain, uint64_t want) {
+    long at = fakeip_find(domain);
+    if (at < 0) return;
+    if (g_dch_n < 64) want &= (1ULL << g_dch_n) - 1ULL;
+    for (size_t i = 0; i < g_dch_n && i < 64; i++)
+        if (!(g_dch[i].fam & DCH_V6)) want &= ~(1ULL << i);
+    if (!want) return;
+    struct fakeip_entry *e = &g_fakeip.entries[at];
+    uint8_t f6[16];
+    fakeip6_of(e->addr, f6);
+    uint64_t old = e->sets6;
+    time_t now = time(NULL);
+    if (old == want) {
+        if (now - e->route6_asserted < FAKEIP_ANSWER_TTL) return;
+        e->route6_asserted = now;
+        for (size_t i = 0; i < g_dch_n; i++)
+            if (want & (1ULL << i)) dch_add6(i, domain, f6, 0);
+        return;
+    }
+    for (size_t i = 0; i < g_dch_n; i++)
+        if ((old & (1ULL << i)) && !(want & (1ULL << i))) dch_del6(i, domain, f6);
+    for (size_t i = 0; i < g_dch_n; i++)
+        if ((want & (1ULL << i)) && !(old & (1ULL << i))) dch_add6(i, domain, f6, 0);
+    e->sets6 = want;
+    e->route6_asserted = now;
+}
+
 /* Восстановить DNAT-карту и наборы каналов после (пере)запуска. Возвращает число
  * восстановленных отображений fake→real, в *routed_out — число вновь утверждённых маршрутов.
  *
@@ -399,12 +525,24 @@ size_t fakeip_rehydrate(int nk_open, size_t *routed_out) {
             else
                 e->real_host = 0;
         }
+        /* Половина IPv6 — тем же правилом: настоящий IPv6 остаётся у записи, только если ядро
+         * приняло элемент карты fakeip6; иначе быстрый путь AAAA закрыт до нового ответа. */
+        if (e->has_real6) {
+            uint8_t f6[16];
+            fakeip6_of(e->addr, f6);
+            if (nk_open != 0 || nft_map_set_element6(g_fakeip6_map, f6, e->real6, NULL) != 0)
+                e->has_real6 = 0;
+        }
         if (nk_open != 0) continue;
         /* Re-derive the channels for the stored domain and re-assert the permanent route
          * elements. fakeip_route_set запоминает набор, поэтому повторное разрешение имени в те
          * же каналы ничего не стоит. */
-        uint64_t m = dch_fakeip_only(dch_match_mask(e->domain));
+        uint64_t all = dch_match_mask(e->domain);
+        uint64_t m = dch_fakeip_only(all);
         if (m) { fakeip_route_set(e->domain, m); routed++; }
+        /* Поддельный IPv6 ложится в наборы, только если он у имени был выдан (есть настоящий
+         * IPv6) и все совпавшие каналы по-прежнему несут IPv6. */
+        if (e->has_real6 && m && dch_all_v6(all)) fakeip_route_set6(e->domain, m);
     }
     if (routed_out) *routed_out = routed;
     return restored;

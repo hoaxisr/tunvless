@@ -520,7 +520,9 @@ static void emit_mixed6(FILE *f, const struct ir_mixed *mix) {
  * восстанавливает. Повтор поддельного адреса пропускается — nft отвергает набор с двойным
  * ключом целиком, а в файле повторы законны (первая раздача побеждает, как у dnsd). Файла нет —
  * карта пустая, как и раньше: так на роутере, где резолвер ещё ничего не раздал. */
-static void emit_fakeip_elements(FILE *f, const char *path) {
+/* fam 6 — карта fakeip6: поддельный IPv6 — пара поддельного IPv4 из второго поля (fakeip6_of),
+ * настоящий — четвёртое поле строки (настоящий IPv6 из ответа AAAA). */
+static void emit_fakeip_elements(FILE *f, const char *path, int fam) {
     FILE *s = fopen(path, "r");
     if (!s) return;
     static uint8_t seen[131072 / 8];       /* 198.18.0.0/15 — бит на адрес */
@@ -535,13 +537,30 @@ static void emit_fakeip_elements(FILE *f, const char *path) {
         if (!t2) continue;
         *t2 = '\0';
         char *real = t2 + 1;
-        char *end = real + strcspn(real, "\t\r\n");
-        *end = '\0';
+        char *t3 = real + strcspn(real, "\t\r\n");
+        char *real6 = *t3 == '\t' ? t3 + 1 : NULL;
+        *t3 = '\0';
         struct in_addr a, b;
-        if (inet_aton(fake, &a) == 0 || inet_aton(real, &b) == 0 || b.s_addr == 0) continue;
+        if (inet_aton(fake, &a) == 0) continue;
         uint32_t fh = ntohl(a.s_addr);
         if ((fh & 0xfffe0000u) != 0xc6120000u) continue;   /* вне 198.18.0.0/15 — не наше */
         uint32_t idx = fh - 0xc6120000u;
+        if (fam == 6) {
+            if (!real6) continue;
+            real6[strcspn(real6, "\t\r\n")] = '\0';
+            uint8_t f6[16], r6[16];
+            if (inet_pton(AF_INET6, real6, r6) != 1) continue;
+            if (seen[idx >> 3] & (uint8_t)(1u << (idx & 7))) continue;
+            seen[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+            fakeip6_of(fh, f6);
+            char fs6[INET6_ADDRSTRLEN], rs6[INET6_ADDRSTRLEN];
+            if (!inet_ntop(AF_INET6, f6, fs6, sizeof(fs6)) ||
+                !inet_ntop(AF_INET6, r6, rs6, sizeof(rs6))) continue;
+            fprintf(f, n ? ",\n            %s : %s" : "        elements = { %s : %s", fs6, rs6);
+            n++;
+            continue;
+        }
+        if (inet_aton(real, &b) == 0 || b.s_addr == 0) continue;
         if (seen[idx >> 3] & (uint8_t)(1u << (idx & 7))) continue;
         seen[idx >> 3] |= (uint8_t)(1u << (idx & 7));
         /* В набор едет РАЗОБРАННЫЙ адрес, а не байты строки. inet_aton принимает не только
@@ -577,7 +596,7 @@ static void print_elements(FILE *f, const struct nft_set *s) {
     int fam = s->key && !strncmp(s->key, "ipv6_addr", 9) ? 6 : 4;
     int list = 0;
     for (const struct nft_elsrc *e = s->els; e; e = e->next) {
-        if (e->k == NFT_EL_FAKEIP_STATE) emit_fakeip_elements(f, e->s);
+        if (e->k == NFT_EL_FAKEIP_STATE) emit_fakeip_elements(f, e->s, fam);
         else if (e->k == NFT_EL_MIXED) {
             if (fam == 6) emit_mixed6(f, e->p);
             else emit_mixed(f, e->p);
@@ -638,7 +657,8 @@ static void print_expr(FILE *f, const struct nft_table *t, const struct nft_rule
     case NFT_X_DNAT:
         /* В таблице одного семейства семейство и так известно, и слово ip после dnat там
          * лишнее; в inet без него nft не знает, адрес какого семейства подставлять. */
-        fprintf(f, "dnat %sto %s map @%s", t->fam == NFT_FAM_INET ? "ip " : "", x->text, x->arg);
+        fprintf(f, "dnat %sto %s map @%s",
+                t->fam != NFT_FAM_INET ? "" : r->fam == 6 ? "ip6 " : "ip ", x->text, x->arg);
         break;
     case NFT_X_JUMP:
         fprintf(f, "jump %s", x->arg);

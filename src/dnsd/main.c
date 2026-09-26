@@ -246,12 +246,14 @@ int dnsd_main(int argc, char **argv) {
      * (nft_table), как у всего остального движка. Спеки эта проба не касается вовсе — делается
      * до ветки ниже и одинаково для обоих источников таблицы каналов. */
     {
-        static char sets_tbl[64], map_tbl[64];
+        static char sets_tbl[64], map_tbl[64], map6_tbl[64];
         int legacy = nft_compat() & NFTC_LEGACY;
         snprintf(sets_tbl, sizeof(sets_tbl), "inet %s", nft_table());
         snprintf(map_tbl, sizeof(map_tbl), "%s %s", legacy ? "ip" : "inet", nft_table());
+        snprintf(map6_tbl, sizeof(map6_tbl), "%s %s", legacy ? "ip6" : "inet", nft_table());
         g_nft_table = sets_tbl;
         g_nft_map_table = map_tbl;
+        g_nft_map6_table = map6_tbl;
         g_nft_sets_interval = !legacy;
     }
 

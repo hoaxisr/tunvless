@@ -430,6 +430,16 @@ static struct pending *pending_alloc(void) {
     return NULL;
 }
 
+/* Каналы, которым принадлежит вопрос. Для A — только каналы с IPv4 (DCH_V4): канал «6» из
+ * таблицы (без набора IPv4) ответ A не забирает. Остальные типы — все совпавшие. */
+static uint64_t match_for(const char *qname, uint16_t qtype) {
+    uint64_t m = dch_match_mask(qname);
+    if (qtype == DNS_TYPE_A)
+        for (size_t i = 0; i < g_dch_n && i < 64; i++)
+            if (!(g_dch[i].fam & DCH_V4)) m &= ~(1ULL << i);
+    return m;
+}
+
 /* Возвращает 1, если датаграмма была и обработана, 0 — если читать нечего.
  * Слушающий сокет неблокирующий, и цикл событий дочитывает очередь до EAGAIN:
  * под всплеском (страница — это 20-40 запросов за миллисекунды) это один
@@ -510,22 +520,48 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
     if (parse_query(buf, (size_t)n, qname, sizeof(qname), &qtype, &qend) == 0) {
         /* Совпавшие каналы — ВСЕ, а решает ответ первый из них: он старший по
          * порядку правил, а ответ клиенту всё равно один. */
-        sets = dch_match_mask(qname);
+        sets = match_for(qname, qtype);
         hit = dch_first(sets);
         /* В журнал — каждый разобранный вопрос, до быстрого пути: ответ из быстрого пути —
          * тоже запрос приложения. Сюда приходят и UDP, и TCP (tcpc_read зовёт эту же функцию). */
         dlog_note(qname, hit);
-        if (hit >= 0 && !g_dch[hit].realip) {
-            if (qtype == DNS_TYPE_AAAA || qtype == DNS_TYPE_HTTPS ||
-                qtype == DNS_TYPE_SVCB) {
-                /* Подавление — свойство правила, а не данных из ответа: NODATA
-                 * можно построить из самого вопроса, наверх не ходим вовсе. */
-                uint8_t out[512];
-                size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 0, 0);
-                if (len) {
-                    make_response_flags(out);
-                    reply_client(out, len, &from, fromlen, &local, have_local);
-                    return 1;
+        /* AAAA имени под правилом без половины IPv6 (хоть один совпавший канал без DCH_V6) —
+         * пустой ответ в любом режиме: клиент с двумя стеками сразу идёт по IPv4. */
+        int aaaa_empty = hit >= 0 && qtype == DNS_TYPE_AAAA && !dch_all_v6(sets);
+        if (hit >= 0 && (aaaa_empty || (!g_dch[hit].realip &&
+                                        (qtype == DNS_TYPE_HTTPS || qtype == DNS_TYPE_SVCB)))) {
+            /* Подавление — свойство правила, а не данных из ответа: NODATA
+             * можно построить из самого вопроса, наверх не ходим вовсе. */
+            uint8_t out[512];
+            size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 0, 0);
+            if (len) {
+                make_response_flags(out);
+                reply_client(out, len, &from, fromlen, &local, have_local);
+                return 1;
+            }
+        } else if (hit >= 0 && !g_dch[hit].realip) {
+            if (qtype == DNS_TYPE_AAAA) {
+                /* fake-IP v6 — тот же быстрый путь, что у A: поддельный IPv6 выводится из
+                 * записи домена, и ответ безопасен до похода наверх, только когда элемент
+                 * карты fakeip6 уже стоит (has_real6 — после ack ядра или rehydrate). */
+                char lname[MAX_HOSTNAME];
+                snprintf(lname, sizeof(lname), "%s", qname);
+                str_lower(lname);
+                long at = fakeip_find(lname);
+                if (at >= 0 && g_fakeip.entries[at].has_real6) {
+                    uint8_t f6[16], out[512];
+                    fakeip6_of(g_fakeip.entries[at].addr, f6);
+                    size_t len = build_rewritten_response6(buf, qend, out, sizeof(out), f6);
+                    if (len) {
+                        make_response_flags(out);
+                        reply_client(out, len, &from, fromlen, &local, have_local);
+                        fakeip_route_set6(lname, dch_fakeip_only(sets));
+                        time_t now = time(NULL);
+                        if (now - g_fakeip.entries[at].refreshed6 < FAKEIP_ANSWER_TTL)
+                            return 1;
+                        g_fakeip.entries[at].refreshed6 = now;
+                        quiet = 1;
+                    }
                 }
             } else if (qtype == DNS_TYPE_A) {
                 /* Ключи таблицы — всегда в нижнем регистре (ответ приводится
@@ -749,7 +785,10 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
     uint16_t qtype = 0;
     size_t qend = 0;
     struct answer_ip ips[32];
-    int nips = parse_response(buf, (size_t)n, qname, sizeof(qname), &qtype, &qend, ips, 32);
+    struct answer_ip6 ips6[16];
+    int n6 = 0;
+    int nips = parse_response(buf, (size_t)n, qname, sizeof(qname), &qtype, &qend, ips, 32,
+                              ips6, 16, &n6);
     /* В нижний регистр СРАЗУ: дальше это имя — ключ таблицы fake-IP и вход
      * матчинга. Прежде вставка шла в регистре ответа (эхо запроса клиента), и
      * клиент с DNS-0x20 плодил второй fake-IP на тот же домен, а быстрый путь,
@@ -771,7 +810,7 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
             hit = p->hit; /* матчинг уже сделан на приёме запроса */
             sets = p->sets;
         } else {
-            sets = dch_match_mask(qname);
+            sets = match_for(qname, qtype);
             hit = dch_first(sets);
         }
     }
@@ -781,16 +820,22 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
         return 1;
     }
 
-    /* Matched a rule. AAAA, HTTPS (65), and SVCB (64) are suppressed outright
-     * (NODATA) rather than relayed:
-     * - AAAA: the engine routes IPv6 since 1.9 (paired `<group>6` sets, `ip -6 rule` per
-     *   output — docs/architecture.md, «4б»), but the resolver does not yet put AAAA answers
-     *   into those sets (no fake-IP v6 pool, no real-ip v6), so letting a real AAAA answer
-     *   through would hand a dual-stack client a real unmanaged address bypassing the tunnel.
+    /* Matched a rule. HTTPS (65) and SVCB (64) are suppressed outright (NODATA) rather than
+     * relayed, and so is AAAA when the rule has no IPv6 half:
+     * - AAAA: since 1.9 the resolver answers it for a rule whose group carries IPv6 (dom6_ok:
+     *   the output routes IPv6 and the clients are expressible for IPv6) — with a fake IPv6
+     *   (fake-IP) or with the real addresses put into the `<set>6` set (real-ip), see below.
+     *   If ANY matched channel lacks the IPv6 half, a real AAAA would hand a dual-stack client
+     *   an address no rule of that channel catches, bypassing its output; a fake IPv6 would
+     *   be DNATed and go the same way. Empty answer: the client goes over IPv4 at once.
      * - HTTPS/SVCB: upstream HTTPS responses contain ipv4hint/ipv6hint (real IPs) and
      *   h3 (QUIC ALPN). Letting real IPv4/IPv6 hints through causes modern browsers to
-     *   attempt direct connections to real IPs outside fake-IP DNAT/set, causing 1-3s delays. */
-    if (qtype == DNS_TYPE_AAAA || qtype == DNS_TYPE_HTTPS || qtype == DNS_TYPE_SVCB) {
+     *   attempt direct connections to real IPs outside fake-IP DNAT/set, causing 1-3s delays.
+     *   Rewriting the hints to fake addresses was considered and rejected: the record also
+     *   carries ECH keys and ALPN tied to the real endpoint, and a browser that finds no
+     *   HTTPS record simply falls back to A/AAAA — which we already answer correctly. */
+    if (qtype == DNS_TYPE_HTTPS || qtype == DNS_TYPE_SVCB ||
+        (qtype == DNS_TYPE_AAAA && !dch_all_v6(sets))) {
         if (!quiet) {
             uint8_t out[512];
             size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 0, 0);
@@ -817,8 +862,70 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
                 for (int k = 0; k < nips; k++)
                     dch_add(c, qname, ntohl(ips[k].addr), set_ttl_clamp(ips[k].ttl));
             }
+        /* real-ip v6: настоящие AAAA — в парные наборы «<канал>6» с тем же сроком ответа.
+         * Сюда доходит только имя, у всех каналов которого половина IPv6 есть (выше). */
+        if (qtype == DNS_TYPE_AAAA)
+            for (size_t c = 0; c < g_dch_n; c++) {
+                if (!(sets & (1ULL << c)) || !g_dch[c].realip) continue;
+                for (int k = 0; k < n6; k++)
+                    dch_add6(c, qname, ips6[k].addr, set_ttl_clamp(ips6[k].ttl));
+            }
         if (!quiet)
             reply_client(buf, (size_t)n, &p->client, p->client_len, &p->local, p->have_local);
+        return 1;
+    }
+
+    /* fake-IP v6: поддельный IPv6 — пара поддельного IPv4 той же записи (fakeip.c). Порядок тот
+     * же, что у A: сначала элемент карты fakeip6 с ack ядра, и только потом ответ клиенту.
+     * Отличие — в отказе: у A отказ карты даёт настоящий ответ (fail-open) или SERVFAIL в окне
+     * пересборки, а здесь — пустой ответ. Настоящий AAAA увёл бы клиента по IPv6 мимо выхода, а
+     * пустой лишь отправляет его на IPv4, где у имени свой путь; SERVFAIL заставил бы клиента
+     * переспросить и A тоже. Ответ без AAAA (NODATA, одни CNAME) уходит как есть — подменять в
+     * нём нечего. */
+    if (qtype == DNS_TYPE_AAAA) {
+        uint32_t fake_addr;
+        if (n6 == 0) {
+            if (!quiet)
+                reply_client(buf, (size_t)n, &p->client, p->client_len, &p->local, p->have_local);
+            return 1;
+        }
+        if (fakeip_lookup_or_alloc(qname, &fake_addr) == 0) {
+            const uint8_t *known = fakeip_entry_get_real6(qname);
+            const uint8_t *real6 = ips6[0].addr;
+            if (known)
+                for (int k = 0; k < n6; k++)
+                    if (!memcmp(ips6[k].addr, known, 16)) { real6 = known; break; }
+            uint8_t f6[16], r6[16];
+            memcpy(r6, real6, 16);          /* known указывает в запись — она может переехать */
+            fakeip6_of(fake_addr, f6);
+            int maprc = nft_map_set_element6(g_fakeip6_map, f6, r6, known);
+            if (maprc == 0) {
+                g_map_fail_since = 0;
+                fakeip_entry_set_real6(qname, r6);
+                fakeip_route_set6(qname, dch_fakeip_only(sets));
+                if (quiet) return 1;
+                uint8_t out[512];
+                size_t len = build_rewritten_response6(buf, qend, out, sizeof(out), f6);
+                if (len > 0) {
+                    reply_client(out, len, &p->client, p->client_len, &p->local, p->have_local);
+                    return 1;
+                }
+            } else if (g_nlk_fd >= 0) {
+                static time_t warned6;
+                time_t now = time(NULL);
+                if (now - warned6 > 60) {
+                    warned6 = now;
+                    fprintf(stderr, "steer dnsd: подмена IPv6 для %s не встала в ядро (rc=%d) — "
+                                    "клиенту отвечено без AAAA\n", qname, maprc);
+                }
+            }
+        }
+        if (!quiet) {
+            uint8_t out[512];
+            size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 0, 0);
+            reply_client(len ? out : buf, len ? len : (size_t)n, &p->client, p->client_len,
+                         &p->local, p->have_local);
+        }
         return 1;
     }
 

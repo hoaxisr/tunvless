@@ -6,14 +6,21 @@ table inet steer {
         flags interval,timeout
         auto-merge
     }
+    set geo_dom6 {
+        type ipv6_addr
+        flags interval,timeout
+        auto-merge
+    }
     chain prerouting_mark {
         type filter hook prerouting priority mangle + 1; policy accept;
         ip saddr { 192.168.1.0/24 } ip daddr @geo_dom meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:geo_dom"
+        iifname "br-lan" ip6 daddr @geo_dom6 meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:geo_dom"
     }
 
     chain postrouting_down {
         type filter hook postrouting priority srcnat + 10; policy accept;
         ip daddr { 192.168.1.0/24 } ip saddr @geo_dom counter comment "steer-down:geo_dom"
+        oifname "br-lan" ip6 saddr @geo_dom6 counter comment "steer-down:geo_dom"
     }
     chain prerouting_dns {
         type nat hook prerouting priority dstnat; policy accept;
@@ -29,8 +36,12 @@ table inet steer {
             198.18.0.9 : 203.0.113.20,
             198.18.0.3 : 203.0.113.13 }
     }
+    map fakeip6 {
+        type ipv6_addr : ipv6_addr;
+    }
     chain prerouting_dnat {
         type nat hook prerouting priority dstnat; policy accept;
         ip daddr 198.18.0.0/15 counter dnat ip to ip daddr map @fakeip
+        ip6 daddr fdfe:dcba:9876::/96 counter dnat ip6 to ip6 daddr map @fakeip6
     }
 }

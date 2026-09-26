@@ -51,9 +51,53 @@
  *
  * Отдельной функцией — чтобы это проверялось стендом: разбор ответа ядра для проверки
  * требует живого nft, а выбор фразы — нет. */
+/* Поддельный ли адрес — из пула IPv4 (198.18.0.0/15) или IPv6 (FAKEIP6_NET, пара к IPv4); в
+ * *fake4 — поддельный IPv4 (у IPv6 — его пара), по нему имя ищется в fakeip.state. */
+static int fake_addr(const char *addr, uint32_t *fake4) {
+    if (!addr) return 0;
+    if (strchr(addr, ':')) {
+        uint8_t a[16];
+        if (strchr(addr, '/') || inet_pton(AF_INET6, addr, a) != 1) return 0;
+        uint32_t v = fakeip6_to4(a);
+        if (fake4) *fake4 = v;
+        return v != 0;
+    }
+    if (strncmp(addr, "198.18.", 7) != 0 && strncmp(addr, "198.19.", 7) != 0) return 0;
+    struct in_addr a;
+    if (fake4) *fake4 = inet_pton(AF_INET, addr, &a) == 1 ? ntohl(a.s_addr) : 0;
+    return 1;
+}
+
+/* Имя, которому резолвер выдал поддельный адрес fake4 (и его пару IPv6), — по файлу состояния
+ * резолвера (fakeip.state, первое и второе поля). 0 — нашлось. */
+static int fake_domain(uint32_t fake4, char *dst, size_t n) {
+    char path[512];
+    if (snprintf(path, sizeof(path), "%s/fakeip.state", steer_state_dir()) >= (int)sizeof(path))
+        return -1;
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char line[1024];
+    int found = -1;
+    while (found && fgets(line, sizeof(line), f)) {
+        char *t1 = strchr(line, '\t');
+        if (!t1) continue;
+        *t1 = '\0';
+        char *fs = t1 + 1;
+        fs[strcspn(fs, "\t\r\n")] = '\0';
+        struct in_addr a;
+        if (inet_pton(AF_INET, fs, &a) != 1 || ntohl(a.s_addr) != fake4) continue;
+        size_t l = strlen(line);
+        if (l >= n) l = n - 1;
+        memcpy(dst, line, l);
+        dst[l] = '\0';
+        found = 0;
+    }
+    fclose(f);
+    return found;
+}
+
 const char *explain_set_phrase(const char *addr, int has_files, int has_domains) {
-    int fake = addr && (strncmp(addr, "198.18.", 7) == 0 || strncmp(addr, "198.19.", 7) == 0);
-    if (fake) return "domain set";
+    if (fake_addr(addr, NULL)) return "domain set";
     if (has_files && has_domains) return "address+domain set";
     return has_domains ? "domain set" : "address set";
 }
@@ -167,19 +211,38 @@ int looks_like_name(const char *s) {
  * Разбирается не формат nft целиком, а слова из цифр, точек, дробей и дефисов после
  * «elements = {»: адрес, префикс, диапазон. Прочее (timeout 1h, expires 59m) адресом не
  * читается и пропускается само. */
+/* Покрывает ли элемент набора tok (адрес, префикс или диапазон) весь спрошенный адрес addr —
+ * у обоих семейств (1.9: адрес IPv6 ищется в парном наборе «<группа>6»). Семейство — по addr:
+ * элемент другого семейства просто не разбирается. */
+static int span_covers(const char *tok, const char *addr) {
+    if (strchr(addr, ':')) {
+        uint8_t qlo[16], qhi[16], lo[16], hi[16];
+        return ipv6_span(addr, qlo, qhi) && ipv6_span(tok, lo, hi) &&
+               memcmp(lo, qlo, 16) <= 0 && memcmp(qhi, hi, 16) <= 0;
+    }
+    uint32_t qlo, qhi, lo, hi;
+    return ipv4_span(addr, &qlo, &qhi) && ipv4_span(tok, &lo, &hi) && lo <= qlo && qhi <= hi;
+}
+
+/* Знак слова элемента в дампе: у IPv6 — ещё шестнадцатеричные буквы и двоеточие. */
+static int elem_char(int c, int v6) {
+    if ((c >= '0' && c <= '9') || c == '.' || c == '/' || c == '-') return 1;
+    return v6 && ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == ':');
+}
+
 static int set_scan(const char *set, const char *addr) {
     for (const char *q = set; *q; q++)
         if (!((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') ||
               (*q >= '0' && *q <= '9') || *q == '_' || *q == '-'))
             return 0;
-    uint32_t qlo, qhi;
-    if (!ipv4_span(addr, &qlo, &qhi)) return 0;
+    int v6 = strchr(addr, ':') != NULL;
+    if (!span_covers(addr, addr)) return 0;
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "nft list set inet %s %.64s 2>/dev/null", nft_table(), set);
     FILE *p = popen(cmd, "r");
     if (!p) return 0;
     int in = 0, hit = 0, c;
-    char tok[40];
+    char tok[96];
     size_t tn = 0;
     const char *key = "elements = {";
     size_t kpos = 0;
@@ -189,15 +252,14 @@ static int set_scan(const char *set, const char *addr) {
             if (!key[kpos]) in = 1;
             continue;
         }
-        if ((c >= '0' && c <= '9') || c == '.' || c == '/' || c == '-') {
+        if (elem_char(c, v6)) {
             if (tn + 1 < sizeof(tok)) tok[tn++] = (char)c;
             continue;
         }
         if (tn) {
             tok[tn] = '\0';
             tn = 0;
-            uint32_t lo, hi;
-            if (ipv4_span(tok, &lo, &hi) && lo <= qlo && qhi <= hi) hit = 1;
+            if (span_covers(tok, addr)) hit = 1;
         }
         if (c == '}') in = 0;
     }
@@ -216,8 +278,7 @@ static int set_scan_mixed(const char *set, const char *addr, char *desc, size_t 
         if (!((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') ||
               (*q >= '0' && *q <= '9') || *q == '_' || *q == '-'))
             return 0;
-    uint32_t qlo, qhi;
-    if (!ipv4_span(addr, &qlo, &qhi)) return 0;
+    if (!span_covers(addr, addr)) return 0;
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "nft list set inet %s %.64s 2>/dev/null", nft_table(), set);
     FILE *p = popen(cmd, "r");
@@ -240,10 +301,9 @@ static int set_scan_mixed(const char *set, const char *addr, char *desc, size_t 
         el[en] = '\0';
         en = 0;
         /* «адрес . протокол . порты [timeout …]» */
-        char a[64], pr[32], po[32];
-        if (sscanf(el, "%63s . %31s . %31s", a, pr, po) == 3) {
-            uint32_t lo, hi;
-            if (ipv4_span(a, &lo, &hi) && lo <= qlo && qhi <= hi) {
+        char a[96], pr[32], po[32];
+        if (sscanf(el, "%95s . %31s . %31s", a, pr, po) == 3) {
+            if (span_covers(a, addr)) {
                 hit = 1;
                 if (!strcmp(pr, "0-255") && !strcmp(po, "0-65535")) full = 1;
                 else if (dk + strlen(pr) + strlen(po) + 4 < dn) {
@@ -307,12 +367,15 @@ int explain_emit(const struct spec *cfg, const struct groups *gr, const char *wh
                    "доменных списках, а вышестоящий сервер его не знает\n", what);
             return 0;
         }
-        int fake = strncmp(resolved, "198.18.", 7) == 0 || strncmp(resolved, "198.19.", 7) == 0;
+        int fake = fake_addr(resolved, NULL);
         fprintf(out, "%s -> %s (%s)\n", what, resolved,
                fake ? "fake-IP, выдан steer — значит имя в доменном списке"
                     : "настоящий адрес — имя ни в одном доменном списке не нашлось");
         addr = resolved;
     }
+    /* Адрес IPv6 (1.9) ищется в парных наборах «<группа>6»: туда компилятор кладёт строки IPv6
+     * списков, а резолвер — поддельные IPv6 и настоящие адреса из ответов AAAA. */
+    int v6 = strchr(addr, ':') != NULL;
     for (size_t i = 0; i < gr->n; i++) {
         /* Сужение составного набора — то, что совпало в его элементах (set_scan_mixed). */
         char mdesc[256] = "";
@@ -329,22 +392,25 @@ int explain_emit(const struct spec *cfg, const struct groups *gr, const char *wh
              * looked". */
             if (getenv("STEER_EXPLAIN_TRACE"))
                 fprintf(stderr, "checking %.63s\n", gr->g[i].name);
-            snprintf(setname, sizeof(setname), "%.63s", gr->g[i].name);
+            if (v6) group_set6_name(&gr->g[i], setname, sizeof(setname));
+            else snprintf(setname, sizeof(setname), "%.63s", gr->g[i].name);
             snprintf(elem, sizeof(elem), "{ %s }", addr);
             if (gr->g[i].composite)
                 hit = set_scan_mixed(setname, addr, mdesc, sizeof(mdesc), &mnarrow);
             else
                 hit = set_lookup(setname, elem, addr);
             /* Исключения-подсети доп. группы (набор «x.com, но не эти адреса»): адрес в них —
-             * значит этот канал его не берёт, смотрим следующий. */
-            if (hit && gr->g[i].xcidr) {
+             * значит этот канал его не берёт, смотрим следующий. Они только IPv4. */
+            if (hit && gr->g[i].xcidr && !v6) {
                 char xn[80];
                 snprintf(xn, sizeof(xn), "%.63s_x", gr->g[i].name);
                 if (set_lookup(xn, elem, addr)) hit = 0;
             }
             /* Старая раскладка: у доменной группы вторая половина набора, с префиксами. */
             if (!hit && legacy_may_have_static(&gr->g[i])) {
-                nft_static_set_name(setname, sizeof(setname), gr->g[i].name);
+                char base[72];
+                snprintf(base, sizeof(base), "%s", setname);
+                nft_static_set_name(setname, sizeof(setname), base);
                 hit = set_lookup(setname, elem, addr);
             }
         }
@@ -364,6 +430,16 @@ int explain_emit(const struct spec *cfg, const struct groups *gr, const char *wh
             fprintf(out, " -> dev %s (mark 0x%08x, table %d)\n", o->device, o->mark, o->table);
         else
             fprintf(out, " -> direct\n");
+        /* Поддельный адрес — чей: имя из файла состояния резолвера. Отдельной строкой, чтобы
+         * первая осталась прежней. */
+        uint32_t f4 = 0;
+        char dom[256];
+        if (fake_addr(addr, &f4) && f4 && fake_domain(f4, dom, sizeof(dom)) == 0)
+            fprintf(out, "      поддельный адрес имени %s\n", dom);
+        /* Выход без IPv6: IPv6 этого правила отвергается (forward_v6), а не идёт через выход. */
+        if (v6 && out_needs_mark(o) && !out_has_cap(o, KC_IPV6))
+            fprintf(out, "      выход без IPv6: трафик IPv6 этого правила отбрасывается, а не "
+                         "идёт напрямую\n");
         /* Канал бывает СУЖЕН по протоколу и портам, а спрошен был адрес. Адрес в наборе
          * лежит — но «идёт туда» верно не для всего его трафика, и промолчать значило бы
          * ответить правдой наполовину: человек, выясняющий, почему TCP к 104.16.0.1 идёт
@@ -386,5 +462,10 @@ int explain_emit(const struct spec *cfg, const struct groups *gr, const char *wh
         return 0;
     }
     fprintf(out, "%s -> no channel matches -> direct (steer does not touch it)\n", addr);
+    uint32_t f4 = 0;
+    char dom[256];
+    if (fake_addr(addr, &f4) && f4 && fake_domain(f4, dom, sizeof(dom)) == 0)
+        fprintf(out, "      поддельный адрес имени %s — правило, выдавшее его, больше не "
+                     "совпадает\n", dom);
     return 0;
 }

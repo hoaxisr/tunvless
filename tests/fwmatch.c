@@ -377,6 +377,10 @@ int main(void) {
              * fake-IP (иначе объяснение соврёт на чужом адресе). */
             { "198.180 не fake-IP", "198.180.0.1", 1, 1, "address+domain set" },
             { "198.1 не fake-IP", "198.1.0.1", 0, 1, "domain set" },
+            /* fake-IP v6 (1.9): пара поддельного IPv4 в пуле fdfe:dcba:9876::/96. */
+            { "fake-IP v6 при обоих списках", "fdfe:dcba:9876::c612:1", 1, 1, "domain set" },
+            { "тот же префикс вне пары — не fake-IP", "fdfe:dcba:9876::1", 1, 1, "address+domain set" },
+            { "настоящий IPv6 при обоих списках", "2001:db8::1", 1, 1, "address+domain set" },
         };
         for (size_t i = 0; i < sizeof(t) / sizeof(*t); i++) {
             const char *got = explain_set_phrase(t[i].addr, t[i].files, t[i].domains);

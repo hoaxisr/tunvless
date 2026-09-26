@@ -77,6 +77,12 @@ struct answer_ip {
     uint32_t ttl;
 };
 
+/* Запись AAAA ответа: адрес в порядке сети и её срок. */
+struct answer_ip6 {
+    uint8_t addr[16];
+    uint32_t ttl;
+};
+
 enum rule_type { RULE_EXACT, RULE_NAMESPACE, RULE_WILDCARD, RULE_REGEX };
 
 struct rule {
@@ -160,6 +166,18 @@ struct fakeip_entry {
      * узнаёт ничего нового, а стоит полного круга сокет-эполл-резолвер. */
     time_t route_asserted;
     time_t refreshed;
+    /* Половина IPv6 той же записи (fake-IP v6, docs/architecture.md, «4б»). Поддельный IPv6 не
+     * хранится: он выводится из addr (fakeip6_of — префикс пула и поддельный IPv4 в младших
+     * 32 битах), поэтому выдача у обоих семейств одна и пул один. real6 — настоящий адрес из
+     * ответа AAAA, под которым стоит элемент карты fakeip6 (has_real6 — ядро его подтвердило
+     * или восстановил rehydrate; четвёртое поле файла состояния). sets6, route6_asserted,
+     * refreshed6 — то же, что sets/route_asserted/refreshed, для наборов «<канал>6» и ответа
+     * AAAA; на диск не пишутся. */
+    uint8_t real6[16];
+    int has_real6;
+    uint64_t sets6;
+    time_t route6_asserted;
+    time_t refreshed6;
 };
 
 struct fakeip_table {
@@ -205,7 +223,13 @@ struct dchan {
     char chan[32];
     char out[32];
     int chan_dom;               /* chan — правило с domains_files */
+    /* Семейства канала (поле family таблицы, tabfmt.h): DCH_V4 — набор `set` и ответы A, DCH_V6 —
+     * парный набор «<set>6» и ответы AAAA (fake-IP v6 или настоящие адреса). Без DCH_V6 AAAA имён
+     * канала гасится пустым ответом: у правила нет половины IPv6 (dom6_ok, spec.h). */
+    int fam;
 };
+#define DCH_V4 1
+#define DCH_V6 2
 
 /* ---------------------------------------------------------------------- */
 /* глобалы, пересекающие границу файла (были static в одном dnsd.c)       */
@@ -265,18 +289,25 @@ int dch_matches(const struct dchan *d, const char *host);
  * сужению совпавших частей. ttl — как у nft_add_element. */
 int dch_add(size_t i, const char *domain, uint32_t addr_host, uint32_t ttl);
 void dch_del(size_t i, const char *domain, uint32_t addr_host);
+/* То же для адреса IPv6 — в парный набор «<set>6» канала i (составной — ключом IPv6). */
+int dch_add6(size_t i, const char *domain, const uint8_t addr[16], uint32_t ttl);
+void dch_del6(size_t i, const char *domain, const uint8_t addr[16]);
 
 /* wire.c */
 int parse_query(const uint8_t *pkt, size_t len, char *out_qname,
                  size_t qname_len, uint16_t *out_qtype, size_t *out_qend);
+/* ips6/max_ips6/n6 — записи AAAA ответа (ips6 == NULL — не нужны; *n6 — сколько найдено). */
 int parse_response(const uint8_t *pkt, size_t len, char *out_qname,
                     size_t qname_len, uint16_t *out_qtype,
                     size_t *out_qend, struct answer_ip *ips,
-                    int max_ips);
+                    int max_ips, struct answer_ip6 *ips6, int max_ips6, int *n6);
 void make_response_flags(uint8_t *pkt);
 size_t build_rewritten_response(const uint8_t *orig, size_t qend,
                                  uint8_t *out, size_t out_cap,
                                  int with_answer, uint32_t fake_addr_host);
+/* Ответ с одной записью AAAA (поддельный IPv6) — тем же сборщиком, что и A. */
+size_t build_rewritten_response6(const uint8_t *orig, size_t qend,
+                                  uint8_t *out, size_t out_cap, const uint8_t fake6[16]);
 
 /* fakeip.c */
 long fakeip_find(const char *domain);
@@ -287,11 +318,21 @@ uint32_t fakeip_entry_get_real(const char *domain);
 void fakeip_entry_set_real(const char *domain, uint32_t real_host);
 void fakeip_route_set(const char *domain, uint64_t want);
 size_t fakeip_rehydrate(int nk_open, size_t *routed_out);
+/* fake-IP v6: настоящий адрес под элементом карты fakeip6 (NULL — не знаем), его запись и
+ * постоянный элемент поддельного IPv6 в наборах «<канал>6» из want. */
+const uint8_t *fakeip_entry_get_real6(const char *domain);
+void fakeip_entry_set_real6(const char *domain, const uint8_t real6[16]);
+void fakeip_route_set6(const char *domain, uint64_t want);
+extern const char *g_fakeip6_map;
 
 /* table.c */
 uint64_t dch_match_mask(const char *host);
 int dch_first(uint64_t mask);
 uint64_t dch_fakeip_only(uint64_t mask);
+/* Все ли каналы из mask несут IPv6 (DCH_V6) — отвечать ли на AAAA имени адресом, а не пустым
+ * ответом. Все, а не первый: канал без IPv6 среди совпавших не забрал бы поддельный IPv6 своих
+ * клиентов, и их соединение ушло бы мимо его выхода. Пустой mask — 0. */
+int dch_all_v6(uint64_t mask);
 void dch_build(const struct spec *sp);
 void dch_sig_write(void);
 
