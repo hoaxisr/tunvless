@@ -19,7 +19,10 @@
 # демон build/steer-xk — базовая сборка с видами vless и xsteer): здоровье выходов xsteer сторож
 # берёт из событий помощников — помощник пишет down, и выход-пул переключается на следующее
 # устройство (switched у подписчика), пишет up — возвращается, и всё это без файлов probe-* и
-# xsteer-*.json в каталоге состояния; ход перебора узлов vless status берёт из памяти демона;
+# xsteer-*.json в каталоге состояния; клиент vless, следящий за узлом сам (up с watch), — приговор
+# без пробы TCP (через его устройство-заглушку она бы не прошла), его down переключает выход-пул
+# внеочередным проходом (период сторожа — 600 с), status показывает node_down с причиной, diag —
+# «узел перестал отвечать», а up возвращает пул; ход перебора узлов vless status берёт из памяти демона;
 # оживление обфускатора — перезапуск помощника демоном (helper-down с причиной, helper-up), ubus
 # не зовётся; смена содержимого файла стратегии zapret и reload перезапускают обработчик только
 # этого выхода.
@@ -381,8 +384,9 @@ XK="${STEER_XK:-$(dirname "$BIN")/steer-xk}"
 if [ "${SUPD_INNER:-}" = 1 ] && [ -x "$XK" ] && command -v unshare >/dev/null 2>&1 &&
    unshare -m sh -c 'mount -t sysfs sysfs /sys' 2>/dev/null &&
    ip link add xa type dummy 2>/dev/null && ip link add xb type dummy 2>/dev/null &&
-   ip link add wo type dummy 2>/dev/null; then
-    for dv in xa xb wo; do ip link set "$dv" addrgenmode none 2>/dev/null; ip link set "$dv" up; done
+   ip link add wo type dummy 2>/dev/null && ip link add va type dummy 2>/dev/null &&
+   ip link add vb type dummy 2>/dev/null; then
+    for dv in xa xb wo va vb; do ip link set "$dv" addrgenmode none 2>/dev/null; ip link set "$dv" up; done
     W="$tmp/w"
     mkdir -p "$W/st" "$W/bin"
     printf '#!/bin/sh\necho "ubus $*" >> "%s/ubus.log"\nexit 0\n' "$W" > "$W/bin/ubus"
@@ -394,16 +398,18 @@ if [ "${SUPD_INNER:-}" = 1 ] && [ -x "$XK" ] && command -v unshare >/dev/null 2>
 echo "\$1 \$2 \$\$" >> "$W/log"
 [ -n "\${STEER_EVENT_FD:-}" ] && eval "exec 9>&\$STEER_EVENT_FD"
 trap 'echo "stop \$1 \$2 \$\$" >> "$W/log"; exit 0' TERM
-case "\$1" in
-nfqws) while :; do sleep 0.1; done ;;
-vless) printf '{"ev":"node","n":2,"total":5}\n' >&9; while :; do sleep 0.1; done ;;
+upline='{"ev":"up"}' downline='{"ev":"down","why":"стенд: отказ"}'
+case "\$1 \$2" in
+nfqws*) while :; do sleep 0.1; done ;;
+"vless vl") printf '{"ev":"node","n":2,"total":5}\n' >&9; while :; do sleep 0.1; done ;;
+vless*) upline='{"ev":"up","watch":1}' downline='{"ev":"down","why":"стенд: узел молчит"}' ;;
 esac
 last=""
 while :; do
     cur=up; [ -e "$W/down.\$2" ] && cur=down
     if [ "\$cur" != "\$last" ]; then
-        if [ "\$cur" = up ]; then printf '{"ev":"up"}\n' >&9
-        else printf '{"ev":"down","why":"стенд: отказ"}\n' >&9; fi
+        if [ "\$cur" = up ]; then printf '%s\n' "\$upline" >&9
+        else printf '%s\n' "\$downline" >&9; fi
         last=\$cur
     fi
     sleep 0.1
@@ -424,7 +430,10 @@ H
  "vpn":{"kind":"interface","devices":["xa","xb"],"on_fail":"drop"},
  "zq":{"kind":"zapret","opts_file":"$W/zq.opts"},
  "zr":{"kind":"zapret","opts_file":"$W/zr.opts"},
- "vl":{"kind":"vless","sub_file":"$W/sub.txt","on_fail":"direct"}$wo},
+ "vl":{"kind":"vless","sub_file":"$W/sub.txt","on_fail":"direct"},
+ "va":{"kind":"vless","sub_file":"$W/sub.txt","on_fail":"direct"},
+ "vb":{"kind":"vless","sub_file":"$W/sub.txt","on_fail":"direct"},
+ "vv":{"kind":"interface","devices":["va","vb"],"on_fail":"drop"}$wo},
  "channels":[]}
 EOF
     }
@@ -435,9 +444,10 @@ EOF
     wspec
     WD=""
     # STEER_FAILOVER_HYST=0 — возврат на ожившее предпочтительное устройство без выдержки в три
-    # прохода: стенд смотрит на то, откуда сторож берёт здоровье, а не на гистерезис.
+    # прохода: стенд смотрит на то, откуда сторож берёт здоровье, а не на гистерезис. Период —
+    # 600 с: всё, что стенд ждёт от сторожа, обязано прийти внеочередным проходом по событию.
     unshare -m sh -c "mount -t sysfs sysfs /sys && PATH=\"$W/bin:\$PATH\" STEER_FAILOVER_HYST=0 \
-        STEER_SUPERVISE_EXE=\"$W/helper\" exec \"$XK\" daemon --watch --supervise \
+        STEER_SUPERVISE_EXE=\"$W/helper\" exec \"$XK\" daemon --watch --watch-period 600 --supervise \
         --socket \"$W/s.sock\" --spec \"$W/spec.json\" --state-dir \"$W/st\" \
         --dnsd-flag --listen-port --dnsd-flag 15411 --dnsd-flag --upstream-port --dnsd-flag 15475" \
         >"$W/d.out" 2>"$W/d.err" &
@@ -477,6 +487,56 @@ EOF
         "$(grep '"ev":"switched","out":"vpn","from":"xb"' "$W/sub.out")"
     check "  файлов probe-* и xsteer-*.json в каталоге состояния нет" "" "$(nofiles)"
 
+    # Клиент vless, следящий за узлом сам (up с watch): его слово — приговор, пробы TCP нет. Через
+    # устройства va и vb (dummy без адреса в пространстве без маршрутов) соединение TCP не уходит
+    # вовсе — проба сторожа признала бы их мёртвыми, а выход-пул vv стоит на va.
+    check "клиент vless с watch: пул на первом устройстве, хотя проба TCP через него не прошла бы" \
+        '{"v":1,"ev":"switched","out":"vv","from":null,"to":"va","why":"start"}' \
+        "$(grep '"ev":"switched","out":"vv"' "$W/sub.out" | head -1)"
+    check "  соединение TCP через va и правда не уходит" "no" \
+        "$(python3 -c 'import socket
+s = socket.socket(); s.settimeout(2)
+s.setsockopt(socket.SOL_SOCKET, 25, b"va\0")
+try: s.connect(("1.1.1.1", 80)); print("yes")
+except OSError: print("no")' 2>&1)"
+    # vast — «в отказе|причина node_down|время есть» у выхода va по status.
+    vast() { wctl status | python3 -c 'import json,sys
+d = json.loads(json.load(sys.stdin)["stdout"])["outputs"]["va"]; n = d.get("node_down") or {}
+print(d.get("failed", False), n.get("why", "-"), n.get("since", 0) > 0, sep="|")' 2>&1; }
+    check "  status va — в строю, без node_down" "False|-|False" "$(vast)"
+    # Узел потерян: клиент пишет down с причиной — демон переключает пул тем же внеочередным
+    # проходом (период сторожа у стенда — 600 с, дождаться его нельзя), va — в отказе.
+    t0=$(date +%s)
+    touch "$W/down.va"
+    wait_for 'grep -q "\"ev\":\"switched\",\"out\":\"vv\",\"from\":\"va\"" "$W/sub.out"' 40
+    check "клиент vless пишет down — пул переключён без прохода по периоду" \
+        '{"v":1,"ev":"switched","out":"vv","from":"va","to":"vb","why":"down"}' \
+        "$(grep '"ev":"switched","out":"vv","from":"va"' "$W/sub.out")"
+    check "  за секунды, а не за период" "yes" "$([ $(($(date +%s) - t0)) -lt 60 ] && echo yes)"
+    check "  подписчику — helper-down с причиной клиента" \
+        '{"v":1,"ev":"helper-down","out":"va","helper":"vless","why":"стенд: узел молчит"}' \
+        "$(grep '"ev":"helper-down","out":"va"' "$W/sub.out")"
+    wait_for '[ "$(vast)" = "True|стенд: узел молчит|True" ]' 10
+    check "  status va — отказ и причина от клиента (node_down)" "True|стенд: узел молчит|True" \
+        "$(vast)"
+    check "  diag va — узел перестал отвечать, с причиной клиента" \
+        "fail|выход va: узел перестал отвечать, трафик канала идёт напрямую|стенд: узел молчит; выход вернётся сам, когда узел ответит" \
+        "$(wctl diag | python3 -c 'import json,sys
+d = json.loads(json.load(sys.stdin)["stdout"])
+for c in d["checks"]:
+    if c["id"] == "output" and c["what"].startswith("выход va:"): print(c["verdict"], c["what"], c["why"], sep="|")' 2>&1)"
+    check "  оживлять нечего — в журнале, что клиент ищет узел сам" "yes" \
+        "$(grep -q 'va: узел не отвечает — клиент ищет узел сам; жду его сообщения' "$W/d.err" && echo yes)"
+    # Узел нашёлся: up с watch — возврат, и никаких следов отказа.
+    rm -f "$W/down.va"
+    wait_for 'grep -q "\"ev\":\"switched\",\"out\":\"vv\",\"from\":\"vb\"" "$W/sub.out"' 40
+    check "клиент vless пишет up — пул вернулся на va" \
+        '{"v":1,"ev":"switched","out":"vv","from":"vb","to":"va","why":"preferred"}' \
+        "$(grep '"ev":"switched","out":"vv","from":"vb"' "$W/sub.out")"
+    wait_for '[ "$(vast)" = "False|-|False" ]' 10
+    check "  status va — снова в строю, node_down нет" "False|-|False" "$(vast)"
+    check "  файлов probe-* по-прежнему нет" "" "$(nofiles)"
+
     # Выход с обфускатором: его устройство не отвечает — оживление перезапуском помощника в демоне.
     wspec wo
     wctl reload >/dev/null
@@ -510,7 +570,7 @@ EOF
     kill -TERM $WD 2>/dev/null
     wait_for '! kill -0 $WD 2>/dev/null' 15
     WD=""
-    ip link del xa; ip link del xb; ip link del wo
+    ip link del xa; ip link del xb; ip link del wo; ip link del va; ip link del vb
 else
     echo "supdmatch: нет root, своего сетевого пространства, своего /sys или $XK — сторож с супервизором пропущен"
 fi

@@ -579,6 +579,35 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
             diag("output", "fail", what, why);
             continue;
         }
+        /* Устройство есть, а узел за ним клиент vless потерял — сказал об этом сам (слежка за
+         * узлом под демоном, src/tunnel/tunnel.c; сюда — из памяти демона через окружение).
+         * Приговор — про узел, а не «устройство не отвечает»: устройство на месте, и чинить его
+         * незачем. Причина — словами клиента. Выход при этом обычно и в отказе (сторож принял
+         * down клиента), и тогда в той же строке — куда пошёл трафик канала. */
+        {
+            const struct output *po = out_for_device(sp, &sp->out[i], sp->out[i].device);
+            struct probe_status pr = { PROBE_NONE, 0, 0, 0, "" };
+            if (out_engine_managed(po)) pr = probe_read(po->name);
+            if (pr.state == PROBE_LOST) {
+                if (sp->out[i].failed)
+                    snprintf(what, sizeof(what), "выход %.40s: узел перестал отвечать, трафик "
+                             "канала %s", sp->out[i].name,
+                             sp->out[i].on_fail == FAIL_DROP ? "остановлен" :
+                             sp->out[i].on_fail == FAIL_ZAPRET ? "идёт через обход" :
+                             "идёт напрямую");
+                else
+                    snprintf(what, sizeof(what), "выход %.40s: узел перестал отвечать",
+                             sp->out[i].name);
+                /* diag() печатает текст в кавычки как есть, а причина — чужая строка: кавычку,
+                 * обратную косую и управляющие байты — пробелом, чтобы JSON не разломился. */
+                for (char *c = pr.why; *c; c++)
+                    if (*c == '"' || *c == '\\' || (unsigned char)*c < 0x20) *c = ' ';
+                snprintf(why, sizeof(why), "%s; выход вернётся сам, когда узел ответит",
+                         pr.why[0] ? pr.why : "узел не отвечает");
+                diag("output", "fail", what, why);
+                continue;
+            }
+        }
         /* Устройство есть, но сторож признал выход неработающим (ни одно устройство не
          * ответило на пробу) и поставил on_fail. Зона и NAT здесь ничего не объясняют: трафик
          * через устройство не идёт вовсе. До этой ветки отчёт говорил «устройство в зоне, NAT

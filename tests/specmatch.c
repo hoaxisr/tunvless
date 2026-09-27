@@ -1242,6 +1242,31 @@ int main(void) {
             unlink(path);
         }
 
+        /* Узел потерян живым клиентом (слежка под демоном) — только из окружения детей демона:
+         * время и причина доезжают, причина — с пробелами, «:» и «%» (кодируются) и кириллицей
+         * (идёт как есть). Соседняя запись без причины читается по-прежнему. */
+        {
+            const char *why = "ответа нет: 100% потерь, TCP не соединился";
+            char ew[256], env[512];
+            probe_mem_escape(why, ew, sizeof(ew));
+            check("причина lost — без пробелов и двоеточий в записи", 1,
+                  !strchr(ew, ' ') && !strchr(ew, ':'));
+            snprintf(env, sizeof(env), "va:probing:2:5 vl:lost:0:0:1790000000:%s", ew);
+            setenv("STEER_PROBE_MEM", env, 1);
+            pr = probe_read("vl");
+            check("lost из окружения: состояние своё", PROBE_LOST, pr.state);
+            check("lost из окружения: время", 1, pr.since == 1790000000L);
+            check("lost из окружения: причина байт в байт", 1, !strcmp(pr.why, why));
+            pr = probe_read("va");
+            check("соседняя запись без причины — прежняя", PROBE_RUNNING, pr.state);
+            check("соседняя запись: номер узла", 2, pr.node);
+            /* Не влезло — обрезано по границе знака, а не посреди кириллицы. */
+            char small[8];
+            probe_mem_escape("узел", small, sizeof(small));
+            check("кодирование не рвёт знак UTF-8", 1, !strcmp(small, "узе"));
+            unsetenv("STEER_PROBE_MEM");
+        }
+
         if (d) { rmdir(d); }
         steer_set_state_dir(saved);
     }

@@ -83,7 +83,10 @@
  * помощники с трубой событий и не пишут; обфускатор выхода interface оживляется перезапуском в
  * супервизоре демона (supd_restart), а не сигналом экземпляру procd через ubus. Смена состояния
  * помощника vless или xsteer (up, down, процесс вышел после up) — внеочередной проход через
- * WATCH_SETTLE_S, как событие сети: упавший туннель не ждёт периода. Без --supervise источник — прежние файлы.
+ * WATCH_SETTLE_S, как событие сети: упавший туннель не ждёт периода. Клиент vless, следящий за
+ * узлом сам (up с watch), говорит down и о потерянном узле — и выход уходит в отказ или группа на
+ * другого члена тем же проходом, без пробы TCP (fostate.h). Без --supervise источник — прежние
+ * файлы.
  *
  * СОБЫТИЯ подписчикам (docs/ctl.md): switched, failed, revived — копятся за проход и уходят
  * после его конца, когда память выходов уже новая (подписчик, спросивший status по событию,
@@ -206,6 +209,9 @@ static int hmem_state(struct fo_hsrc *hs, const char *out, struct fo_hstate *h) 
     const struct helper_state *st = helper_state_of(((struct fo_hmem *)hs)->d, out);
     if (!st) return fo_hsrc_files.ops->state(&fo_hsrc_files, out, h);
     h->node = h->total = 0;
+    /* Процесс жив и сам следит за узлом (последний его up — с watch, evline.h): UP — приговор без
+     * пробы, DOWN — ждать его up (fostate.h). */
+    h->watch = st->running && st->watch;
     if (st->nonode) {
         h->st = FO_HS_NONODE;
         h->node = (int)st->nonode;

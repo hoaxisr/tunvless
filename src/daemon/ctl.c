@@ -885,8 +885,9 @@ static int job_start(struct conn *c, char *const argv[], int timeout_s, size_t o
     if (!j->tm && !(j->tm = loop_timer_new(s->l, job_timer, c))) return -1;
     int po[2], pe[2];
     /* Ход перебора узлов vless из памяти супервизора (--supervise) — ребёнку в окружение: клиенты
-     * с трубой событий файлов probe-* не пишут, а подкоманды спрашивают probe_read. */
-    char pmem[1024];
+     * с трубой событий файлов probe-* не пишут, а подкоманды спрашивают probe_read. Запись
+     * потерянного узла несёт причину (закодированной — до пятисот байт на выход), отсюда запас. */
+    char pmem[4096];
     supd_probe_env(s->d.sup, pmem, sizeof(pmem));
     if (pipe2(po, O_CLOEXEC) != 0) return -1;
     if (pipe2(pe, O_CLOEXEC) != 0) { close(po[0]); close(po[1]); return -1; }

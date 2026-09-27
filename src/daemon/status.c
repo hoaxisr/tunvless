@@ -29,6 +29,7 @@
 #include "groups.h"
 #include "generate.h"
 #include "grpurl.h"
+#include "jsonw.h"
 
 
 /* ---- status --------------------------------------------------------------- */
@@ -243,14 +244,16 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
              * status по кругу, и второй источник дал бы на экране два разных мгновения.
              * Поля нет вовсе, когда сказать нечего (устройство есть, файла нет, он устарел
              * или писавший процесс мёртв) — «не знаем» не должно читаться как «плохо». */
+            /* Ход подъёма спрашивается у ВЛАДЕЛЬЦА устройства, а не у выхода, который его назвал:
+             * запись перебора узлов пишет клиент vless под своим именем, и пул, ждущий этот
+             * туннель, иначе отдавал бы «устройства нет» вместо «проверяю узлы, 3 из 26» — то же
+             * враньё, ради снятия которого перебор и стал виден (I-100). У живого устройства
+             * спрашивается только выход, чьё устройство создаёт наш процесс: о другом сказать
+             * нечего, и читать ради него запись незачем. */
+            const struct output *po = out_for_device(sp, &sp->out[i], sp->out[i].device);
+            struct probe_status pr = { PROBE_NONE, 0, 0, 0, "" };
+            if (!up || out_engine_managed(po)) pr = probe_read(po->name);
             if (!up) {
-                /* Ход подъёма спрашивается у ВЛАДЕЛЬЦА устройства, а не у выхода, который
-                 * его назвал: запись перебора узлов пишет клиент vless под своим именем, и
-                 * пул, ждущий этот туннель, иначе отдавал бы «устройства нет» вместо
-                 * «проверяю узлы, 3 из 26» — то же враньё, ради снятия которого перебор и
-                 * стал виден (I-100). */
-                struct probe_status pr =
-                    probe_read(out_for_device(sp, &sp->out[i], sp->out[i].device)->name);
                 if (pr.state == PROBE_RUNNING)
                     fprintf(out, ",\"probe\":{\"state\":\"probing\",\"node\":%d,\"total\":%d}",
                            pr.node, pr.total);
@@ -262,6 +265,16 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
                 else if (pr.state == PROBE_NO_SUCH_NODE)
                     fprintf(out, ",\"probe\":{\"state\":\"no_such_node\",\"node\":%d"
                                  ",\"total\":%d}", pr.node, pr.total);
+            }
+            /* Устройство есть, а узел за ним клиент потерял (слежка за узлом под демоном,
+             * src/tunnel/tunnel.c). Обычно выход тогда и в отказе (up:false, failed:true — сторож
+             * принял down клиента), но поле своё, а не probe: probe значит «устройства нет, подъём
+             * идёт или не удался», а устройство на месте. Причина — словами клиента, время —
+             * когда сказал. Поля нет — узел отвечает или сказать нечего (без демона слежки нет). */
+            if (pr.state == PROBE_LOST) {
+                fprintf(out, ",\"node_down\":{\"why\":");
+                jsonw_str(out, pr.why);
+                fprintf(out, ",\"since\":%ld}", pr.since);
             }
             /* Кандидаты: у группы — устройства членов по порядку, у выхода — его устройство. */
             const struct output *m[MAX_MEMBERS];

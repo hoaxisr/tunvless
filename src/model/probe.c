@@ -51,6 +51,61 @@ void probe_source(int (*fn)(const char *out_name, struct probe_status *st)) {
     g_probe_mem = fn;
 }
 
+void probe_mem_escape(const char *why, char *dst, size_t n) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t w = 0;
+    if (!n) return;
+    for (const unsigned char *s = (const unsigned char *)why; *s; s++) {
+        int esc = *s <= ' ' || *s == '%' || *s == ':' || *s == 0x7f;
+        if (w + (esc ? 3 : 1) >= n) break;
+        if (esc) {
+            dst[w++] = '%';
+            dst[w++] = hex[*s >> 4];
+            dst[w++] = hex[*s & 15];
+        } else {
+            dst[w++] = (char)*s;
+        }
+    }
+    /* Не влезло — не оставлять в конце недописанный знак UTF-8. */
+    size_t i = w, k = 0;
+    while (i > 0 && k < 4 && ((unsigned char)dst[i - 1] & 0xC0) == 0x80) { i--; k++; }
+    if (i > 0 && why[0]) {
+        unsigned char lead = (unsigned char)dst[i - 1];
+        size_t need = lead >= 0xF0 ? 3 : lead >= 0xE0 ? 2 : lead >= 0xC0 ? 1 : 0;
+        if (need != k && lead >= 0xC0) w = i - 1;
+    }
+    dst[w] = '\0';
+}
+
+static int hexv(char c) {
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'A' && c <= 'F' ? c - 'A' + 10
+         : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+}
+
+/* Обратно к probe_mem_escape; не влезшее обрезается по границе знака. */
+static void probe_mem_unescape(const char *s, char *dst, size_t n) {
+    size_t w = 0;
+    while (*s && w + 1 < n) {
+        int a, b;
+        if (s[0] == '%' && (a = hexv(s[1])) >= 0 && (b = hexv(s[2])) >= 0) {
+            dst[w++] = (char)(a * 16 + b);
+            s += 3;
+        } else {
+            dst[w++] = *s++;
+        }
+    }
+    if (*s) {
+        size_t i = w, k = 0;
+        while (i > 0 && k < 4 && ((unsigned char)dst[i - 1] & 0xC0) == 0x80) { i--; k++; }
+        if (i > 0) {
+            unsigned char lead = (unsigned char)dst[i - 1];
+            size_t need = lead >= 0xF0 ? 3 : lead >= 0xE0 ? 2 : lead >= 0xC0 ? 1 : 0;
+            if (need != k && lead >= 0xC0) w = i - 1;
+        }
+    }
+    dst[w] = '\0';
+}
+
 /* Запись выхода out_name в STEER_PROBE_MEM. 1 — нашлась (*st заполнено). */
 static int probe_env(const char *out_name, struct probe_status *st) {
     const char *p = getenv("STEER_PROBE_MEM");
@@ -62,24 +117,40 @@ static int probe_env(const char *out_name, struct probe_status *st) {
         if (len > ol && !strncmp(p, out_name, ol) && p[ol] == ':') {
             char word[16] = "";
             int node = 0, total = 0;
-            char rec[96];
+            long since = 0;
+            /* Запись lost несёт причину (до 159 байт, в худшем случае каждый втрое длиннее —
+             * %XX), поэтому буфер не 96, как хватало трём полям. */
+            char rec[640];
             size_t rl = len - ol - 1;
             if (rl >= sizeof(rec)) rl = sizeof(rec) - 1;
             memcpy(rec, p + ol + 1, rl);
             rec[rl] = '\0';
-            char *c1 = strchr(rec, ':');
-            if (c1) {
-                *c1 = ' ';
-                char *c2 = strchr(c1, ':');
-                if (c2) *c2 = ' ';
+            /* Поля через «:»: состояние, узел, всего, а у lost ещё время и причина. Причина —
+             * последняя и своих «:» не содержит (закодированы), так что делится по первым
+             * четырём. */
+            char *f[5] = { rec, NULL, NULL, NULL, NULL };
+            for (int k = 1; k < 5; k++) {
+                char *c = strchr(f[k - 1], ':');
+                if (!c) break;
+                *c = '\0';
+                f[k] = c + 1;
             }
-            if (sscanf(rec, "%15s %d %d", word, &node, &total) != 3) return 0;
+            if (!f[2] || sscanf(f[0], "%15s", word) != 1 || sscanf(f[1], "%d", &node) != 1 ||
+                sscanf(f[2], "%d", &total) != 1)
+                return 0;
             st->node = node;
             st->total = total;
+            st->since = 0;
+            st->why[0] = '\0';
             st->state = !strcmp(word, "probing") ? PROBE_RUNNING
                       : !strcmp(word, "failed")  ? PROBE_FAILED
-                      : !strcmp(word, "nonode")  ? PROBE_NO_SUCH_NODE : PROBE_NONE;
+                      : !strcmp(word, "nonode")  ? PROBE_NO_SUCH_NODE
+                      : !strcmp(word, "lost")    ? PROBE_LOST : PROBE_NONE;
             if (st->state == PROBE_NONE) st->node = st->total = 0;
+            if (st->state == PROBE_LOST) {
+                if (f[3] && sscanf(f[3], "%ld", &since) == 1) st->since = since;
+                if (f[4]) probe_mem_unescape(f[4], st->why, sizeof(st->why));
+            }
             return 1;
         }
         p = e;
@@ -88,10 +159,10 @@ static int probe_env(const char *out_name, struct probe_status *st) {
 }
 
 struct probe_status probe_read(const char *out_name) {
-    struct probe_status out = { PROBE_NONE, 0, 0 };
+    struct probe_status out = { PROBE_NONE, 0, 0, 0, "" };
     if (g_probe_mem && g_probe_mem(out_name, &out) == 0) return out;
     if (probe_env(out_name, &out)) return out;
-    out = (struct probe_status){ PROBE_NONE, 0, 0 };
+    out = (struct probe_status){ PROBE_NONE, 0, 0, 0, "" };
     char path[256];
     probe_path(path, sizeof(path), out_name);
     FILE *f = fopen(path, "r");

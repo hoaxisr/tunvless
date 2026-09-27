@@ -194,6 +194,7 @@ static void ev_line(struct supd *s, struct helper *h, const char *line) {
         st->up = 1;
         st->known = 1;
         st->said_down = 0;
+        st->watch = evline_int(&e, "watch", &v) && v == 1;
         st->since = (long)time(NULL);
         st->why[0] = '\0';
         emit_state(s, h, "helper-up", NULL);
@@ -623,7 +624,7 @@ static int start_one(struct helper *h, void *arg) {
         if (loop_fd_add(s->l, h->evfd, EPOLLIN, ev_cb, s) != 0) { close(h->evfd); h->evfd = -1; }
         if (h->st.started) h->st.restarts++;
         h->st.running = 1;
-        h->st.up = h->st.known = h->st.said_down = 0;
+        h->st.up = h->st.known = h->st.said_down = h->st.watch = 0;
         h->st.node = h->st.total = h->st.nonode = 0;
         h->st.health_n = 0;
         h->st.started = (long)time(NULL);
@@ -659,6 +660,11 @@ static void child_cb(struct loop *l, pid_t pid, int status, void *arg) {
         int was_up = h->st.up;
         h->st.running = 0;
         h->st.up = 0;
+        /* down клиента, следившего за узлом, говорил об узле этого процесса (он и выходит, найдя
+         * другой узел, — tunnel.c, «слежка за узлом»). Новый процесс выберет узел заново, и
+         * «ни один узел не ответил» (probe_of) до его подъёма было бы неправдой. */
+        if (h->st.watch) h->st.said_down = 0;
+        h->st.watch = 0;
         /* Погашен нами — причина наша, а не код выхода, который это «вышел по SIGTERM». */
         if (h->gone)
             snprintf(h->st.why, sizeof(h->st.why), "выход убран из спеки");
@@ -862,6 +868,9 @@ static enum probe_state probe_of(const struct helper *h, int *node, int *total) 
     *total = (int)st->total;
     if (st->nonode) { *node = (int)st->nonode; return PROBE_NO_SUCH_NODE; }
     if (st->running && !st->known && st->node > 0) { *node = (int)st->node; return PROBE_RUNNING; }
+    /* down после up с watch — узел потерян живым клиентом, а не подъём кончился ничем: устройство
+     * на месте, и «ни один узел не ответил» было бы про подъём, которого не было (probe.h). */
+    if (st->running && st->watch && st->said_down) { *total = 0; return PROBE_LOST; }
     if (st->said_down) return PROBE_FAILED;
     *total = 0;
     return PROBE_NONE;
@@ -874,6 +883,12 @@ static int probe_mem(const char *out, struct probe_status *ps) {
         const struct helper *h = &s->set.h[i];
         if (h->table || h->gone || strcmp(h->name, out) || strcmp(h->cmd, "vless")) continue;
         ps->state = probe_of(h, &ps->node, &ps->total);
+        ps->since = 0;
+        ps->why[0] = '\0';
+        if (ps->state == PROBE_LOST) {
+            ps->since = h->st.since;
+            snprintf(ps->why, sizeof(ps->why), "%.*s", (int)sizeof(ps->why) - 1, h->st.why);
+        }
         return 0;
     }
     return -1;
@@ -954,9 +969,17 @@ void supd_probe_env(const struct supd *s, char *buf, size_t n) {
         int node, total;
         enum probe_state ps = probe_of(h, &node, &total);
         const char *word = ps == PROBE_RUNNING ? "probing" : ps == PROBE_FAILED ? "failed"
-                         : ps == PROBE_NO_SUCH_NODE ? "nonode" : "none";
-        int m = snprintf(buf + w, n - w, "%s%s:%s:%d:%d", w > 16 ? " " : "", h->name, word,
-                         node, total);
+                         : ps == PROBE_NO_SUCH_NODE ? "nonode" : ps == PROBE_LOST ? "lost"
+                         : "none";
+        /* У lost ещё время и причина — diag ребёнком называет её так же, как status демона. */
+        char tail[600] = "";
+        if (ps == PROBE_LOST) {
+            char ew[520];
+            probe_mem_escape(h->st.why, ew, sizeof(ew));
+            snprintf(tail, sizeof(tail), ":%ld:%s", h->st.since, ew);
+        }
+        int m = snprintf(buf + w, n - w, "%s%s:%s:%d:%d%s", w > 16 ? " " : "", h->name, word,
+                         node, total, tail);
         if (m < 0 || (size_t)m >= n - w) { buf[w] = '\0'; break; }
         w += (size_t)m;
     }
