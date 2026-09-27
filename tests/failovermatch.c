@@ -941,7 +941,7 @@ int main(void) {
         char dir[] = "/tmp/failovermatch.XXXXXX";
         char *d = mkdtemp(dir);
         steer_set_state_dir(d ? d : "/tmp");
-        g_probe_stub = (struct probe_status){ PROBE_NONE, 0, 0 };
+        g_probe_stub = (struct probe_status){ PROBE_NONE, 0, 0, 0, "" };
         g_slept = 0;
         char err[4096] = "";
         int rc = revive_with_stderr(&o, "vlA", err, sizeof(err));
@@ -951,13 +951,13 @@ int main(void) {
 
         /* Ни один узел не ответил — ждать по-прежнему осмысленно: узлы есть, следующая
          * попытка procd может застать один из них живым. */
-        g_probe_stub = (struct probe_status){ PROBE_FAILED, 0, 29 };
+        g_probe_stub = (struct probe_status){ PROBE_FAILED, 0, 29, 0, "" };
         g_slept = 0;
         rc = revive_with_stderr(&o, "vlB", err, sizeof(err));
         check("узлы не ответили: сторож всё равно ждёт", g_slept, 10);
 
         /* А номер вне подписки не исправится сам никогда. */
-        g_probe_stub = (struct probe_status){ PROBE_NO_SUCH_NODE, 31, 29 };
+        g_probe_stub = (struct probe_status){ PROBE_NO_SUCH_NODE, 31, 29, 0, "" };
         g_slept = 0;
         rc = revive_with_stderr(&o, "vlC", err, sizeof(err));
         check("номер вне подписки: не ждём вовсе", g_slept, 0);

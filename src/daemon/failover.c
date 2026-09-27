@@ -220,6 +220,7 @@ static int files_state(struct fo_hsrc *s, const char *out, struct fo_hstate *h) 
     struct probe_status pr = probe_read(out);
     h->node = pr.node;
     h->total = pr.total;
+    h->watch = 0;           /* файлы пишет клиент без трубы, а он за узлом не следит */
     if (pr.state == PROBE_RUNNING) { h->st = FO_HS_PROBING; return 0; }
     if (pr.state == PROBE_NO_SUCH_NODE) { h->st = FO_HS_NONODE; return 0; }
     h->st = FO_HS_UNKNOWN;
@@ -305,7 +306,8 @@ const struct output *out_for_device(const struct spec *sp, const struct output *
  * xs_state_read выше): спека про него знает только имя устройства, а про рукопожатие с хабом
  * знает его собственный клиент. Устаревший файл (писавшего процесса нет) возвращает нас к
  * наличию устройства: врать в сторону «сломано» здесь дороже всего — при on_fail=drop это
- * blackhole работающему выходу. Туннель, который завершает TCP у себя (vless), — пробой TCP;
+ * blackhole работающему выходу. Туннель, который завершает TCP у себя (vless), — пробой TCP,
+ * а под демоном, чей клиент сам следит за узлом, — словом клиента, без пробы (fostate.h, watch);
  * остальное — пробой ICMP. */
 int (*g_health_probe)(const struct spec *, const struct output *, const char *);
 
@@ -1784,12 +1786,16 @@ static int hp_start(struct fo_run *r, int kind, const struct output *o, const ch
     if (!device_present(dev)) return 0;
     o = out_for_device(sp, o, dev);
     /* Устройство создаёт наш процесс — сначала спросить о нём источник здоровья (fostate.h):
-     * «не поднят» — приговор без пробы, «поднят» — дальше прежняя мера устройства. */
+     * «не поднят» — приговор без пробы, «поднят» — дальше прежняя мера устройства, а у
+     * помощника, который сам следит за узлом (watch), «поднят» — уже приговор: устройство на
+     * месте (проверено выше), и проба TCP узла за ним не мерила бы (fostate.h, «ПОМОЩНИК, КОТОРЫЙ
+     * СЛЕДИТ САМ»). */
     if (out_engine_managed(o)) {
-        struct fo_hstate h;
-        if (r->hs->ops->state(r->hs, o->name, &h) == 0 && h.st != FO_HS_UNKNOWN &&
-            h.st != FO_HS_UP)
-            return 0;
+        struct fo_hstate h = { FO_HS_UNKNOWN, 0, 0, 0 };
+        if (r->hs->ops->state(r->hs, o->name, &h) == 0 && h.st != FO_HS_UNKNOWN) {
+            if (h.st != FO_HS_UP) return 0;
+            if (h.watch) { r->res = 1; return 0; }
+        }
     }
     const struct kind_ops *k = kind_of(o);
     if (k->health) { r->res = k->health(sp, o, dev); return 0; }
@@ -1916,6 +1922,16 @@ static void rv_nl_open(struct fo_run *r) {
         return;
     }
     r->rv.nl = fd;
+}
+
+/* Устройство dev создаёт процесс, который жив, сам следит за узлом и сказал down (fostate.h,
+ * watch): оживлять его нечем и незачем — клиент ищет узел сам, и его up позовёт проход сам.
+ * Спрашивается у ВЛАДЕЛЬЦА устройства, как и всё о здоровье. */
+static int rv_self_watched(struct fo_run *r, const struct output *o, const char *dev) {
+    const struct output *ow = out_for_device(r->sp, o, dev);
+    struct fo_hstate h = { FO_HS_UNKNOWN, 0, 0, 0 };
+    return out_engine_managed(ow) && r->hs->ops->state(r->hs, ow->name, &h) == 0 &&
+           h.st == FO_HS_DOWN && h.watch;
 }
 
 /* Начать оживление устройства dev выхода o; итог (1 — ожило) — в r->res в состоянии ret. */
@@ -2496,8 +2512,12 @@ static void fo_step(struct fo_run *r) {
                  * (fo_pass_defer_revive): группа, которая идёт после него, не должна ждать
                  * его ifdown/ifup и шагов ожидания, чтобы уйти на живого члена. */
                 if (r->defer_rev && named_member(sp, o)) {
+                    /* Член, чей клиент сам ищет узел, оживления не ждёт (rv_self_watched): его
+                     * up позовёт проход сам, и лишний проход ради него ничего бы не сделал. */
                     for (size_t k = 0; k < r->cand_n; k++)
-                        if (restart_due(r->st, r->cand[k]->device)) r->rev_wanted = 1;
+                        if (restart_due(r->st, r->cand[k]->device) &&
+                            !rv_self_watched(r, o, r->cand[k]->device))
+                            r->rev_wanted = 1;
                     r->s = S_FIN;
                     continue;
                 }
@@ -2560,6 +2580,16 @@ static void fo_step(struct fo_run *r) {
         case RV_START: {
             const struct output *ro = r->rv.o;
             const char *dev = r->rv.dev;
+            /* Клиент жив и сам ищет потерянный узел (fostate.h, watch): ни перезапуска, ни
+             * ожидания в проходе — выход вернёт внеочередной проход по его up. Раньше
+             * restart_allowed: отметка «перезапускали» тут была бы неправдой и на пять минут
+             * отложила бы настоящее оживление, если процесс потом упадёт. */
+            if (rv_self_watched(r, ro, dev)) {
+                fprintf(stderr, LOG_W "%s: узел не отвечает — клиент ищет узел сам; жду его "
+                                "сообщения\n", dev);
+                rv_done(r, 0);
+                continue;
+            }
             if (!restart_allowed(r->st, dev)) {
                 if (r->verbose)
                     fprintf(stderr, LOG_I "%s: перезапуск был недавно, пропускаю\n", dev);
@@ -2578,7 +2608,7 @@ static void fo_step(struct fo_run *r) {
              * клиента выхода kind=xsteer (он назван по имени выхода, а имя устройства у такого
              * выхода по умолчанию — то же). */
             const struct output *ow = out_for_device(sp, ro, dev);
-            struct fo_hstate hst = { FO_HS_UNKNOWN, 0, 0 };
+            struct fo_hstate hst = { FO_HS_UNKNOWN, 0, 0, 0 };
             int hknown = out_engine_managed(ow) && r->hs->ops->state(r->hs, ow->name, &hst) == 0;
             if (!hknown && r->hs->ops->xsdev(r->hs, dev, NULL, NULL)) {
                 fprintf(stderr, LOG_W "%s: не отвечает — клиента туннеля поднимет заново "
