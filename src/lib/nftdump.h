@@ -47,6 +47,13 @@ long nfd_set_count(uint8_t family, const char *table, const char *set);
 int nfd_table_exists(uint8_t family, const char *table);
 int nfd_chain_exists(uint8_t family, const char *table, const char *chain);
 
+/* Отпечаток таблицы для apply-сверки демона (src/daemon/recon.c): FNV-1a 64 по цепочкам, правилам
+ * по порядку и заголовкам наборов — без номеров объектов, без состояния выражений (counter, quota,
+ * last) и без элементов наборов (их кладут резолвер и сторож; что входит и почему — в nftdump.c).
+ * Одинаков, пока таблицу меняют только элементами. 0 — таблица есть, отпечаток в *fp; 1 — таблицы
+ * нет; -1 — ядро не ответило. */
+int nfd_table_fp(uint8_t family, const char *table, uint64_t *fp);
+
 /* Есть ли в таблице правило `redirect to :PORT` (выражение redir с портом из immediate).
  * 1 — есть, 0 — нет. */
 int nfd_has_redirect(uint8_t family, const char *table, uint16_t port);

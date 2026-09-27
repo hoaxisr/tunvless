@@ -467,6 +467,7 @@ static void table_pipe_lost(void) {
     }
     g_orphan_since = mono_sec();
     if (!g_orphan_since) g_orphan_since = 1;
+    stderr_rescue();            /* труба журнала procd могла уйти вместе с демоном (adopt.c) */
     fprintf(stderr, "steer[warn] dnsd: демон пропал (труба таблицы закрыта) — отвечаю по "
                     "последней таблице и жду нового демона %d с\n", g_orphan_sec);
 }
@@ -492,6 +493,17 @@ int table_pipe_take(int fd, long *waited) {
     g_table_feed.len = 0;
     *waited = g_orphan_since ? (long)(mono_sec() - g_orphan_since) : 0;
     g_orphan_since = 0;
+    return 0;
+}
+
+int table_pipe_release(void) {
+    if (g_table_fd >= 0) {
+        /* Как в table_pipe_take: EOF умершего хозяина мог ещё не дойти до цикла. */
+        int rc = table_pipe_readable();
+        if (rc > 0) return -1;
+        if (rc == 0) table_pipe_lost();
+    }
+    g_running = 0;
     return 0;
 }
 
@@ -1979,6 +1991,8 @@ int run_proxy(int listen_port, int upstream_port) {
         if (g_orphan_since) {
             time_t left = g_orphan_since + g_orphan_sec - mono_sec();
             if (left <= 0) {
+                /* Службу, скорее всего, остановили: труба журнала procd закрыта (adopt.c). */
+                stderr_rescue();
                 fprintf(stderr, "steer[warn] dnsd: нового демона нет %d с — выхожу\n", g_orphan_sec);
                 break;
             }

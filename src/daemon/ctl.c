@@ -1402,7 +1402,11 @@ static int plan_take(struct conn *c) {
  * идти незачем. */
 static void commit_start(struct conn *c, job_done_fn done) {
     struct ctl_srv *s = c->srv;
-    recon_decide(&s->rec, &c->plan, &c->diff);
+    /* Спека в памяти — последняя применённая: по ней сверка знает, как должна стоять
+     * маршрутизация выходов, чья подпись не изменилась; память сторожа — какие из них в отказе. */
+    recon_decide(&s->rec, &c->plan, s->d.have ? s->d.sp : NULL, s->d.outs, &c->diff);
+    /* Расхождение в ядре — сторожу внеочередной проход после применения (recon.c). */
+    if (c->diff.watch) c->watch = 1;
     c->committed = 0;
     if (!recon_diff_any(&c->diff)) { done(c, 0); return; }
     char buf[1024], *av[24];
