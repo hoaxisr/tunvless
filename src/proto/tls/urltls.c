@@ -59,7 +59,7 @@ struct urltls {
 
 struct urltls_work {
     int fd;
-    struct sockaddr_in dst;
+    struct sockaddr_storage dst;
     char host[128];
     char path[160];
     uint32_t mark;
@@ -105,13 +105,15 @@ static int status_ok(const unsigned char *b, size_t n) {
 /* Весь замер — в потоке. Итог: мс или -1. */
 static int measure(const struct urltls_work *w) {
     long t0 = mono_ms(), deadline = t0 + w->timeout_ms;
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    int v6 = w->dst.ss_family == AF_INET6;
+    int fd = socket(v6 ? AF_INET6 : AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
     if (w->mark && setsockopt(fd, SOL_SOCKET, SO_MARK, &w->mark, sizeof(w->mark)) != 0) goto fail;
     if (!w->mark && w->dev[0] &&
         setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, w->dev, (socklen_t)strlen(w->dev) + 1) != 0)
         goto fail;
-    if (connect(fd, (const struct sockaddr *)&w->dst, sizeof(w->dst)) != 0) {
+    socklen_t dl = v6 ? (socklen_t)sizeof(struct sockaddr_in6) : (socklen_t)sizeof(struct sockaddr_in);
+    if (connect(fd, (const struct sockaddr *)&w->dst, dl) != 0) {
         if (errno != EINPROGRESS) goto fail;
         struct pollfd p = { fd, POLLOUT, 0 };
         long left = deadline - mono_ms();
@@ -142,8 +144,10 @@ static int measure(const struct urltls_work *w) {
 
     /* Порт в Host — только нестандартный (RFC 9110 §7.2), как у HTTP в urltest.c. */
     char hh[160], req[512];
-    if (ntohs(w->dst.sin_port) != 443)
-        snprintf(hh, sizeof(hh), "%.127s:%u", w->host, (unsigned)ntohs(w->dst.sin_port));
+    unsigned port = ntohs(v6 ? ((const struct sockaddr_in6 *)&w->dst)->sin6_port
+                             : ((const struct sockaddr_in *)&w->dst)->sin_port);
+    if (port != 443)
+        snprintf(hh, sizeof(hh), "%.127s:%u", w->host, port);
     else
         snprintf(hh, sizeof(hh), "%s", w->host);
     int rn = snprintf(req, sizeof(req),
@@ -221,7 +225,7 @@ static void urltls_ready(struct loop *l, int fd, uint32_t ev, void *arg) {
     cb(a, ms);
 }
 
-struct urltls *urltls_start(struct loop *l, const struct sockaddr_in *dst, const char *host,
+struct urltls *urltls_start(struct loop *l, const struct sockaddr_storage *dst, const char *host,
                             const char *path, uint32_t mark, const char *dev, int timeout_ms,
                             void (*cb)(void *arg, int ms), void *arg) {
     struct urltls *t = calloc(1, sizeof(*t));

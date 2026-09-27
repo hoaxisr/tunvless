@@ -101,6 +101,25 @@ const char *plat_etc_path(char *buf, size_t n, const char *name) {
     return buf;
 }
 
+/* Каталог спеки — копией, а не указателем в argv: путь приходит и из разобранных флагов, и из
+ * plat_spec_default (его буфер статический, но общий с другими вопросами). */
+static char g_keep_dir[256];
+
+const char *steer_keep_dir(void) {
+    return g_keep_dir[0] ? g_keep_dir : plat()->etc_dir;
+}
+
+void steer_set_keep_dir_of(const char *spec_path) {
+    g_keep_dir[0] = '\0';
+    if (!spec_path || !*spec_path) return;
+    const char *sl = strrchr(spec_path, '/');
+    if (!sl) { snprintf(g_keep_dir, sizeof(g_keep_dir), "."); return; }
+    size_t n = sl == spec_path ? 1 : (size_t)(sl - spec_path);
+    if (n >= sizeof(g_keep_dir)) return;     /* не влез — умолчание платформы, а не обрубок */
+    memcpy(g_keep_dir, spec_path, n);
+    g_keep_dir[n] = '\0';
+}
+
 /* spec.yaml рядом с spec.json: тот же путь с другим окончанием. Выводится из spec_path, а не
  * пишется второй строкой в таблицу платформы — две строки разошлись бы. */
 const char *plat_spec_yaml(void) {

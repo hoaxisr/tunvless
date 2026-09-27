@@ -68,6 +68,12 @@ void fo_fail_apply(struct output *o);
 
 /* ---- прочее, что тест дёргает напрямую, в обход cmd_failover ----------------------- */
 void active_get(const char *out, char *dev, size_t n);
+/* Устройство есть и не down (/sys/class/net). И замер группы своим таймером (folat.c) спрашивает
+ * то же, что проход, — поэтому видно и ему. */
+int device_present(const char *dev);
+/* Устройство выхода out по записи active памяти st ("" — записи нет, "-" — отказ). */
+struct fo_store;
+void active_get_st(struct fo_store *st, const char *out, char *dev, size_t n);
 int revive(const struct spec *sp, const struct output *o, const char *dev, int verbose);
 void cleanup_probe_rule(void);
 int device_healthy_for(const struct spec *sp, const struct output *o, const char *dev);

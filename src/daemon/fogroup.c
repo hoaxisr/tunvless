@@ -13,8 +13,9 @@
  * устройств самим пулом, и его поведение не меняется ни в чём, кроме меры задержки.
  *
  * ЗАПИСИ ХРАНИЛИЩА (тексты, как файлы каталога состояния; у демона — в памяти, с копией на диск):
- *   select  — `группа член` по строке: выбор человека у pick: manual. Переживает перезапуск: файл
- *             <каталог состояния>/select рядом с реестром меток, пишется только при изменении;
+ *   select  — `группа член` по строке: выбор человека у pick: manual. Переживает перезапуск и
+ *             перезагрузку: файл select рядом со спекой (steer_keep_dir, platform.h; каталог
+ *             состояния роутера — tmpfs), пишется только при изменении, атомарно и с fsync;
  *   groups  — `группа член|- живые,через,запятую|-`: итог прохода для status и для следующего
  *             прохода (кто был выбран — у вложенных групп устройство листа неоднозначно);
  *   latency — прежняя запись замеров; у именованного члена ключ — его имя, у безымянного —
@@ -34,6 +35,7 @@
 #include "spec.h"
 #include "fostate.h"
 #include "fogroup.h"
+#include "folat.h"
 #include "nftvmap.h"
 #include "nftdump.h"
 #include "failover_int.h"
@@ -296,6 +298,25 @@ int fog_groups_cur(struct fo_store *st, const struct spec *sp, const struct outp
     return k;
 }
 
+int fog_groups_alive(struct fo_store *st, const struct spec *sp, const struct output *go,
+                     unsigned *alive) {
+    const struct group_cfg *g = out_group(go);
+    *alive = 0;
+    if (!g) return 0;
+    char *text = rec_read(st, "groups");
+    char val[700], m[64], al[640];
+    int found = 0;
+    if (text && rec_get(text, go->name, val, sizeof(val)) && sscanf(val, "%63s %639s", m, al) == 2) {
+        found = 1;
+        for (char *tok = strtok(al, ","); tok; tok = strtok(NULL, ",")) {
+            int k = member_idx(sp, g, tok);
+            if (k >= 0) *alive |= 1u << k;
+        }
+    }
+    free(text);
+    return found;
+}
+
 void fog_adopt(struct spec *sp, struct fo_store *st) {
     char *groups = rec_read(st, "groups"), *sel = rec_read(st, "select");
     char *lat = rec_read(st, "latency");
@@ -318,17 +339,18 @@ void fog_adopt(struct spec *sp, struct fo_store *st) {
             if (sel && rec_get(sel, sp->out[i].name, val, sizeof(val))) g->sel = member_idx(sp, g, val);
             if (g->sel < 0) g->sel = g->def >= 0 ? g->def : 0;
         }
-        /* Замеры: строки `группа ключ мс отметка` (формат записи latency в failover.c). */
-        for (size_t k = 0; k < MAX_MEMBERS; k++) g->lat_ms[k] = -1;
-        for (const char *ln = lat; ln && *ln; ) {
-            char o[32], d[32];
-            int v;
-            long at;
-            if (sscanf(ln, "%31s %31s %d %ld", o, d, &v, &at) == 4 && !strcmp(o, sp->out[i].name))
-                for (size_t k = 0; k < g->members_n; k++)
-                    if (!strcmp(fog_lat_key(&sp->out[g->members[k]]), d)) g->lat_ms[k] = v;
-            const char *e = strchr(ln, '\n');
-            ln = e ? e + 1 : NULL;
+        /* Замеры: запись latency (формат — folat.h). */
+        for (size_t k = 0; k < MAX_MEMBERS; k++) {
+            g->lat_ms[k] = -1;
+            g->lat4_ms[k] = g->lat6_ms[k] = -2;
+        }
+        for (size_t k = 0; lat && k < g->members_n; k++) {
+            struct folat_rec rc;
+            if (!folat_rec_get(st, sp->out[i].name, fog_lat_key(&sp->out[g->members[k]]), &rc))
+                continue;
+            g->lat_ms[k] = rc.ms;
+            g->lat4_ms[k] = rc.ms4;
+            g->lat6_ms[k] = rc.ms6;
         }
     }
     free(groups);

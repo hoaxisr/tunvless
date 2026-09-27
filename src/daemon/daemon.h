@@ -45,6 +45,10 @@ int looks_like_name(const char *s);
  * возвращает код подкоманды explain. */
 void status_answer(const struct spec *sp, const struct groups *gr, FILE *out);
 int status_fast(FILE *out);
+/* Свои поля объекта выхода от того, кто знает помощников по их событиям (супервизор демона,
+ * supd.c): fn печатает фрагмент JSON с запятой впереди или ничего. NULL — снять. Тот же шов,
+ * что probe_source у хода перебора узлов (probe.h). */
+void status_extra_source(void (*fn)(FILE *out, const char *out_name));
 int explain_emit(const struct spec *sp, const struct groups *gr, const char *what, FILE *out);
 
 /* Соединения с меткой движка (дамп ctnetlink) — src/daemon/conns.c, тем же разговором с

@@ -9,11 +9,12 @@
 struct loop;
 struct urltls;
 
-/* Запрос GET path к host (SNI и проверка сертификата) по адресу dst — через сокет с SO_MARK mark
- * (mark != 0) или привязанный к dev (dev != NULL). cb позовётся один раз из цикла l: ms >= 0 —
- * пришёл ответ 204 или 200, время до первого байта ответа от начала соединения; -1 — нет. NULL —
- * поток не завёлся, обратного вызова не будет (итог — «не измерилось»). */
-struct urltls *urltls_start(struct loop *l, const struct sockaddr_in *dst, const char *host,
+/* Запрос GET path к host (SNI и проверка сертификата) по адресу dst (IPv4 или IPv6 — по его
+ * семейству) — через сокет с SO_MARK mark (mark != 0) или привязанный к dev (dev != NULL). cb
+ * позовётся один раз из цикла l: ms >= 0 — пришёл ответ 204 или 200, время до первого байта
+ * ответа от начала соединения; -1 — нет. NULL — поток не завёлся, обратного вызова не будет
+ * (итог — «не измерилось»). */
+struct urltls *urltls_start(struct loop *l, const struct sockaddr_storage *dst, const char *host,
                             const char *path, uint32_t mark, const char *dev, int timeout_ms,
                             void (*cb)(void *arg, int ms), void *arg);
 /* Отменить: cb не позовётся, поток уйдёт сам, дойдя до конца. */

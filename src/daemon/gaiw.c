@@ -34,7 +34,7 @@ struct gaiw_work {
 void gaiw_resolve(struct kind_name *nm) {
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = nm->v4only ? AF_INET : AF_UNSPEC;
+    hints.ai_family = nm->v4only ? AF_INET : nm->v6only ? AF_INET6 : AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_protocol = IPPROTO_UDP;
     char port[8];

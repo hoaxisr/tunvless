@@ -44,6 +44,30 @@
 #include "groups.h"
 #include "v2.h"
 #include "fogroup.h"
+#include "ctlcall.h"
+
+/* ПОДКОМАНДА ПРИ ЖИВОМ ДЕМОНЕ — ЕГО ОТВЕТОМ. status и diag подкомандой собирают тот же ответ, что
+ * демон (status_answer, diag_emit), но без его памяти: хода перебора узлов vless (клиент с
+ * трубой событий файлов probe-* не пишет), замеров групп latency (живут в памяти сторожа),
+ * состояния помощников (отставленные пути моста tgws). Клиент steer и так идёт к демону, а
+ * мимо него остаётся прямой вызов `steerd status` — так его делает rpcd на роутере. Поэтому
+ * подкоманда сперва спрашивает демон ЭТИХ спеки и каталога состояния (version, как клиент) и
+ * отдаёт его ответ байт в байт, а сама считает, только когда демона нет, он чужой или не
+ * ответил.
+ *
+ * Сокет, а не запись демоном хода перебора в файл на tmpfs: файл закрыл бы один перебор узлов,
+ * а память демона — это ещё замеры и помощники, и писать её в файл на каждое событие значило
+ * бы держать вторую копию состояния, которая однажды разойдётся с первой. Цена сокета — два
+ * коротких запроса к демону, который отвечает на них из памяти за миллисекунды.
+ *
+ * STEER_DAEMON_ASKED — клиент steer уже спрашивал демон и отдал команду движку, потому что тот
+ * не ответил или чужой: спрашивать второй раз незачем (зависший демон стоил бы второго срока). */
+static int ask_daemon(const char *line, const char *spec, const char *state_dir) {
+    const char *asked = getenv("STEER_DAEMON_ASKED");
+    if (asked && *asked) return -1;
+    ctlcall_socket(NULL);
+    return ctlcall_forward(line, spec, state_dir, 10);
+}
 
 /* Уровень в журнале — см. одноимённые макросы в failover.c и obfs.c. Метка подсистемы
  * здесь «apply»: все строки ниже пишутся при компиляции и применении спеки. Отказы
@@ -337,6 +361,8 @@ int main(int argc, char **argv) {
     static struct groups gr;
     cli_parse(c, argc, argv, 2, &a);
     if (a.state_dir) steer_set_state_dir(a.state_dir);
+    /* Выбор человека (select) — рядом со спекой этого запуска (platform.h, steer_keep_dir). */
+    steer_set_keep_dir_of(plat_spec_resolve(a.spec));
     const char *spec = a.spec, *arg = a.npos ? a.pos[0] : NULL;
 
     if (!strcmp(cmd, "apply")) return cmd_apply(spec, a.dry_run);
@@ -356,8 +382,17 @@ int main(int argc, char **argv) {
         if (spec_print_v2(stdout, &cfg, &e) < 0) err_die(&e);
         return fflush(stdout) == 0 ? 0 : 1;
     }
-    if (!strcmp(cmd, "status")) return cmd_status(spec, a.fast);
-    if (!strcmp(cmd, "diag")) return cmd_diag(spec);
+    /* status и diag при живом демоне этой спеки — его ответом (ask_daemon): ход перебора узлов,
+     * замеры групп и состояние помощников знает только он. --fast — снимок на диске, тот же у
+     * обоих, спрашивать незачем. */
+    if (!strcmp(cmd, "status")) {
+        int rc = a.fast ? -1 : ask_daemon("status\n", spec, a.state_dir);
+        return rc >= 0 ? rc : cmd_status(spec, a.fast);
+    }
+    if (!strcmp(cmd, "diag")) {
+        int rc = ask_daemon("diag\n", spec, a.state_dir);
+        return rc >= 0 ? rc : cmd_diag(spec);
+    }
     if (!strcmp(cmd, "down")) return cmd_down();
     if (!strcmp(cmd, "supervise")) return cmd_supervise(spec);
     if (!strcmp(cmd, "failover"))

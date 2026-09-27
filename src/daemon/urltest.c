@@ -32,7 +32,12 @@
  * tls13.c блокирующее по устройству (читает сокет со SO_RCVTIMEO), и переписывать его ради замера
  * раз в три минуты — второй TLS рядом с первым. Поток — не процесс: fork на замер нет. В сборке без
  * TLS (steer-mini) urltls нет вовсе — слабая ссылка, — и адрес https:// отвергает ещё разбор спеки
- * (urltest_https_ok в grpurl.c). */
+ * (urltest_https_ok в grpurl.c).
+ *
+ * СЕМЕЙСТВО — параметр замера. Группа, все живые члены которой несут IPv6 (KC_IPV6), меряется
+ * дважды — по IPv4 и по IPv6 (src/daemon/folat.c): путь IPv6 через туннель — свой, и член, быстрый
+ * по IPv4, может не везти IPv6 вовсе. Замер по IPv6 — тот же запрос из сокета AF_INET6 к адресу из
+ * AAAA; метка члена ведёт его по правилу и таблице IPv6 члена (ip -6 rule), как трафик группы. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -59,47 +64,52 @@
  * этих функций — ноль. Объявлены здесь, а не заголовком urltls.h: каталог TLS — слой полного
  * пакета, и ядро о нём знает только эти две строки. */
 struct urltls;
-extern struct urltls *urltls_start(struct loop *l, const struct sockaddr_in *dst, const char *host,
+extern struct urltls *urltls_start(struct loop *l, const struct sockaddr_storage *dst, const char *host,
                                    const char *path, uint32_t mark, const char *dev, int timeout_ms,
                                    void (*cb)(void *arg, int ms), void *arg) __attribute__((weak));
 extern void urltls_cancel(struct urltls *t) __attribute__((weak));
 
 /* ---- кэш имён ---------------------------------------------------------------------------- */
 
-#define DNS_CACHE_N    4
+/* Запись — на имя и семейство: у одного адреса проверки ответы A и AAAA живут порознь (замер по
+ * IPv6 спрашивает только AAAA, и отказ AAAA не должен стереть годный A). */
+#define DNS_CACHE_N    8
 #define DNS_OK_MS      (300L * 1000L)
 #define DNS_FAIL_MS    (30L * 1000L)
 
 struct dns_ent {
     char host[128];
+    int fam;
     int ok;
-    struct in_addr a;
+    struct sockaddr_storage a;
     long until;
 };
 static struct dns_ent g_dns[DNS_CACHE_N];
 
 /* 1 — в кэше годный адрес; 0 — в кэше отказ (свежий); -1 — нет записи. */
-static int dns_get(const char *host, struct in_addr *a) {
+static int dns_get(const char *host, int fam, struct sockaddr_storage *a) {
     long now = loop_now_ms();
     for (size_t i = 0; i < DNS_CACHE_N; i++)
-        if (g_dns[i].host[0] && !strcmp(g_dns[i].host, host) && g_dns[i].until > now) {
+        if (g_dns[i].host[0] && g_dns[i].fam == fam && !strcmp(g_dns[i].host, host) &&
+            g_dns[i].until > now) {
             if (g_dns[i].ok) *a = g_dns[i].a;
             return g_dns[i].ok;
         }
     return -1;
 }
 
-static void dns_put(const char *host, int ok, struct in_addr a) {
+static void dns_put(const char *host, int fam, int ok, const struct sockaddr_storage *a) {
     size_t slot = 0;
     long oldest = 0;
     for (size_t i = 0; i < DNS_CACHE_N; i++) {
-        if (!strcmp(g_dns[i].host, host)) { slot = i; break; }
+        if (g_dns[i].fam == fam && !strcmp(g_dns[i].host, host)) { slot = i; break; }
         if (i == 0 || g_dns[i].until < oldest) { oldest = g_dns[i].until; slot = i; }
     }
     struct dns_ent *e = &g_dns[slot];
     snprintf(e->host, sizeof(e->host), "%s", host);
+    e->fam = fam;
     e->ok = ok;
-    e->a = a;
+    if (ok) e->a = *a;
     e->until = loop_now_ms() + (ok ? DNS_OK_MS : DNS_FAIL_MS);
 }
 
@@ -110,6 +120,7 @@ enum { UT_DNS, UT_CONN, UT_SEND, UT_RECV, UT_TLS };
 struct urltest {
     struct loop *l;
     struct urltest_url u;
+    int fam;                    /* AF_INET или AF_INET6 */
     uint32_t mark;
     char dev[32];
     urltest_cb cb;
@@ -120,7 +131,7 @@ struct urltest {
     int fd;
     struct gaiw *gw;
     struct urltls *tls;
-    struct sockaddr_in dst;
+    struct sockaddr_storage dst;
     long t0, t_first;
     char req[512];
     size_t req_n, req_off;
@@ -233,12 +244,17 @@ static void ut_tls_cb(void *arg, int ms) {
     ut_finish(u, ms);
 }
 
-/* Адрес известен — соединяться. */
-static void ut_connect(struct urltest *u, struct in_addr a) {
-    memset(&u->dst, 0, sizeof(u->dst));
-    u->dst.sin_family = AF_INET;
-    u->dst.sin_port = htons(u->u.port);
-    u->dst.sin_addr = a;
+/* Адрес известен — соединяться. Порт — из адреса проверки, семейство — из самого адреса. */
+static void ut_connect(struct urltest *u, const struct sockaddr_storage *a) {
+    u->dst = *a;
+    socklen_t dl;
+    if (u->dst.ss_family == AF_INET6) {
+        ((struct sockaddr_in6 *)&u->dst)->sin6_port = htons(u->u.port);
+        dl = sizeof(struct sockaddr_in6);
+    } else {
+        ((struct sockaddr_in *)&u->dst)->sin_port = htons(u->u.port);
+        dl = sizeof(struct sockaddr_in);
+    }
     long left = u->deadline - loop_now_ms();
     if (left <= 0) { ut_finish(u, -1); return; }
 
@@ -251,7 +267,7 @@ static void ut_connect(struct urltest *u, struct in_addr a) {
         return;
     }
 
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    int fd = socket(u->dst.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) { ut_finish(u, -1); return; }
     if (u->mark) {
         if (setsockopt(fd, SOL_SOCKET, SO_MARK, &u->mark, sizeof(u->mark)) != 0) {
@@ -267,7 +283,7 @@ static void ut_connect(struct urltest *u, struct in_addr a) {
         }
     }
     u->t0 = loop_now_ms();
-    int rc = connect(fd, (struct sockaddr *)&u->dst, sizeof(u->dst));
+    int rc = connect(fd, (struct sockaddr *)&u->dst, dl);
     if (rc != 0 && errno != EINPROGRESS) { close(fd); ut_finish(u, -1); return; }
     u->fd = fd;
     u->st = rc == 0 ? UT_SEND : UT_CONN;
@@ -283,25 +299,27 @@ static void ut_connect(struct urltest *u, struct in_addr a) {
 static void ut_gai_cb(void *arg, const struct kind_name *names, size_t n) {
     struct urltest *u = arg;
     u->gw = NULL;
-    struct in_addr a = { 0 };
-    int ok = n >= 1 && names[0].rc == 0 && names[0].addr_len >= (socklen_t)sizeof(struct sockaddr_in) &&
-             names[0].addr.ss_family == AF_INET;
-    if (ok) a = ((const struct sockaddr_in *)&names[0].addr)->sin_addr;
-    dns_put(u->u.host, ok, a);
+    socklen_t need = u->fam == AF_INET6 ? (socklen_t)sizeof(struct sockaddr_in6)
+                                        : (socklen_t)sizeof(struct sockaddr_in);
+    int ok = n >= 1 && names[0].rc == 0 && names[0].addr_len >= need &&
+             names[0].addr.ss_family == u->fam;
+    dns_put(u->u.host, u->fam, ok, &names[0].addr);
     if (!ok) { ut_finish(u, -1); return; }
-    ut_connect(u, a);
+    ut_connect(u, &names[0].addr);
 }
 
-struct urltest *urltest_start(struct loop *l, const char *url, uint32_t mark, const char *dev,
-                              int timeout_ms, urltest_cb cb, void *arg, int *ms) {
+struct urltest *urltest_start(struct loop *l, const char *url, int fam, uint32_t mark,
+                              const char *dev, int timeout_ms, urltest_cb cb, void *arg, int *ms) {
     *ms = -1;
     struct urltest_url pu;
     if (urltest_url_parse(url, &pu, NULL, 0) != 0) return NULL;
     if (pu.https && !urltls_start) return NULL;
+    if (fam != AF_INET6) fam = AF_INET;
     struct urltest *u = calloc(1, sizeof(*u));
     if (!u) return NULL;
     u->l = l;
     u->u = pu;
+    u->fam = fam;
     u->mark = mark;
     if (dev) snprintf(u->dev, sizeof(u->dev), "%s", dev);
     u->cb = cb;
@@ -321,21 +339,32 @@ struct urltest *urltest_start(struct loop *l, const char *url, uint32_t mark, co
     u->req_n = rn > 0 && (size_t)rn < sizeof(u->req) ? (size_t)rn : 0;
 
     u->in_start = 1;
-    struct in_addr a;
+    struct sockaddr_storage a;
+    memset(&a, 0, sizeof(a));
+    struct in_addr a4;
     if (!u->req_n) {
         ut_finish(u, -1);
-    } else if (inet_pton(AF_INET, pu.host, &a) == 1) {
-        ut_connect(u, a);
+    } else if (inet_pton(AF_INET, pu.host, &a4) == 1) {
+        /* Литерал IPv4 — замера по IPv6 у такого адреса нет: AAAA не спросить. */
+        if (fam == AF_INET6) {
+            ut_finish(u, -1);
+        } else {
+            struct sockaddr_in *s4 = (struct sockaddr_in *)&a;
+            s4->sin_family = AF_INET;
+            s4->sin_addr = a4;
+            ut_connect(u, &a);
+        }
     } else {
-        int c = dns_get(pu.host, &a);
-        if (c == 1) ut_connect(u, a);
+        int c = dns_get(pu.host, fam, &a);
+        if (c == 1) ut_connect(u, &a);
         else if (c == 0) ut_finish(u, -1);
         else {
             struct kind_name nm;
             memset(&nm, 0, sizeof(nm));
             snprintf(nm.host, sizeof(nm.host), "%s", pu.host);
             nm.port = pu.port;
-            nm.v4only = 1;
+            nm.v4only = fam == AF_INET;
+            nm.v6only = fam == AF_INET6;
             u->st = UT_DNS;
             u->gw = gaiw_start(l, &nm, 1, ut_gai_cb, u);
             if (!u->gw) ut_gai_cb(u, &nm, 1);   /* поток не создался — разрешено синхронно */

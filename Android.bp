@@ -102,6 +102,8 @@ cc_defaults {
         "src/daemon/urltest.c",
         "src/daemon/fogroup.c",
         "src/lib/nftvmap.c",
+        "src/daemon/folat.c",
+        "src/lib/ctlcall.c",
         "src/kinds/kind.c",
         "src/kinds/direct.c",
         "src/kinds/group.c",
@@ -246,12 +248,14 @@ cc_binary {
     relative_install_path: "der",
     srcs: [
         "src/client/main.c",
+        "src/lib/ctlcall.c",
         "src/platform/platform.c",
         "src/platform/openwrt.c",
         "src/platform/android.c",
     ],
     local_include_dirs: [
         "src/platform",
+        "src/lib",
         "src/client",
     ],
     cflags: [

@@ -47,6 +47,7 @@
 #include "reality.h"
 #include "run.h"
 #include "evline.h"
+#include "ctlcall.h"
 
 #define LOG_W "steer[warn] xsteer: "
 #define LOG_I "steer[info] xsteer: "
@@ -217,9 +218,10 @@ static struct xs_secrets g_sc;
  * опрашивают раз в пять секунд. */
 static void state_write(struct spoke *s) {
     /* Ребёнок демона с --supervise (труба событий есть): здоровье демон знает из up/down, и файл
-     * для сторожа не пишется — раз в две секунды на флеш телефона (evline.h). Цена — `steer
-     * xsteer-peers` у такого выхода печатает только конфигурацию, без живого состояния. Клиент,
-     * поднятый netifd или руками, трубы не имеет и пишет файл, как раньше. */
+     * для сторожа не пишется — раз в две секунды на флеш телефона (evline.h). `steer
+     * xsteer-peers` у такого выхода берёт живое состояние у демона (команда сокета helper) —
+     * без счётчиков и рукопожатия: их знает только этот процесс. Клиент, поднятый netifd или
+     * руками, трубы не имеет и пишет файл, как раньше. */
     if (evline_enabled()) return;
     char tmp[336];
     snprintf(tmp, sizeof(tmp), "%s.tmp", s->state_path);
@@ -1869,7 +1871,16 @@ int cmd_xsteer_peers(const char *spec_path, const char *out_name, const char *co
     char sp[320];
     snprintf(sp, sizeof(sp), "%s/xsteer-%.40s.json", steer_state_dir(), o->name);
     FILE *f = fopen(sp, "r");
-    if (!f) return 1;              /* состояния нет: рукопожатий не было */
+    if (!f) {
+        /* Клиент — ребёнок демона с трубой событий: файла он не пишет, и живое состояние — у
+         * демона в памяти (команда сокета helper: процесс, up, причина отказа, перезапуски).
+         * Счётчиков и рукопожатия там нет — клиент сообщает только смену состояния. Демона нет
+         * или помощник не его — состояния нет: рукопожатий не было. */
+        char line[64];
+        snprintf(line, sizeof(line), "helper %.31s\n", o->name);
+        ctlcall_socket(NULL);
+        return ctlcall_forward(line, spec_path, steer_state_dir(), 10) == 0 ? 0 : 1;
+    }
     char line[1024];
     if (fgets(line, sizeof(line), f)) fputs(line, stdout);
     fclose(f);

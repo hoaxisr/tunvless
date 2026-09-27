@@ -572,6 +572,7 @@ static void ctl_do_put_file(struct conn *c, struct cbuf *r);
 static void ctl_do_list_files(struct conn *c, struct cbuf *r);
 static void ctl_do_rm_file(struct conn *c, struct cbuf *r);
 static void mem_select(struct conn *c, struct cbuf *r);
+static void mem_helper(struct conn *c, struct cbuf *r);
 static void st_apply(struct conn *c);
 static void st_check(struct conn *c);
 static void st_reload(struct conn *c);
@@ -608,6 +609,7 @@ static const struct ctl_cmd CTL_CMDS[] = {
     {"apply",       NULL, NULL, st_apply,  CTL_BODY_MAX, 0, 0, {{0}}, 0, 1, 1},
     {"reload",      NULL, NULL, st_reload, 0, 0, 0, {{0}}, 0, 1, 1},
     {"conns",       NULL, mem_conns, NULL, 0, 0, 0, {{0}}, 0, 0, 0},
+    {"helper",      NULL, mem_helper, NULL, 0, 1, 1, {{CA_NAME, NULL, NULL, 0, 0}}, 0, 0, 0},
     {"dns-log",     NULL, mem_dns_log, NULL, 0, 0, 0, {{0}}, 0, 0, 0},
     {"put-file",    NULL, ctl_do_put_file, NULL, CTL_FILE_MAX, 1, 1, {{CA_FILE, NULL, NULL, 0, 0}}, 0, 0, 0},
     {"list-files",  NULL, ctl_do_list_files, NULL, 0, 0, 0, {{0}}, 0, 0, 0},
@@ -1114,7 +1116,7 @@ static void mem_conns(struct conn *c, struct cbuf *r) {
 }
 
 /* select ГРУППА ЧЛЕН — выбор члена группы pick: manual без apply (fogroup.c, fog_select): выбор
- * кладётся в память сторожа (и в файл select рядом с реестром меток), таблица группы тут же
+ * кладётся в память сторожа (и в файл select рядом со спекой), таблица группы тут же
  * переписывается на лист члена, подписчикам — switched с by: select (или failed, если член не
  * работает: у manual это on_fail группы, а не другой член). Идущий проход сторожа прерывается —
  * его решения легли бы поверх выбора, — и следующий идёт после успокоения. Движок выключен —
@@ -1138,6 +1140,23 @@ static void mem_select(struct conn *c, struct cbuf *r) {
         code = fog_select(d->view, d->outs ? d->outs : &fo_store_files, c->q.argv[0], c->q.argv[1],
                           ctl_enabled(), sel_emit, d, f);
         if (code == 0) watchd_spec_changed(s->watch);
+    }
+    mem_end(&m, r, code);
+}
+
+/* helper ВЫХОД — живое состояние помощников выхода из памяти супервизора (--supervise): процесс,
+ * up, причина отказа, перезапуски, узел vless, отставленные пути моста tgws (supd_helper_json).
+ * Этим отвечает `steer xsteer-peers` у выхода под демоном: клиент xsteer с трубой событий файла
+ * xsteer-<выход>.json не пишет. Помощника нет (демон не супервизор, выход без помощника) — код 1. */
+static void mem_helper(struct conn *c, struct cbuf *r) {
+    struct steerd *d = &c->srv->d;
+    struct mem_run m;
+    FILE *f = mem_begin(&m);
+    if (!f) { resp_error(r, "internal", "нет памяти под ответ"); return; }
+    int code = 0;
+    if (supd_helper_json(d->sup, c->q.argv[0], f) != 0) {
+        fprintf(stderr, "steer: helper: у выхода %s нет помощника под этим демоном\n", c->q.argv[0]);
+        code = 1;
     }
     mem_end(&m, r, code);
 }
@@ -2674,6 +2693,8 @@ int ctl_serve_main(int argc, char **argv) {
     /* Команды в процессе (status, conns, dns-log) читают каталог состояния сами — тот же,
      * что подкомандам передаётся флагом. */
     if (cf->state_dir) steer_set_state_dir(cf->state_dir);
+    /* Выбор select — рядом со спекой демона (platform.h, steer_keep_dir): переживает перезагрузку. */
+    steer_set_keep_dir_of(plat_spec_resolve(cf->spec));
 
     /* Запись в ушедший сокет — ошибка send (MSG_NOSIGNAL), а не смерть демона; SIGPIPE
      * игнорируется ещё и ради записи, которую делает код в процессе. Детям он возвращается

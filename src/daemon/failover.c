@@ -54,6 +54,7 @@
 #include "failover_int.h"
 #include "fostate.h"
 #include "fogroup.h"
+#include "folat.h"
 #include "urltest.h"
 
 /* Уровень в журнале приписывается КАЖДОЙ строке — это контракт, по которому управляющий
@@ -101,7 +102,7 @@ static int device_src(const char *dev, char *out, size_t n) {
     return found;
 }
 
-static int device_present(const char *dev) {
+int device_present(const char *dev) {
     char path[128];
     snprintf(path, sizeof(path), "/sys/class/net/%s/operstate", dev);
     FILE *f = fopen(path, "r");
@@ -1201,22 +1202,45 @@ static struct route_facts route_facts_read(const struct output *o) {
  * половина строк означала бы для них «сторож не проходил» у половины выходов; половина
  * замеров `latency` хуже их отсутствия (по ней сторож переключился бы на кандидата, чей замер
  * уцелел). */
+/* Запись `select` — выбор человека у pick: manual — лежит не в каталоге состояния, а рядом со
+ * спекой (steer_keep_dir, platform.h): каталог состояния роутера — tmpfs, и выбор, переживший
+ * перезапуск, пропадал бы при перезагрузке. Пишется она только при смене выбора (rec_set в
+ * fogroup.c сравнивает текст), то есть флеш видит запись на команду человека, а не на проход. */
+static int files_keep(const char *name) {
+    return !strcmp(name, "select");
+}
+
+static void files_path(const char *name, char *path, size_t n) {
+    snprintf(path, n, "%s/%s", files_keep(name) ? steer_keep_dir() : steer_state_dir(), name);
+}
+
 static FILE *files_open_r(struct fo_store *st, const char *name) {
     (void)st;
     char path[320];
-    snprintf(path, sizeof(path), "%s/%s", steer_state_dir(), name);
-    return fopen(path, "r");
+    files_path(name, path, sizeof(path));
+    FILE *f = fopen(path, "r");
+    /* Выбор, сделанный движком до переноса записи, лежит в каталоге состояния, пока роутер не
+     * перезагружен: взять его оттуда, а следующая команда select положит его на место. */
+    if (!f && files_keep(name)) {
+        snprintf(path, sizeof(path), "%s/%s", steer_state_dir(), name);
+        f = fopen(path, "r");
+    }
+    return f;
 }
 
 static void files_put(struct fo_store *st, const char *name, const char *data, size_t n) {
     (void)st;
     char path[320], tmp[336];
-    snprintf(path, sizeof(path), "%s/%s", steer_state_dir(), name);
+    files_path(name, path, sizeof(path));
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
     FILE *f = fopen(tmp, "w");
     if (!f) return;
     size_t w = n ? fwrite(data, 1, n, f) : 0;
-    if (fclose(f) != 0 || w != n || rename(tmp, path) != 0) unlink(tmp);
+    /* Постоянный носитель: данные — на флеш до rename, иначе отключение питания сразу после
+     * команды оставило бы на месте выбора пустой файл (переименование на jffs2/ubifs и ext4
+     * доходит до носителя раньше данных). Записи редкие — цена fsync не видна. */
+    int bad = fflush(f) != 0 || (files_keep(name) && fsync(fileno(f)) != 0);
+    if (fclose(f) != 0 || bad || w != n || rename(tmp, path) != 0) unlink(tmp);
 }
 
 static const struct fo_store_ops files_ops = { files_open_r, files_put };
@@ -1258,49 +1282,17 @@ void failover_hyst_reset_for_test(void) { g_hyst_cache = -2; }
  * с загрузки: по стенным часам сравнивать нельзя, ntpd на только что поднявшемся роутере
  * подводит их на годы, и любой замер выглядел бы свежим или древним. Цена — перезагрузка
  * обнуляет отсчёт и первый тик после неё меряет заново, что и правильно. */
-#define LAT_TOLERANCE_MS 50
-#define LAT_INTERVAL_S   180
+/* Чтение и запись — folat.c (folat_rec_get, folat_rec_put): у группы, меренной по обоим
+ * семействам, строка несёт ещё замеры IPv4 и IPv6, а читают запись и проход, и расписание замеров
+ * демона, и status. Запись — заменой целиком (у файлов — временный файл и rename, см. files_put):
+ * обрыв на середине оставил бы половину строк. */
+#define LAT_TOLERANCE_MS FOLAT_TOLERANCE_MS
+#define LAT_INTERVAL_S   FOLAT_INTERVAL_S
 
 static long mono_now(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (long)t.tv_sec;
-}
-
-static int lat_get(struct fo_store *st, const char *out, const char *dev, int *ms, long *age) {
-    FILE *f = st->ops->open_r(st, "latency");
-    if (!f) return 0;
-    char o[32], d[32];
-    int v = 0; long at = 0, found = 0;
-    while (fscanf(f, "%31s %31s %d %ld", o, d, &v, &at) == 4)
-        if (!strcmp(o, out) && !strcmp(d, dev)) { *ms = v; *age = mono_now() - at; found = 1; }
-    fclose(f);
-    return (int)found;
-}
-
-/* Записать замеры выхода, оставив записи остальных на месте. Заменой целиком (у файлов —
- * временный файл и rename, см. files_put): обрыв на середине оставил бы половину строк. */
-static void lat_put(struct fo_store *st, const char *out, const struct output *const *devs,
-                    int *ms, size_t n) {
-    char *buf = NULL;
-    size_t bn = 0;
-    FILE *old = st->ops->open_r(st, "latency");
-    FILE *f = open_memstream(&buf, &bn);
-    if (!f) { if (old) fclose(old); return; }
-    if (old) {
-        char o[32], d[32];
-        int v; long at;
-        while (fscanf(old, "%31s %31s %d %ld", o, d, &v, &at) == 4)
-            if (strcmp(o, out) != 0) fprintf(f, "%s %s %d %ld\n", o, d, v, at);
-        fclose(old);
-    }
-    long now = mono_now();
-    /* Ключ члена — устройство у безымянного члена пула v1 (как было) и имя у именованного члена
-     * группы v2: у вложенной группы устройство листа меняется, а член — нет (fog_lat_key). */
-    for (size_t k = 0; k < n; k++)
-        if (ms[k] >= 0) fprintf(f, "%s %s %d %ld\n", out, fog_lat_key(devs[k]), ms[k], now);
-    if (fclose(f) == 0) st->ops->put(st, "latency", buf, bn);
-    free(buf);
 }
 
 static int active_streak_get(struct fo_store *st, const char *out) {
@@ -1316,7 +1308,7 @@ static int active_streak_get(struct fo_store *st, const char *out) {
     return val;
 }
 
-static void active_get_st(struct fo_store *st, const char *out, char *dev, size_t n) {
+void active_get_st(struct fo_store *st, const char *out, char *dev, size_t n) {
     dev[0] = '\0';
     FILE *f = st->ops->open_r(st, "active");
     if (!f) return;
@@ -1614,6 +1606,12 @@ struct fo_run {
     int tol;
     long iv;
     int ms[MAX_MEMBERS];
+    /* Замеры по семействам (folat.h): v6 — группа меряется и по IPv6 (folat_want_v6). */
+    int ms4[MAX_MEMBERS], ms6[MAX_MEMBERS];
+    int v6;
+    /* fo_pass_lat_extern: замеры по сроку делает расписание демона (folat.c), проход меряет только
+     * живых членов без замера вовсе. */
+    int lat_extern;
     int best, pick;
     /* Группа v2 (именованные члены, group_named): здоровье члена — приговор его прохода (alive),
      * своих проб и оживления у группы нет (fogroup.c, шапка). pk — номер выбранного члена, galive —
@@ -1636,7 +1634,8 @@ struct fo_run {
         char src[64];
         struct foprobe *p;
         const struct output *m;       /* замер: член группы (метка — у именованного) */
-        struct urltest *ut;           /* замер: идущий urltest */
+        struct folat_m *fm;           /* замер: идущий urltest члена (IPv4 и, если надо, IPv6) */
+        int ms6;                      /* замер: итог по IPv6 (-2 — не мерили) */
     } hp;
 
     /* ---- идущее оживление ---- */
@@ -1752,13 +1751,14 @@ static void hp_icmp_cb(void *arg, int ok, int ms) {
  *
  * Через члена — меткой именованного члена (SO_MARK: правило fwmark члена и его таблица, тот же
  * путь, что у трафика группы и у `over`, включая TUN и цепочки подложек); у безымянного члена
- * пула v1 метки нет — привязкой к устройству (SO_BINDTODEVICE), как мерила и прежняя проба. */
-#define URLTEST_TIMEOUT_MS 5000
-
-static void hp_url_cb(void *arg, int ms) {
+ * пула v1 метки нет — привязкой к устройству (SO_BINDTODEVICE), как мерила и прежняя проба.
+ * Замер члена целиком — folat_member (folat.c): у группы, меренной по обоим семействам, он идёт
+ * по IPv4 и IPv6 сразу, итог IPv4 — в r->res, IPv6 — в r->hp.ms6. */
+static void hp_url_cb(void *arg, int ms4, int ms6) {
     struct fo_run *r = arg;
-    r->hp.ut = NULL;
-    r->res = ms;
+    r->hp.fm = NULL;
+    r->res = ms4;
+    r->hp.ms6 = ms6;
     fo_step(r);
 }
 
@@ -1773,24 +1773,11 @@ static int hp_start(struct fo_run *r, int kind, const struct output *o, const ch
     r->hp.best = -1;
     if (kind == HP_HEALTH && g_health_probe) { r->res = g_health_probe(sp, o, dev); return 0; }
     if (kind == HP_LATENCY) {
-        if (g_latency_probe) { r->res = g_latency_probe(sp, o, dev); return 0; }
-        r->res = -1;
-        if (!device_present(dev)) return 0;
-        const struct group_cfg *g = out_group(o);
-        const struct output *m = r->hp.m;
-        uint32_t mark = m && m >= sp->out && m < sp->out + MAX_OUTPUTS ? m->mark : 0;
-        o = out_for_device(sp, m && mark ? m : o, dev);
-        const struct kind_ops *k = kind_of(o);
-        if (k->latency) { r->res = k->latency(sp, o, dev); return 0; }
-        /* И туннель xsteer, поднятый netifd, — по тому же доводу, что у вида xsteer: мерить его
-         * нечем, а число из пробы наружу означало бы не задержку туннеля, а наличие интернета у
-         * хаба. */
-        if (r->hs->ops->xsdev(r->hs, dev, NULL, NULL)) return 0;
-        int ms = -1;
-        r->hp.ut = urltest_start(r->l, g && g->url[0] ? g->url : GROUP_URL_DEFAULT, mark,
-                                 mark ? NULL : dev, URLTEST_TIMEOUT_MS, hp_url_cb, r, &ms);
-        if (r->hp.ut) return 1;
-        r->res = ms;
+        int ms4 = -1, ms6 = -2;
+        r->hp.fm = folat_member(r->l, sp, o, r->hp.m, dev, r->hs, r->v6, hp_url_cb, r, &ms4, &ms6);
+        if (r->hp.fm) return 1;
+        r->res = ms4;
+        r->hp.ms6 = ms6;
         return 0;
     }
     r->res = 0;
@@ -1992,7 +1979,7 @@ static struct fo_run *run_new(struct loop *l, struct spec *sp, struct fo_store *
 
 static void run_free(struct fo_run *r) {
     if (r->hp.p) foprobe_cancel(r->hp.p);
-    if (r->hp.ut) urltest_cancel(r->hp.ut);
+    if (r->hp.fm) folat_member_cancel(r->hp.fm);
     probe_rule_clear(r);
     if (r->rv.sp) fospawn_cancel(r->rv.sp);
     if (r->rv.gw) gaiw_cancel(r->rv.gw);
@@ -2034,6 +2021,10 @@ void fo_pass_traffic(struct fo_run *r, fo_traffic_fn fn, void *arg) {
 
 void fo_pass_defer_revive(struct fo_run *r) {
     if (r) r->defer_rev = 1;
+}
+
+void fo_pass_lat_extern(struct fo_run *r) {
+    if (r) r->lat_extern = 1;
 }
 
 /* Выход o — член группы спеки v2 (именованные члены)? */
@@ -2348,12 +2339,16 @@ static void fo_step(struct fo_run *r) {
                 r->iv  = g->lat_interval_s  > 0 ? g->lat_interval_s  : LAT_INTERVAL_S;
                 int stale = 0;
                 for (size_t k = 0; k < r->cand_n; k++) {
-                    long age = 0;
+                    struct folat_rec rc;
                     r->ms[k] = -1;
-                    if (lat_get(r->st, o->name, fog_lat_key(r->cand[k]), &r->ms[k], &age)) {
-                        if (age > r->iv || age < 0) stale = 1;
+                    if (folat_rec_get(r->st, o->name, fog_lat_key(r->cand[k]), &rc)) {
+                        long age = mono_now() - rc.at;
+                        r->ms[k] = rc.ms;
+                        /* У демона срок замера — его таймер (folat.c), а не проход. */
+                        if (!r->lat_extern && (age > r->iv || age < 0)) stale = 1;
                     } else if (!r->named || ((r->galive >> k) & 1u)) stale = 1;
                 }
+                r->v6 = r->named && folat_want_v6(sp, o, r->galive);
                 /* Без трафика через группу замеров нет (idle_timeout): выбор — по тому, что уже
                  * измерено, а новый замер — когда трафик пойдёт. */
                 if (stale && fog_idle(sp, o, fog_idle_limit(o), r->traffic, r->traffic_arg)) {
@@ -2374,11 +2369,25 @@ static void fo_step(struct fo_run *r) {
 
         case S_LAT_M:
             if (r->k >= r->cand_n) {
-                lat_put(r->st, o->name, r->cand, r->ms, r->cand_n);
+                /* Выбор — по задержке члена (у группы, меренной по обоим семействам, — худшей из
+                 * двух, group_latency_score); мёртвый член группы v2 не мерился (-2) и строки не
+                 * получает. */
+                folat_score(r->ms4, r->ms6, r->cand_n, r->v6, r->ms);
+                struct folat_rec rec[MAX_MEMBERS];
+                long now = mono_now();
+                for (size_t k = 0; k < r->cand_n; k++) {
+                    int mine = r->ms4[k] != -2;
+                    rec[k].ms = mine ? r->ms[k] : -2;
+                    rec[k].ms4 = mine && r->v6 ? r->ms4[k] : -2;
+                    rec[k].ms6 = mine && r->v6 ? r->ms6[k] : -2;
+                    rec[k].at = now;
+                }
+                folat_rec_put(r->st, o->name, r->cand, rec, r->cand_n, r->lat_extern);
                 r->s = S_LAT_C;
                 continue;
             }
             if (r->named && !((r->galive >> r->k) & 1u)) {
+                r->ms4[r->k] = r->ms6[r->k] = -2;
                 r->ms[r->k++] = -1;
                 continue;
             }
@@ -2388,7 +2397,8 @@ static void fo_step(struct fo_run *r) {
             continue;
 
         case S_LAT_M_R:
-            r->ms[r->k] = r->res;
+            r->ms4[r->k] = r->res < 0 ? -1 : r->res;
+            r->ms6[r->k] = r->hp.ms6;
             r->k++;
             r->s = S_LAT_M;
             continue;
