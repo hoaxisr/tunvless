@@ -104,6 +104,8 @@ int status_fast(FILE *out) {
  *   alive    — живые члены по последнему проходу; у balance это и есть состав карты раздачи;
  *   select   — manual: выбор человека (команда select) или default, пока выбора не было;
  *   url, latency — latency: адрес проверки и замеры urltest по членам, мс (только измеренные);
+ *   latency4, latency6 — у группы, меренной по обоим семействам: замеры по IPv4 и IPv6 порознь
+ *              (latency тогда — худший из двух у каждого члена); у остальных полей нет;
  *   weights  — balance: веса членов по порядку. */
 static void group_emit(FILE *out, const struct spec *sp, const struct output *o) {
     const struct group_cfg *g = out_group(o);
@@ -128,6 +130,19 @@ static void group_emit(FILE *out, const struct spec *sp, const struct output *o)
             if (g->lat_ms[k] >= 0)
                 fprintf(out, "%s\"%s\":%d", n++ ? "," : "", sp->out[g->members[k]].name, g->lat_ms[k]);
         fprintf(out, "}");
+        /* Группа, меренная по обоим семействам (все живые члены несут IPv6, src/daemon/folat.c):
+         * замеры по IPv4 и IPv6 порознь; latency тогда — худший из двух, по нему и выбор. */
+        int fam = 0;
+        for (size_t k = 0; k < g->members_n; k++)
+            if (g->lat4_ms[k] != -2 || g->lat6_ms[k] != -2) fam = 1;
+        for (int v = 0; fam && v < 2; v++) {
+            const int *a = v ? g->lat6_ms : g->lat4_ms;
+            fprintf(out, ",\"latency%d\":{", v ? 6 : 4);
+            n = 0;
+            for (size_t k = 0; k < g->members_n; k++)
+                if (a[k] >= 0) fprintf(out, "%s\"%s\":%d", n++ ? "," : "", sp->out[g->members[k]].name, a[k]);
+            fprintf(out, "}");
+        }
     }
     if (g->pick == PICK_BALANCE) {
         fprintf(out, ",\"weights\":[");
@@ -136,6 +151,13 @@ static void group_emit(FILE *out, const struct spec *sp, const struct output *o)
         fprintf(out, "]");
     }
     fprintf(out, "}");
+}
+
+/* Поля выхода, которые знает только демон-супервизор (daemon.h, status_extra_source). */
+static void (*g_status_extra)(FILE *out, const char *out_name);
+
+void status_extra_source(void (*fn)(FILE *out, const char *out_name)) {
+    g_status_extra = fn;
 }
 
 /* Сам ответ. Поток параметром, потому что печатается он ДВАЖДЫ в разные места: в снимок на
@@ -259,6 +281,9 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
             const struct kind_ops *k = kind_of(&sp->out[i]);
             if (k->status) k->status(out, sp, &sp->out[i]);
         }
+        /* То, что о помощнике выхода знает демон по его событиям (у моста tgws — отставленные
+         * пути, paths_down): только в ответе демона-супервизора, подкоманда о них не знает. */
+        if (g_status_extra) g_status_extra(out, sp->out[i].name);
         fprintf(out, "}");
     }
     fprintf(out, "},\"channels\":[");

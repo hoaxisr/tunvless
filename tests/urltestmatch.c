@@ -19,6 +19,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 
 #include "loop.h"
 #include "urltest.h"
@@ -125,14 +126,15 @@ static void on_guard(struct loop *l, struct loop_timer *t, void *arg) {
     loop_stop(l, 0);
 }
 
-/* Замер url со сроком timeout_ms; возврат — мс или -1; *took — сколько длился по стенным часам. */
-static int run(const char *url, int timeout_ms, long *took) {
+/* Замер url по семейству fam со сроком timeout_ms; возврат — мс или -1; *took — сколько длился по
+ * стенным часам. */
+static int run_fam(const char *url, int fam, int timeout_ms, long *took) {
     g_calls = 0;
     g_ms = -2;
     fresh();
     long t0 = loop_now_ms();
     int ms = -2;
-    struct urltest *u = urltest_start(g_l, url, 0, NULL, timeout_ms, on_done, NULL, &ms);
+    struct urltest *u = urltest_start(g_l, url, fam, 0, NULL, timeout_ms, on_done, NULL, &ms);
     if (u) {
         struct loop_timer *g = loop_timer_new(g_l, on_guard, NULL);
         loop_timer_set(g, timeout_ms + 3000);
@@ -142,6 +144,67 @@ static int run(const char *url, int timeout_ms, long *took) {
     }
     if (took) *took = loop_now_ms() - t0;
     return ms;
+}
+
+static int run(const char *url, int timeout_ms, long *took) {
+    return run_fam(url, AF_INET, timeout_ms, took);
+}
+
+/* Ответчик 204 на [::1] (поток, как у IPv4); порт — в *port. 0 — IPv6 на петле нет. */
+static int g_lfd6 = -1;
+static void *srv6_thread(void *arg) {
+    int *hits = arg;
+    for (;;) {
+        int c = accept(g_lfd6, NULL, NULL);
+        if (c < 0) { if (errno == EINTR) continue; return NULL; }
+        char req[512];
+        size_t n = 0;
+        while (n < sizeof(req) - 1) {
+            ssize_t k = recv(c, req + n, sizeof(req) - 1 - n, 0);
+            if (k <= 0) break;
+            n += (size_t)k;
+            req[n] = '\0';
+            if (strstr(req, "\r\n\r\n")) break;
+        }
+        __atomic_add_fetch(hits, 1, __ATOMIC_SEQ_CST);
+        send_s(c, "HTTP/1.1 204 No Content\r\n\r\n");
+        close(c);
+    }
+}
+
+static int srv6_up(unsigned short *port, int *hits) {
+    g_lfd6 = socket(AF_INET6, SOCK_STREAM, 0);
+    if (g_lfd6 < 0) return 0;
+    int one = 1;
+    setsockopt(g_lfd6, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    setsockopt(g_lfd6, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
+    struct sockaddr_in6 a = { .sin6_family = AF_INET6, .sin6_addr = IN6ADDR_LOOPBACK_INIT };
+    socklen_t al = sizeof(a);
+    if (bind(g_lfd6, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(g_lfd6, 16) != 0 ||
+        getsockname(g_lfd6, (struct sockaddr *)&a, &al) != 0) {
+        close(g_lfd6);
+        g_lfd6 = -1;
+        return 0;
+    }
+    *port = ntohs(a.sin6_port);
+    pthread_t th;
+    pthread_create(&th, NULL, srv6_thread, hits);
+    pthread_detach(th);
+    return 1;
+}
+
+/* Имя, у которого есть AAAA на ::1 (/etc/hosts машины стенда): NULL — нет такого. */
+static const char *v6_name(void) {
+    static const char *const names[] = { "localhost", "ip6-localhost", "ip6-loopback", NULL };
+    for (size_t i = 0; names[i]; i++) {
+        struct addrinfo h = { .ai_family = AF_INET6, .ai_socktype = SOCK_STREAM }, *res = NULL;
+        if (getaddrinfo(names[i], "80", &h, &res) == 0 && res) {
+            int ok = IN6_IS_ADDR_LOOPBACK(&((struct sockaddr_in6 *)res->ai_addr)->sin6_addr);
+            freeaddrinfo(res);
+            if (ok) return names[i];
+        }
+    }
+    return NULL;
 }
 
 static void url_of(char *b, size_t n, int mode, const char *path) {
@@ -189,10 +252,14 @@ int main(void) {
     check("HTTPS в сборке без urltls — нет", 0, urltest_https_ok());
     int ms = 5;
     check("https:// без urltls — итог сразу (NULL)", 1,
-          urltest_start(g_l, "https://127.0.0.1/", 0, NULL, 1000, on_done, NULL, &ms) == NULL);
+          urltest_start(g_l, "https://127.0.0.1/", AF_INET, 0, NULL, 1000, on_done, NULL, &ms) == NULL);
     check("  и это -1", -1, ms);
     check("негодный адрес — итог сразу", 1,
-          urltest_start(g_l, "gopher://x/", 0, NULL, 1000, on_done, NULL, &ms) == NULL && ms == -1);
+          urltest_start(g_l, "gopher://x/", AF_INET, 0, NULL, 1000, on_done, NULL, &ms) == NULL && ms == -1);
+    ms = 5;
+    check("IPv6 к литералу IPv4 — итог сразу: -1 (AAAA не спросить)", 1,
+          urltest_start(g_l, "http://127.0.0.1/", AF_INET6, 0, NULL, 1000, on_done, NULL, &ms) == NULL &&
+          ms == -1);
 
     /* ---- замеры ---- */
     char url[128];
@@ -247,7 +314,7 @@ int main(void) {
     url_of(url, sizeof(url), M204SLOW, "/");
     g_calls = 0;
     fresh();
-    struct urltest *ut = urltest_start(g_l, url, 0, NULL, 2000, on_done, NULL, &ms);
+    struct urltest *ut = urltest_start(g_l, url, AF_INET, 0, NULL, 2000, on_done, NULL, &ms);
     check("отмена: замер начат", 1, ut != NULL);
     urltest_cancel(ut);
     struct loop_timer *g = loop_timer_new(g_l, on_guard, NULL);
@@ -258,6 +325,21 @@ int main(void) {
 
     /* Имя, которого нет: -1 (по отказу DNS или по сроку). */
     check("несуществующее имя — не измерилось", -1, run("http://no-such-host.invalid/", 2500, NULL));
+
+    /* IPv6: имя с AAAA на ::1 — запрос из сокета AF_INET6 доходит до ответчика на [::1], а тот же
+     * адрес по IPv4 — нет (там ответчика на этом порту нет). Нет IPv6 на петле или имени с AAAA —
+     * пропуск (стенд машины, а не движка). */
+    unsigned short p6 = 0;
+    int hits6 = 0;
+    const char *n6 = v6_name();
+    if (n6 && srv6_up(&p6, &hits6)) {
+        snprintf(url, sizeof(url), "http://%s:%u/generate_204", n6, p6);
+        check("IPv6: замер через AAAA — есть", 1, run_fam(url, AF_INET6, 3000, NULL) >= 0);
+        check("  запрос дошёл до ответчика на [::1]", 1, hits6);
+        check("  второй раз (кэш AAAA отдельно от A) — тоже", 1, run_fam(url, AF_INET6, 3000, NULL) >= 0);
+    } else {
+        printf("urltestmatch: IPv6 на петле нет — замер по IPv6 пропущен\n");
+    }
 
     loop_free(g_l);
     return unit_done("urltestmatch");

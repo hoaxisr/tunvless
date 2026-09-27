@@ -385,6 +385,23 @@ static void t_pick(void) {
     check("с живого текущего — только за выигрыш больше допуска", 1, group_latency_keep(ms2, 1, 0, 50));
     check("… а за больший — уходим", 0, group_latency_keep(ms1, 0, 1, 50));
 
+    /* По обоим семействам (group_latency_score): худший из двух, не ответивший по IPv6 выбывает;
+     * по IPv6 не ответил никто — выбор по IPv4. */
+    int a4[] = { 20, 60 }, a6[] = { 300, 70 }, sc[2];
+    group_latency_score(a4, a6, 2, sc);
+    check("IPv4+IPv6: у члена худший из двух", 1, sc[0] == 300 && sc[1] == 70);
+    check("… и выбор — ровный по обоим, хоть он медленнее по IPv4", 1,
+          group_latency_pick(sc, 2, 50, &best));
+    int b4[] = { 20, 60 }, b6[] = { -1, 70 };
+    group_latency_score(b4, b6, 2, sc);
+    check("IPv6 у члена не ответил — член выбыл", 1, sc[0] == -1 && sc[1] == 70);
+    int c4[] = { 20, 60 }, c6[] = { -1, -1 };
+    group_latency_score(c4, c6, 2, sc);
+    check("по IPv6 не ответил никто — по IPv4", 1, sc[0] == 20 && sc[1] == 60);
+    int d4[] = { -1, 60 }, d6[] = { 30, 70 };
+    group_latency_score(d4, d6, 2, sc);
+    check("IPv4 у члена не ответил — член выбыл и по обоим", 1, sc[0] == -1 && sc[1] == 70);
+
     int ns = -1;
     check("гистерезис: держим живое текущее", 1, group_hysteresis(1, 0, 1, 0, 3, &ns));
     check("… серия растёт", 1, ns);

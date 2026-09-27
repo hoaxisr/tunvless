@@ -66,6 +66,10 @@ while :; do
         printf '{"ev":"down","why":"стенд: отказ"}\n' >&9
         exit 3
     fi
+    if [ -e "$tmp/health.\$2" ]; then
+        rm -f "$tmp/health.\$2"
+        printf '{"ev":"health","dc":2,"media":1,"domain":"kws2.example","cool":300}\n' >&9
+    fi
     sleep 0.1
 done
 H
@@ -152,6 +156,36 @@ check "up из трубы — подписчику helper-up по каждому
 {"v":1,"ev":"helper-up","out":"t","helper":"obfs"}' "$(grep '"ev":"helper-up"' "$tmp/sub.out" | sort)"
 check "node из трубы — подписчику node" '{"v":1,"ev":"node","out":"a","n":2,"total":5}' \
     "$(grep '"ev":"node"' "$tmp/sub.out")"
+
+# health (мост отставил путь до ДЦ; у стенда его пишет заглушка обфускатора — моста в сборке нет):
+# подписчику — событие health, в status выхода и в ответе helper — paths_down до конца срока.
+touch "$tmp/health.b"
+wait_for 'grep -q "\"ev\":\"health\"" "$tmp/sub.out"' 5
+check "health из трубы — подписчику health" \
+    '{"v":1,"ev":"health","out":"b","helper":"obfs","dc":2,"media":true,"domain":"kws2.example","cool":300}' \
+    "$(grep '"ev":"health"' "$tmp/sub.out")"
+pdown() { python3 -c 'import json,sys
+d = json.loads(sys.stdin.read())
+d = json.loads(d["stdout"]) if "stdout" in d else d
+p = d["outputs"]["b"].get("paths_down") if "outputs" in d else d.get("paths_down")
+print("-" if p is None else " ".join("%s %s %s %s" % (x["dc"], x["media"], x["domain"], x["until"] - x["at"]) for x in p))'; }
+check "  status выхода — paths_down (ДЦ, медийный, домен, срок)" "2 True kws2.example 300" \
+    "$(ctl status | pdown)"
+check "  helper b — живое состояние из памяти демона" "True True 2 True kws2.example 300" \
+    "$(ctl helper b | python3 -c 'import json,sys
+d = json.loads(json.load(sys.stdin)["stdout"])
+p = d["paths_down"][0]
+print(d["running"], d["up"], p["dc"], p["media"], p["domain"], p["until"] - p["at"])')"
+check "  helper у выхода без помощника — код 1" "1" "$(ctl helper nope | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])')"
+# steerd status мимо клиента при живом демоне этой спеки — ответ демона (paths_down знает только он);
+# клиент, уже спросивший демон (STEER_DAEMON_ASKED), получает ответ самого движка.
+ENG="$(dirname "$BIN")/steerd"
+check "steerd status при живом демоне — его ответ, а не подкоманды" "2 True kws2.example 300" \
+    "$(STEER_SOCKET="$tmp/s.sock" "$ENG" status --spec "$tmp/spec.json" --state-dir "$tmp/st" | pdown)"
+check "  после клиента (STEER_DAEMON_ASKED) — считает сам" "-" \
+    "$(STEER_DAEMON_ASKED=1 STEER_SOCKET="$tmp/s.sock" "$ENG" status --spec "$tmp/spec.json" --state-dir "$tmp/st" | pdown)"
+check "  чужая спека — считает сам" "-" \
+    "$(cp "$tmp/spec.json" "$tmp/other.json"; STEER_SOCKET="$tmp/s.sock" "$ENG" status --spec "$tmp/other.json" --state-dir "$tmp/st" | pdown)"
 
 # Резолвер на таблице: канал swap.test есть — AAAA погашен; чужое имя — ответ апстрима.
 wait_for '[ "$(python3 "$tmp/qaaaa.py" "$LPORT" other.test)" = 1 ]' 5
@@ -418,6 +452,14 @@ EOF
     check "  status из памяти — оно же" '"xa"' "$(wst '["outputs"]["vpn"]["device"]')"
     check "  status: перебор узлов vless — из памяти демона" \
         '{"state":"probing","node":2,"total":5}' "$(wst '["outputs"]["vl"]["probe"]')"
+    # Мимо клиента (так status зовёт rpcd): подкоманда при живом демоне отвечает его ответом —
+    # файлов probe-* нет, и сама она хода перебора не знала бы.
+    check "  steerd status мимо клиента — тот же ход перебора, от демона" \
+        '{"state":"probing","node":2,"total":5}' \
+        "$(STEER_SOCKET="$W/s.sock" "$XK" status --spec "$W/spec.json" --state-dir "$W/st" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["outputs"]["vl"].get("probe"), separators=(",", ":")))' 2>&1)"
+    check "  helper xa — живое состояние клиента xsteer из памяти демона (xsteer-peers)" \
+        "xsteer True True" \
+        "$(wctl helper xa | python3 -c 'import json,sys; d=json.loads(json.load(sys.stdin)["stdout"]); print(d["helper"], d["running"], d["up"])' 2>&1)"
 
     touch "$W/down.xa"
     wait_for 'grep -q "\"ev\":\"switched\",\"out\":\"vpn\",\"from\":\"xa\"" "$W/sub.out"' 40

@@ -69,6 +69,14 @@
  * то, что увидел бы очередной `steer failover`, — и не перепривязывает выходы на пустом месте
  * (перепривязка снимает соединения выхода).
  *
+ * Запись `select` (выбор человека у pick: manual) отражается тем же путём, но лежит рядом со
+ * спекой, а не в каталоге состояния (files_put в failover.c): она обязана пережить перезагрузку.
+ *
+ * ЗАМЕРЫ ГРУПП latency — своими таймерами (folat.c), а не в проходе: у каждой группы таймер на её
+ * interval, и замер, меняющий выбор, зовёт внеочередной проход сразу (watchd_lat_kick). Проход
+ * меряет сам, только если у живого члена замера нет вовсе (fo_pass_lat_extern). Таймеры сверяются
+ * со спекой после каждого прохода и снимаются вместе со сторожем, когда движок выключают.
+ *
  * ЗДОРОВЬЕ ПОМОЩНИКОВ (демон ещё и с --supervise). Помощники — дети демона, и их состояние он
  * знает по событиям из трубы (helpers.h, helper_state_of). Проход берёт его отсюда — источник
  * здоровья помощника в памяти (fostate.h), — а не из файлов probe-* и xsteer-*.json, которые
@@ -103,6 +111,7 @@
 #include "fostate.h"
 #include "helpers.h"
 #include "nftdump.h"
+#include "folat.h"
 #include "watchd.h"
 
 #define LOG_WW "steer[warn] watch: "
@@ -262,6 +271,7 @@ struct watchd {
     long masq_at;                 /* когда последний раз возвращали masquerade (телефон) */
     struct fo_mem mem;
     struct fo_hmem hmem;          /* здоровье помощников — у супервизора демона (--supervise) */
+    struct folat *lat;            /* замеры групп latency своими таймерами (folat.c) */
 };
 
 static void watchd_pass_start(struct watchd *w);
@@ -412,6 +422,9 @@ static void watchd_after(struct watchd *w) {
     if (plat()->iptables_masq && w->d->have && watch_masq_due(&w->masq_at, w->eventful))
         iptables_masq_ensure(w->d->sp);
     w->eventful = 0;
+    /* Таймеры замеров групп latency — по спеке, которую проход только что прошёл (новая группа
+     * получает свой, ушедшая теряет). */
+    if (!watchd_dormant(w)) folat_sync(w->lat);
     /* На роутере события за время прохода — следы его же ifdown/ifup (см. шапку). */
     if (plat()->netifd && w->nl >= 0) watch_nl_drain(w->nl);
     if (w->pending) {
@@ -501,6 +514,30 @@ static int watchd_traffic(void *arg, const struct spec *sp, const struct output 
     return 0;
 }
 
+/* ---- замеры групп latency своими таймерами (folat.c) ---------------------------------------- */
+
+static const struct spec *watchd_lat_spec(void *arg) {
+    struct watchd *w = arg;
+    return w->d->have ? w->d->sp : NULL;
+}
+
+static struct fo_hsrc *watchd_lat_hs(void *arg) {
+    struct watchd *w = arg;
+    return w->d->sup ? &w->hmem.base : &fo_hsrc_files;
+}
+
+/* Замер сменил бы выбор группы — внеочередной проход сейчас, без успокоения: ждать нечего, это
+ * не пачка событий сети. Идёт проход — ещё один после него. */
+static void watchd_lat_kick(void *arg, const char *group) {
+    struct watchd *w = arg;
+    if (watchd_dormant(w)) return;
+    fprintf(stderr, "steer[info] watch: %s: по замеру быстрее другой член — внеочередной проход\n",
+            group);
+    if (w->run) { w->pending = 1; return; }
+    w->settling = 1;
+    loop_timer_set(w->tm, 0);
+}
+
 static void watchd_pass_start(struct watchd *w) {
     if (!w->sp) w->sp = malloc(sizeof(*w->sp));
     if (!w->sp) {
@@ -523,6 +560,8 @@ static void watchd_pass_start(struct watchd *w) {
     /* Супервизор заводится после сторожа — спрашивается на каждый проход. */
     if (w->d->sup) fo_pass_helpers(w->run, &w->hmem.base);
     fo_pass_traffic(w->run, watchd_traffic, w);
+    /* Замеры по сроку — таймерами групп (folat.c), а не проходом. */
+    if (w->lat) fo_pass_lat_extern(w->run);
     if (!w->revive_next) fo_pass_defer_revive(w->run);
     w->revive_next = 0;
     loop_timer_set(w->kill_tm, WATCHD_PASS_MAX_S * 1000L);
@@ -561,9 +600,14 @@ struct watchd *watchd_start(struct steerd *d, const struct watchd_conf *c, int o
     w->hmem.d = d;
     w->tm = loop_timer_new(w->l, watchd_timer, w);
     w->kill_tm = loop_timer_new(w->l, watchd_kill, w);
-    if (!w->tm || !w->kill_tm) {
+    struct folat_conf lc = { .l = w->l, .st = &w->mem.base, .spec = watchd_lat_spec,
+                             .hs = watchd_lat_hs, .traffic = watchd_traffic,
+                             .kick = watchd_lat_kick, .arg = w };
+    w->lat = folat_new(&lc);
+    if (!w->tm || !w->kill_tm || !w->lat) {
         loop_timer_free(w->tm);
         loop_timer_free(w->kill_tm);
+        free(w->lat);
         free(w);
         return NULL;
     }
@@ -614,6 +658,8 @@ void watchd_enable(struct watchd *w, int on) {
     loop_timer_stop(w->tm);
     w->settling = w->pending = 0;
     watchd_nl_down(w);
+    /* И замеры групп: выключенный движок — ни одного пробуждения. */
+    folat_stop(w->lat);
 }
 
 void watchd_release(struct watchd *w) {
@@ -642,4 +688,5 @@ void watchd_stop(struct watchd *w) {
         fo_pass_abort(w->run);
         w->run = NULL;
     }
+    if (w) folat_stop(w->lat);
 }

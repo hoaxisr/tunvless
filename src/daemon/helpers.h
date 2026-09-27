@@ -17,6 +17,7 @@
 #ifndef STEER_HELPERS_H
 #define STEER_HELPERS_H
 
+#include <stdio.h>
 #include <sys/types.h>
 
 #include "spec.h"
@@ -27,6 +28,17 @@
 #define HELPERS_DELAY_MS 5000L
 #define HELPERS_DELAY_MAX_MS 300000L
 #define HELPERS_STABLE_MS 60000L
+
+/* Путь моста tgws, отставленный им самим (событие health, evline.h): через domain для ДЦ dc
+ * (media — медийный) данные не шли, и мост не ходит этим путём до until. Мест — по числу
+ * путей, которые мост отставляет порознь: пять ДЦ, обычный и медийный, свой домен или общий;
+ * лишнее вытесняет самое старое. */
+#define HELPER_HEALTH_MAX 8
+struct helper_health {
+    int dc, media;
+    char domain[64];
+    long at, until;       /* когда сообщено и до когда отставлен (time()) */
+};
 
 /* Что демон знает о помощнике выхода по его событиям. Время — секунды Unix (time()). */
 struct helper_state {
@@ -40,6 +52,10 @@ struct helper_state {
     long since;           /* когда up сменилось (0 — ни разу) */
     long started;         /* когда запущен процесс */
     unsigned restarts;    /* сколько раз перезапущен с подъёма демона */
+    /* Мост tgws: отставленные им пути (health). Сбрасываются с новым процессом — отставку
+     * помнит сам мост, и новый экземпляр начинает с чистого листа. */
+    struct helper_health health[HELPER_HEALTH_MAX];
+    size_t health_n;
 };
 
 struct helper {
@@ -162,6 +178,11 @@ const struct helper_state *helper_state_of(const struct steerd *d, const char *o
  * и подъём, как выйдет; ждущего паузы — подъём сейчас). 0 — заказано; -1 — такого помощника у
  * демона нет. */
 int supd_restart(struct supd *s, const char *out, const char *cmd);
+
+/* Живое состояние помощников выхода name одной строкой JSON на помощника (команда сокета helper,
+ * docs/ctl.md): процесс, up, причина последнего отказа, перезапуски; у vless — узел, у tgws —
+ * отставленные пути. -1 — такого помощника у демона нет (ничего не напечатано). */
+int supd_helper_json(const struct supd *s, const char *name, FILE *out);
 
 /* Ход перебора узлов клиентов vless из памяти демона — в запись окружения для детей демона
  * (`STEER_PROBE_MEM=…`, её читает probe_read вместо файлов probe-*; см. src/model/probe.h). Пусто

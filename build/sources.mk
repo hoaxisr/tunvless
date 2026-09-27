@@ -116,6 +116,7 @@ CORE_SRC := src/lib/run.c src/lib/jsonw.c src/lib/evline.c src/compile/groups.c 
             src/cli/cli.c src/tools/srsread.c src/tools/hwid.c src/daemon/ctl.c \
             src/daemon/conns.c src/daemon/loop.c src/daemon/state.c src/daemon/watchd.c src/daemon/recon.c src/daemon/rulewd.c \
             src/daemon/foprobe.c src/daemon/gaiw.c src/daemon/urltest.c src/daemon/fogroup.c src/lib/nftvmap.c \
+            src/daemon/folat.c src/lib/ctlcall.c \
             $(KINDS_BASE_SRC)
 
 # Общее для обеих ролей: формат кадра, конфигурация, маршрутизация, рукопожатие, соединение
@@ -157,7 +158,7 @@ PROFILE_android  := $(PROFILE_extended)
 # `steer` — маленький клиент сокета, один на все профили: в нём нет ни спеки, ни компилятора,
 # только разбор команды, протокол v1 и exec движка. Платформа — ради путей по умолчанию (спека,
 # сокет, каталог состояния): клиент выбирает их так же, как движок (src/platform).
-CLIENT_SRC := src/client/main.c $(PLATFORM_SRC)
+CLIENT_SRC := src/client/main.c src/lib/ctlcall.c $(PLATFORM_SRC)
 
 PROFILE_DEFS_base     :=
 PROFILE_DEFS_extended := -DSTEER_EXTENDED

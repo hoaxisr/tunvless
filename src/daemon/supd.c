@@ -115,6 +115,7 @@ struct supd {
 static void supd_kick(struct supd *s);
 static const struct supd *g_probe_sup;
 static int probe_mem(const char *out, struct probe_status *ps);
+static void status_fields(FILE *out, const char *name);
 
 /* ---- события помощников ------------------------------------------------------------------- */
 
@@ -143,6 +144,45 @@ static void wake_watch(struct supd *s, const struct helper *h) {
     if (!s->d->watch || !s->d->have) return;
     const struct output *o = out_by_name(s->d->sp, h->name);
     if (o && out_engine_managed(o)) watchd_helper_changed(s->d->watch);
+}
+
+/* health (мост tgws): путь до ДЦ отставлен — оценка пути, а не помощника целиком, поэтому
+ * здоровья выхода она не меняет и сторожа не будит (выход моста сторож не выбирает: устройства у
+ * него нет). Демон её помнит — status выхода показывает отставленные пути, пока их срок не
+ * вышел (paths_down, supd_status_fields), — и шлёт подписчикам событием health. Тот же путь
+ * повторно — запись обновляется на месте; мест нет — вытесняется самая старая. */
+static void ev_health(struct supd *s, struct helper *h, const struct evline *e) {
+    long dc, media = 0, cool = 0;
+    const char *dom = evline_str(e, "domain");
+    if (!evline_int(e, "dc", &dc)) return;
+    evline_int(e, "media", &media);
+    evline_int(e, "cool", &cool);
+    if (cool < 0) cool = 0;
+    if (!dom) dom = "";
+    struct helper_state *st = &h->st;
+    struct helper_health *p = NULL;
+    for (size_t i = 0; i < st->health_n && !p; i++)
+        if (st->health[i].dc == dc && st->health[i].media == !!media &&
+            !strcmp(st->health[i].domain, dom))
+            p = &st->health[i];
+    if (!p && st->health_n < HELPER_HEALTH_MAX) p = &st->health[st->health_n++];
+    if (!p) {
+        p = &st->health[0];
+        for (size_t i = 1; i < st->health_n; i++)
+            if (st->health[i].at < p->at) p = &st->health[i];
+    }
+    long now = (long)time(NULL);
+    p->dc = (int)dc;
+    p->media = !!media;
+    snprintf(p->domain, sizeof(p->domain), "%s", dom);
+    p->at = now;
+    p->until = now + cool;
+    char out[80], dj[160], f[400];
+    steerd_json_str(out, sizeof(out), h->name);
+    steerd_json_str(dj, sizeof(dj), p->domain);
+    snprintf(f, sizeof(f), ",\"out\":%s,\"helper\":\"%s\",\"dc\":%d,\"media\":%s,\"domain\":%s,"
+             "\"cool\":%ld", out, h->cmd, p->dc, p->media ? "true" : "false", dj, cool);
+    steerd_emit(s->d, "health", f);
 }
 
 static void ev_line(struct supd *s, struct helper *h, const char *line) {
@@ -178,9 +218,9 @@ static void ev_line(struct supd *s, struct helper *h, const char *line) {
     } else if (!strcmp(e.ev, "nonode")) {
         if (evline_int(&e, "node", &v)) st->nonode = v;
         if (evline_int(&e, "total", &t)) st->total = t;
+    } else if (!strcmp(e.ev, "health")) {
+        ev_health(s, h, &e);
     }
-    /* health (мост tgws) — оценка пути до ДЦ, а не помощника целиком: в состоянии помощника ей
-     * места нет, сторожу она пока не нужна. */
 }
 
 /* Дочитать трубу помощника. 1 — открыта, 0 — конец (закрыта здесь же). */
@@ -585,6 +625,7 @@ static int start_one(struct helper *h, void *arg) {
         h->st.running = 1;
         h->st.up = h->st.known = h->st.said_down = 0;
         h->st.node = h->st.total = h->st.nonode = 0;
+        h->st.health_n = 0;
         h->st.started = (long)time(NULL);
         helper_started(h, pid);
     }
@@ -695,6 +736,7 @@ struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
     /* status демона отвечает в процессе — ход перебора узлов берёт отсюда (probe.h). */
     g_probe_sup = s;
     probe_source(probe_mem);
+    status_extra_source(status_fields);
     size_t fn = supd_plan(s);
     memcpy(s->set.h, s->fresh, fn * sizeof(s->fresh[0]));
     s->set.n = fn;
@@ -839,6 +881,70 @@ static int probe_mem(const char *out, struct probe_status *ps) {
         return 0;
     }
     return -1;
+}
+
+/* ---- состояние помощников наружу: status и команда helper ------------------------------ */
+
+static void health_json(FILE *out, const struct helper_state *st, long now) {
+    int n = 0;
+    fputs("[", out);
+    for (size_t i = 0; i < st->health_n; i++) {
+        const struct helper_health *p = &st->health[i];
+        if (p->until <= now) continue;
+        char dj[160];
+        steerd_json_str(dj, sizeof(dj), p->domain);
+        fprintf(out, "%s{\"dc\":%d,\"media\":%s,\"domain\":%s,\"at\":%ld,\"until\":%ld}",
+                n++ ? "," : "", p->dc, p->media ? "true" : "false", dj, p->at, p->until);
+    }
+    fputs("]", out);
+}
+
+/* Объект выхода моста tgws в status: отставленные им пути, чей срок не вышел (пустой массив —
+ * отставленных нет). Только у выхода, чей помощник — ребёнок этого демона: у моста всегда, у
+ * другого помощника — если он о путях сообщал (health пишет только мост; так событие видно и
+ * стенду, у которого моста в сборке нет). */
+static void status_fields(FILE *out, const char *name) {
+    const struct supd *s = g_probe_sup;
+    if (!s || !name) return;
+    for (size_t i = 0; i < s->set.n; i++) {
+        const struct helper *h = &s->set.h[i];
+        if (h->table || h->gone || strcmp(h->name, name)) continue;
+        if (strcmp(h->cmd, "tgws") && !h->st.health_n) continue;
+        fputs(",\"paths_down\":", out);
+        health_json(out, &h->st, (long)time(NULL));
+        return;
+    }
+}
+
+int supd_helper_json(const struct supd *s, const char *name, FILE *out) {
+    if (!s || !name) return -1;
+    int found = 0;
+    long now = (long)time(NULL);
+    for (size_t i = 0; i < s->set.n; i++) {
+        const struct helper *h = &s->set.h[i];
+        if (h->table || h->gone || strcmp(h->name, name)) continue;
+        const struct helper_state *st = &h->st;
+        char nj[80], wj[512];
+        steerd_json_str(nj, sizeof(nj), h->name);
+        fprintf(out, "{\"schema\":1,\"out\":%s,\"helper\":\"%s\",\"running\":%s,\"up\":%s",
+                nj, h->cmd, st->running ? "true" : "false", st->up ? "true" : "false");
+        fprintf(out, ",\"since\":%ld,\"started\":%ld,\"restarts\":%u", st->since, st->started,
+                st->restarts);
+        if (st->why[0]) {
+            steerd_json_str(wj, sizeof(wj), st->why);
+            fprintf(out, ",\"last_down\":%s", wj);
+        }
+        if (!strcmp(h->cmd, "vless") && (st->node || st->nonode))
+            fprintf(out, ",\"node\":%ld,\"total\":%ld", st->nonode ? st->nonode : st->node,
+                    st->total);
+        if (!strcmp(h->cmd, "tgws") || st->health_n) {
+            fputs(",\"paths_down\":", out);
+            health_json(out, st, now);
+        }
+        fputs("}\n", out);
+        found = 1;
+    }
+    return found ? 0 : -1;
 }
 
 void supd_probe_env(const struct supd *s, char *buf, size_t n) {

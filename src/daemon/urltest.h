@@ -19,15 +19,17 @@ struct urltest;
  * соединения; -1 — ответа нет, он не тот или срок вышел. */
 typedef void (*urltest_cb)(void *arg, int ms);
 
-/* Замер url через члена. mark != 0 — сокет с SO_MARK (метка члена: запрос идёт по его правилу
- * fwmark и таблице); иначе dev != NULL — SO_BINDTODEVICE (безымянный член пула v1, у которого своей
- * метки нет); ни того ни другого — обычный путь (стенды). timeout_ms — на весь замер, с DNS.
+/* Замер url через члена. fam — AF_INET (сокет IPv4, имя — только A) или AF_INET6 (сокет IPv6, имя
+ * — только AAAA; у литерала IPv4 замера по IPv6 нет: сразу -1). mark != 0 — сокет с SO_MARK (метка
+ * члена: запрос идёт по его правилу fwmark и таблице, у IPv6 — по правилу и таблице IPv6 члена);
+ * иначе dev != NULL — SO_BINDTODEVICE (безымянный член пула v1, у которого своей метки нет); ни
+ * того ни другого — обычный путь (стенды). timeout_ms — на весь замер, с DNS.
  *
  * NULL — замер кончился сразу (адрес негоден, HTTPS нет в сборке, сокет не открылся): итог в *ms,
  * обратного вызова не будет. Иначе cb позовётся ровно один раз, если замер не отменён. Цикл не
  * блокируется ни на миг. */
-struct urltest *urltest_start(struct loop *l, const char *url, uint32_t mark, const char *dev,
-                              int timeout_ms, urltest_cb cb, void *arg, int *ms);
+struct urltest *urltest_start(struct loop *l, const char *url, int fam, uint32_t mark,
+                              const char *dev, int timeout_ms, urltest_cb cb, void *arg, int *ms);
 /* Отменить идущий замер: сокет, таймер, разрешение имени и поток HTTPS снимаются, cb не
  * зовётся. NULL — ничего. */
 void urltest_cancel(struct urltest *u);

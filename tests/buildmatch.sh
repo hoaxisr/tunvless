@@ -442,7 +442,10 @@ check "файл keep.d есть в репозитории" "yes" "$([ -f "$KEEP"
 #
 # spec.yaml — спека v2 в YAML рядом со spec.json (1.9, docs/spec-v2.md): без неё в списке
 # обновление прошивки «с сохранением настроек» оставляло роутер без спеки.
-for f in /etc/steer/spec.json /etc/steer/spec.yaml /etc/steer/sub.txt /etc/steer/sub.userinfo \
+#
+# select — выбор члена группы pick: manual командой select (1.9): лежит рядом со спекой, чтобы
+# пережить перезагрузку (каталог состояния — tmpfs), и обязан пережить и обновление прошивки.
+for f in /etc/steer/spec.json /etc/steer/spec.yaml /etc/steer/select /etc/steer/sub.txt /etc/steer/sub.userinfo \
          /etc/steer/subs /etc/steer/lists/custom /etc/steer/xsteer /etc/steer/zapret; do
     check "keep.d объявляет $f" "1" "$(grep -cx "$f" "$KEEP")"
 done

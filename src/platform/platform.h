@@ -103,6 +103,19 @@ const char *steer_rt_tables_dir(void);
 void steer_set_rt_tables_dir(const char *dir);    /* NULL — вернуть путь платформы */
 /* "<etc_dir>/<name>" в buf; возвращает buf. */
 const char *plat_etc_path(char *buf, size_t n, const char *name);
+/* КАТАЛОГ ВЫБОРА ЧЕЛОВЕКА — то, что обязано пережить перезагрузку (выбор `select` группы
+ * pick: manual). Каталог состояния на роутере — tmpfs (/var/lib/steer живёт в /var → /tmp), и
+ * запись там переживает перезапуск службы, но не перезагрузку. Постоянный носитель — каталог,
+ * где лежит сама спека этого запуска (у пакета — etc платформы: /etc/steer на роутере, он же
+ * объявлен в keep.d и переживает sysupgrade; /data/misc/steer на телефоне): выбор — такая же
+ * настройка человека, как спека, только сделанная командой, а не правкой файла. Каталог
+ * спеки, а не etc платформы, — затем, чтобы стенд с `--spec $tmp/spec.yaml` писал выбор к себе,
+ * а не в /etc машины.
+ *
+ * steer_set_keep_dir_of — по пути спеки, которую читает этот запуск (NULL — умолчание: etc
+ * платформы); зовут точки входа, разобравшие --spec (main.c, демон). */
+const char *steer_keep_dir(void);
+void steer_set_keep_dir_of(const char *spec_path);
 
 /* СПЕКА ПО УМОЛЧАНИЮ — spec.json или spec.yaml рядом (docs/spec-v2.md, «Файл спеки»).
  * plat_spec_yaml — путь spec.yaml рядом с spec_path. plat_spec_default — какую из двух читать:

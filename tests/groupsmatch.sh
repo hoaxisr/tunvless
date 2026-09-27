@@ -11,11 +11,18 @@
 # Что проверяется.
 #  1. manual: `steer select man b` переключает таблицу группы на устройство b без apply (набор
 #     правил в ядре не пересоздаётся), подписчику — switched с by: select и member; status — select
-#     и selected; выбор переживает перезапуск демона (файл select); select мёртвого члена — отказ
+#     и selected; выбор переживает перезапуск демона и «перезагрузку» (чистый каталог состояния,
+#     та же спека: файл select лежит рядом со спекой, а не в tmpfs); select мёртвого члена — отказ
 #     группы по on_fail (blackhole), а не другой член; отказы команды (не член, не manual).
 #  2. latency = urltest: через двух членов с разной задержкой выбирается быстрый, хотя он второй
 #     по порядку; запрос идёт именно через члена (ответчик видит адрес его устройства); гистерезис:
 #     выигрыш меньше tolerance — остаётся на текущем; больше — уходит.
+#  2а. interval короче периода сторожа: группа с interval 10 при периоде 60 меряется каждые ~10 с
+#     (по счётчику запросов у ответчика), а член, ставший медленным, теряет группу по замеру, не
+#     дожидаясь прохода по периоду.
+#  2б. IPv6: у группы, все члены которой несут IPv6, замер идёт и по IPv4, и по IPv6 (ответчик видит
+#     запрос с адреса IPv6 каждого члена); status — latency4 и latency6; член, быстрый по IPv4, но
+#     медленный по IPv6, не выигрывает (выбор — по худшему из двух).
 #  3. balance: новые соединения клиента расходятся по обоим членам; упавший член выпадает из карты
 #     (карта в ядре — только цепочка живого, событие balance), новые идут на живого; установленное
 #     соединение не перескакивает ни при уходе, ни при возврате другого члена.
@@ -80,6 +87,20 @@ for k in 1 2; do
     ip link set sw$k addrgenmode none 2>/dev/null
     ip link set sw$k up; ip addr add 10.9.$k.1/24 dev sw$k
 done
+# IPv6 членов (2б): свой адрес у каждой пары и адрес ответчика fd02::1 на обоих его концах — маршрут
+# члена IPv6 — «default dev swN», и соседа fd02::1 ответчик находит на том конце, куда пришёл запрос.
+# Не встало (IPv6 в пространстве выключен) — часть 2б пропускается.
+# keep_addr_on_down: стенд роняет устройства членов (ip link set down), а IPv6 без этого снимает
+# адреса с упавшего устройства насовсем.
+V6=1
+for k in 1 2; do
+    sysctl -qw "net.ipv6.conf.sw$k.keep_addr_on_down=1" 2>/dev/null
+    ip -6 addr add fd09:$k::1/64 dev sw$k nodad 2>/dev/null || V6=0
+    R ip -6 addr add fd09:$k::2/64 dev sw${k}p nodad 2>/dev/null || V6=0
+    R ip -6 addr add fd02::1/128 dev sw${k}p nodad 2>/dev/null || V6=0
+done
+# Имя адреса проверки с A и AAAA — файлом hosts в пространстве имён монтирования демона.
+printf '127.0.0.1 localhost\n10.2.0.1 probe.test\nfd02::1 probe.test\n' > "$tmp/hosts"
 ip link add lanx type veth peer name lanxp
 ip link set lanxp netns "$CPID"
 ip link set lanx up; ip addr add 192.168.7.1/24 dev lanx
@@ -127,9 +148,16 @@ def serve(c, a):
             c.sendall(b'HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n')
     finally:
         c.close()
-while True:
-    c, a = s.accept()
-    threading.Thread(target=serve, args=(c, a), daemon=True).start()
+def accept_loop(sock):
+    while True:
+        c, a = sock.accept()
+        threading.Thread(target=serve, args=(c, a), daemon=True).start()
+# IPv6 (2б): тот же ответчик на [fd02::1]:8080, журнал — с адресом IPv6 члена.
+if len(sys.argv) > 2 and sys.argv[2] == '1':
+    s6 = socket.socket(socket.AF_INET6); s6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s6.bind(('fd02::1', 8080)); s6.listen(64)
+    threading.Thread(target=accept_loop, args=(s6,), daemon=True).start()
+accept_loop(s)
 PY
 # Эхо: на каждую строку отвечает адресом собеседника (через какого члена пришло соединение).
 cat > "$tmp/echo.py" <<'PY'
@@ -160,7 +188,7 @@ while True:
 PY
 : > "$tmp/http.log"
 # nsenter напрямую, а не функцией R: у функции в фоне $! — подоболочка, и kill её не снял бы сервер.
-nsenter -t "$RPID" -n python3 "$tmp/http.py" "$tmp/http.log" >"$tmp/http.err" 2>&1 & HP=$!
+nsenter -t "$RPID" -n python3 "$tmp/http.py" "$tmp/http.log" "$V6" >"$tmp/http.err" 2>&1 & HP=$!
 nsenter -t "$RPID" -n python3 "$tmp/echo.py" >"$tmp/echo.err" 2>&1 & EP=$!
 sleep 0.5
 
@@ -179,6 +207,8 @@ j() { python3 "$tmp/j.py" "$1"; }
 
 printf '10.2.0.0/24\n' > "$tmp/bal.lst"
 printf '10.3.0.0/24\n' > "$tmp/idl.lst"
+V6G=""
+[ "$V6" = 1 ] && V6G='  v6g: { kind: group, pick: latency, members: [b, a], url: "http://probe.test:8080/v6_204", tolerance: 60, idle_timeout: 0 }'
 cat > "$tmp/spec.yaml" <<EOF
 version: 2
 lan: { devices: [lanx] }
@@ -191,6 +221,8 @@ outputs:
   man: { kind: group, pick: manual, members: [a, b], default: a }
   lat: { kind: group, pick: latency, members: [b, a], url: "http://10.2.0.1:8080/generate_204", tolerance: 60, idle_timeout: 0 }
   idl: { kind: group, pick: latency, members: [b, a], url: "http://10.2.0.1:8080/idle_204", idle_timeout: 3600 }
+  iv:  { kind: group, pick: latency, members: [b, a], url: "http://10.2.0.1:8080/iv_204", tolerance: 60, interval: 10, idle_timeout: 0 }
+$V6G
   bal: { kind: group, pick: balance, members: [a, b] }
 rules:
   - { name: bal, to: [lb], out: bal }
@@ -200,8 +232,10 @@ S="--spec $tmp/spec.yaml --state-dir $tmp/st"
 STEER_SOCKET="$tmp/steer.sock"
 export STEER_SOCKET
 c() { "$BIN" "$@" $S; }
+PERIOD=3
 start_daemon() {
-    unshare -m sh -c "mount -t sysfs sysfs /sys && exec \"$BIN\" daemon --watch --watch-period 3 --apply \
+    unshare -m sh -c "mount -t sysfs sysfs /sys && mount --bind \"$tmp/hosts\" /etc/hosts && \
+        exec \"$BIN\" daemon --watch --watch-period $PERIOD --apply \
         --socket \"$tmp/steer.sock\" $S" >>"$tmp/d.out" 2>>"$tmp/d.err" &
     D=$!
     wait_for '[ -S "$tmp/steer.sock" ] && [ "$(grep -c "watch: первый проход" "$tmp/d.err")" -gt "$starts" ]' 15
@@ -241,7 +275,8 @@ check "  подписчику — switched by: select с членом" \
     '{"v":1,"ev":"switched","out":"man","from":"sw1","to":"sw2","why":"select","member":"b","by":"select"}' \
     "$(grep '"ev":"switched"' "$tmp/sub.out" | grep '"by":"select"' | head -n 1)"
 check "  status: select b, selected b" "b b" "$(st outputs.man.group.select) $(st outputs.man.group.selected)"
-check "  выбор — в файле select рядом с реестром" "man b" "$(cat "$tmp/st/select")"
+check "  выбор — в файле select рядом со спекой, не в каталоге состояния" "man b -" \
+    "$(cat "$tmp/select") $([ -e "$tmp/st/select" ] && echo есть || echo -)"
 sleep 7
 check "  проход сторожа выбор не отменяет" "sw2" "$(tdev man)"
 out="$(c select man nope 2>&1)"; rc=$?
@@ -254,6 +289,14 @@ check "перезапуск: таблица осталась на b" "sw2" "$(td
 start_daemon
 sleep 1
 check "  после перезапуска демона выбор тот же (status select и таблица)" "b sw2" \
+    "$(st outputs.man.group.select) $(tdev man)"
+# «Перезагрузка»: каталог состояния на роутере — tmpfs, после неё он пуст, а спека (и выбор рядом
+# с ней) — на месте.
+stop_daemon
+[ -n "$tmp" ] && [ -d "$tmp/st" ] && rm -rf "$tmp/st" && mkdir -p "$tmp/st"
+start_daemon
+wait_for '[ "$(tdev man)" = sw2 ]' 10
+check "  после «перезагрузки» (чистый каталог состояния) выбор тот же" "b sw2" \
     "$(st outputs.man.group.select) $(tdev man)"
 
 ip link set sw2 down
@@ -294,9 +337,63 @@ check "  гистерезис: выигрыш b меньше допуска — 
 R tc qdisc change dev sw1p root netem delay 250ms
 stop_daemon
 start_daemon
-wait_for '[ "$(tdev lat)" = sw2 ]' 15
+wait_for '[ "$(tdev lat) $(st outputs.lat.group.selected)" = "sw2 b" ]' 15
 check "  выигрыш больше допуска — уходит на b" "sw2 b" "$(tdev lat) $(st outputs.lat.group.selected)"
 R tc qdisc del dev sw1p root
+
+# ---- 2а. interval короче периода сторожа ----
+# Период 60 — проход по периоду за время проверки не наступает (события сети сторожа будят, но
+# задержка netem на стороне ответчика — не событие в нашем пространстве). Первый замер — проходом,
+# дальше — таймером группы раз в 10 с: по два запроса (член a и член b) на замер.
+stop_daemon
+PERIOD=60
+ivs="$(grep -c '^/iv_204 ' "$tmp/http.log")"
+kicks="$(grep -c 'iv: по замеру быстрее другой член' "$tmp/d.err")"
+start_daemon
+wait_for '[ "$(grep -c "^/iv_204 " "$tmp/http.log")" -ge $((ivs + 2)) ]' 20
+check "interval 10 при периоде 60: первый замер — в первом проходе (запрос через каждого члена)" "yes" \
+    "$([ "$(grep -c '^/iv_204 ' "$tmp/http.log")" -ge $((ivs + 2)) ] && echo yes || echo no)"
+iv0="$(grep -c '^/iv_204 ' "$tmp/http.log")"
+# Таймеры групп заводятся в конце первого прохода (он ещё меряет другие группы) — окно с запасом.
+sleep 23
+iv1="$(grep -c '^/iv_204 ' "$tmp/http.log")"
+check "  за 23 с — два замера таймером группы (по запросу на члена), а не ноль до прохода" "yes" \
+    "$([ $((iv1 - iv0)) -ge 4 ] && [ $((iv1 - iv0)) -le 6 ] && echo yes || echo "запросов: $((iv1 - iv0))")"
+# Медленным становится тот член, что несёт группу сейчас (оба быстры — держится текущий).
+case "$(tdev iv)" in sw1) slow=sw1p want="sw2 b" ;; *) slow=sw2p want="sw1 a" ;; esac
+R tc qdisc add dev "$slow" root netem delay 200ms
+wait_for '[ "$(tdev iv) $(st outputs.iv.group.selected)" = "$want" ]' 25
+check "  несущий член стал медленным — группа на другом по замеру таймера, не дожидаясь прохода" \
+    "$want" "$(tdev iv) $(st outputs.iv.group.selected)"
+check "  внеочередной проход — по замеру" "yes" \
+    "$([ "$(grep -c 'iv: по замеру быстрее другой член' "$tmp/d.err")" -gt "$kicks" ] && echo yes || echo no)"
+R tc qdisc del dev "$slow" root
+PERIOD=3
+
+# ---- 2б. IPv6: замер по обоим семействам, выбор по худшему ----
+if [ "$V6" = 1 ]; then
+    # b медленный только по IPv6: netem в полосе prio, куда фильтр кладёт IPv6 с его стороны.
+    R tc qdisc add dev sw2p root handle 1: prio
+    R tc qdisc add dev sw2p parent 1:3 handle 30: netem delay 200ms
+    R tc filter add dev sw2p parent 1: protocol ipv6 prio 1 u32 match u32 0 0 flowid 1:3
+    stop_daemon
+    start_daemon
+    wait_for '[ "$(st outputs.v6g.group.latency6 | tr "," "\n" | grep -c "^[ab]=")" = 2 ] && [ "$(tdev v6g)" = sw1 ]' 20
+    check "IPv6: status — latency4 и latency6 у обоих членов" "2 2" \
+        "$(st outputs.v6g.group.latency4 | tr ',' '\n' | grep -c '^[ab]=') $(st outputs.v6g.group.latency6 | tr ',' '\n' | grep -c '^[ab]=')"
+    check "  запрос по IPv6 шёл через каждого члена (ответчик видел оба адреса IPv6)" "2" \
+        "$(grep '^/v6_204 fd09:' "$tmp/http.log" | awk '{ print $2 }' | sort -u | grep -c '^fd09:[12]::1$')"
+    v4b="$(st outputs.v6g.group.latency4 | tr ',' '\n' | awk -F= '$1 == "b" { print $2 }')"
+    v6b="$(st outputs.v6g.group.latency6 | tr ',' '\n' | awk -F= '$1 == "b" { print $2 }')"
+    lb="$(st outputs.v6g.group.latency | tr ',' '\n' | awk -F= '$1 == "b" { print $2 }')"
+    check "  b быстр по IPv4 и медлен по IPv6; latency у b — худший из двух" "yes" \
+        "$([ -n "$v4b" ] && [ -n "$v6b" ] && [ "$v4b" -lt 150 ] && [ "$v6b" -ge 190 ] && [ "$lb" = "$v6b" ] && echo yes || echo "v4=$v4b v6=$v6b latency=$lb")"
+    check "  выбор — a: b первый по порядку и быстр по IPv4, но медлен по IPv6" "sw1 a" \
+        "$(tdev v6g) $(st outputs.v6g.group.selected)"
+    R tc qdisc del dev sw2p root
+else
+    echo "groupsmatch: IPv6 в пространстве стенда не встал — часть 2б пропущена"
+fi
 
 # ---- 4. idle_timeout ----
 check "idle_timeout: без трафика через группу — ни одного запроса проверки" "0" \

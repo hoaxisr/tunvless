@@ -37,6 +37,9 @@ int fog_balance_sync(const struct spec *sp, const struct output *g, unsigned ali
 void fog_groups_save(struct fo_store *st, const struct spec *sp, const int *cur, const unsigned *alive);
 /* Номер члена по записи `groups` (-1 — записи нет или член больше не в группе). */
 int fog_groups_cur(struct fo_store *st, const struct spec *sp, const struct output *g);
+/* Живые члены по записи `groups` (маска в *alive). 0 — записи нет: сторож группу ещё не проходил. */
+int fog_groups_alive(struct fo_store *st, const struct spec *sp, const struct output *g,
+                     unsigned *alive);
 
 /* Состояние групп для status (cur, alive, sel, lat_ms у struct group_cfg) — из записей `groups`,
  * `select` и `latency` хранилища st. */
@@ -46,7 +49,7 @@ void fog_adopt(struct spec *sp, struct fo_store *st);
 const char *fog_lat_key(const struct output *m);
 
 /* КОМАНДА select: группа gname (pick: manual) — член mname. Выбор кладётся в запись `select`
- * (переживает перезапуск: файл рядом с реестром меток), таблица группы тут же переписывается на
+ * (переживает перезапуск и перезагрузку: файл рядом со спекой), таблица группы тут же переписывается на
  * лист члена — как сторож при переключении, — а упавший член даёт группе её on_fail, а не
  * другого члена. ev — событие switched (by: select) или failed. route = 0 — только запомнить
  * выбор (движок выключен: маршрутизацию трогать нельзя, выбор применит следующий проход после

@@ -82,7 +82,10 @@ void group_cfg_init(struct group_cfg *g) {
     g->idle_timeout_s = -1;
     g->cur = -1;
     g->sel = -1;
-    for (size_t i = 0; i < MAX_MEMBERS; i++) g->lat_ms[i] = -1;
+    for (size_t i = 0; i < MAX_MEMBERS; i++) {
+        g->lat_ms[i] = -1;
+        g->lat4_ms[i] = g->lat6_ms[i] = -2;
+    }
 }
 
 int group_named(const struct group_cfg *g) {
@@ -168,6 +171,17 @@ int group_latency_pick(const int *ms, size_t n, int tol, int *best) {
 
 int group_latency_keep(const int *ms, int cur, int pick, int tol) {
     return ms[cur] - ms[pick] <= tol;
+}
+
+void group_latency_score(const int *ms4, const int *ms6, size_t n, int *score) {
+    int any6 = 0;
+    for (size_t k = 0; k < n; k++)
+        if (ms6[k] >= 0) any6 = 1;
+    for (size_t k = 0; k < n; k++) {
+        if (!any6) score[k] = ms4[k] >= 0 ? ms4[k] : -1;
+        else if (ms4[k] < 0 || ms6[k] < 0) score[k] = -1;
+        else score[k] = ms4[k] > ms6[k] ? ms4[k] : ms6[k];
+    }
 }
 
 int group_hysteresis(int cur, int first, int cur_alive, int streak, int hyst, int *new_streak) {
