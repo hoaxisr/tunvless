@@ -1269,7 +1269,7 @@ static void srv_spec_changed(struct ctl_srv *s, const char *by, int enabled,
     memset(&ch, 0, sizeof(ch));
     struct cbuf cj = {0};
     if (steerd_load(&s->d) == 0) {
-        supd_spec_changed(s->d.sup, &ch);
+        supd_spec_changed(s->d.sup, &ch, d && d->ruleset);
         changed_json(&cj, d, &ch);
         struct cbuf f = {0};
         cb_fmt(&f, ",\"by\":\"%s\",\"spec\":\"%s\",\"enabled\":%s", by, s->d.fp,

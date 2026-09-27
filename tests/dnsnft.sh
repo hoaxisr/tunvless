@@ -206,6 +206,7 @@ kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null
 #  c. real-ip: настоящий AAAA клиенту и в набор «<канал>6» со сроком.
 #  d. Перезапуск: карта и набор восстановлены из файла, AAAA отвечается сразу тем же адресом.
 #  e. Карта fakeip6 не того типа — пустой AAAA, а не настоящий.
+#  f. Набор правил заменён, затем HUP — поддельные адреса обоих семейств снова в наборах каналов.
 nft add table inet steer
 nft add map inet steer fakeip '{ type ipv4_addr : ipv4_addr; }'
 nft add map inet steer fakeip6 '{ type ipv6_addr : ipv6_addr; }'
@@ -307,6 +308,18 @@ start6
 check "d. перезапуск: элемент карты fakeip6 восстановлен из файла" "2001:db8:77::1" "$(map6 "$f6")"
 check "d. и поддельный IPv6 — снова в наборе канала" "1" "$(in6 "${set_c6}6" "$f6")"
 check "d. AAAA — тот же поддельный адрес" "$f6" "$(ask6 v6.io)"
+
+# f. Набор правил заменён (apply пересоздаёт таблицу — наборы каналов приходят пустыми), затем
+#    HUP, как после reload: постоянные элементы поддельных адресов обоих семейств снова в наборах
+#    сразу, без запроса имени. Прежде они возвращались только запросом после дросселя (60 с), а
+#    клиент с поддельным адресом в кэше всё это время шёл напрямую. Набор IPv4 канала заводится
+#    только здесь — элемента поддельного IPv4 в нём не было, и его появление — работа прохода.
+nft add set inet steer "$set_c6" '{ type ipv4_addr; flags interval,timeout; }'
+nft flush set inet steer "${set_c6}6"
+kill -HUP "$DPID6"
+sleep 0.5
+check "f. после замены набора и HUP поддельный IPv6 снова в наборе канала" "1" "$(in6 "${set_c6}6" "$f6")"
+check "f. и поддельный IPv4 — в наборе канала IPv4" "1" "$(in6 "$set_c6" "$f4")"
 
 nft delete map inet steer fakeip6
 nft add map inet steer fakeip6 '{ type ipv6_addr : ipv4_addr; }'

@@ -502,7 +502,40 @@ void fakeip_route_set6(const char *domain, uint64_t want) {
     e->route6_asserted = now;
 }
 
-/* Восстановить DNAT-карту и наборы каналов после (пере)запуска. Возвращает число
+/* Постоянные элементы имени — в каждый канал want заново, без дросселя fakeip_route_set и
+ * независимо от того, что память считает уже стоящим; из каналов прежнего sets, которых нет в
+ * want, — снять. EEXIST у dch_add — желаемое состояние. Нужен проходу ниже: после замены набора
+ * правил (apply пересоздаёт таблицу целиком, наборы каналов — пустыми) sets записи совпадает с
+ * want, и fakeip_route_set молчал бы до конца дросселя, а клиент с поддельным адресом в кэше всё
+ * это время шёл бы мимо выхода: пакет к поддельному адресу набор не метит, а карта dnat, которую
+ * apply засевает из файла состояния, разворачивает его в настоящий адрес — напрямую. */
+static void route_reassert(struct fakeip_entry *e, uint64_t want) {
+    if (g_dch_n < 64) want &= (1ULL << g_dch_n) - 1ULL;
+    for (size_t i = 0; i < g_dch_n && i < 64; i++)
+        if ((e->sets & (1ULL << i)) && !(want & (1ULL << i))) dch_del(i, e->domain, e->addr);
+    for (size_t i = 0; i < g_dch_n && i < 64; i++)
+        if (want & (1ULL << i)) dch_add(i, e->domain, e->addr, 0);
+    e->sets = want;
+    e->route_asserted = time(NULL);
+}
+
+static void route_reassert6(struct fakeip_entry *e, uint64_t want) {
+    if (g_dch_n < 64) want &= (1ULL << g_dch_n) - 1ULL;
+    for (size_t i = 0; i < g_dch_n && i < 64; i++)
+        if (!(g_dch[i].fam & DCH_V6)) want &= ~(1ULL << i);
+    uint8_t f6[16];
+    fakeip6_of(e->addr, f6);
+    for (size_t i = 0; i < g_dch_n && i < 64; i++)
+        if ((e->sets6 & (1ULL << i)) && !(want & (1ULL << i))) dch_del6(i, e->domain, f6);
+    for (size_t i = 0; i < g_dch_n && i < 64; i++)
+        if (want & (1ULL << i)) dch_add6(i, e->domain, f6, 0);
+    e->sets6 = want;
+    e->route6_asserted = time(NULL);
+}
+
+/* Восстановить DNAT-карту и наборы каналов после (пере)запуска — и после каждой новой таблицы
+ * каналов или перечитывания списков (proxy.c, reassert_routes): набор правил мог быть заменён
+ * вместе с наборами каналов. Возвращает число
  * восстановленных отображений fake→real, в *routed_out — число вновь утверждённых маршрутов.
  *
  * ГЛАВНОЕ ЗДЕСЬ — real_host остаётся у записи ТОЛЬКО если ядро подтвердило отображение.
@@ -535,14 +568,18 @@ size_t fakeip_rehydrate(int nk_open, size_t *routed_out) {
         }
         if (nk_open != 0) continue;
         /* Re-derive the channels for the stored domain and re-assert the permanent route
-         * elements. fakeip_route_set запоминает набор, поэтому повторное разрешение имени в те
-         * же каналы ничего не стоит. */
+         * elements — БЕЗ дросселя и во все каналы, а не только в новые (route_reassert ниже):
+         * этот проход зовут и после замены набора правил, когда наборы в ядре пересозданы
+         * пустыми, а память резолвера помнит элементы «уже стоящими». */
         uint64_t all = dch_match_mask(e->domain);
         uint64_t m = dch_fakeip_only(all);
-        if (m) { fakeip_route_set(e->domain, m); routed++; }
+        if (m || e->sets) route_reassert(e, m);
+        if (m) routed++;
         /* Поддельный IPv6 ложится в наборы, только если он у имени был выдан (есть настоящий
-         * IPv6) и все совпавшие каналы по-прежнему несут IPv6. */
-        if (e->has_real6 && m && dch_all_v6(all)) fakeip_route_set6(e->domain, m);
+         * IPv6) и все совпавшие каналы по-прежнему несут IPv6; иначе прежние элементы IPv6
+         * снимаются — на AAAA такого имени адресом больше не отвечают. */
+        uint64_t m6 = e->has_real6 && m && dch_all_v6(all) ? m : 0;
+        if (m6 || e->sets6) route_reassert6(e, m6);
     }
     if (routed_out) *routed_out = routed;
     return restored;
