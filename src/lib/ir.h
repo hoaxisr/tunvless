@@ -249,5 +249,9 @@ struct nft_expr *ir_expr_insert(struct nft_rule *r, struct nft_expr *before, enu
 /* ---- печать (print.c) ---- */
 /* Текст nft всего дерева в f. Элементы наборов читаются из файлов потоком. */
 void nft_print(const struct nft_rs *rs, FILE *f);
+/* 1 (по умолчанию) — элементы из файла состояния резолвера (NFT_EL_FAKEIP_STATE) печатаются; 0 —
+ * пропускаются, будто файла нет. 0 ставит только отпечаток плана apply-сверки (apply-plan в
+ * src/daemon/apply.c): зачем — у print_elements в print.c. */
+extern int g_print_state_seed;
 
 #endif
