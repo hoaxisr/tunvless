@@ -61,6 +61,11 @@ procd_add_config_trigger() { echo "trigger \$*"; }
 SPEC="$it/spec.json"
 STEER="$it/steer"
 STEERD="$it/steerd"
+start() { echo "start" >> "$it/calls"; }
+[ -n "\${NODAEMON:-}" ] && STEER="$it/steer3"
+[ -n "\${REFUSED:-}" ] && STEER="$it/steer1"
+[ -n "\${AUTOSTART_OFF:-}" ] && steer_autostart_off() { return 0; }
+[ -n "\${AUTOSTART_ON:-}" ] && steer_autostart_off() { return 1; }
 case "\$1" in
   start) start_service ;;
   triggers) service_triggers ;;
@@ -91,6 +96,26 @@ EOF
         check "init.d: $c — запрос reload демону клиентом" "steer reload --spec $it/spec.json" \
             "$(head -n 1 "$it/calls")"
     done
+    # Демона нет (код 3 клиента): служба включена и её поднимают — тревоги в stderr нет; выключена
+    # и не поднимут — строка клиента в stderr. Отказ самого reload (код 1) виден всегда.
+    printf '#!/bin/sh\necho "steer $*" >> "%s/calls"\necho "steer: reload: демон движка не отвечает" >&2\nexit 3\n' "$it" > "$it/steer3"
+    printf '#!/bin/sh\necho "steer: reload: спека не прошла проверку" >&2\nexit 1\n' > "$it/steer1"
+    chmod +x "$it/steer3" "$it/steer1"
+    # quiet РЕЖИМ КОМАНДА — «stderr-строк старт-вызовов»
+    quiet() { : > "$it/calls"
+        e="$(env $1 sh "$it/run.sh" "$2" 2>&1 >/dev/null)"
+        echo "$(printf '%s' "$e" | grep -c .) $(grep -c '^start$' "$it/calls")"; }
+    check "init.d без демона, служба включена: reload_dnsd поднимает её молча" "0 1" \
+        "$(quiet "NODAEMON=1 AUTOSTART_ON=1" reload_dnsd)"
+    check "  reload — тоже" "0 1" "$(quiet "NODAEMON=1 AUTOSTART_ON=1" reload)"
+    check "  reload_zapret не поднимает и молчит" "0 0" "$(quiet "NODAEMON=1 AUTOSTART_ON=1" reload_zapret)"
+    check "  reapply применяет движком и молчит" "0 steerd apply --spec $it/spec.json" \
+        "$(: > "$it/calls"; e="$(NODAEMON=1 sh "$it/run.sh" reapply 2>&1 >/dev/null)"
+           echo "$(printf '%s' "$e" | grep -c .) $(grep '^steerd' "$it/calls")")"
+    check "init.d без демона, автозапуск снят: reload_dnsd не поднимает и говорит почему" "1 0" \
+        "$(quiet "NODAEMON=1 AUTOSTART_OFF=1" reload_dnsd)"
+    check "  reload_zapret — тоже говорит" "1 0" "$(quiet "NODAEMON=1 AUTOSTART_OFF=1" reload_zapret)"
+    check "отказ reload демоном — в stderr всегда" "1 0" "$(quiet "REFUSED=1 AUTOSTART_ON=1" reload_dnsd)"
     rm -rf "$it"
 fi
 
