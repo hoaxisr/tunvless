@@ -51,11 +51,7 @@ int g_nftc;
 static int has_ip(const struct spec *sp, int nftc) {
     if (!(nftc & NFTC_LEGACY)) return 0;
     if (tgws_present(sp)) return 1;
-#ifdef STEER_TGWS
-    return 0;
-#else
-    return 1;                       /* заворот DNS стоит всегда — см. prerouting_dns */
-#endif
+    return !prof()->no_resolver;    /* заворот DNS стоит всегда, где есть резолвер — см. prerouting_dns */
 }
 
 /* Метит ли спека IPv6 самого устройства (каналы на телефон, ведущие в выход с IPv6, —
@@ -65,7 +61,6 @@ static int has_ip(const struct spec *sp, int nftc) {
  * и шапка файла в apply (добавить-и-удалить таблицу ip6) до того, как дерево построено. Набор ли
  * у правила с подсетями IPv6, здесь не узнать (списки не читаются) — достаточно того, что такой
  * трафик может быть: лишняя цепочка из одного правила ничего не стоит. */
-#ifndef STEER_TGWS
 static int local_v6_marking(const struct spec *sp) {
     if (!plat()->local_channels || !STEER_REROUTE_BIT) return 0;
     for (size_t i = 0; i < sp->rule_n; i++) {
@@ -77,17 +72,13 @@ static int local_v6_marking(const struct spec *sp) {
     }
     return 0;
 }
-#endif
 
+/* Без резолвера (мини-сборка tgws, src/profile/tgws.c) таблицы ip6 нет вовсе: заворота DNS по
+ * IPv6 она не ставит, а каналов на само устройство у роутера, где она живёт, нет. */
 static int has_ip6(const struct spec *sp, int nftc) {
-#ifdef STEER_TGWS
-    (void)sp;
-    (void)nftc;
-    return 0;
-#else
+    if (prof()->no_resolver) return 0;
     if (!(nftc & NFTC_LEGACY)) return 0;
     return (nftc & NFTC_IP6NAT) || local_v6_marking(sp);
-#endif
 }
 
 int legacy_has_ip(const struct spec *sp) { return has_ip(sp, g_nftc); }

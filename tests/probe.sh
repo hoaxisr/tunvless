@@ -24,7 +24,7 @@ set -u
 umask 077
 
 BUILD=${BUILD:-build}
-# Хаб живёт в СЕРВЕРНОЙ сборке (-DSTEER_SERVER): на VPS нет ни спеки, ни выходов, а у роутерной
+# Хаб живёт в СЕРВЕРНОЙ сборке (профиль server): на VPS нет ни спеки, ни выходов, а у роутерной
 # сборки подкоманда xsteer-hub — штатная заглушка «ставится из архива steer-hub». Стенд поэтому
 # просит именно серверный бинарник, а не расширенный: перепутать их легко, и молчаливо это
 # выглядело бы как «хаб не поднялся».
@@ -56,14 +56,11 @@ command -v openssl >/dev/null 2>&1 || { echo "probe: ПРОПУЩЕН — нет
 command -v ip >/dev/null 2>&1 || { echo "probe: ПРОПУЩЕН — нет iproute2"; exit 0; }
 [ -x "$BIN" ] || {
     echo "probe: ПРОПУЩЕН — нет $BIN. Серверная сборка собирается так (mbedtls системный):"
-    echo "        cc -O1 -w $(make -s print-inc) -DSTEER_SERVER \\"
+    echo "        cc -O1 -w $(make -s print-inc) -DHAVE_CONFIG_H \\"
     echo "           \"-DMBEDTLS_PRIVATE(x)=x\" -o build/steer-hub-native \\"
-    echo "           src/lib/run.c src/lib/jsonw.c src/compile/groups.c src/compile/generate.c src/compile/ir.c src/compile/print.c src/compile/legacy.c src/daemon/fwcheck.c src/daemon/apply.c src/daemon/status.c src/daemon/nftquery.c src/daemon/diag.c src/daemon/explain.c src/daemon/supervise.c src/daemon/watch.c src/daemon/main.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c src/model/probe.c src/compile/nftcompat.c src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c src/dnsd/rules.c src/dnsd/wire.c src/dnsd/origdst.c src/dnsd/fakeip.c src/dnsd/table.c src/dnsd/dlog.c src/dnsd/proxy.c src/dnsd/main.c src/daemon/failover.c src/tools/aggregate.c src/daemon/conns.c \\"
-    echo "           src/proto/obfs/obfs.c src/cli/cli.c src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/xsteer/xsroute.c \\"
-    echo "           src/proto/tls/chello.c src/proto/xsteer/xshake.c src/proto/xsteer/xsconn.c src/proto/xsteer/xsstream.c \\"
-    echo "           src/proto/xsteer/xsepoch.c src/proto/tls/tls13.c src/proto/tls/reality.c src/tunnel/tun.c \\"
-    echo "           src/proto/tls/h2.c src/proto/xsteer/xsadmin.c src/proto/xsteer/xshub.c \\"
+    echo "           \$(. build/sources.sh; profile_src server) \\"
     echo "           -lmbedtls -lmbedx509 -lmbedcrypto -lpthread"
+    echo "        (список файлов — профиль server в build/sources.mk; make ext-test собирает так же)"
     echo "        (на mbedtls 3.x флаг доступа другой: -DMBEDTLS_ALLOW_PRIVATE_ACCESS)"
     exit 0
 }

@@ -7,9 +7,10 @@ set -eu
 cd "$(dirname "$0")/.."
 
 BIN="${TMPDIR:-/tmp}/tun-gso"
-# tun.c берёт путь узла TUN у платформы (src/platform) — она компонуется вместе с ним.
+# tun.c берёт путь узла TUN у платформы (src/platform) — она компонуется вместе с ним, а с ней
+# умолчания профиля (src/profile/profile.c; список — PLATFORM_SRC в build/sources.mk).
 cc -O2 -Wall -Wextra $(make -s print-inc) -o "$BIN" tests/tun-gso.c src/tunnel/tun.c \
-    src/platform/platform.c src/platform/openwrt.c src/platform/android.c
+    src/platform/platform.c src/platform/openwrt.c src/platform/android.c src/profile/profile.c
 
 NS=steer-tungso
 ip netns delete "$NS" 2>/dev/null || true

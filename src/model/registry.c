@@ -11,16 +11,9 @@
 /* База метки и число бит — в spec.h: их знает не только распорядитель, но и тот, кто
  * ставит правило и генерирует ruleset, а маска выводится из них же. */
 #define MARK_BASE   STEER_MARK_BASE
-/* У мини-сборки (STEER_TGWS) свой ряд номеров таблиц. Выходу kind=tgws таблица не нужна, но
- * номер ему выдаётся вместе с меткой и живёт в реестре, а уборка мёртвых правил (steer.c,
- * cleanup_stale_routing) делает по реестру `ip route flush table N`. С общей базой N совпадал
- * бы с таблицей выхода полного движка — и удаление или переименование выхода микропакета
- * молча опустошало бы чужую таблицу маршрутизации. Полный движок берёт 300..315 (MAX_OUTPUTS). */
-#ifdef STEER_TGWS
-#define TABLE_BASE  316
-#else
-#define TABLE_BASE  300
-#endif
+/* Первый номер таблицы — данные профиля (src/profile/profile.h): у мини-сборки tgws свой ряд
+ * (316..), почему — в src/profile/tgws.c. Полный движок берёт 300..315 (MAX_OUTPUTS). */
+#define TABLE_BASE  (prof()->table_base)
 
 /* ---- mark/table registry -------------------------------------------------- */
 /* Persisted, because an output must keep its mark across restarts: a reboot that
@@ -163,13 +156,9 @@ static void rt_tables_write(const struct spec *s) {
     const char *dir = steer_rt_tables_dir();
     if (!dir) return;
     char path[512];
-    /* Файл — свой у каждой сборки: мини-сборка с тем же именем перезаписывала бы имена таблиц
+    /* Файл — свой у каждого профиля: мини-сборка с тем же именем перезаписывала бы имена таблиц
      * полного движка своими. */
-#ifdef STEER_TGWS
-    snprintf(path, sizeof(path), "%s/stgws.conf", dir);
-#else
-    snprintf(path, sizeof(path), "%s/steer.conf", dir);
-#endif
+    snprintf(path, sizeof(path), "%s/%s", dir, prof()->rt_tables_file);
 
     char want[1024];
     size_t wn = 0;

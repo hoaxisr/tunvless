@@ -746,16 +746,16 @@ int main(void) {
 
     /* ---- виды выходов, существующие только в расширенной сборке ------------------
      *
-     * Этот же файл собирается ДВАЖДЫ: build/specmatch без STEER_EXTENDED и
-     * build/specmatch-ext с ним. Иначе положительные случаи kind=vless и kind=xsteer
-     * недостижимы вовсе — базовая сборка отвергает такую спеку парсером, — и до
-     * появления второго бинарника vless не был проверен здесь ни одной строкой.
-     * Прецедент тот же, что у build/diagsim: один исходник, два бинарника. */
+     * Этот же файл собирается ДВАЖДЫ: build/specmatch без видов расширенной части и
+     * build/specmatch-ext с ними (и с ключом стенда SPECMATCH_EXT). Иначе положительные
+     * случаи kind=vless и kind=xsteer недостижимы вовсе — базовая сборка отвергает такую
+     * спеку реестром видов, — и до появления второго бинарника vless не был проверен здесь
+     * ни одной строкой. Прецедент тот же, что у build/diagsim: один исходник, два бинарника. */
     {
         const char *s = SPEC(
             "\"outputs\":{\"vpn\":{\"kind\":\"xsteer\"}},"
             "\"channels\":[]}");
-#ifdef STEER_EXTENDED
+#ifdef SPECMATCH_EXT
         check("xsteer: спека принята", 0, load_from_str(s));
         check("xsteer: вид xsteer", 1, kind_of(&g_spec.out[0]) == OUT_XSTEER);
         /* Устройство и путь к конфигурации выводятся из имени выхода: держать их
@@ -778,7 +778,7 @@ int main(void) {
         const char *s = SPEC(
             "\"outputs\":{\"vpn\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/sub.txt\"}},"
             "\"channels\":[]}");
-#ifdef STEER_EXTENDED
+#ifdef SPECMATCH_EXT
         check("vless: спека принята", 0, load_from_str(s));
         check("vless: вид vless", 1, kind_of(&g_spec.out[0]) == OUT_VLESS);
         check("vless: устройство создаёт наш процесс", 1, out_engine_managed(&g_spec.out[0]));
@@ -798,7 +798,7 @@ int main(void) {
      * Проверяется здесь и разбор, и ЗНАЧЕНИЕ поля (out_node_list): порядок перебора решает,
      * через какую страну пойдёт трафик, а стенда на подъём туннеля нет — он требует и
      * mbedtls, и сети. Функции живут в src/kinds/vless.c, то есть только в расширенной сборке. */
-#ifdef STEER_EXTENDED
+#ifdef SPECMATCH_EXT
     {
         /* Развёртка выбора в порядок перебора. Собирается прямо в структуре: это чистая
          * функция от поля спеки и размера подписки, спека для неё не нужна. */
@@ -849,7 +849,7 @@ int main(void) {
             "\"channels\":[]}");
         check("nodes на kind=interface — отказ", 2, load_from_str(s));
     }
-#ifdef STEER_EXTENDED
+#ifdef SPECMATCH_EXT
     {
         const char *s = SPEC(
             "\"outputs\":{\"vpn\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/sub.txt\","
@@ -952,7 +952,7 @@ int main(void) {
         check("хвостовая запятая в nodes — отказ", 2, load_from_str(s));
     }
 #endif
-#ifdef STEER_EXTENDED
+#ifdef SPECMATCH_EXT
     {
         /* Явный conf побеждает умолчание, но обязан быть абсолютным: процесс запускает
          * procd со своим рабочим каталогом, и относительный путь «работал бы из шелла». */
@@ -1546,7 +1546,7 @@ int main(void) {
             "\"outputs\":{\"a\":{\"kind\":\"awg\",\"via\":\"b\"},"
             "\"b\":{\"kind\":\"awg\",\"via\":\"a\"}},\"channels\":[]}")));
     }
-#ifdef STEER_EXTENDED
+#ifdef SPECMATCH_EXT
     {
         check("via: awg через vless (пример владельца) — принята", 0, load_from_str(SPEC(
             "\"outputs\":{\"a\":{\"kind\":\"awg\",\"via\":\"v\"},"

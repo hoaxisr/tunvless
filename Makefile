@@ -21,7 +21,7 @@ DEFS    := -DSTEER_VERSION='"$(VERSION)"' $(if $(REV),-DSTEER_REV='"$(REV)"',)
 # (его же читают build.sh и build/build-ext.sh). Заголовки ядра — зависимостью целиком:
 # список файлов сборки они не меняют, а пересобрать движок при их правке нужно всегда.
 include build/sources.mk
-CORE_HDR := $(wildcard $(addsuffix /*.h,$(CORE_DIRS) $(THIRD_DIRS)))
+CORE_HDR := $(wildcard $(addsuffix /*.h,$(CORE_DIRS) $(PROFILE_DIRS) $(THIRD_DIRS)))
 EXT_ALL_SRC := $(sort $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(EXT_SERVER_SRC) $(EXT_TGWS_SRC))
 # Модель для стендов, которые компонуют её отдельным списком: разбор спрашивает вид у реестра, поэтому
 # вместе с моделью идут виды (src/kinds). Без awg.c: он тянет run_quiet из lib/run.c, а стенды
@@ -173,21 +173,21 @@ ndk-check:
 		echo "ndk-check: $$a — steerd и steer собираются"; \
 	done
 
-# Мини-сборка микропакета tgws на хосте — для стенда tgwsmark: ядро движка с -DSTEER_TGWS,
-# мост заменён заглушкой (tests/tgws-stub.c), потому что настоящий тянет TLS и docker.
-# Проверяется не мост, а ruleset рядом с полным движком: свой бит метки, свой порт, свой ряд
-# таблиц, чужой реестр.
-$(BUILD)/tgwssim: $(CORE_SRC) $(CORE_HDR) tests/tgws-stub.c VERSION
+# Мини-сборка микропакета tgws на хосте — для стенда tgwsmark: ядро движка с файлом профиля
+# tgws (src/profile/tgws.c), мост заменён заглушкой (tests/tgws-stub.c), потому что настоящий
+# тянет TLS и docker. Проверяется не мост, а ruleset рядом с полным движком: свой бит метки,
+# свой порт, свой ряд таблиц, чужой реестр.
+$(BUILD)/tgwssim: $(CORE_SRC) $(CORE_HDR) src/profile/tgws.c tests/tgws-stub.c VERSION
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(DEFS) -DSTEER_TGWS -o $@ $(CORE_SRC) tests/tgws-stub.c
+	$(CC) $(CFLAGS) $(DEFS) -o $@ $(CORE_SRC) src/profile/tgws.c tests/tgws-stub.c
 
-# Движок, собранный как расширенный, но без самой расширенной части: нужен стенду
-# diagmatch, потому что спеку с `kind: vless` базовая сборка отвергает парсером, а
-# проверять диагностику интереснее всего именно на VLESS-выходе. Три подкоманды
+# Движок, собранный как расширенный (виды и файл профиля extended), но без самой расширенной
+# части: нужен стенду diagmatch, потому что спеку с `kind: vless` базовая сборка отвергает
+# реестром видов, а проверять диагностику интереснее всего именно на VLESS-выходе. Подкоманды
 # расширенной сборки заменены заглушками — см. tests/vless-stub.c.
-$(BUILD)/diagsim: $(CORE_SRC) $(KINDS_EXT_SRC) $(CORE_HDR) tests/vless-stub.c
+$(BUILD)/diagsim: $(CORE_SRC) $(KINDS_EXT_SRC) $(CORE_HDR) src/profile/extended.c tests/vless-stub.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(DEFS) -DSTEER_EXTENDED -o $@ $(CORE_SRC) $(KINDS_EXT_SRC) tests/vless-stub.c
+	$(CC) $(CFLAGS) $(DEFS) -o $@ $(CORE_SRC) $(KINDS_EXT_SRC) src/profile/extended.c tests/vless-stub.c
 
 # SHA-256 движка против sha256sum оболочки. Отдельная цель, потому что стенду нужен ПОЛНЫЙ
 # хеш: в самом идентификаторе он обрезан до двадцати знаков, и расхождение в старших байтах
@@ -274,16 +274,16 @@ $(BUILD)/specmatch: tests/specmatch.c $(MODEL_KINDS) src/kinds/awg.c src/model/s
 	$(CC) $(CFLAGS) -o $@ tests/specmatch.c $(MODEL_KINDS) src/kinds/awg.c
 
 # Тот же исходник, собранный КАК РАСШИРЕННЫЙ. Нужен потому, что виды выходов vless и
-# xsteer в базовой сборке отвергаются парсером (и обязаны отвергаться — см. spec.c), а
-# значит их положительные случаи в build/specmatch недостижимы: до появления этого
-# бинарника kind=vless не проверялся здесь ни одной строкой, только комментарием.
-# Прецедент тот же, что у build/diagsim: один исходник, два бинарника, ветки внутри под
-# #ifdef — так «базовая отказывает» и «расширенная разбирает» проверяются одним файлом.
-# Отказ базовой сборки даёт реестр видов, а не #ifdef в разборе: здесь виды расширенной части
-# (KINDS_EXT_SRC) скомпонованы, в build/specmatch — нет.
+# xsteer в базовой сборке отвергаются реестром видов (и обязаны отвергаться — см.
+# src/kinds/kind.c), а значит их положительные случаи в build/specmatch недостижимы: до
+# появления этого бинарника kind=vless не проверялся здесь ни одной строкой, только комментарием.
+# Один исходник, два бинарника, ветки стенда под его собственным ключом -DSPECMATCH_EXT — так
+# «базовая отказывает» и «расширенная разбирает» проверяются одним файлом. Отказ базовой сборки
+# даёт реестр видов, а не #ifdef в разборе: здесь виды расширенной части (KINDS_EXT_SRC)
+# скомпонованы, в build/specmatch — нет.
 $(BUILD)/specmatch-ext: tests/specmatch.c $(MODEL_KINDS) src/kinds/awg.c $(KINDS_EXT_SRC) src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -DSTEER_EXTENDED -o $@ tests/specmatch.c $(MODEL_KINDS) src/kinds/awg.c $(KINDS_EXT_SRC)
+	$(CC) $(CFLAGS) -DSPECMATCH_EXT -o $@ tests/specmatch.c $(MODEL_KINDS) src/kinds/awg.c $(KINDS_EXT_SRC)
 
 # Поддельный TCP проверяется в памяти: сборка и разбор сегмента, контрольные суммы и
 # арифметика номеров — чистые функции без сокетов, поэтому стенд не требует ни сети, ни
@@ -381,7 +381,7 @@ $(BUILD)/h2match: tests/h2match.c src/proto/tls/h2.c src/proto/tls/h2.h src/prot
 XHUPMATCH_SRC = src/proto/tls/h2.c src/proto/vless/vless_proto.c src/proto/vless/vision.c
 $(BUILD)/xhupmatch: tests/xhupmatch.c src/proto/vless/client.c src/proto/vless/client.h src/proto/tls/h2.h $(XHUPMATCH_SRC)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -DSTEER_EXTENDED -o $@ tests/xhupmatch.c \
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/xhupmatch.c \
 		$(XHUPMATCH_SRC) $(PLATFORM_SRC) -lpthread
 
 # Разбор подписки — единственное место, куда в движок попадает чужой текст из интернета.
@@ -455,7 +455,7 @@ TUNNELMATCH_SRC = src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/vless_proto.
                   src/proto/vless/sub.c src/lib/jsonw.c src/lib/evline.c $(MODEL_KINDS) $(KINDS_EXT_SRC)
 $(BUILD)/tunnelmatch: tests/tunnelmatch.c src/tunnel/tunnel.c $(TUNNELMATCH_SRC)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -DSTEER_EXTENDED -o $@ tests/tunnelmatch.c \
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/tunnelmatch.c \
 		$(TUNNELMATCH_SRC) -lpthread -ldl
 
 # Имя устройства: движок работает ровно с тем именем, о котором просил, — иначе отказ. Ядро

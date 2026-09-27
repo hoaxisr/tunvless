@@ -8,8 +8,8 @@
  *
  * Вид в БАЗОВОЙ сборке: правила перехвата пишет любой движок, а мост живёт своей программой —
  * в полном пакете и в микропакете stgws. Поэтому помощник для супервизора (он поднимает мост сам
- * только на телефоне) называется лишь там, где команда моста есть в том же бинарнике, — в
- * расширенной сборке, как было до переноса вида сюда. */
+ * только на телефоне) называется лишь в полном пакете (профиль extended), как было до переноса
+ * вида сюда. */
 #include <stdio.h>
 #include <string.h>
 
@@ -58,18 +58,16 @@ static int tgws_check(const struct spec *sp, const struct output *o, struct err 
     return 0;
 }
 
-#ifdef STEER_EXTENDED
-/* Помощник — мост. В подпись — домен точек (helper_sig в daemon/helpers.c). */
+/* Помощник — мост. В подпись — домен точек (helper_sig в daemon/helpers.c). Только у полного
+ * пакета (prof()->extended, src/profile/extended.c): в базовой сборке моста нет, а у микропакета
+ * stgws его поднимает свой init-скрипт. -1 — помощник не нужен (kind_ops.helper). */
 static int tgws_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
     (void)sp;
+    if (!prof()->extended) return -1;
     snprintf(h->cmd, sizeof(h->cmd), "tgws");
     kind_sig_mix(&h->sig, o->tg.domain, strlen(o->tg.domain));
     return 0;
 }
-#define TGWS_HELPER tgws_helper
-#else
-#define TGWS_HELPER NULL
-#endif
 
 /* `steer tgws-instances` — что поднимать для выходов kind=tgws: имя и порт, по строке на выход.
  * Тот же довод, что у zapret-instances (kinds/zapret.c), включая главный: порт выводит движок
@@ -148,5 +146,5 @@ const struct kind_ops kind_tgws = {
     .keys_of = tgws_keys_of,
     .check = tgws_check,
     .emit = tgws_emit,
-    .helper = TGWS_HELPER,
+    .helper = tgws_helper,
 };

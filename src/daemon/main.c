@@ -66,36 +66,50 @@ int dnsd_sig_print(const char *spec, FILE *out);
 /* Та же таблица, которую демон шлёт резолверу трубой --table-fd (docs/architecture.md, раздел
  * 4а) — текстом в stdout, для стендов и ручной отладки. src/dnsd/tabfmt.c. */
 void tabfmt_build(const struct spec *sp, FILE *out);
-/* Клиент VLESS есть только в расширенной сборке (steer-extended). В базовой команда
- * отвечает внятным отказом, а не отсутствует: «неизвестная команда» на steer vless
- * заставила бы искать опечатку вместо того, чтобы поставить нужный пакет. */
-/* МИНИ-СБОРКА (STEER_TGWS) — это тот же движок без всего, кроме перехвата Telegram.
+/* КОМАНДЫ МОДУЛЕЙ, КОТОРЫХ В СБОРКЕ МОЖЕТ НЕ БЫТЬ (docs/architecture.md, раздел 2, правило 3).
  *
- * Заводится она для отдельного микропакета tgws: там нужен ровно мост, спека с одним выходом
- * и правила к нему, а клиент VLESS, звезда xsteer и работа с подпиской не нужны вовсе. На
- * роутере с шестью с половиной мегабайтами overlay это не придирка: расширенная сборка весит
- * три четверти мегабайта, мини — вдвое меньше, и в пакет с бинарником внутри это заметно.
+ * Клиенты VLESS и xsteer, подписка, мост Telegram, служебные команды xsteer и хаб живут в своих
+ * файлах, и есть ли они в бинарнике, решает профиль в build/sources.mk. Ссылки на них здесь
+ * СЛАБЫЕ — как у реестра видов (src/kinds/kind.c): файла в профиле нет — адрес нулевой, и
+ * команда отвечает внятным отказом, а не отсутствует: «неизвестная команда» на steer vless
+ * заставила бы искать опечатку вместо того, чтобы поставить нужный пакет.
  *
- * Подкоманды, которых в мини-сборке нет, отвечают той же внятной заглушкой, что и в базовой:
- * «неизвестная команда» заставила бы искать опечатку вместо нужного пакета. */
-#if defined(STEER_EXTENDED) || defined(STEER_TGWS)
-/* Мост Telegram → веб-сокет; объяснение целиком — в src/proto/tgws/tgws.c. */
-int cmd_tgws(const char *spec_path, const char *out_name);
-int cmd_tgws_probe(int dc, int media, int direct, int timeout_s);
-int cmd_tls_probe(const char *host, const char *addr, int port, int local_port, int quiet);
-#endif
-#ifdef STEER_EXTENDED
-int cmd_vless(const char *spec_path, const char *out_name);
-int cmd_vless_nodes(const char *spec_path, const char *out_name);
-int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int timeout_s);
-/* Скачивание и обработка подписки. Реализация и рассказ, почему это работа движка, а не
- * управляющего слоя, — в src/proto/vless/subfetch.{c,h}. Объявлены здесь, как соседние
- * cmd_vless*, а не подключением subfetch.h: ядро не включает заголовков протоколов, иначе
- * его сборка без расширенной части (профили base, server, tgws) формально зависела бы от
- * subfetch.c — tests/buildmatch.sh сверяет это замыканием по #include. */
-int cmd_sub_fetch(const char *url, const char *out_path, const char *info_path);
-int cmd_sub_quota(const char *url, const char *info_path);
-#else
+ * Где что есть:
+ *   - клиенты VLESS и xsteer, подписка — только полный пакет (профили extended и android);
+ *   - мост tgws и tls-probe — полный пакет и микропакет tgws. Мини-сборка — тот же движок без
+ *     всего, кроме перехвата Telegram: там нужен ровно мост, спека с одним выходом и правила к
+ *     нему, а клиент VLESS, звезда xsteer и работа с подпиской не нужны вовсе. На роутере с
+ *     шестью с половиной мегабайтами overlay это не придирка: расширенная сборка весит три
+ *     четверти мегабайта, мини — вдвое меньше, и в пакет с бинарником внутри это заметно;
+ *   - служебные команды xsteer (ключ, проверка, ссылка) — полный пакет и сервер: без них
+ *     оператор хаба не смог бы ни ключ сделать, ни файл проверить;
+ *   - хаб — только сервер: на роутере хабу делать нечего, и подкоманды, поднимающей слушателя
+ *     на публичном порту, там быть не должно.
+ *
+ * Объявлены здесь, а не подключением заголовков протоколов (tgws.h, subfetch.h): ядро не
+ * включает заголовков протоколов, иначе его сборка без расширенной части (профили base, server,
+ * tgws) формально зависела бы от их файлов — tests/buildmatch.sh сверяет это замыканием по
+ * #include. Скачивание и обработка подписки и рассказ, почему это работа движка, а не
+ * управляющего слоя, — в src/proto/vless/subfetch.{c,h}; мост — в src/proto/tgws/tgws.c. */
+int cmd_tgws(const char *spec_path, const char *out_name) __attribute__((weak));
+int cmd_tgws_probe(int dc, int media, int direct, int timeout_s) __attribute__((weak));
+int cmd_tls_probe(const char *host, const char *addr, int port, int local_port,
+                  int quiet) __attribute__((weak));
+int cmd_vless(const char *spec_path, const char *out_name) __attribute__((weak));
+int cmd_vless_nodes(const char *spec_path, const char *out_name) __attribute__((weak));
+int cmd_vless_probe(const char *spec_path, const char *out_name, int node,
+                    int timeout_s) __attribute__((weak));
+int cmd_sub_fetch(const char *url, const char *out_path, const char *info_path) __attribute__((weak));
+int cmd_sub_quota(const char *url, const char *info_path) __attribute__((weak));
+int cmd_xsteer_key(void) __attribute__((weak));
+int cmd_xsteer_check(const char *conf) __attribute__((weak));
+int cmd_xsteer_link(const char *what, const char *name) __attribute__((weak));
+int cmd_xsteer(const char *spec_path, const char *out_name, const char *conf,
+               const char *device, int stream, int stream_port) __attribute__((weak));
+int cmd_xsteer_peers(const char *spec_path, const char *out_name,
+                     const char *conf) __attribute__((weak));
+int cmd_xsteer_hub(const char *conf) __attribute__((weak));
+
 /* ПОДСТРОКУ «steer-extended» ЗДЕСЬ ЧИТАЮТ СНАРУЖИ — это контракт, а не просто текст.
  * splify2 определяет вид установленного пакета так:
  *     out="$(steer vless '' 2>&1)"; case "$out" in *steer-extended*) vless=0 ;; esac
@@ -107,71 +121,17 @@ static int no_vless(void) {
                     "нужен пакет steer-extended\n");
     return 2;
 }
-static int cmd_vless(const char *spec_path, const char *out_name) {
-    (void)spec_path; (void)out_name;
-    return no_vless();
-}
-static int cmd_vless_nodes(const char *spec_path, const char *out_name) {
-    (void)spec_path; (void)out_name;
-    return no_vless();
-}
-static int cmd_vless_probe(const char *spec_path, const char *out_name,
-                           int node, int timeout_s) {
-    (void)spec_path; (void)out_name; (void)node; (void)timeout_s;
-    return no_vless();
-}
-static int cmd_sub_fetch(const char *url, const char *out_path, const char *info_path) {
-    (void)url; (void)out_path; (void)info_path;
-    return no_vless();
-}
-static int cmd_sub_quota(const char *url, const char *info_path) {
-    (void)url; (void)info_path;
-    return no_vless();
-}
 /* ЕДИНСТВЕННАЯ ПОДКОМАНДА «VLESS», КОТОРАЯ ОТВЕЧАЕТ И ЗДЕСЬ. Идентификатор роутера считает
  * src/tools/hwid.c, входящий в обе сборки: читателей у него стало двое, и второй (телеметрия
  * splify2) работает на роутере, где расширенной сборки нет. Заглушки поэтому нет — есть
  * настоящая функция, объявленная в hwid.h. */
-#ifndef STEER_TGWS
-static int cmd_tgws(const char *spec_path, const char *out_name) {
-    (void)spec_path; (void)out_name;
-    return no_vless();
-}
-static int cmd_tgws_probe(int dc, int media, int direct, int timeout_s) {
-    (void)dc; (void)media; (void)direct; (void)timeout_s; return no_vless();
-}
-static int cmd_tls_probe(const char *host, const char *addr, int port, int local_port, int quiet) {
-    (void)host; (void)addr; (void)port; (void)local_port; (void)quiet; return no_vless();
-}
-#endif
-#endif
 
-/* Клиент и хаб xsteer. Клиент — расширенная сборка, хаб — серверная: на роутере хабу делать
- * нечего, и подкоманды, поднимающей слушателя на публичном порту, там быть не должно. */
-/* Клиент — только расширенная сборка. А вот проверка конфигурации и генерация ключей нужны и
- * серверной: без них оператор хаба не смог бы ни ключ сделать, ни файл проверить. */
-#if defined(STEER_EXTENDED) || defined(STEER_SERVER)
-int cmd_xsteer_key(void);
-int cmd_xsteer_check(const char *conf);
-int cmd_xsteer_link(const char *what, const char *name);
-#else
 static int no_xsteer_admin(void) {
     fprintf(stderr, "steer: служебные команды xsteer в этой сборке отсутствуют — "
                     "нужен пакет steer-extended\n");
     return 2;
 }
-static int cmd_xsteer_key(void) { return no_xsteer_admin(); }
-static int cmd_xsteer_check(const char *conf) { (void)conf; return no_xsteer_admin(); }
-static int cmd_xsteer_link(const char *what, const char *name) {
-    (void)what; (void)name; return no_xsteer_admin();
-}
-#endif
 
-#ifdef STEER_EXTENDED
-int cmd_xsteer(const char *spec_path, const char *out_name, const char *conf,
-               const char *device, int stream, int stream_port);
-int cmd_xsteer_peers(const char *spec_path, const char *out_name, const char *conf);
-#else
 static int no_xsteer(void) {
     /* Та же контрактная подстрока «steer-extended», что у VLESS, и по той же причине:
      * splify2 определяет вид пакета пробой `steer xsteer ''`. */
@@ -179,23 +139,8 @@ static int no_xsteer(void) {
                     "нужен пакет steer-extended\n");
     return 2;
 }
-static int cmd_xsteer(const char *spec_path, const char *out_name, const char *conf,
-                      const char *device, int stream, int stream_port) {
-    (void)spec_path; (void)out_name; (void)conf; (void)device;
-    (void)stream; (void)stream_port;
-    return no_xsteer();
-}
-static int cmd_xsteer_peers(const char *spec_path, const char *out_name, const char *conf) {
-    (void)spec_path; (void)out_name; (void)conf;
-    return no_xsteer();
-}
-#endif
 
-#ifdef STEER_SERVER
-int cmd_xsteer_hub(const char *conf);
-#else
-static int cmd_xsteer_hub(const char *conf) {
-    (void)conf;
+static int no_hub(void) {
     /* ВТОРАЯ контрактная подстрока — «steer-hub». Она отличает «нужен другой пакет для
      * роутера» от «нужен артефакт для сервера», и без этого различия человека посылали бы
      * ставить steer-extended туда, где хаба всё равно не будет. */
@@ -203,7 +148,6 @@ static int cmd_xsteer_hub(const char *conf) {
                     "он ставится на VPS из архива steer-hub\n");
     return 2;
 }
-#endif
 
 int aggregate_main(int argc, char **argv);
 
@@ -455,7 +399,7 @@ int main(int argc, char **argv) {
         if (build_groups(&cfg, &gr, &e) < 0) err_die(&e);
         return dnsd_wanted() ? 0 : 1;
     }
-    if (!strcmp(cmd, "tgws")) return cmd_tgws(spec, arg);
+    if (!strcmp(cmd, "tgws")) return cmd_tgws ? cmd_tgws(spec, arg) : no_vless();
     if (!strcmp(cmd, "tls-probe")) {
         /* ХОСТ[:ПОРТ]; адрес назначения — флагом --out, исходящий порт — флагом --node.
          * Своих флагов не заводим: эти уже есть и значат ровно то, что нужно. */
@@ -477,6 +421,7 @@ int main(int argc, char **argv) {
             pt = (int)v;
         }
         if (!hb[0]) { fprintf(stderr, "нужно имя узла\n"); return 2; }
+        if (!cmd_tls_probe) return no_vless();
         return cmd_tls_probe(hb, a.out_file, pt, a.node > 0 ? a.node : 0, 0);
     }
     if (!strcmp(cmd, "tgws-probe")) {
@@ -488,14 +433,19 @@ int main(int argc, char **argv) {
                     "а получила «%s»\n", arg);
             return 2;
         }
+        if (!cmd_tgws_probe) return no_vless();
         return cmd_tgws_probe(a.node > 0 ? a.node : 2, arg && !strcmp(arg, "media"),
                               a.direct, a.timeout);
     }
-    if (!strcmp(cmd, "vless")) return cmd_vless(spec, arg);
-    if (!strcmp(cmd, "vless-nodes")) return cmd_vless_nodes(spec, arg);
-    if (!strcmp(cmd, "vless-probe")) return cmd_vless_probe(spec, arg, a.node, a.timeout);
-    if (!strcmp(cmd, "sub-fetch")) return cmd_sub_fetch(arg, a.out_file, a.info_file);
-    if (!strcmp(cmd, "sub-quota")) return cmd_sub_quota(arg, a.info_file);
+    if (!strcmp(cmd, "vless")) return cmd_vless ? cmd_vless(spec, arg) : no_vless();
+    if (!strcmp(cmd, "vless-nodes"))
+        return cmd_vless_nodes ? cmd_vless_nodes(spec, arg) : no_vless();
+    if (!strcmp(cmd, "vless-probe"))
+        return cmd_vless_probe ? cmd_vless_probe(spec, arg, a.node, a.timeout) : no_vless();
+    if (!strcmp(cmd, "sub-fetch"))
+        return cmd_sub_fetch ? cmd_sub_fetch(arg, a.out_file, a.info_file) : no_vless();
+    if (!strcmp(cmd, "sub-quota"))
+        return cmd_sub_quota ? cmd_sub_quota(arg, a.info_file) : no_vless();
     if (!strcmp(cmd, "sub-hwid")) return cmd_sub_hwid();
     if (!strcmp(cmd, "dev-id")) return cmd_dev_id();
     if (!strcmp(cmd, "srs-read")) return srs_dump(arg, a.out_file, a.prefixes_out, a.meta_out);
@@ -516,18 +466,24 @@ int main(int argc, char **argv) {
     /* Серверная половина. Спека ей не нужна и не читается: сервер живёт на VPS, где
      * ни выходов, ни каналов нет — есть порт, который слушать, и локальный WireGuard,
      * которому пересылать. */
-    if (!strcmp(cmd, "xsteer"))
+    if (!strcmp(cmd, "xsteer")) {
+        if (!cmd_xsteer) return no_xsteer();
         return cmd_xsteer(spec, arg, a.config, a.device, a.stream, a.stream_port);
-    if (!strcmp(cmd, "xsteer-peers")) return cmd_xsteer_peers(spec, arg, a.config);
-    if (!strcmp(cmd, "xsteer-key")) return cmd_xsteer_key();
-    if (!strcmp(cmd, "xsteer-check")) return cmd_xsteer_check(a.config);
+    }
+    if (!strcmp(cmd, "xsteer-peers"))
+        return cmd_xsteer_peers ? cmd_xsteer_peers(spec, arg, a.config) : no_xsteer();
+    if (!strcmp(cmd, "xsteer-key")) return cmd_xsteer_key ? cmd_xsteer_key() : no_xsteer_admin();
+    if (!strcmp(cmd, "xsteer-check"))
+        return cmd_xsteer_check ? cmd_xsteer_check(a.config) : no_xsteer_admin();
     /* Источник — позиционный аргумент, а если его нет, то --config: команда одинаково удобна и
      * в конвейере («steer xsteer-link -»), и там, где путь уже назван флагом, как у соседей. */
-    if (!strcmp(cmd, "xsteer-link"))
+    if (!strcmp(cmd, "xsteer-link")) {
+        if (!cmd_xsteer_link) return no_xsteer_admin();
         return cmd_xsteer_link(a.npos > 0 ? a.pos[0] : a.config, a.name);
+    }
     /* Хаб живёт на VPS: спека ему не нужна и не читается — там ни выходов, ни каналов, а
      * есть конфигурация звезды и порт. Прецедент тот же, что у obfs-server. */
-    if (!strcmp(cmd, "xsteer-hub")) return cmd_xsteer_hub(a.config);
+    if (!strcmp(cmd, "xsteer-hub")) return cmd_xsteer_hub ? cmd_xsteer_hub(a.config) : no_hub();
     if (!strcmp(cmd, "obfs-server")) {
         if (!a.listen) die("нужен --listen ПОРТ (порт поддельного TCP)", NULL);
         if (!a.forward) die("нужен --forward АДРЕС:ПОРТ (куда отдавать датаграммы)", NULL);

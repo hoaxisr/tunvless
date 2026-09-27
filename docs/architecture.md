@@ -129,6 +129,15 @@ splify2 (`files/usr/lib/splify2/rpcd/m-spec.sh`).
    `--platform` переопределяет выбор для стендов. `#ifdef STEER_ANDROID` в общем коде нет.
 3. **Сборка — набор модулей, а не набор макросов.** Профиль в `build/sources.mk` перечисляет
    виды, протоколы и раскладку меток. `STEER_EXTENDED` и `STEER_TGWS` уходят.
+   *Сделано:* ключей `-DSTEER_EXTENDED/-DSTEER_SERVER/-DSTEER_TGWS` нет ни в коде, ни в путях
+   сборки (`PROFILE_DEFS_*` пусты, кроме умолчания платформы телефона). Команды модулей —
+   слабые ссылки в `daemon/main.c` (файла нет в профиле — штатный отказ с тем же текстом), виды —
+   слабые ссылки реестра `kinds/kind.c`, а то, что модулем не выражается, — файл профиля
+   `src/profile/<профиль>.c` (`profile.h`): имя варианта сборки, признак полного пакета, у
+   мини-сборки tgws — поле метки роутера (подменяется в `plat()`), ряд таблиц, файл имён
+   таблиц, порты моста и «без резолвера». У base файла профиля нет — действуют умолчания
+   (`profile/profile.c`); два файла профиля в одной сборке не компонуются. Сторож —
+   `tests/buildmatch.sh`, «правило 3».
 4. **Слои зависят только вниз.**
 5. **Ошибки возвращаются.** Модели и компилятору `die()` не нужен: они возвращают код и
    заполняют `struct err`, а процесс завершает только точка входа бинарника.
@@ -208,6 +217,7 @@ src/
   kinds/      kind.h (struct kind_ops, биты свойств, реестр),
               direct.c interface.c awg.c tunnel.c xsteer.c zapret.c tgws.c group.c
   platform/   platform.h, openwrt.c, android.c
+  profile/    profile.h, profile.c (умолчания), extended.c, server.c, tgws.c — данные профиля
   compile/    groups.c, ir.c (дерево ruleset), print.c (текущая раскладка), legacy.c (ядра 4.9),
               nftcompat.c
   daemon/     main.c, ctl.c (сокет, протокол), apply.c (сверка), watch.c (сторож),
@@ -855,8 +865,10 @@ procd держит один `steerd daemon --watch --supervise --apply`; на т
   по критериям раздела 2 нужно сначала замерить на QEMU-стенде.
 - `compile/ir.h` подключают и `compile`, и `kinds` (через `emit`) — само дерево стоит опустить
   ниже по слоям.
-- Макросы профилей `STEER_EXTENDED`, `STEER_SERVER`, `STEER_TGWS` ещё в коде — их заменит
-  состав файлов профиля.
+- ~~Макросы профилей `STEER_EXTENDED`, `STEER_SERVER`, `STEER_TGWS` ещё в коде — их заменит
+  состав файлов профиля.~~ Сделано: команды — слабые ссылки, данные профиля — `src/profile`
+  (правило 3 раздела 2); `tests/buildmatch.sh` следит, что макросов нет ни в `src`, ни в путях
+  сборки.
 - Тексты отказов «в сборке под Android» не переписаны под выбор платформы при запуске —
   правка вместе с перезаписью снимка.
 - `static struct spec` в ветке masquerade `daemon/watch.c` добавляет ~230 КБ к bss роутера

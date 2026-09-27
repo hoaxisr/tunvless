@@ -815,8 +815,8 @@ static void build_forward_v6(struct nft_table *t, const struct spec *sp, const s
     }
 }
 
-#ifndef STEER_TGWS
-/* ПЕРЕНАПРАВЛЕНИЕ DNS СТОИТ ВСЕГДА, а не только при доменных каналах.
+/* ПЕРЕНАПРАВЛЕНИЕ DNS СТОИТ ВСЕГДА, а не только при доменных каналах (кроме профиля без
+ * резолвера — мини-сборки tgws, src/profile/tgws.c).
  *
  * Раньше оно появлялось и исчезало вместе с has_domains(), и это была переменная,
  * от которой зависели три вещи в разных местах: сам резолвер (needs-dnsd в
@@ -901,7 +901,6 @@ static void build_dns_redirect(struct nft_table *t, const struct spec *sp) {
         ir_x(r, "redirect to :%d", DNS_PORT);
     }
 }
-#endif
 
 /* Карта подмены fake→real и её правило dnat. Элементы карты — из файла состояния резолвера,
  * читает печатник (почему она засевается — у emit_fakeip_elements в print.c).
@@ -1260,9 +1259,7 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
      * zapret в тексте стоят раньше цепочки моста, в каком бы порядке выходы ни шли в спеке
      * (kind.c: kind_emit_all). */
     kind_emit_all(rs, sp);
-#ifndef STEER_TGWS
-    build_dns_redirect(t, sp);
-#endif
+    if (!prof()->no_resolver) build_dns_redirect(t, sp);
     /* Остальное по-прежнему по факту доменных каналов: карта fakeip и цепочка dstnat
      * стоят per-packet, и держать их пустыми на роутере без доменов незачем. Это гейт
      * по СТОИМОСТИ, а не по смыслу, и переворачиваться он может свободно — ни один

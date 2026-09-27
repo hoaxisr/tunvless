@@ -58,6 +58,7 @@ cc_defaults {
         "src/platform/platform.c",
         "src/platform/openwrt.c",
         "src/platform/android.c",
+        "src/profile/profile.c",
         "src/model/parse.c",
         "src/model/v1.c",
         "src/model/check.c",
@@ -127,6 +128,7 @@ cc_defaults {
         "src/dnsd",
         "src/tools",
         "src/proto/obfs",
+        "src/profile",
         "src/tunnel",
         "src/proto/tls",
         "src/proto/vless",
@@ -224,9 +226,11 @@ cc_binary {
         // registry answers "requires steer-extended" — see src/kinds/kind.c.
         "src/kinds/vless.c",
         "src/kinds/xsteer.c",
+        // The profile file of the full package (src/profile/profile.h): the build's name and the
+        // [steer-extended] marks in help. Profiles are sets of files, not defines.
+        "src/profile/extended.c",
     ],
     cflags: [
-        "-DSTEER_EXTENDED",
         "-DMBEDTLS_CONFIG_FILE=\"steer_mbedtls_config.h\"",
         // Soong builds this project with -Werror, and a comment in src/proto/tls/certverify.c
         // contains "*val/*val_n" (-Wcomment). That file is protected from edits, so the
@@ -249,9 +253,11 @@ cc_binary {
         "src/platform/platform.c",
         "src/platform/openwrt.c",
         "src/platform/android.c",
+        "src/profile/profile.c",
     ],
     local_include_dirs: [
         "src/platform",
+        "src/profile",
         "src/client",
     ],
     cflags: [

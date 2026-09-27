@@ -8,6 +8,7 @@
 
 #include "cli.h"
 #include "spec.h"
+#include "profile.h"
 
 /* Версию подставляет сборка (-DSTEER_VERSION) из файла VERSION. Умолчание нужно
  * потому, что исходники движка компилируют ещё и стенды из tests/: им до версии дела
@@ -29,13 +30,8 @@
 #define STEER_REV "неизвестна"
 #endif
 
-#if defined(STEER_SERVER)
-#define STEER_BUILD "серверная сборка, хаб xsteer"
-#elif defined(STEER_EXTENDED)
-#define STEER_BUILD "расширенная сборка, VLESS/Reality"
-#else
-#define STEER_BUILD "базовая сборка"
-#endif
+/* Вариант сборки и то, есть ли в ней команды полного пакета, — данные профиля
+ * (src/profile/profile.h): файл профиля в сборке есть — есть и его имя. */
 
 /* ---- флаги ----------------------------------------------------------------
  * Описание флага живёт в одном месте на всю программу: команды ссылаются на него
@@ -692,15 +688,15 @@ static void help_all(FILE *out) {
             fprintf(out, "\n%s:\n", group);
         }
         fprintf(out, "  %-13s %s", CMDS[i].name, CMDS[i].brief);
-#ifndef STEER_EXTENDED
-        /* Команда названа даже там, где её нет. «Неизвестная команда» на steer vless
-         * заставила бы искать опечатку вместо того, чтобы поставить нужный пакет. */
-        if (CMDS[i].ext && !CMDS[i].srv) fputs(" [steer-extended]", out);
-        /* Хаб — не «другой пакет для роутера», а другой артефакт: архив для VPS. Маркер
-         * поэтому свой, иначе человека послали бы ставить steer-extended туда, где он не
-         * поможет. */
-        if (CMDS[i].srv) fputs(" [steer-hub]", out);
-#endif
+        if (!prof()->extended) {
+            /* Команда названа даже там, где её нет. «Неизвестная команда» на steer vless
+             * заставила бы искать опечатку вместо того, чтобы поставить нужный пакет. */
+            if (CMDS[i].ext && !CMDS[i].srv) fputs(" [steer-extended]", out);
+            /* Хаб — не «другой пакет для роутера», а другой артефакт: архив для VPS. Маркер
+             * поэтому свой, иначе человека послали бы ставить steer-extended туда, где он не
+             * поможет. */
+            if (CMDS[i].srv) fputs(" [steer-hub]", out);
+        }
         fputc('\n', out);
     }
     fprintf(out, "\nСправка и версия:\n"
@@ -712,11 +708,10 @@ static void help_all(FILE *out) {
           "\n"
           "Подробности по команде: steer help apply   (то же самое: steer apply --help)\n",
           plat()->name, plat_names());
-#ifndef STEER_EXTENDED
-    fputs("\nЭто базовая сборка: команды, помеченные [steer-extended], откажутся работать.\n"
-          "VLESS/Reality есть в пакете steer-extended — он ставится вместо этого и умеет всё то же.\n"
-          "Помеченное [steer-hub] живёт в архиве для VPS: на роутере хабу делать нечего.\n", out);
-#endif
+    if (!prof()->extended)
+        fputs("\nЭто базовая сборка: команды, помеченные [steer-extended], откажутся работать.\n"
+              "VLESS/Reality есть в пакете steer-extended — он ставится вместо этого и умеет всё то же.\n"
+              "Помеченное [steer-hub] живёт в архиве для VPS: на роутере хабу делать нечего.\n", out);
 }
 
 static void help_cmd(FILE *out, const struct cli_cmd *c) {
@@ -732,12 +727,11 @@ static void help_cmd(FILE *out, const struct cli_cmd *c) {
         fputs("\nФлаги:\n", out);
         print_flags(out, c->flags);
     }
-#ifndef STEER_EXTENDED
+    if (prof()->extended) return;
     if (c->srv)
         fputs("\nВ этой сборке команды нет: хаб ставится на VPS из архива steer-hub.\n", out);
     else if (c->ext)
         fputs("\nВ этой сборке команды нет: нужен пакет steer-extended.\n", out);
-#endif
 }
 
 void cli_help(FILE *out, const struct cli_cmd *cmd) {
@@ -752,7 +746,7 @@ void cli_usage_short(FILE *out) {
 }
 
 void cli_version(FILE *out) {
-    fprintf(out, "steer %s (%s, ревизия %s)\n", STEER_VERSION, STEER_BUILD, STEER_REV);
+    fprintf(out, "steer %s (%s, ревизия %s)\n", STEER_VERSION, prof()->build, STEER_REV);
 }
 
 /* ---- подсказка по опечатке -------------------------------------------------- */

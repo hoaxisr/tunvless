@@ -14,14 +14,21 @@
 # `ИМЯ := значение`, продолжение строки обратной косой чертой, ссылки `$(ИМЯ)` на имена,
 # объявленные ВЫШЕ. Ничего другого из make здесь не использовать.
 #
-# Профиль — это набор файлов одной сборки. Макросы STEER_EXTENDED/STEER_SERVER/STEER_TGWS
-# пока остаются рядом (PROFILE_DEFS_*); по плану пересборки (docs/architecture.md) они
-# уходят, и профиль будет решать всё составом файлов.
+# Профиль — это набор файлов одной сборки, и больше ничего (docs/architecture.md, раздел 2,
+# правило 3): какие команды и виды есть в бинарнике, решает наличие их файлов (слабые ссылки в
+# src/daemon/main.c и src/kinds/kind.c), а то, что файлом модуля не выражается (имя варианта
+# сборки, раскладка меток и таблиц мини-сборки tgws, резолвер), — файл профиля src/profile/
+# <профиль>.c. Прежние ключи -DSTEER_EXTENDED/-DSTEER_SERVER/-DSTEER_TGWS сняты; PROFILE_DEFS_*
+# остались ради умолчания платформы телефона и читаются сценариями сборки по-прежнему.
 
 # Каталоги слоёв (docs/architecture.md). Заголовки подключаются по имени (`#include "spec.h"`)
 # из любого слоя, поэтому каждая сборка получает -I на все каталоги сразу; имена заголовков
 # в дереве уникальны, и стенд tests/buildmatch.sh за этим следит.
 CORE_DIRS := src/lib src/model src/platform src/compile src/daemon src/kinds src/cli src/dnsd src/tools src/proto/obfs
+# Файлы профилей (src/profile, profile.h): profile.c — умолчания, в каждой сборке (с платформой,
+# PLATFORM_SRC); остальные — по одному на профиль, у base своего файла нет. Отдельно от ядра и
+# от расширенной части, потому что файл профиля не входит ни в одну сборку, кроме своей.
+PROFILE_DIRS := src/profile
 EXT_DIRS  := src/tunnel src/proto/tls src/proto/vless src/proto/xsteer src/proto/tgws
 # Клиент сокета `steer` (src/client) — отдельный бинарник, не профиль движка: CLIENT_SRC ниже.
 CLIENT_DIRS := src/client
@@ -30,7 +37,7 @@ CLIENT_DIRS := src/client
 # <yaml.h>, поэтому её каталог — в -I у всех; обёртка движка над ней называется ynode.h, а не
 # yaml.h, ровно чтобы имена заголовков оставались уникальными (tests/buildmatch.sh).
 THIRD_DIRS := src/third_party/libyaml
-INC_DIRS  := $(CORE_DIRS) $(EXT_DIRS) $(CLIENT_DIRS) $(THIRD_DIRS)
+INC_DIRS  := $(CORE_DIRS) $(PROFILE_DIRS) $(EXT_DIRS) $(CLIENT_DIRS) $(THIRD_DIRS)
 # Определения, которых ждёт сторонний код: yaml_private.h подключает config.h (номер версии
 # libyaml) только при HAVE_CONFIG_H. Ключ идёт во ВСЕ пути сборки движка — Makefile, build.sh,
 # build/build-ext*.sh (там он читается отсюда), в Android.bp — флагом библиотеки libsteer_yaml;
@@ -50,7 +57,9 @@ THIRD_DEFS := -DHAVE_CONFIG_H
 # выбирается при запуске, и код обеих есть в каждой сборке. Идёт вместе с моделью, потому что
 # модель её и спрашивает первой: разбор (zapret и каналы на само устройство), реестр (поле
 # метки), пути состояния. Стенды, компонующие модель, получают платформу тем же списком.
-PLATFORM_SRC := src/platform/platform.c src/platform/openwrt.c src/platform/android.c
+# С ней же — умолчания профиля (src/profile/profile.c): поле метки мини-сборки tgws подменяет
+# поле роутера в plat(), так что платформа без профиля не компонуется.
+PLATFORM_SRC := src/platform/platform.c src/platform/openwrt.c src/platform/android.c src/profile/profile.c
 
 # Чтение YAML (docs/architecture.md, «4в. Устройство 1.9», шаг 2): событийный парсер libyaml 0.2.5
 # (src/third_party/libyaml, MIT; только разбор — без загрузчика и эмиттера) и обёртка движка
@@ -146,9 +155,9 @@ EXT_TGWS_SRC := src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/r
                 src/proto/tls/chello.c src/proto/tgws/tgws.c src/proto/tls/tlsprobe.c
 
 PROFILE_base     := $(CORE_SRC)
-PROFILE_extended := $(CORE_SRC) $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(KINDS_EXT_SRC)
-PROFILE_server   := $(CORE_SRC) $(XS_COMMON_SRC) $(EXT_SERVER_SRC)
-PROFILE_tgws     := $(CORE_SRC) $(EXT_TGWS_SRC)
+PROFILE_extended := $(CORE_SRC) $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(KINDS_EXT_SRC) src/profile/extended.c
+PROFILE_server   := $(CORE_SRC) $(XS_COMMON_SRC) $(EXT_SERVER_SRC) src/profile/server.c
+PROFILE_tgws     := $(CORE_SRC) $(EXT_TGWS_SRC) src/profile/tgws.c
 # Телефон: тот же состав, что расширенный роутерный (Android.bp, цель steer).
 PROFILE_android  := $(PROFILE_extended)
 
@@ -159,11 +168,12 @@ PROFILE_android  := $(PROFILE_extended)
 # сокет, каталог состояния): клиент выбирает их так же, как движок (src/platform).
 CLIENT_SRC := src/client/main.c $(PLATFORM_SRC)
 
+# Ключей профилей нет (шапка файла): всё, чем профили различаются, — их списки выше.
 PROFILE_DEFS_base     :=
-PROFILE_DEFS_extended := -DSTEER_EXTENDED
-PROFILE_DEFS_server   := -DSTEER_SERVER
-PROFILE_DEFS_tgws     := -DSTEER_TGWS
+PROFILE_DEFS_extended :=
+PROFILE_DEFS_server   :=
+PROFILE_DEFS_tgws     :=
 # Телефон — не профиль, а платформа (src/platform): код обеих платформ есть в любой сборке, а
 # ключ задаёт только умолчание выбора при запуске — прошивка ведёт себя как телефон, где бы ни
 # запустилась. --platform и STEER_PLATFORM его переопределяют.
-PROFILE_DEFS_android  := -DSTEER_DEFAULT_PLATFORM=android -DSTEER_EXTENDED
+PROFILE_DEFS_android  := -DSTEER_DEFAULT_PLATFORM=android
