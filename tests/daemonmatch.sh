@@ -206,8 +206,9 @@ import socket, struct, sys
 port, name = int(sys.argv[1]), sys.argv[2]
 q = struct.pack('>HHHHHH', 0x7a7a, 0x0100, 1, 0, 0, 0)
 for l in name.split('.'): q += bytes([len(l)]) + l.encode()
-# Тип 65 (HTTPS): имя под правилом резолвер гасит в любом случае. AAAA сигналом больше не
-# годится — с 1.9 на AAAA имени под правилом в выход с IPv6 резолвер отвечает адресом.
+# Тип 65 (HTTPS): имя под правилом резолвер гасит в любом случае. AAAA годится сигналом только у
+# спеки v1 — у спеки v2 на AAAA имени под правилом в выход с IPv6 резолвер отвечает адресом, а
+# HTTPS не зависит от формата спеки.
 q += b'\x00' + struct.pack('>HH', 65, 1)
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
 s.sendto(q, ('127.0.0.1', port))
