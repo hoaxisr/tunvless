@@ -833,6 +833,12 @@ int cmd_apply_plan(int argc, char **argv) {
     if (!f) die("cannot open a stream for the ruleset fingerprint", NULL);
     static char buf[65536];
     setvbuf(f, buf, _IOFBF, sizeof(buf));
+    /* Отпечаток — без засева карты fake-IP из файла состояния резолвера: файл растёт с каждым
+     * выданным адресом, и с засевом та же спека давала бы новый отпечаток после любого нового
+     * имени в сети, то есть полную замену таблицы на каждый reload (print.c, у print_elements).
+     * Загрузка (apply-commit --ruleset, ruleset_load) печатает засев как прежде — план в ядро
+     * не идёт и текста не хранит, так что другого читателя у этого флага здесь нет. */
+    g_print_state_seed = 0;
     if (generate(&cfg, &gr, f, &e) < 0) err_die(&e);
     fclose(f);
     printf("nftc %d\nruleset %016llx\ncounts %zu %zu\n", g_nftc, h, cfg.rule_n, cfg.out_n);
