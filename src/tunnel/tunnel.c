@@ -3146,7 +3146,7 @@ int cmd_vless(const char *spec_path, const char *out_name) {
     /* Кандидаты в порядке предпочтения. Пустой `nodes` (и прежнее `node: -1`) означает «вся
      * подписка», выбранное подмножество — только его узлы и только в написанном порядке. Одна
      * функция на подъём и на `vless-probe`: покажи диагностика другой порядок, она объясняла
-     * бы не тот перебор, который случится (см. out_node_list в spec.c). */
+     * бы не тот перебор, который случится (см. out_node_list в kinds/vless.c). */
     static int sel[MAX_NODES];
     size_t sel_n = out_node_list(o, cnt, sel, MAX_NODES);
     if (!sel_n) {

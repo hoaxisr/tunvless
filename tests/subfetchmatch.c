@@ -61,7 +61,7 @@ int mbedtls_sha256(const unsigned char *input, size_t ilen, unsigned char *outpu
     return 0;
 }
 
-/* Тот же запуск, что в steer.c: заглушка curl обязана запускаться по-настоящему, иначе
+/* Тот же запуск, что в src/lib/run.c: заглушка curl обязана запускаться по-настоящему, иначе
  * ветка скачивания осталась бы непроверенной вовсе. */
 int run_quiet(const char *const argv[]);
 int run_quiet(const char *const argv[]) {

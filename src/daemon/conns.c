@@ -176,7 +176,7 @@ static int ctnl_conns_rec(const uint8_t *a, const uint8_t *end, uint8_t family, 
     return 0;
 }
 
-/* Реестр меток: «имя метка таблица» построчно — тот же разбор, что у registry_assign (spec.c),
+/* Реестр меток: «имя метка таблица» построчно — тот же разбор, что у registry_assign (model/registry.c),
  * и то же отсечение меток вне поля: такая запись осталась от сборки с другим полем и
  * сопоставлять её с записями conntrack нельзя. Только читается: conns ничего не раздаёт. */
 static void conns_registry(struct ctnl_conns_ctx *x) {

@@ -44,7 +44,7 @@ local49-tool mk wg9 10.77.0.1/24
 local49-tool mk wg8 10.78.0.1/24
 # Как netd: NAT раздачи в iptables на восходящий интерфейс. На ядре 4.9 первая сработавшая
 # регистрация nat решает судьбу соединения, поэтому masquerade движка обязан жить в той же
-# таблице iptables, а не цепочкой nft рядом (см. android_masq_sync в steer.c).
+# таблице iptables, а не цепочкой nft рядом (см. iptables_masq_sync в src/daemon/apply.c).
 iptables -t nat -A POSTROUTING -o up0 -j MASQUERADE
 printf '203.0.113.0/24\n' > $W/p.lst
 printf '198.51.100.0/24\n' > $W/q.lst

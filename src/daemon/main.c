@@ -61,7 +61,7 @@ void probe_rule_cleanup(void);   /* failover.c */
 void dnsd_usage_flags(FILE *out);
 void aggregate_usage_flags(FILE *out);
 /* Подпись таблицы доменных каналов: ею init-скрипт решает, хватит ли резолверу SIGHUP или
- * нужен перезапуск с пятисекундной паузой procd. Живёт в dnsd.c — там таблица. */
+ * нужен перезапуск с пятисекундной паузой procd. Живёт в dnsd/table.c — там таблица. */
 int dnsd_sig_print(const char *spec, FILE *out);
 /* Та же таблица, которую демон шлёт резолверу трубой --table-fd (docs/architecture.md, раздел
  * 4а) — текстом в stdout, для стендов и ручной отладки. src/dnsd/tabfmt.c. */
