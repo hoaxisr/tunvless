@@ -374,13 +374,21 @@ static int g_nk_open = -1;
  * пустоту). Демон присылает таблицу после каждой замены набора правил, даже неизменную
  * (supd_spec_changed), SIGHUP приходит после reload без демона — и этот проход ставит всё заново:
  * EEXIST на уцелевших элементах — желаемое состояние. Стоит по транзакции на имя, как проход при
- * запуске. */
+ * запуске.
+ *
+ * Тем же проходом возвращаются элементы real-ip со сроком (realip.c): настоящие адреса из
+ * ответов, которые клиент ещё держит в кэше, — с оставшимся сроком. */
 static void reassert_routes(void) {
-    if (g_nk_open != 0 || !g_fakeip.n) return;
-    size_t routed = 0;
-    size_t restored = fakeip_rehydrate(g_nk_open, &routed);
-    if (restored || routed)
-        fprintf(stderr, "steer dnsd: fake-IP: %zu map, %zu routes re-asserted\n", restored, routed);
+    if (g_nk_open != 0) return;
+    if (g_fakeip.n) {
+        size_t routed = 0;
+        size_t restored = fakeip_rehydrate(g_nk_open, &routed);
+        if (restored || routed)
+            fprintf(stderr, "steer dnsd: fake-IP: %zu map, %zu routes re-asserted\n",
+                    restored, routed);
+    }
+    size_t ri = realip_reassert();
+    if (ri) fprintf(stderr, "steer dnsd: real-ip: %zu element(s) re-asserted with remaining TTL\n", ri);
 }
 
 /* Труба таблицы (--table-fd) стала читаемой: дочитать её до EAGAIN (неблокирующая, как и
@@ -392,8 +400,9 @@ static void reassert_routes(void) {
  * пересчитаны под таблицу, которой на момент их запроса ещё не было. Ни один считает их
  * протухшими и не трогает — это не в зоне ответственности замены таблицы вовсе.
  *
- * Возвращает 0, если труба сломалась не по контракту (испорченный текст) или демон её закрыл
- * (EOF) — в обоих случаях резолверу отвечать больше не на что, вызывающий обязан завершиться. */
+ * Возвращает 1 — труба открыта и дочитана; 0 — демон её закрыл (EOF: он вышел или убит, см.
+ * table_pipe_lost ниже); -1 — труба сломалась не по контракту (испорченный текст): резолверу
+ * верить больше нечему, вызывающий обязан завершиться. */
 static int table_pipe_readable(void) {
     for (;;) {
         char chunk[4096];
@@ -404,14 +413,11 @@ static int table_pipe_readable(void) {
             fprintf(stderr, "steer[warn] dnsd: труба таблицы: %s\n", strerror(errno));
             return 0;
         }
-        if (r == 0) {
-            fprintf(stderr, "steer dnsd: труба таблицы закрыта родителем — выходим\n");
-            return 0;
-        }
+        if (r == 0) return 0;
         int rc = tabfmt_feed(&g_table_feed, chunk, (size_t)r);
         if (rc < 0) {
             fprintf(stderr, "steer[warn] dnsd: труба таблицы: испорченный текст\n");
-            return 0;
+            return -1;
         }
         /* rc == 1 может повториться без нового чтения — демон вправе прислать две таблицы
          * подряд одной записью, а следующая уже целиком лежит в g_table_feed. */
@@ -425,9 +431,68 @@ static int table_pipe_readable(void) {
         if (got) reassert_routes();
         if (rc < 0) {
             fprintf(stderr, "steer[warn] dnsd: труба таблицы: испорченный текст\n");
-            return 0;
+            return -1;
         }
     }
+}
+
+/* РЕЗОЛВЕР ПЕРЕЖИВАЕТ ДЕМОНА (adopt.c — там доводы и протокол).
+ *
+ * Прежде закрытая демоном труба значила «выйти»: резолвер — ребёнок демона, и после kill -9
+ * демона DNS клиентов, завёрнутый на резолвер, не отвечал до перезапуска procd (~5 с). Теперь
+ * EOF трубы — «демона нет»: резолвер отвечает дальше с последней таблицей и ждёт нового демона
+ * g_orphan_sec секунд. Новый демон отдаёт новую трубу через управляющий сокет
+ * (table_pipe_take), и таблица снова идёт по ней. Не пришёл — резолвер выходит сам: демон
+ * удалён или служба остановлена без него. Штатная остановка (stop, SIGTERM демону) гасит
+ * резолвер явно, сигналом, как и прежде. g_orphan_sec == 0 — прежнее поведение: EOF — выход. */
+int g_orphan_sec = 60;
+static time_t g_orphan_since;           /* CLOCK_MONOTONIC, с; 0 — у резолвера есть демон */
+
+static time_t mono_sec(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec;
+}
+
+static void table_pipe_lost(void) {
+    epoll_ctl(g_epfd, EPOLL_CTL_DEL, g_table_fd, NULL);
+    close(g_table_fd);
+    g_table_fd = -1;
+    g_table_feed.len = 0;             /* недописанная таблица умершего демона — не наша */
+    if (!g_running) return;           /* SIGTERM уже пришёл: это остановка, а не пропажа */
+    if (g_orphan_sec <= 0 || g_adopt_fd < 0) {
+        fprintf(stderr, "steer dnsd: труба таблицы закрыта родителем — выходим\n");
+        g_running = 0;
+        return;
+    }
+    g_orphan_since = mono_sec();
+    if (!g_orphan_since) g_orphan_since = 1;
+    fprintf(stderr, "steer[warn] dnsd: демон пропал (труба таблицы закрыта) — отвечаю по "
+                    "последней таблице и жду нового демона %d с\n", g_orphan_sec);
+}
+
+int table_pipe_take(int fd, long *waited) {
+    if (g_table_fd >= 0) {
+        /* Прежний хозяин мог умереть только что, и EOF его трубы ещё ждёт в этой же пачке
+         * событий: дочитать сейчас. Открыта — хозяин жив, и второму демону резолвер не отдаётся
+         * (два демона на одном каталоге состояния — не наш случай, и молча уводить резолвер у
+         * живого значило бы оставить того писать в пустоту). */
+        int rc = table_pipe_readable();
+        if (rc > 0) return -1;
+        if (rc < 0) { g_running = 0; return -1; }
+        table_pipe_lost();
+        if (!g_running) return -1;
+    }
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    struct epoll_event tev = {0};
+    tev.events = EPOLLIN;
+    tev.data.ptr = &g_table_fd;
+    if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &tev) != 0) return -1;
+    g_table_fd = fd;
+    g_table_feed.len = 0;
+    *waited = g_orphan_since ? (long)(mono_sec() - g_orphan_since) : 0;
+    g_orphan_since = 0;
+    return 0;
 }
 
 /* Снятие протухших ожиданий. Вызывается из секундного тика цикла событий, а не
@@ -883,20 +948,29 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
          * имя законно, и решать спор должен порядок цепочки. Каналы поддельного
          * адреса среди совпавших пропускаются — им поддельного адреса никто не
          * выдавал, класть в их набор нечего. */
-        if (qtype == DNS_TYPE_A)
+        /* Каждый адрес ещё и запоминается со сроком (realip.c): замена набора правил
+         * опустошает наборы, и после новой таблицы элементы возвращаются с оставшимся сроком,
+         * а не ждут следующего ответа на это имя. */
+        if (qtype == DNS_TYPE_A) {
             for (size_t c = 0; c < g_dch_n; c++) {
                 if (!(sets & (1ULL << c)) || !g_dch[c].realip) continue;
                 for (int k = 0; k < nips; k++)
                     dch_add(c, qname, ntohl(ips[k].addr), set_ttl_clamp(ips[k].ttl));
             }
+            for (int k = 0; k < nips; k++)
+                realip_note(qname, ntohl(ips[k].addr), set_ttl_clamp(ips[k].ttl));
+        }
         /* real-ip v6: настоящие AAAA — в парные наборы «<канал>6» с тем же сроком ответа.
          * Сюда доходит только имя, у всех каналов которого половина IPv6 есть (выше). */
-        if (qtype == DNS_TYPE_AAAA)
+        if (qtype == DNS_TYPE_AAAA) {
             for (size_t c = 0; c < g_dch_n; c++) {
                 if (!(sets & (1ULL << c)) || !g_dch[c].realip) continue;
                 for (int k = 0; k < n6; k++)
                     dch_add6(c, qname, ips6[k].addr, set_ttl_clamp(ips6[k].ttl));
             }
+            for (int k = 0; k < n6; k++)
+                realip_note6(qname, ips6[k].addr, set_ttl_clamp(ips6[k].ttl));
+        }
         if (!quiet)
             reply_client(buf, (size_t)n, &p->client, p->client_len, &p->local, p->have_local);
         return 1;
@@ -1737,6 +1811,8 @@ int run_proxy(int listen_port, int upstream_port) {
     tcp_listen_open(listen_port);
     /* Сокет журнала имён — см. «журнал имён» выше. */
     dlog_listen();
+    /* Управляющий сокет — только резолверу на таблице: забирать его есть смысл лишь демону. */
+    if (g_table_fd >= 0) adopt_listen();
     /* --table-fd: первая таблица уже разобрана (dnsd_main, tabfmt_read_first, ДО этой функции)
      * — здесь труба заводится в epoll только ради СЛЕДУЮЩИХ. Неблокирующая по той же причине,
      * что и остальные сокеты цикла: готовность epoll не обещает, что read не заблокируется. */
@@ -1896,6 +1972,15 @@ int run_proxy(int listen_port, int upstream_port) {
             time_t left = g_fakeip_last_rewrite + FAKEIP_ANSWER_TTL - now;
             timeout = left > 0 ? (int)left * 1000 : 0;
         }
+        /* Без демона — проснуться к концу срока ожидания нового (table_pipe_lost). */
+        if (g_orphan_since) {
+            time_t left = g_orphan_since + g_orphan_sec - mono_sec();
+            if (left <= 0) {
+                fprintf(stderr, "steer[warn] dnsd: нового демона нет %d с — выхожу\n", g_orphan_sec);
+                break;
+            }
+            if (timeout < 0 || timeout > (int)left * 1000) timeout = (int)left * 1000;
+        }
         int n = epoll_wait(g_epfd, events, 32, timeout);
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -1911,7 +1996,16 @@ int run_proxy(int listen_port, int upstream_port) {
             } else if (events[i].data.ptr == &g_dlog_fd) {
                 dlog_serve();
             } else if (events[i].data.ptr == &g_table_fd) {
-                if (!table_pipe_readable()) g_running = 0;
+                /* Труба могла смениться в этой же пачке (adopt_conn_event раньше по массиву):
+                 * событие прежней — не повод читать новую, но и вреда от чтения нет. */
+                if (g_table_fd < 0) continue;
+                int rc = table_pipe_readable();
+                if (rc < 0) g_running = 0;
+                else if (rc == 0) table_pipe_lost();
+            } else if (events[i].data.ptr == &g_adopt_fd) {
+                adopt_accept();
+            } else if (events[i].data.ptr == &g_adopt_conn || events[i].data.ptr == &g_adopt_owner) {
+                adopt_conn_event(events[i].data.ptr);
             } else if (tcp_event(events[i].data.ptr, events[i].events)) {
                 /* соединение TCP — клиента или наверх; всё сделано внутри */
             } else {
@@ -1927,6 +2021,7 @@ int run_proxy(int listen_port, int upstream_port) {
 
     tcp_close_all();
     dlog_close();
+    adopt_close();
     if (g_nlk_fd >= 0) close(g_nlk_fd);
     if (g_up_fd >= 0) close(g_up_fd);
     if (g_table_fd >= 0) close(g_table_fd);

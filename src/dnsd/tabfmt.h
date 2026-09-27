@@ -165,4 +165,11 @@ int tabfmt_read_first(int fd, struct tabfmt_feed *st);
 extern int g_table_fd;
 extern struct tabfmt_feed g_table_feed;
 
+/* Демон пропал (труба закрылась) — сколько секунд резолвер отвечает по последней таблице и ждёт
+ * нового демона (--orphan-timeout, proxy.c); 0 — выйти сразу, как прежде. Новый демон забирает
+ * живой резолвер через его управляющий сокет — <каталог состояния>/DNSD_CTL_SOCK (src/dnsd/
+ * adopt.c: протокол и доводы; сторона демона — src/daemon/supd.c, adopt_dnsd). */
+extern int g_orphan_sec;
+#define DNSD_CTL_SOCK "dnsd-ctl.sock"
+
 #endif

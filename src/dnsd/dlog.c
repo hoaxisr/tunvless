@@ -186,12 +186,8 @@ void dlog_close(void) {
 /* Подключились к сокету журнала: отдать журнал и закрыть. Запись — со сроком 200 мс на всё:
  * ответ (до ~80 КиБ) обычно целиком ложится в буфер сокета за один вызов, а собеседник,
  * который не читает, не должен держать разрешение имён дольше этого. */
-/* Раскладка ответа SO_PEERCRED — своя, по той же причине, что dnsd_in6_pktinfo: struct ucred
- * libc показывает только с _GNU_SOURCE, а этот файл включают стенды со своим порядком
- * заголовков. Поля — ядра (include/linux/socket.h), от libc не зависят. По той же причине
- * accept, а не accept4. */
-struct dnsd_ucred { pid_t pid; uid_t uid; gid_t gid; };
-
+/* Раскладка ответа SO_PEERCRED — struct dnsd_ucred (dnsd_int.h). По той же причине, по какой
+ * она своя (_GNU_SOURCE), — accept, а не accept4. */
 void dlog_serve(void) {
     for (int k = 0; k < 4; k++) {
         int c = accept(g_dlog_fd, NULL, NULL);

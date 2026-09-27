@@ -342,6 +342,31 @@ void dlog_listen(void);
 void dlog_close(void);
 void dlog_serve(void);
 
+/* realip.c — память элементов real-ip со сроком: после новой таблицы (замена набора правил)
+ * они возвращаются в наборы с оставшимся сроком, а не ждут следующего ответа DNS. */
+void realip_note(const char *qname, uint32_t addr_host, uint32_t ttl);
+void realip_note6(const char *qname, const uint8_t addr[16], uint32_t ttl);
+size_t realip_reassert(void);
+
+/* adopt.c — управляющий сокет резолвера на таблице: новый демон забирает живой резолвер
+ * (труба таблицы через SCM_RIGHTS). adopt_listen — после того, как epoll заведён. */
+extern int g_adopt_fd;
+extern int g_adopt_conn;
+extern int g_adopt_owner;
+void adopt_listen(void);
+void adopt_accept(void);
+void adopt_conn_event(int *slot);
+void adopt_close(void);
+/* proxy.c: взять новую трубу таблицы от демона (adopt.c). 0 — взята, *waited — сколько секунд
+ * резолвер был без демона; -1 — у резолвера есть живой хозяин (труба открыта), и чужой демон её
+ * не получит. */
+int table_pipe_take(int fd, long *waited);
+
+/* Раскладка ответа SO_PEERCRED — своя, по той же причине, что dnsd_in6_pktinfo: struct ucred
+ * libc показывает только с _GNU_SOURCE, а файлы резолвера включают стенды со своим порядком
+ * заголовков. Поля — ядра (include/linux/socket.h), от libc не зависят. */
+struct dnsd_ucred { pid_t pid; uid_t uid; gid_t gid; };
+
 /* proxy.c */
 int run_proxy(int listen_port, int upstream_port);
 

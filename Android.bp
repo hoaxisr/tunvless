@@ -82,6 +82,8 @@ cc_defaults {
         "src/dnsd/table.c",
         "src/dnsd/tabfmt.c",
         "src/dnsd/dlog.c",
+        "src/dnsd/realip.c",
+        "src/dnsd/adopt.c",
         "src/dnsd/proxy.c",
         "src/dnsd/main.c",
         "src/daemon/failover.c",
