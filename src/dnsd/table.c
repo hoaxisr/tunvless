@@ -273,9 +273,14 @@ static int dch_join_domain_group(const struct spec *sp, const struct spec_rule *
  * набор и v6-двойника (dom6_ok — одно решение на обоих; доп. группа набора .srs половины IPv6 не
  * имеет, как и у компилятора, group_has_set6). Раскладка ядра — та, что стоит (nft_compat_seen6:
  * по netlink, без пробы `nft -c` — таблицу собирает и демон в своём процессе), и спрашивается
- * только когда от неё что-то зависит: fake-IP с выходом и клиентами, которые IPv6 допускают. */
+ * только когда от неё что-то зависит: fake-IP с выходом и клиентами, которые IPv6 допускают.
+ *
+ * Спека v1 (sp->dns.names_v4 — ставит перевод v1) — всегда только IPv4: на AAAA её имён пустой
+ * ответ, как до 1.9, хотя компилятор набор «<имя>6» и двойника заводит. Доводы — у поля в
+ * spec.h. Таблица демону несёт это полем семейства «4», и резолверу номер формата спеки знать не
+ * нужно. */
 static int dch_fam(const struct spec *sp, const struct spec_rule *r, int realip, int extra) {
-    if (extra) return DCH_V4;
+    if (extra || sp->dns.names_v4) return DCH_V4;
     const struct spec_client *w = rule_who(sp, r);
     const struct output *o = rule_out(sp, r);
     if (!dom6_ok(sp, o, w->from, w->from_n, realip, 0)) return DCH_V4;

@@ -616,8 +616,9 @@ EOF
 tdout="$("$BIN" apply --dry-run --spec "$tmp/threedom.json" --state-dir "$tmp/state-td" 2>&1)"
 check "fakeip, realip и свои клиенты — три разных набора" "3" \
     "$(printf '%s\n' "$tdout" | sed -n 's/^    set \([a-z0-9_]*\) .*/\1/p' | grep -v '6$' | sort -u | wc -l)"
-# Половина IPv6 — у fakeip и realip клиентов по умолчанию, но не у клиента из одного адреса
-# IPv4: его IPv6 правилом не узнать, и резолвер отвечает на AAAA его имён пустым ответом.
+# Половина IPv6 в наборе правил — у fakeip и realip клиентов по умолчанию, но не у клиента из
+# одного адреса IPv4: его IPv6 правилом не узнать. (Спека здесь v1, и на AAAA резолвер отвечает
+# пустым ответом у всех трёх — sp->dns.names_v4; набор правил от этого не меняется.)
 check "  пары IPv6 — у fakeip и realip, у клиента из адреса IPv4 — нет" "vpn_dom6 vpn_dom_c0r6" \
     "$(printf '%s\n' "$tdout" | sed -n 's/^    set \([a-z0-9_]*6\) .*/\1/p' | sort | paste -sd' ')"
 
@@ -1413,8 +1414,10 @@ spec <<'EOF'
       "match": { "prefixes_files": ["TMP/dc.lst"], "proto": "udp", "ports": ["50000-65535"] } }
   ] }
 EOF
+# Семейство в подписи — «4»: спека v1, и на AAAA её имён резолвер отвечает пустым ответом, как до
+# 1.9 (sp->dns.names_v4, spec.h), хотя набор vpn_dom6 компилятор заводит (проверка ниже).
 hsig="$("$BIN" dnsd-sig --spec "$tmp/spec.json" --state-dir "$tmp/st-dch" 2>/dev/null)"
-check "гибридный канал в доменной группе соседа" "vpn_dom|0|46|$tmp/dcnames.lst|$tmp/dc.lst" "$hsig"
+check "гибридный канал в доменной группе соседа" "vpn_dom|0|4|$tmp/dcnames.lst|$tmp/dc.lst" "$hsig"
 hout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-dch" 2>/dev/null)"
 check "и компилятор завёл ровно эти наборы" "set vpn_dom {|set vpn_dom6 {|set vpn_ip_c0_p1 {" \
     "$(printf '%s\n' "$hout" | grep -o 'set [a-z0-9_]* {' | paste -sd'|')"

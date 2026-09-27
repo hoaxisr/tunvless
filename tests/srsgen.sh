@@ -219,12 +219,13 @@ check "… деление по сужению" yes "$(has "$G" 'meta l4proto udp
 check "… подсети набора — в статической половине доменного набора" yes "$(has "$G" 'set vpn_dom_n {')"
 
 # ---- 11. таблица резолвера: выбор клауз и сужение -------------------------------------------
+# Семейство «4»: спеки здесь v1, а у них имена правил только IPv4 (sp->dns.names_v4, spec.h).
 tab="$(STEER_NFT_CONCAT=1 "$BIN" dnsd-table --spec "$tmp/mx_comp.json" 2>/dev/null)"
-check "таблица резолвера: составной набор — клаузы с сужением" yes "$(has "$tab" "vpn_dom_c0_m|vpn|0|46|mixed|srs:0=-:$FIX/mixed.srs")"
+check "таблица резолвера: составной набор — клаузы с сужением" yes "$(has "$tab" "vpn_dom_c0_m|vpn|0|4|mixed|srs:0=-:$FIX/mixed.srs")"
 tab="$(STEER_NFT_CONCAT=1 "$BIN" dnsd-table --spec "$tmp/mx_own.json" 2>/dev/null)"
 check "… свои списки канала — с его сужением (cl:)" yes "$(has "$tab" "cl:-:$tmp/own.pfx")"
 tab="$("$BIN" dnsd-table --spec "$tmp/tg_srs.json" 2>/dev/null)"
-check "обычный набор — номера клауз имён" yes "$(has "$tab" "vpn_dom|vpn|0|46|tg|srs:0:$FIX/telegram.srs")"
+check "обычный набор — номера клауз имён" yes "$(has "$tab" "vpn_dom|vpn|0|4|tg|srs:0:$FIX/telegram.srs")"
 
 # ---- 12. большой список со смешанным сужением — деление вместо составного набора -------------
 if command -v python3 >/dev/null 2>&1; then
