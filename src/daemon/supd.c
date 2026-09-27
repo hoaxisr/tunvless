@@ -550,7 +550,7 @@ static void changes_of(const struct supd *s, size_t fn, struct supd_changes *ch)
     }
 }
 
-void supd_spec_changed(struct supd *s, struct supd_changes *ch) {
+void supd_spec_changed(struct supd *s, struct supd_changes *ch, int replaced) {
     if (ch) memset(ch, 0, sizeof(*ch));
     if (!s || s->stopping) return;
     size_t fn = supd_plan(s);
@@ -558,6 +558,7 @@ void supd_spec_changed(struct supd *s, struct supd_changes *ch) {
     helpers_merge(&s->set, s->fresh, fn);
     helpers_compact(&s->set);
     int sent = tab_send(s, 0);
+    if (!sent && replaced) tab_send(s, 1);
     if (ch) ch->dnsd = sent;
     supd_kick(s);
 }

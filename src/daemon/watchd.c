@@ -250,6 +250,7 @@ struct watchd {
     struct loop_timer *kill_tm;   /* срок идущего прохода */
     int settling;                 /* tm стоит на успокоении, а не на периоде */
     int pending;                  /* после идущего прохода нужен ещё один */
+    int revive_next;              /* ...и в нём члены групп оживляются (FO_PASS_REVIVE) */
     int eventful;                 /* проход идёт по событию сети или смене спеки */
     int on;                       /* движок включён: без этого ни таймера, ни сокета событий */
     int hold;                     /* первый проход ждёт конца стартового apply (watchd_release) */
@@ -421,9 +422,15 @@ static void watchd_after(struct watchd *w) {
     }
 }
 
+/* Итог FO_PASS_REVIVE — член группы v2 молчал, и его оживление отложено (fo_pass_defer_revive):
+ * группа в этом проходе уже ушла на живого члена, а оживление — в следующем, через успокоение. */
 static void watchd_pass_done(void *arg, int res) {
-    (void)res;
-    watchd_after(arg);
+    struct watchd *w = arg;
+    if (res & FO_PASS_REVIVE) {
+        w->revive_next = 1;
+        w->pending = 1;
+    }
+    watchd_after(w);
 }
 
 static void watchd_kill(struct loop *l, struct loop_timer *t, void *arg) {
@@ -516,6 +523,8 @@ static void watchd_pass_start(struct watchd *w) {
     /* Супервизор заводится после сторожа — спрашивается на каждый проход. */
     if (w->d->sup) fo_pass_helpers(w->run, &w->hmem.base);
     fo_pass_traffic(w->run, watchd_traffic, w);
+    if (!w->revive_next) fo_pass_defer_revive(w->run);
+    w->revive_next = 0;
     loop_timer_set(w->kill_tm, WATCHD_PASS_MAX_S * 1000L);
 }
 

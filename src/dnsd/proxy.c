@@ -359,6 +359,30 @@ static void reload_rules(void) {
     }
 }
 
+/* Длинный сокет nf_tables (nftlk_open в run_proxy): 0 — открыт. */
+static int g_nk_open = -1;
+
+/* ПОСЛЕ НОВОЙ ТАБЛИЦЫ ИЛИ ПЕРЕЧИТАННЫХ СПИСКОВ — вернуть в ядро постоянные элементы fake-IP.
+ *
+ * apply заменяет таблицу nftables целиком (src/daemon/apply.c, «ЗАМЕНА ТАБЛИЦЫ»): карта fakeip
+ * засевается в новом наборе из файла состояния, а наборы каналов приходят пустыми — постоянные
+ * элементы поддельных адресов, которые кладёт резолвер, исчезают. Прежде они возвращались только
+ * с запросом имени после дросселя (FAKEIP_ANSWER_TTL), а до того пакет клиента к поддельному
+ * адресу из его кэша не метился, разворачивался картой в настоящий адрес и уходил напрямую —
+ * после каждого «Применить», меняющего набор правил, и после каждого перезапуска службы (stop
+ * снимает таблицу, резолвер поднимается раньше стартового apply и восстанавливает элементы в
+ * пустоту). Демон присылает таблицу после каждой замены набора правил, даже неизменную
+ * (supd_spec_changed), SIGHUP приходит после reload без демона — и этот проход ставит всё заново:
+ * EEXIST на уцелевших элементах — желаемое состояние. Стоит по транзакции на имя, как проход при
+ * запуске. */
+static void reassert_routes(void) {
+    if (g_nk_open != 0 || !g_fakeip.n) return;
+    size_t routed = 0;
+    size_t restored = fakeip_rehydrate(g_nk_open, &routed);
+    if (restored || routed)
+        fprintf(stderr, "steer dnsd: fake-IP: %zu map, %zu routes re-asserted\n", restored, routed);
+}
+
 /* Труба таблицы (--table-fd) стала читаемой: дочитать её до EAGAIN (неблокирующая, как и
  * остальные сокеты цикла) и применить каждую полную таблицу, которая в ней собралась — тем же
  * путём, каким SIGHUP применяет новые файлы правил (reload_rules выше): набор каналов уже
@@ -391,11 +415,14 @@ static int table_pipe_readable(void) {
         }
         /* rc == 1 может повториться без нового чтения — демон вправе прислать две таблицы
          * подряд одной записью, а следующая уже целиком лежит в g_table_feed. */
+        int got = 0;
         while (rc == 1) {
             fprintf(stderr, "steer dnsd: таблица от демона: %zu доменных канал(ов)\n", g_dch_n);
             reload_rules();
+            got = 1;
             rc = tabfmt_feed(&g_table_feed, NULL, 0);
         }
+        if (got) reassert_routes();
         if (rc < 0) {
             fprintf(stderr, "steer[warn] dnsd: труба таблицы: испорченный текст\n");
             return 0;
@@ -1808,6 +1835,7 @@ int run_proxy(int listen_port, int upstream_port) {
      * fake-IP mappings — every matched domain then relays its real answer
      * (fail-open), exactly as if the rules never matched. */
     int nk_open = nftlk_open();
+    g_nk_open = nk_open;
 
     reload_rules();
     if (g_fakeip_state_path) fakeip_state_load(g_fakeip_state_path);
@@ -1840,7 +1868,7 @@ int run_proxy(int listen_port, int upstream_port) {
     struct epoll_event events[32];
     time_t last_reap = 0;
     while (g_running) {
-        if (g_reload_pending) { g_reload_pending = 0; reload_rules(); }
+        if (g_reload_pending) { g_reload_pending = 0; reload_rules(); reassert_routes(); }
         time_t now = time(NULL);
         if (now != last_reap) {
             /* Секундный тик: снять протухшие ожидания (см. pending_reap). */

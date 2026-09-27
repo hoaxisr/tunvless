@@ -439,7 +439,10 @@ check "файл keep.d есть в репозитории" "yes" "$([ -f "$KEEP"
 # Каталог подписок и каталог СВОИХ списков объявлены с запуска 65. Оба заводит splify2, и оба
 # невосстановимы: несколько подписок со своим учётом остатка живут в /etc/steer/subs, а
 # /etc/steer/lists/custom человек набивает руками — перекачать его неоткуда.
-for f in /etc/steer/spec.json /etc/steer/sub.txt /etc/steer/sub.userinfo \
+#
+# spec.yaml — спека v2 в YAML рядом со spec.json (1.9, docs/spec-v2.md): без неё в списке
+# обновление прошивки «с сохранением настроек» оставляло роутер без спеки.
+for f in /etc/steer/spec.json /etc/steer/spec.yaml /etc/steer/sub.txt /etc/steer/sub.userinfo \
          /etc/steer/subs /etc/steer/lists/custom /etc/steer/xsteer /etc/steer/zapret; do
     check "keep.d объявляет $f" "1" "$(grep -cx "$f" "$KEEP")"
 done

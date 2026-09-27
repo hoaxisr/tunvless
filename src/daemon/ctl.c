@@ -1028,8 +1028,11 @@ static void mem_version(struct conn *c, struct cbuf *r) {
     /* realpath на каждый ответ, а не при старте: спеки при старте может ещё не быть (роутер без
      * настройки), а файла нет — путь как написан. */
     char rp[PATH_MAX];
+    /* Файл, который спека сейчас (plat_spec_resolve): init-скрипт называет spec.json и тогда,
+     * когда лежит spec.yaml, а клиент без --spec сверяет с тем, что лежит. */
+    const char *sp = plat_spec_resolve(c->srv->cf.spec);
     cb_str(r, ",\"spec_path\":");
-    cb_jstr(r, realpath(c->srv->cf.spec, rp) ? rp : c->srv->cf.spec);
+    cb_jstr(r, realpath(sp, rp) ? rp : sp);
     cb_str(r, ",\"state_dir\":");
     cb_jstr(r, realpath(steer_state_dir(), rp) ? rp : steer_state_dir());
 }
@@ -1269,7 +1272,7 @@ static void srv_spec_changed(struct ctl_srv *s, const char *by, int enabled,
     memset(&ch, 0, sizeof(ch));
     struct cbuf cj = {0};
     if (steerd_load(&s->d) == 0) {
-        supd_spec_changed(s->d.sup, &ch);
+        supd_spec_changed(s->d.sup, &ch, d && d->ruleset);
         changed_json(&cj, d, &ch);
         struct cbuf f = {0};
         cb_fmt(&f, ",\"by\":\"%s\",\"spec\":\"%s\",\"enabled\":%s", by, s->d.fp,
@@ -1420,7 +1423,9 @@ static void apply_planned(struct conn *c, int code) {
     struct ctl_srv *s = c->srv;
     struct job *j = &c->job;
     struct cbuf none = {0};
-    const char *spec = s->cf.spec;
+    /* Тело ложится в тот файл, который спека сейчас (spec.json или spec.yaml): под именем из
+     * --spec рядом со spec.yaml легла бы вторая спека, и следующее чтение отказало бы. */
+    const char *spec = plat_spec_resolve(s->cf.spec);
     if (code != 0 || j->timed_out) {
         unlink(c->tmp);
         if (code < 0) { resp_error(&c->resp, "internal", "не удалось дождаться движка"); conn_reply(c); return; }
@@ -1469,7 +1474,7 @@ static void apply_planned(struct conn *c, int code) {
 static void apply_committed(struct conn *c, int code) {
     struct ctl_srv *s = c->srv;
     struct job *j = &c->job;
-    const char *spec = s->cf.spec;
+    const char *spec = plat_spec_resolve(s->cf.spec);  /* тот же файл, что в apply_planned */
     struct cbuf out, err;
     commit_output(c, &out, &err);
     if (code != 0 || (c->committed && j->timed_out)) {
@@ -1934,7 +1939,7 @@ static void ctl_do_rm_file(struct conn *c, struct cbuf *r) {
         return;
     }
     struct cbuf spec = {0};
-    int have = ctl_read_file(q->cf->spec, &spec, 4 * CTL_BODY_MAX);
+    int have = ctl_read_file(plat_spec_resolve(q->cf->spec), &spec, 4 * CTL_BODY_MAX);
     if (have < 0) {
         resp_error(r, "internal", "не удалось прочитать сохранённую спеку");
     } else if (have == 1 && ctl_spec_mentions(&spec, path)) {
