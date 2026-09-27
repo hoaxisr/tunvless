@@ -25,7 +25,6 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include "spec.h"
-#include "awg.h"   /* имя устройства kind=awg — static inline, без awg.c */
 #include "obfs.h"
 #include "check.h"
 #include "v1.h"
@@ -618,8 +617,9 @@ static int parse_channels(struct js *j, struct spec *s, struct v1_ctx *x, struct
                              * Что теряется при переходе на fakeip: читаемость traceroute.
                              * В real-IP ответ идёт клиенту нетронутым, DNAT нет, ICMP не
                              * переписывается и трассировка показывает настоящие узлы (см.
-                             * dnsd.c). Взамен fakeip даёт точность на домен: в real-IP два
-                             * домена за одним адресом склеиваются, и если они в разных
+                             * ветку real-IP в upstream_answer, src/dnsd/proxy.c). Взамен
+                             * fakeip даёт точность на домен: в real-IP два домена за
+                             * одним адресом склеиваются, и если они в разных
                              * каналах, первый разрешённый решает за оба. Пул поддельных
                              * адресов исчерпать нечем — 198.18.0.0/15 это 131072 адреса
                              * против полутора тысяч имён в самом большом списке. */
