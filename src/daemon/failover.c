@@ -1443,6 +1443,16 @@ void outputs_adopt_active_st(struct spec *sp, struct fo_store *st) {
  * успевал бы завершить рукопожатие. */
 #define RESTART_COOLDOWN 300
 
+/* То же без записи: разрешил бы restart_allowed перезапуск сейчас (fo_pass_defer_revive). */
+static int restart_due(struct fo_store *st, const char *dev) {
+    char name[48];
+    snprintf(name, sizeof(name), "restart-%.32s", dev);
+    FILE *f = st->ops->open_r(st, name);
+    long last = 0;
+    if (f) { if (fscanf(f, "%ld", &last) != 1) last = 0; fclose(f); }
+    return !last || (long)time(NULL) - last >= RESTART_COOLDOWN;
+}
+
 static int restart_allowed(struct fo_store *st, const char *dev) {
     char name[48];
     snprintf(name, sizeof(name), "restart-%.32s", dev);
@@ -1615,6 +1625,8 @@ struct fo_run {
     unsigned grp_alive[MAX_OUTPUTS];
     fo_traffic_fn traffic;            /* трафик через группу — idle_timeout (fostate.h); NULL — нет */
     void *traffic_arg;
+    int defer_rev;                    /* fo_pass_defer_revive: членов групп v2 не оживлять здесь */
+    int rev_wanted;                   /* ...и такое оживление отложено — итог FO_PASS_REVIVE */
 
     /* ---- идущая проба ---- */
     struct {
@@ -2018,6 +2030,22 @@ void fo_pass_traffic(struct fo_run *r, fo_traffic_fn fn, void *arg) {
     if (!r) return;
     r->traffic = fn;
     r->traffic_arg = arg;
+}
+
+void fo_pass_defer_revive(struct fo_run *r) {
+    if (r) r->defer_rev = 1;
+}
+
+/* Выход o — член группы спеки v2 (именованные члены)? */
+static int named_member(const struct spec *sp, const struct output *o) {
+    size_t idx = (size_t)(o - sp->out);
+    for (size_t j = 0; j < sp->out_n; j++) {
+        const struct group_cfg *g = out_group(&sp->out[j]);
+        if (!g || !group_named(g)) continue;
+        for (size_t k = 0; k < g->members_n; k++)
+            if (g->members[k] == idx) return 1;
+    }
+    return 0;
 }
 
 /* ---- шаг выхода: действия после решения (прежний хвост тела цикла failover_pass) ----------- */
@@ -2454,6 +2482,15 @@ static void fo_step(struct fo_run *r) {
              * не оживляет: каждый член — выход со своим проходом, и оживление — в нём. */
             if (!r->chosen && !r->via_down && !r->named) {
                 if (r->cur >= 0) r->cur_dead = 1;   /* ни одно не ответило — и текущее тоже */
+                /* Член группы v2 под сторожем демона — оживление следующим проходом
+                 * (fo_pass_defer_revive): группа, которая идёт после него, не должна ждать
+                 * его ifdown/ifup и шагов ожидания, чтобы уйти на живого члена. */
+                if (r->defer_rev && named_member(sp, o)) {
+                    for (size_t k = 0; k < r->cand_n; k++)
+                        if (restart_due(r->st, r->cand[k]->device)) r->rev_wanted = 1;
+                    r->s = S_FIN;
+                    continue;
+                }
                 r->k = 0;
                 r->s = S_REV;
                 continue;
@@ -2491,7 +2528,7 @@ static void fo_step(struct fo_run *r) {
             /* Строки о переключении — в stdout: у долгоживущего процесса он буферизован, а
              * читают его журнал сервиса и стенды — сразу после прохода. */
             fflush(stdout);
-            run_end(r, 0);
+            run_end(r, r->rev_wanted ? FO_PASS_REVIVE : 0);
             return;
 
         /* ---- одна проба или одно оживление (синхронные обёртки для стенда) ---- */
