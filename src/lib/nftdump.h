@@ -27,6 +27,7 @@
 /* Семейства — числа NFPROTO_* (linux/netfilter.h): inet 1, ip 2, ip6 10. */
 #define NFD_INET 1
 #define NFD_IP   2
+#define NFD_IP6  10
 
 /* Правила перечисленных цепочек таблицы по одному, одним дампом: комментарий (userdata, как его
  * пишет nft; "" — нет), счётчик (has_counter 0 — выражения counter в правиле нет). 0 — таблицу

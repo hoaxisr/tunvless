@@ -118,7 +118,14 @@ check "… interval,timeout (имена кладёт резолвер)" yes "$(h
 check "элементы — без пересечений, у каждого своё сужение" yes "$(has "$T" 'elements = { 192.0.2.0/24 . 17 . 19000-20000, 198.51.100.0/25 . 17 . 50000-65535, 198.51.100.128/25 . 0-255 . 0-65535, 203.0.113.0/25 . 17 . 50000-65535 }')"
 check "правило одно: адрес . протокол . порт" yes "$(has "$T" 'ip saddr { 192.168.1.0/24 } ip daddr . meta l4proto . th dport @vpn_dom_c0_m meta mark set')"
 check "встречный путь — тем же ключом" yes "$(has "$T" 'ip saddr . meta l4proto . th sport @vpn_dom_c0_m counter comment "steer-down:vpn_dom_c0_m"')"
-check "правил у канала одно" 1 "$(grep -c 'comment "steer:' "$tmp/mx_comp.nft")"
+check "правил у канала одно" 1 "$(grep 'comment "steer:' "$tmp/mx_comp.nft" | grep -vc 'ip6 ')"
+# Выход с IPv6: у составного доменного набора — пара IPv6 тем же ключом, и её наполняет резолвер
+# (fake-IP v6), поэтому с timeout; правило — v6-двойник тем же ключом.
+check "… пара IPv6 составного набора — с timeout" yes "$(has "$T" 'set vpn_dom_c0_m6 {
+        type ipv6_addr . inet_proto . inet_service
+        flags interval,timeout')"
+check "… и v6-двойник тем же ключом" 1 \
+    "$(grep 'comment "steer:' "$tmp/mx_comp.nft" | grep -c 'ip6 daddr . meta l4proto . th dport @vpn_dom_c0_m6')"
 check "отдельного x_l4 у правила нет" no "$(has "$T" 'meta l4proto udp')"
 
 # Свои списки канала рядом с набором — в тот же составной набор, со сужением канала (нет —
@@ -213,11 +220,11 @@ check "… подсети набора — в статической полов�
 
 # ---- 11. таблица резолвера: выбор клауз и сужение -------------------------------------------
 tab="$(STEER_NFT_CONCAT=1 "$BIN" dnsd-table --spec "$tmp/mx_comp.json" 2>/dev/null)"
-check "таблица резолвера: составной набор — клаузы с сужением" yes "$(has "$tab" "vpn_dom_c0_m|vpn|0|4|mixed|srs:0=-:$FIX/mixed.srs")"
+check "таблица резолвера: составной набор — клаузы с сужением" yes "$(has "$tab" "vpn_dom_c0_m|vpn|0|46|mixed|srs:0=-:$FIX/mixed.srs")"
 tab="$(STEER_NFT_CONCAT=1 "$BIN" dnsd-table --spec "$tmp/mx_own.json" 2>/dev/null)"
 check "… свои списки канала — с его сужением (cl:)" yes "$(has "$tab" "cl:-:$tmp/own.pfx")"
 tab="$("$BIN" dnsd-table --spec "$tmp/tg_srs.json" 2>/dev/null)"
-check "обычный набор — номера клауз имён" yes "$(has "$tab" "vpn_dom|vpn|0|4|tg|srs:0:$FIX/telegram.srs")"
+check "обычный набор — номера клауз имён" yes "$(has "$tab" "vpn_dom|vpn|0|46|tg|srs:0:$FIX/telegram.srs")"
 
 # ---- 12. большой список со смешанным сужением — деление вместо составного набора -------------
 if command -v python3 >/dev/null 2>&1; then

@@ -302,7 +302,7 @@ check "и байты файла в набор не уехали" "0" "$(printf '
 check "domain channel still tests its set" "1" \
     "$(printf '%s\n' "$dout" | grep 'steer:geo_dom' | grep -c 'ip daddr @geo_dom')"
 check "domain set is declared empty, with timeouts" "1" \
-    "$(printf '%s\n' "$dout" | grep -A3 'set geo_dom' | grep -c 'flags interval,timeout')"
+    "$(printf '%s\n' "$dout" | grep -A3 'set geo_dom {' | grep -c 'flags interval,timeout')"
 check "fake-IP DNAT appears with a domain channel" "1" \
     "$(printf '%s\n' "$dout" | grep -c 'dnat ip to ip daddr map @fakeip')"
 # У разворота fake-IP счётчик обязателен, и это не единообразие ради единообразия.
@@ -404,9 +404,13 @@ cat > "$tmp/xspec.json" <<EOF
 EOF
 mixout="$("$BIN" apply --dry-run --spec "$tmp/xspec.json" --state-dir "$tmp/state-m" 2>&1)"
 check "адреса и домены в одном правиле принимаются" "1" \
-    "$(printf '%s\n' "$mixout" | grep -c 'set vpn_dom')"
+    "$(printf '%s\n' "$mixout" | grep -c 'set vpn_dom {')"
 check "набор смешанного правила с timeout" "1" \
-    "$(printf '%s\n' "$mixout" | grep -c 'flags interval,timeout')"
+    "$(printf '%s\n' "$mixout" | grep -A2 'set vpn_dom {' | grep -c 'flags interval,timeout')"
+# Выход interface несёт IPv6 — у доменной группы парный набор IPv6 с тем же timeout: туда
+# резолвер кладёт поддельные IPv6 (fake-IP v6), docs/architecture.md, «4б».
+check "и парный набор IPv6 доменной группы — тоже с timeout" "1" \
+    "$(printf '%s\n' "$mixout" | grep -A2 'set vpn_dom6 {' | grep -c 'flags interval,timeout')"
 check "и адреса из файла в нём есть" "1" \
     "$(printf '%s\n' "$mixout" | grep -c 'elements = {')"
 check "набора _ip при этом не появилось" "0" \
@@ -423,10 +427,16 @@ cat > "$tmp/twospec.json" <<EOF
   ] }
 EOF
 twoout="$("$BIN" apply --dry-run --spec "$tmp/twospec.json" --state-dir "$tmp/state-two" 2>&1)"
+# Набор IPv4 один; рядом — его парный набор IPv6 (доменная группа выхода с IPv6), и у правила
+# v6-двойник с тем же комментарием — счётчик канала остаётся одним числом.
 check "два правила одного сервиса — один набор" "1" \
+    "$(printf '%s\n' "$twoout" | grep -c '    set vpn_dom {')"
+check "  и его пара IPv6 — единственный второй набор" "2" \
     "$(printf '%s\n' "$twoout" | grep -c '    set ')"
 check "и одно правило в цепочке метки" "1" \
-    "$(printf '%s\n' "$twoout" | grep -c 'comment \"steer:')"
+    "$(printf '%s\n' "$twoout" | grep 'comment \"steer:' | grep -c 'ip daddr @vpn_dom ')"
+check "  и его v6-двойник" "1" \
+    "$(printf '%s\n' "$twoout" | grep 'comment \"steer:' | grep -c 'ip6 daddr @vpn_dom6 ')"
 
 # ---- вывод `steer fit` годен каналу как есть ----------------------------------
 # Фиттер объединяет два соседних адреса, не складывающихся в выровненный префикс, в
@@ -605,7 +615,11 @@ cat > "$tmp/threedom.json" <<EOF
 EOF
 tdout="$("$BIN" apply --dry-run --spec "$tmp/threedom.json" --state-dir "$tmp/state-td" 2>&1)"
 check "fakeip, realip и свои клиенты — три разных набора" "3" \
-    "$(printf '%s\n' "$tdout" | sed -n 's/^    set \([a-z0-9_]*\) .*/\1/p' | sort -u | wc -l)"
+    "$(printf '%s\n' "$tdout" | sed -n 's/^    set \([a-z0-9_]*\) .*/\1/p' | grep -v '6$' | sort -u | wc -l)"
+# Половина IPv6 — у fakeip и realip клиентов по умолчанию, но не у клиента из одного адреса
+# IPv4: его IPv6 правилом не узнать, и резолвер отвечает на AAAA его имён пустым ответом.
+check "  пары IPv6 — у fakeip и realip, у клиента из адреса IPv4 — нет" "vpn_dom6 vpn_dom_c0r6" \
+    "$(printf '%s\n' "$tdout" | sed -n 's/^    set \([a-z0-9_]*6\) .*/\1/p' | sort | paste -sd' ')"
 
 # Канал «весь трафик» рядом со списочным того же выхода: раньше они сливались в одну
 # группу, правило получало имя _ip и начинало проверять набор — то есть «весь трафик этой
@@ -930,6 +944,10 @@ sig1="$("$BIN" dnsd-sig --spec "$tmp/dspec.json" --state-dir "$tmp/state-sig" 2>
 check "подпись печатается по строке на доменный канал" "1" "$(printf '%s\n' "$sig1" | grep -c .)"
 check "в строке набор, режим и файл" "1" \
     "$(printf '%s\n' "$sig1" | grep -c '^[a-z0-9_]*_dom|[01]|')"
+# Семейства канала — тоже в подписи: половина IPv6 правила (выход сменили на несущий IPv6)
+# меняет таблицу каналов, а HUP её не пересобирает.
+check "в строке — семейства канала (4 или 46)" "1" \
+    "$(printf '%s\n' "$sig1" | grep -Ec '^[a-z0-9_]*_dom\|[01]\|(4|46)\|')"
 sig2="$("$BIN" dnsd-sig --spec "$tmp/dspec.json" --state-dir "$tmp/state-sig" 2>/dev/null)"
 check "повторный вызов даёт то же самое — иначе HUP не выбрать никогда" "$sig1" "$sig2"
 # Другой файл списка — другая таблица: перечень файлов берётся из спеки при запуске, и HUP
@@ -1396,9 +1414,9 @@ spec <<'EOF'
   ] }
 EOF
 hsig="$("$BIN" dnsd-sig --spec "$tmp/spec.json" --state-dir "$tmp/st-dch" 2>/dev/null)"
-check "гибридный канал в доменной группе соседа" "vpn_dom|0|$tmp/dcnames.lst|$tmp/dc.lst" "$hsig"
+check "гибридный канал в доменной группе соседа" "vpn_dom|0|46|$tmp/dcnames.lst|$tmp/dc.lst" "$hsig"
 hout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-dch" 2>/dev/null)"
-check "и компилятор завёл ровно эти наборы" "set vpn_dom {|set vpn_ip_c0_p1 {" \
+check "и компилятор завёл ровно эти наборы" "set vpn_dom {|set vpn_dom6 {|set vpn_ip_c0_p1 {" \
     "$(printf '%s\n' "$hout" | grep -o 'set [a-z0-9_]* {' | paste -sd'|')"
 # Встречный путь: клиент — ПОЛУЧАТЕЛЬ, значит порт сервера здесь исходящий. Без зеркала
 # счётчик скачанного считал бы и тот TCP, который правило разметки не берёт, — то есть
@@ -1672,8 +1690,11 @@ check "legacy: exthdr exists не ставится (4.9 грузит вмест�
 check "legacy: dnat по карте без слова ip" "1" \
     "$(printf '%s\n' "$lout" | grep -c 'dnat to ip daddr map @fakeip')"
 check "legacy: ip6 без пробы не собирается" "0" "$(printf '%s\n' "$lout" | grep -c '^table ip6 ')"
-check "legacy: сказано, чего не будет (notrack дважды и IPv6)" "3" \
+# Четвёртая строка (1.9) — у доменных правил fake-IP без nat в ip6 нет IPv6: AAAA гасится.
+check "legacy: сказано, чего не будет (notrack дважды, IPv6 и fake-IP v6)" "4" \
     "$(grep -c 'не знает notrack\|nat для IPv6' "$tmp/legacy.err")"
+check "legacy: про fake-IP v6 — отдельной строкой" "1" \
+    "$(grep -c 'у доменных правил fake-IP нет IPv6' "$tmp/legacy.err")"
 # Современная раскладка той же спеки — прежний текст: ни одной строки старой раскладки.
 mout="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run --spec "$tmp/legacy.json" \
         --state-dir "$tmp/st-legacy" 2>/dev/null)"

@@ -26,6 +26,7 @@
 #include "srs.h"
 #include "ctl.h"
 #include "groups.h"
+#include "legacy.h"
 #include "daemon.h"
 
 /* Дописать адресный список в группу, растя вектор вдвое. Отказ памяти здесь — это «правила
@@ -283,6 +284,10 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
         else
             group_set_name(sp, g->name, sizeof(g->name), g->out, g->domains ? "dom" : "ip",
                            g->from, g->from_n, g->realip, g->l4);
+        /* Половина IPv6 доменной группы — тем же решением, что у резолвера (dom6_ok): он
+         * кладёт адреса в «<имя>6», только если у группы есть набор и правило IPv6. */
+        const struct output *o = out_by_name(sp, g->out);
+        g->dom6 = g->domains && o && dom6_ok(sp, o, g->from, g->from_n, g->realip, g_nftc);
     }
     /* Страховка, а не проверка входа: имя обязано быть уникальным по построению, и если
      * оно всё-таки повторилось — значит различитель не различил (например, два имени
@@ -305,6 +310,12 @@ int has_domains(const struct groups *gr) {
 int has_fakeip(const struct groups *gr) {
     for (size_t i = 0; i < gr->n; i++)
         if (gr->g[i].domains && !gr->g[i].realip) return 1;
+    return 0;
+}
+
+int has_fakeip6(const struct groups *gr) {
+    for (size_t i = 0; i < gr->n; i++)
+        if (gr->g[i].dom6 && !gr->g[i].realip) return 1;
     return 0;
 }
 

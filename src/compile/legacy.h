@@ -9,8 +9,8 @@
 #include "ir.h"
 
 /* Раскладка набора правил этого запуска — флаги NFTC_* из nft_compat. Ставит cmd_apply
- * перед генерацией; читают и apply.c (report_legacy_gaps), и diag.c, и explain.c — ноль
- * значит современное ядро. */
+ * перед build_groups (от неё зависит половина IPv6 доменных групп, поле dom6); читают и
+ * apply.c (report_legacy_gaps), и diag.c, и explain.c — ноль значит современное ядро. */
 extern int g_nftc;
 #define NFT_LEGACY (g_nftc & NFTC_LEGACY)
 

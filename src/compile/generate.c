@@ -480,7 +480,7 @@ static void build_group_sets(struct nft_table *t, const struct groups *gr) {
             if (group_has_set6(g)) {
                 struct nft_set *s6 = ir_set_add(t, n6, "ipv6_addr . inet_proto . inet_service");
                 if (!s6) return;
-                s6->flags = NFT_SET_INTERVAL;
+                s6->flags = NFT_SET_INTERVAL | (g->dom6 ? NFT_SET_TIMEOUT : 0);
                 set_add_mixed(t, s6, g, 6);
             }
             continue;
@@ -519,13 +519,15 @@ static void build_group_sets(struct nft_table *t, const struct groups *gr) {
             set_add_srs(t, x, g, 1, 4);
         }
         /* Парный набор IPv6 (docs/architecture.md, «4б»): строки IPv6 тех же файлов и подсети
-         * IPv6 тех же наборов .srs. Флаг timeout ему не нужен: адресов резолвер в него пока не
-         * кладёт (AAAA для имён под правилом подавлены до fake-IP v6), и элементы в нём —
-         * только постоянные. */
+         * IPv6 тех же наборов .srs. У доменной группы с половиной IPv6 (dom6) его наполняет и
+         * резолвер — поддельными адресами IPv6 (навсегда) и настоящими из ответов AAAA (со
+         * сроком ответа), поэтому флаг timeout, как у набора IPv4 доменной группы. На старом
+         * ядре такой набор делится надвое тем же шагом, что набор IPv4 (legacy.c). Без dom6
+         * элементы в нём только постоянные, и флага нет. */
         if (group_has_set6(g)) {
             struct nft_set *s6 = ir_set_add(t, n6, "ipv6_addr");
             if (!s6) return;
-            s6->flags = NFT_SET_INTERVAL;
+            s6->flags = NFT_SET_INTERVAL | (g->dom6 ? NFT_SET_TIMEOUT : 0);
             s6->auto_merge = 1;
             if (g->addrs6)
                 for (size_t k = 0; k < g->files_n; k++) ir_set_file(s6, g->files[k]);
@@ -912,18 +914,33 @@ static void build_dns_redirect(struct nft_table *t, const struct spec *sp) {
  * (Tailscale, ZeroTier): 198.18.0.0/15 уходит в туннель, только если роутер
  * объявил этот диапазон маршрутом, и по умолчанию он его не объявляет. Из
  * локальной сети вопрос не встаёт вовсе — там роутер и есть шлюз. */
-static void build_fakeip(struct nft_table *t) {
+static void build_fakeip(struct nft_table *t, int v6) {
     struct nft_set *m = ir_map_add(t, "fakeip", "ipv4_addr", "ipv4_addr");
     ir_gap(m);
     char path[512];
-    if (snprintf(path, sizeof(path), "%s/fakeip.state", steer_state_dir()) < (int)sizeof(path))
-        ir_set_fakeip_state(m, path);
-    struct nft_rule *r = ir_rule(ir_base_chain_add(t, "prerouting_dnat", "nat", "prerouting",
-                                                   "dstnat", 0));
+    int have_path = snprintf(path, sizeof(path), "%s/fakeip.state", steer_state_dir()) <
+                    (int)sizeof(path);
+    if (have_path) ir_set_fakeip_state(m, path);
+    /* Карта fake-IP v6 (docs/architecture.md, «4б»): поддельный IPv6 из пула FAKEIP6_NET →
+     * настоящий адрес из ответа AAAA. Засевается из того же файла состояния (четвёртое поле —
+     * см. fakeip.c). Только когда есть доменная группа fake-IP с половиной IPv6: иначе резолвер
+     * поддельных IPv6 не выдаёт, и спека без IPv6 даёт прежний набор правил до байта. */
+    if (v6) {
+        struct nft_set *m6 = ir_map_add(t, "fakeip6", "ipv6_addr", "ipv6_addr");
+        if (m6 && have_path) ir_set_fakeip_state(m6, path);
+    }
+    struct nft_chain *c = ir_base_chain_add(t, "prerouting_dnat", "nat", "prerouting", "dstnat", 0);
+    struct nft_rule *r = ir_rule(c);
     ir_rule_fam(r, 4);
     ir_x(r, "ip daddr 198.18.0.0/15");
     ir_counter(r, 0, 0);
     ir_dnat(r, "ip daddr", "fakeip");
+    if (!v6) return;
+    r = ir_rule(c);
+    ir_rule_fam(r, 6);
+    ir_x(r, "ip6 daddr " FAKEIP6_NET);
+    ir_counter(r, 0, 0);
+    ir_dnat(r, "ip6 daddr", "fakeip6");
 }
 
 /* Make traceroute show the REAL intermediate routers while the destination
@@ -1028,6 +1045,15 @@ void nft_emit_output_dns(struct nft_rs *rs, const struct spec *sp, const struct 
     ir_x(r, "ip daddr 198.18.0.0/15");
     ir_counter(r, 0, 0);
     ir_dnat(r, "ip daddr", "fakeip");
+    ir_comment(r, "steer-fakeip-local");
+    /* Поддельные IPv6 — тем же правилом по карте fakeip6 (только когда она есть; на старом ядре
+     * без nat в ip6 её нет — dom6_ok). */
+    if (!has_fakeip6(gr)) return;
+    r = ir_rule(c);
+    ir_rule_fam(r, 6);
+    ir_x(r, "ip6 daddr " FAKEIP6_NET);
+    ir_counter(r, 0, 0);
+    ir_dnat(r, "ip6 daddr", "fakeip6");
     ir_comment(r, "steer-fakeip-local");
 }
 
@@ -1242,7 +1268,7 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
      * по СТОИМОСТИ, а не по смыслу, и переворачиваться он может свободно — ни один
      * чужой ключ от него не зависит. */
     if (has_domains(gr)) {
-        if (has_fakeip(gr)) build_fakeip(t);
+        if (has_fakeip(gr)) build_fakeip(t, has_fakeip6(gr));
         if (plat()->local_channels && has_local_domains(gr)) nft_emit_output_dns(rs, sp, gr);
         if (sp->traceroute_hops) build_traceroute_raw(t);
     }

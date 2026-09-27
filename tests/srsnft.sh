@@ -73,8 +73,11 @@ nft -f "$tmp/rs.nft" 2> "$tmp/load.err"
 check "ядро приняло набор правил с составным набором" 0 "$?"
 [ -s "$tmp/load.err" ] && cat "$tmp/load.err"
 
+# Сумма по правилам канала: у доменной группы выхода с IPv6 рядом с правилом IPv4 стоит его
+# v6-двойник с тем же комментарием (1.9, fake-IP v6), и счётчик канала — их сумма.
 cnt() { nft list chain inet steer prerouting_mark 2>/dev/null |
-        sed -n 's/.*counter packets \([0-9]*\) .*comment "steer:vpn_dom_c0_m".*/\1/p'; }
+        sed -n 's/.*counter packets \([0-9]*\) .*comment "steer:vpn_dom_c0_m".*/\1/p' |
+        awk '{ s += $1 } END { print s + 0 }'; }
 udp() { inc python3 -c "import socket,sys; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.sendto(b'x',('$1',$2))"; }
 tcp() { inc python3 -c "
 import socket

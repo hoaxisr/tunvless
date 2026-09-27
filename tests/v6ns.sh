@@ -194,6 +194,117 @@ check "  клиент снова ходит в туннель" "ok" "$(ping6c 20
 kill "$D" 2>/dev/null
 wait "$D" 2>/dev/null
 
+# ---- доменные правила по IPv6: fake-IP v6 и real-ip v6 ----
+# Имя fake.test — адрес 2001:db8:7::1, имя real.test — 2001:db8:8::1; оба адреса есть ТОЛЬКО за
+# туннелем. Клиент спрашивает резолвер (он на роутере, наверху — поддельный апстрим на петле):
+#   fake-IP: получает поддельный IPv6 из пула, пинг по нему доходит до цели — значит правило
+#            v6-двойник пометило поддельный адрес (набор «<канал>6»), а dnat по карте fakeip6
+#            перевёл его в настоящий, и маршрут метки увёл пакет в туннель;
+#   real-ip: получает настоящий адрес, он лежит в наборе «<канал>6» со сроком, пинг — в туннель.
+if command -v python3 >/dev/null 2>&1; then
+    $IT ip addr add 2001:db8:7::1/128 dev t1 nodad
+    $IT ip addr add 2001:db8:8::1/128 dev t1 nodad
+    check "без доменных правил: адрес real.test недостижим (он только за туннелем)" "нет" \
+        "$(ping6c 2001:db8:8::1)"
+    printf 'fake.test\n' > "$tmp/f.lst"
+    printf 'real.test\n' > "$tmp/r.lst"
+    cat > "$tmp/dspec.json" <<EOF
+{ "schema": 2, "lan_devices": ["r0"],
+  "outputs": { "wg": { "kind": "interface", "device": "t0", "on_fail": "drop" },
+               "tg": { "kind": "tgws", "domain": "example.com" } },
+  "channels": [ { "name": "a", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "wg" },
+                { "name": "t", "match": { "prefixes_file": "$tmp/t.lst" }, "out": "tg" },
+                { "name": "f", "match": { "domains_files": ["$tmp/f.lst"] }, "out": "wg" },
+                { "name": "r", "match": { "domains_files": ["$tmp/r.lst"], "mode": "realip" },
+                  "out": "wg" } ] }
+EOF
+    DS="--spec $tmp/dspec.json --state-dir $tmp/st"
+    "$BIN" apply $DS >"$tmp/apply-d.out" 2>&1
+    check "apply с доменными правилами и IPv6 проходит" "0" "$?"
+    tabd="$("$BIN" dnsd-table $DS 2>/dev/null)"
+    set_f="$(printf '%s\n' "$tabd" | awk -F'|' '$5 == "f" { print $1 }')"
+    set_r="$(printf '%s\n' "$tabd" | awk -F'|' '$5 == "r" { print $1 }')"
+    check "  карта fakeip6 в ядре" "0" "$(nft list map inet steer fakeip6 >/dev/null 2>&1; echo $?)"
+    check "  парный набор IPv6 доменной группы — с timeout" "1" \
+        "$(nft list set inet steer "${set_r}6" 2>/dev/null | grep -c 'flags interval,timeout')"
+    cat > "$tmp/up.py" <<'PY'
+import socket, sys
+A = {b'\x04fake\x04test\x00': '2001:db8:7::1', b'\x04real\x04test\x00': '2001:db8:8::1'}
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+while True:
+    data, addr = s.recvfrom(2048)
+    qend = 12
+    while data[qend]: qend += 1 + data[qend]
+    name = data[12:qend + 1]
+    qtype = data[qend + 1] << 8 | data[qend + 2]
+    qend += 5
+    if qtype == 28 and name in A:
+        n, ans = 1, b'\xc0\x0c\x00\x1c\x00\x01\x00\x00\x00\x3c\x00\x10' + \
+            socket.inet_pton(socket.AF_INET6, A[name])
+    elif qtype == 1:
+        n, ans = 1, b'\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04' + bytes([203, 0, 113, 7])
+    else:
+        n, ans = 0, b''
+    hdr = data[:2] + b'\x81\x80' + data[4:6] + bytes([0, n, 0, 0, 0, 0])
+    s.sendto(hdr + data[12:qend] + ans, addr)
+PY
+    cat > "$tmp/q6.py" <<'PY'
+import socket, struct, sys
+server, port, name = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+q = struct.pack('>HHHHHH', 0x5a5a, 0x0100, 1, 0, 0, 0)
+for l in name.split('.'): q += bytes([len(l)]) + l.encode()
+q += b'\x00' + struct.pack('>HH', 28, 1)
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.settimeout(3)
+s.sendto(q, (server, port))
+try:
+    d, _ = s.recvfrom(2048)
+except socket.timeout:
+    print("timeout"); sys.exit()
+if struct.unpack('>H', d[6:8])[0] == 0: print("empty")
+else: print(socket.inet_ntop(socket.AF_INET6, d[-16:]))
+PY
+    python3 "$tmp/up.py" 15393 >/dev/null 2>&1 & UP=$!
+    "$BIN" dnsd $DS --listen-port 15390 --upstream-port 15393 >"$tmp/dnsd.out" 2>&1 & DN=$!
+    pids="$pids $UP $DN"
+    sleep 1
+    fk="$($IC python3 "$tmp/q6.py" fd00:1::1 15390 fake.test)"
+    check "fake-IP v6: клиент получил поддельный IPv6 из пула" "fdfe:dcba:9876::c612" \
+        "$(echo "$fk" | sed 's/:[0-9a-f]*$//')"
+    check "  в карте fakeip6 — настоящий адрес" "1" \
+        "$(nft list map inet steer fakeip6 | grep -c "$fk : 2001:db8:7::1")"
+    check "  поддельный IPv6 — в наборе правила" "1" \
+        "$(nft list set inet steer "${set_f}6" | grep -c "$fk")"
+    check "  клиент по поддельному IPv6 доходит до цели (dnat v6 и туннель)" "ok" "$(ping6c "$fk")"
+    check "  счётчик dnat v6 растёт" "yes" \
+        "$(nft list chain inet steer prerouting_dnat | grep '@fakeip6' | grep -q 'packets [1-9]' && echo yes || echo no)"
+    rl="$($IC python3 "$tmp/q6.py" fd00:1::1 15390 real.test)"
+    check "real-ip v6: клиент получил настоящий адрес" "2001:db8:8::1" "$rl"
+    check "  адрес — в наборе «<канал>6» со сроком" "1" \
+        "$(nft list set inet steer "${set_r}6" | grep '2001:db8:8::1' | grep -c timeout)"
+    check "  клиент по нему доходит до цели через туннель" "ok" "$(ping6c 2001:db8:8::1)"
+    # explain по адресам IPv6: поддельный — с именем, которому он выдан; настоящий из real-ip;
+    # подсеть списка; правило в выход без IPv6 — с пометкой, что такой трафик отбрасывается.
+    ex="$("$BIN" explain "$fk" $DS 2>/dev/null)"
+    check "explain fake6: доменное правило и выход" "1" \
+        "$(printf '%s\n' "$ex" | grep -c "^$fk -> domain set \"${set_f}\" -> output \"wg\" -> dev t0")"
+    check "  и имя, которому выдан адрес" "1" \
+        "$(printf '%s\n' "$ex" | grep -c 'поддельный адрес имени fake.test')"
+    check "explain real-ip v6: правило real-ip" "1" \
+        "$("$BIN" explain 2001:db8:8::1 $DS 2>/dev/null | grep -c "domain set \"${set_r}\" -> output \"wg\"")"
+    # Адресный список «a» и доменный «f» — один выход и одни клиенты, то есть одна группа и один
+    # набор (гибридный): подсеть списка лежит в его паре IPv6.
+    check "explain подсети IPv6 списка" "1" \
+        "$("$BIN" explain 2001:db8:1::9 $DS 2>/dev/null | grep -c "address+domain set \"${set_f}\" -> output \"wg\"")"
+    check "explain IPv6 правила в выход без IPv6 — отбрасывается" "1" \
+        "$("$BIN" explain 2001:db8:5::1 $DS 2>/dev/null | grep -c 'выход без IPv6')"
+    kill "$DN" "$UP" 2>/dev/null
+    wait "$DN" 2>/dev/null
+    [ "$fail" -gt 0 ] && tail -n 20 "$tmp/dnsd.out"
+else
+    echo "v6ns: python3 нет — доменные правила по IPv6 пропущены"
+fi
+
 # ---- steer down ----
 "$BIN" down --state-dir "$tmp/st" >/dev/null 2>&1
 check "steer down: правила IPv6 выхода нет" "0" "$(ours6)"

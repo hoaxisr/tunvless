@@ -48,6 +48,9 @@ static void build(struct ruleset *rs, const char *const *lines) {
 }
 
 int main(void) {
+    /* Раскладка ядра — современная, без пробы nft: от неё зависит половина IPv6 каналов
+     * fake-IP (dom6_ok), и стенд не должен зависеть от машины. */
+    setenv("STEER_NFT_COMPAT", "modern", 1);
     {
         static const char *const lines[] = { "youtube.com", "=exact.example", NULL };
         struct ruleset rs;
@@ -477,7 +480,7 @@ int main(void) {
 
                 /* Снимок ровно того, что tabfmt_build напечатала (dch_build уже отработал
                  * внутри неё), — «дч_build по спеке» из требования стенда. */
-                struct { char set[64], out[32], chan[32]; int realip; size_t rules_n;
+                struct { char set[64], out[32], chan[32]; int realip, fam; size_t rules_n;
                          char rules_path[MAX_FILES][256]; } snap[MAX_RULES];
                 size_t snap_n = g_dch_n;
                 for (size_t i = 0; i < snap_n; i++) {
@@ -489,12 +492,20 @@ int main(void) {
                     memcpy(snap[i].out, g_dch[i].out, sizeof(snap[i].out));
                     memcpy(snap[i].chan, g_dch[i].chan, sizeof(snap[i].chan));
                     snap[i].realip = g_dch[i].realip;
+                    snap[i].fam = g_dch[i].fam;
                     snap[i].rules_n = g_dch[i].rules_n;
                     for (size_t k = 0; k < g_dch[i].rules_n; k++)
                         snprintf(snap[i].rules_path[k], sizeof(snap[i].rules_path[k]),
                                  "%s", g_dch[i].rules_path[k]);
                 }
                 check("формат таблицы: dch_build дал два канала", 2, (int)snap_n);
+                /* Выход interface несёт IPv6, клиенты по умолчанию — устройствами: у обоих
+                 * каналов (fake-IP и real-ip) половина IPv6 есть, и таблица говорит «46». */
+                for (size_t i = 0; i < snap_n; i++)
+                    check("формат таблицы: канал выхода с IPv6 — семейства 4 и 6",
+                          DCH_V4 | DCH_V6, snap[i].fam);
+                check("формат таблицы: строка канала несёт «|46|»", 1,
+                      text && strstr(text, "|0|46|web") != NULL);
 
                 /* g_dch сейчас держит указатели ВНУТРЬ cfg (dch_build, table.c: rules_path —
                  * заимствованные строки спеки, никем не malloc'нутые). tabfmt_parse же исходит
@@ -522,6 +533,8 @@ int main(void) {
                     check(what, 0, strcmp(snap[i].chan, g_dch[i].chan));
                     snprintf(what, sizeof(what), "формат таблицы: канал %zu, realip", i);
                     check(what, snap[i].realip, g_dch[i].realip);
+                    snprintf(what, sizeof(what), "формат таблицы: канал %zu, семейства", i);
+                    check(what, snap[i].fam, g_dch[i].fam);
                     snprintf(what, sizeof(what), "формат таблицы: канал %zu, число файлов", i);
                     check(what, (int)snap[i].rules_n, (int)g_dch[i].rules_n);
                     for (size_t k = 0; k < snap[i].rules_n && k < g_dch[i].rules_n; k++) {
@@ -547,22 +560,16 @@ int main(void) {
                       tabfmt_parse("0\n", 2));
                 check("формат таблицы: пустая таблица — ноль каналов", 0, (int)g_dch_n);
 
-                /* ЗАДЕЛ ПОД IPv6 (решение владельца, 1.9): поле family — «4», «6» или «46».
-                 * dch_build/tabfmt_build сегодня пишут только «4» (проверено выше — оба канала
-                 * из спеки), но РАЗБОР обязан понимать все три уже сейчас, не дожидаясь, пока
-                 * резолвер научится IPv6 сам (см. tabfmt.h). */
+                /* Поле family — «4», «6» или «46» (1.9, IPv6): все три принимаются целиком, без
+                 * предупреждений, и ложатся в поле fam канала. */
                 {
-                    /* Чистая «6» — резолверу нечем: набора и fake-IP под IPv6 у него нет.
-                     * Канал не должен попасть в g_dch, но разбор — не отказ (это не испорченный
-                     * текст, а законное значение поля, для которого резолвер честно говорит
-                     * «не умею»). */
                     static const char v6only[] = "1\nsix_set|out1|0|6|six\n";
                     check("формат таблицы: family=6 — разбор не отказывает", 0,
                           tabfmt_parse(v6only, sizeof(v6only) - 1));
-                    check("формат таблицы: family=6 — канал не заведён", 0, (int)g_dch_n);
+                    check("формат таблицы: family=6 — канал заведён", 1, (int)g_dch_n);
+                    if (g_dch_n == 1)
+                        check("формат таблицы: family=6 — только IPv6", DCH_V6, g_dch[0].fam);
 
-                    /* «46» — v4-часть работает как обычно, участвует v6 или нет — тут не
-                     * проверяется (её попросту ещё нет), только то, что КАНАЛ остаётся. */
                     static const char dual[] = "1\nboth_set|out1|0|46|both\n";
                     check("формат таблицы: family=46 — разбор не отказывает", 0,
                           tabfmt_parse(dual, sizeof(dual) - 1));
@@ -570,7 +577,14 @@ int main(void) {
                     if (g_dch_n == 1) {
                         check("формат таблицы: family=46 — набор тот, что в строке", 0,
                               strcmp(g_dch[0].set, "both_set"));
+                        check("формат таблицы: family=46 — оба семейства", DCH_V4 | DCH_V6,
+                              g_dch[0].fam);
                     }
+                    static const char v4[] = "1\nfour_set|out1|0|4|four\n";
+                    check("формат таблицы: family=4 — разбор не отказывает", 0,
+                          tabfmt_parse(v4, sizeof(v4) - 1));
+                    if (g_dch_n == 1)
+                        check("формат таблицы: family=4 — только IPv4", DCH_V4, g_dch[0].fam);
 
                     /* Ни «4», ни «6», ни «46» — испорченный текст, а не неизвестное будущее
                      * значение: формат обязан отказать, а не молча решить что-нибудь за
@@ -653,6 +667,136 @@ int main(void) {
         check("TC снят", 0, out[2] & 0x02);
         check("AD снят", 0, out[3] & 0x20);
         check("QR стоит", 0x80, out[2] & 0x80);
+    }
+
+    /* ---- fake-IP v6 и real-ip v6 (docs/architecture.md, «4б») ---------------------------
+     *
+     * Пул fake-IP v6 — пара к IPv4: fdfe:dcba:9876::/96 и поддельный IPv4 в младших 32 битах.
+     * Проверяется то, что ломается молча: пара совпадает в обе стороны, у записи один и тот же
+     * адрес на оба семейства, первый выданный — не адрес сети; файл состояния с четвёртым полем
+     * читается и пишется, прежний формат — тоже, испорченный IPv6 не губит строку; разбор AAAA
+     * ответа и сборка ответа с поддельным IPv6. */
+    {
+        uint8_t a6[16];
+        fakeip6_of(0xC6120005u, a6);
+        char s6[INET6_ADDRSTRLEN] = "";
+        inet_ntop(AF_INET6, a6, s6, sizeof(s6));
+        check_str("fake6: пара 198.18.0.5", "fdfe:dcba:9876::c612:5", s6);
+        check("fake6: обратно — тот же IPv4", 1, fakeip6_to4(a6) == 0xC6120005u);
+        uint8_t other[16];
+        inet_pton(AF_INET6, "fdfe:dcba:9876::c0a8:1", other);
+        check("fake6: адрес префикса вне 198.18/15 — не поддельный", 0, (int)fakeip6_to4(other));
+        inet_pton(AF_INET6, "2001:db8::c612:5", other);
+        check("fake6: чужой префикс — не поддельный", 0, (int)fakeip6_to4(other));
+
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        g_fakeip_next = 1;
+        g_fakeip_state_path = NULL;
+        uint32_t a = 0;
+        fakeip_lookup_or_alloc("v6.test", &a);
+        fakeip6_of(a, a6);
+        check("fake6: первая выдача — не адрес сети пула", 1, a6[15] != 0 || a6[14] != 0);
+        check("fake6: у записи ещё нет настоящего IPv6", 1, fakeip_entry_get_real6("v6.test") == NULL);
+        uint8_t r6[16];
+        inet_pton(AF_INET6, "2001:db8::77", r6);
+        fakeip_entry_set_real6("v6.test", r6);
+        const uint8_t *got6 = fakeip_entry_get_real6("v6.test");
+        check("fake6: настоящий IPv6 запомнен", 1, got6 && !memcmp(got6, r6, 16));
+        check("fake6: IPv4 записи не тронут", 0, (int)fakeip_entry_get_real("v6.test"));
+
+        char dir[] = "/tmp/dnsmatch-f6.XXXXXX";
+        if (!mkdtemp(dir)) { perror("mkdtemp"); return 2; }
+        char path[768];
+        snprintf(path, sizeof(path), "%s/fakeip.state", dir);
+        g_fakeip_state_path = path;
+        fakeip_state_rewrite();
+        FILE *f = fopen(path, "r");
+        char line[512] = "";
+        if (f) { if (!fgets(line, sizeof(line), f)) line[0] = '\0'; fclose(f); }
+        char want[256];
+        struct in_addr ia; ia.s_addr = htonl(a);
+        snprintf(want, sizeof(want), "v6.test\t%s\t-\t2001:db8::77\n", inet_ntoa(ia));
+        check_str("состояние: строка с IPv6 и без IPv4 — «-» на месте IPv4", want, line);
+
+        f = fopen(path, "w");
+        fputs("old.test\t198.18.0.9\t93.184.216.34\n"
+              "both.test\t198.18.0.10\t93.184.216.35\t2001:db8::a\n"
+              "only6.test\t198.18.0.11\t-\t2001:db8::b\n"
+              "bad6.test\t198.18.0.12\t93.184.216.36\tне-адрес\n", f);
+        fclose(f);
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        g_fakeip_next = 1;
+        fakeip_state_load(path);
+        check("состояние: все четыре строки загружены", 4, (int)g_fakeip.n);
+        check("состояние: прежняя трёхполевая — IPv4 есть, IPv6 нет", 1,
+              fakeip_entry_get_real("old.test") == 0x5DB8D822u && !fakeip_entry_get_real6("old.test"));
+        uint8_t w6[16];
+        inet_pton(AF_INET6, "2001:db8::a", w6);
+        got6 = fakeip_entry_get_real6("both.test");
+        check("состояние: четырёхполевая — оба настоящих", 1,
+              fakeip_entry_get_real("both.test") == 0x5DB8D823u && got6 && !memcmp(got6, w6, 16));
+        check("состояние: «-» — IPv4 не известен, IPv6 есть", 1,
+              fakeip_entry_get_real("only6.test") == 0 && fakeip_entry_get_real6("only6.test"));
+        check("состояние: испорченный IPv6 — строка цела, IPv4 есть", 1,
+              fakeip_entry_get_real("bad6.test") == 0x5DB8D824u && !fakeip_entry_get_real6("bad6.test"));
+        size_t routed = 0;
+        fakeip_rehydrate(-1, &routed);
+        check("восстановление без ядра: настоящий IPv6 сброшен — быстрый путь AAAA закрыт", 1,
+              !fakeip_entry_get_real6("both.test") && !fakeip_entry_get_real6("only6.test"));
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        g_fakeip_next = 1;
+        g_fakeip_state_path = NULL;
+        unlink(path);
+        rmdir(dir);
+
+        /* Ответ апстрима с A и двумя AAAA: A считаются как прежде, AAAA — отдельно. */
+        uint8_t resp[160] = { 0x12, 0x34, 0x81, 0x80, 0, 1, 0, 3, 0, 0, 0, 0,
+                              1, 'a', 0, 0, 28, 0, 1 };
+        size_t pos = 19;
+        static const uint8_t rr_a[] = { 0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4 };
+        memcpy(resp + pos, rr_a, sizeof(rr_a)); pos += sizeof(rr_a);
+        for (int k = 0; k < 2; k++) {
+            static const uint8_t hd[] = { 0xC0, 0x0C, 0, 28, 0, 1, 0, 0, 1, 0, 0, 16 };
+            memcpy(resp + pos, hd, sizeof(hd)); pos += sizeof(hd);
+            uint8_t ad[16];
+            inet_pton(AF_INET6, k ? "2001:db8::2" : "2001:db8::1", ad);
+            memcpy(resp + pos, ad, 16); pos += 16;
+        }
+        char qn[MAX_HOSTNAME];
+        uint16_t qt = 0;
+        size_t qe = 0;
+        struct answer_ip ips[4];
+        struct answer_ip6 ips6[4];
+        int n6 = -1;
+        int n4 = parse_response(resp, pos, qn, sizeof(qn), &qt, &qe, ips, 4, ips6, 4, &n6);
+        check("AAAA: записей A — одна", 1, n4);
+        check("AAAA: записей AAAA — две", 2, n6);
+        uint8_t w2[16];
+        inet_pton(AF_INET6, "2001:db8::2", w2);
+        check("AAAA: второй адрес и срок", 1, n6 == 2 && !memcmp(ips6[1].addr, w2, 16) &&
+                                             ips6[1].ttl == 256);
+        check("AAAA: тип вопроса", 28, qt);
+        uint8_t out[512];
+        size_t len = build_rewritten_response6(resp, qe, out, sizeof(out), a6);
+        check("ответ с fake6: длина — вопрос и одна запись AAAA", (int)(qe + 28), (int)len);
+        check("ответ с fake6: одна запись", 1, len ? out[7] : -1);
+        check("ответ с fake6: тип AAAA, длина 16", 1,
+              len && out[qe + 3] == 28 && out[qe + 11] == 16 && !memcmp(out + qe + 12, a6, 16));
+
+        /* Половина IPv6 имени: все совпавшие каналы обязаны её нести. */
+        memset(g_dch, 0, sizeof(g_dch));
+        g_dch_n = 3;
+        g_dch[0].fam = DCH_V4 | DCH_V6;
+        g_dch[1].fam = DCH_V4 | DCH_V6;
+        g_dch[2].fam = DCH_V4;
+        check("dch_all_v6: оба канала с IPv6", 1, dch_all_v6(3));
+        check("dch_all_v6: среди совпавших канал без IPv6 — нет", 0, dch_all_v6(5));
+        check("dch_all_v6: пусто — нет", 0, dch_all_v6(0));
+        memset(g_dch, 0, sizeof(g_dch));
+        g_dch_n = 0;
     }
 
     /* ---- ожидания: номер транзакции и отпечаток вопроса ----------------------------

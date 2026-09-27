@@ -33,4 +33,17 @@ int nft_concat_element(int add, const char *set_name, uint32_t addr_host,
 int nft_map_set_element(const char *map_name, uint32_t fake_host,
                          uint32_t real_host, uint32_t known_real);
 
+/* IPv6 (fake-IP v6 и real-ip v6, docs/architecture.md, «4б»): те же операции с адресами из 16
+ * байт в порядке сети. known_real — установленное значение карты или NULL («не знаем»).
+ * g_nft_map6_table — таблица карты fakeip6 ("<семейство> <таблица>"). */
+extern const char *g_nft_map6_table;
+int nftlk_elem_msg6(uint16_t nft_msg_type, const char *table,
+                     const char *obj_name, const uint8_t key[16],
+                     int interval, const uint8_t *data, uint64_t timeout_ms);
+int nft_add_element6(const char *set_name, const uint8_t key[16], uint32_t ttl);
+int nft_concat_element6(int add, const char *set_name, const uint8_t addr[16],
+                        const struct nftlk_box *box, uint32_t ttl);
+int nft_map_set_element6(const char *map_name, const uint8_t fake[16], const uint8_t real[16],
+                         const uint8_t *known_real);
+
 #endif

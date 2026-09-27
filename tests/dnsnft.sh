@@ -42,7 +42,7 @@ nft add table inet steer 2>/dev/null || { echo "dnsnft: nf_tables недосту
 nft add map inet steer fakeip '{ type ipv4_addr : ipv4_addr; }'
 
 tmp="$(mktemp -d)"
-trap 'kill ${DPID:-0} ${UPID:-0} ${MPID:-0} 2>/dev/null; rm -rf "$tmp"' EXIT
+trap 'kill ${DPID:-0} ${UPID:-0} ${MPID:-0} ${DPID6:-0} ${UPID6:-0} 2>/dev/null; rm -rf "$tmp"' EXIT
 
 LPORT=15310
 UPORT=15363
@@ -194,8 +194,129 @@ nft delete table inet steer
 check "после принятого отображения окно началось заново: SERVFAIL" "rcode2" "$(ask win2.io)"
 
 kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null
+
+# --- 7. fake-IP v6 и real-ip v6 (docs/architecture.md, «4б») ------------------------------
+# Свой резолвер со своим каталогом состояния: первая запись файла состояния случается сразу, а
+# следующие — не чаще раза в минуту, и проверять восстановление по чужому, уже записанному
+# файлу нельзя. Апстрим отвечает на A адресом из ip, на AAAA — из ip6.
+#  a. AAAA имени fake-IP-правила в выход с IPv6 — поддельный IPv6 из пула, пара поддельного IPv4
+#     той же записи; в карте fakeip6 — настоящий IPv6; поддельный — постоянным элементом набора
+#     «<канал>6»; в файле состояния — четвёртое поле.
+#  b. Правило в выход без IPv6 — пустой AAAA; имя вне правил — настоящий AAAA.
+#  c. real-ip: настоящий AAAA клиенту и в набор «<канал>6» со сроком.
+#  d. Перезапуск: карта и набор восстановлены из файла, AAAA отвечается сразу тем же адресом.
+#  e. Карта fakeip6 не того типа — пустой AAAA, а не настоящий.
+nft add table inet steer
+nft add map inet steer fakeip '{ type ipv4_addr : ipv4_addr; }'
+nft add map inet steer fakeip6 '{ type ipv6_addr : ipv6_addr; }'
+cat > "$tmp/upstream6.py" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+while True:
+    data, addr = s.recvfrom(2048)
+    qend = 12
+    while data[qend]: qend += 1 + data[qend]
+    qtype = data[qend + 1] << 8 | data[qend + 2]
+    qend += 5
+    hdr = data[:2] + b'\x81\x80' + data[4:6] + b'\x00\x01\x00\x00\x00\x00'
+    if qtype == 28:
+        ip = socket.inet_pton(socket.AF_INET6, open(sys.argv[3]).read().strip())
+        ans = b'\xc0\x0c\x00\x1c\x00\x01\x00\x00\x00\x3c\x00\x10' + ip
+    else:
+        ip = bytes(int(x) for x in open(sys.argv[2]).read().split("."))
+        ans = b'\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04' + ip
+    s.sendto(hdr + data[12:qend] + ans, addr)
+PY
+cat > "$tmp/client6.py" <<'PY'
+import socket, struct, sys
+port, name = int(sys.argv[1]), sys.argv[2]
+q = struct.pack('>HHHHHH', 0x4343, 0x0100, 1, 0, 0, 0)
+for l in name.split('.'): q += bytes([len(l)]) + l.encode()
+q += b'\x00' + struct.pack('>HH', 28, 1)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
+s.sendto(q, ('127.0.0.1', port))
+try:
+    d, _ = s.recvfrom(2048)
+except socket.timeout:
+    print("timeout"); sys.exit()
+rc = d[3] & 0x0f
+if rc: print("rcode%d" % rc)
+elif struct.unpack('>H', d[6:8])[0] == 0: print("empty")
+else: print(socket.inet_ntop(socket.AF_INET6, d[-16:]))
+PY
+printf 'v6.io\nv6b.io\n' > "$tmp/d6.lst"
+printf 'r6.io\n' > "$tmp/r6.lst"
+printf 't4.io\n' > "$tmp/t4.lst"
+printf '{"schema":1,"from_default":["127.0.0.0/8"],'\
+'"outputs":{"vpn":{"kind":"interface","device":"lo"},"tg":{"kind":"tgws","domain":"example.com"}},'\
+'"channels":[{"name":"c6","match":{"domains_files":["%s/d6.lst"]},"out":"vpn"},'\
+'{"name":"r6","match":{"domains_files":["%s/r6.lst"],"mode":"realip"},"out":"vpn"},'\
+'{"name":"t4","match":{"domains_files":["%s/t4.lst"]},"out":"tg"}]}' \
+    "$tmp" "$tmp" "$tmp" > "$tmp/spec6.json"
+tab6="$("$BIN" dnsd-table --spec "$tmp/spec6.json" 2>/dev/null)"
+set_c6="$(printf '%s\n' "$tab6" | awk -F'|' '$5 == "c6" { print $1 }')"
+set_r6="$(printf '%s\n' "$tab6" | awk -F'|' '$5 == "r6" { print $1 }')"
+check "таблица: fake-IP и real-ip в выход с IPv6 — «46», в выход без IPv6 — «4»" "46 46 4" \
+    "$(printf '%s\n' "$tab6" | awk -F'|' 'NF > 4 { printf "%s%s", s, $4; s = " " }')"
+nft add set inet steer "${set_c6}6" '{ type ipv6_addr; flags interval,timeout; }'
+nft add set inet steer "${set_r6}6" '{ type ipv6_addr; flags interval,timeout; }'
+LPORT6=15320
+UPORT6=15373
+echo 203.0.113.61 > "$tmp/ip4"
+echo 2001:db8:77::1 > "$tmp/ip6"
+python3 "$tmp/upstream6.py" "$UPORT6" "$tmp/ip4" "$tmp/ip6" & UPID6=$!
+mkdir -p "$tmp/state6"
+sleep 1
+start6() {
+    "$BIN" dnsd --spec "$tmp/spec6.json" --state-dir "$tmp/state6" \
+        --listen-port "$LPORT6" --upstream-port "$UPORT6" >> "$tmp/log6" 2>&1 & DPID6=$!
+    sleep 1
+}
+start6
+ask6() { python3 "$tmp/client6.py" "$LPORT6" "$1"; }
+map6() { nft get element inet steer fakeip6 "{ $1 }" 2>/dev/null |
+         sed -n 's/.*elements = { [0-9a-f:]* : \([0-9a-f:]*\).*/\1/p'; }
+in6() { nft list set inet steer "$1" 2>/dev/null | grep -c "$2"; }
+
+f6="$(ask6 v6.io)"
+settle
+check "a. AAAA fake-IP-правила — адрес из пула fake-IP v6" "fdfe:dcba:9876::c612" \
+    "$(echo "$f6" | sed 's/:[0-9a-f]*$//')"
+check "a. в карте fakeip6 — настоящий IPv6" "2001:db8:77::1" "$(map6 "$f6")"
+check "a. поддельный IPv6 — в наборе канала" "1" "$(in6 "${set_c6}6" "$f6")"
+check "a. и без срока (постоянный элемент)" "0" \
+    "$(nft list set inet steer "${set_c6}6" | grep "$f6" | grep -c timeout)"
+check "a. в файле состояния — четвёртое поле" "1" \
+    "$(grep -c "^v6.io	198\.1[89]\.[0-9.]*	-	2001:db8:77::1\$" "$tmp/state6/fakeip.state")"
+f4="$(python3 "$tmp/client.py" "$LPORT6" v6.io)"
+pair="$(python3 -c "import ipaddress,sys; a=int(ipaddress.IPv4Address(sys.argv[1])); print(ipaddress.IPv6Address((0xfdfedcba9876 << 80) | a))" "$f4" 2>/dev/null)"
+check "a. поддельный IPv6 — пара поддельного IPv4 той же записи" "$pair" "$f6"
+check "b. правило в выход без IPv6 — пустой AAAA" "empty" "$(ask6 t4.io)"
+check "b. имя вне правил — настоящий AAAA" "2001:db8:77::1" "$(ask6 out.io)"
+echo 2001:db8:77::2 > "$tmp/ip6"
+check "c. real-ip: клиенту — настоящий AAAA" "2001:db8:77::2" "$(ask6 r6.io)"
+check "c. real-ip: адрес — в наборе «<канал>6» со сроком" "1" \
+    "$(nft list set inet steer "${set_r6}6" | grep '2001:db8:77::2' | grep -c timeout)"
+
+kill "$DPID6" 2>/dev/null; wait "$DPID6" 2>/dev/null
+nft delete element inet steer fakeip6 "{ $f6 }"
+nft flush set inet steer "${set_c6}6"
+echo 2001:db8:77::3 > "$tmp/ip6"
+start6
+check "d. перезапуск: элемент карты fakeip6 восстановлен из файла" "2001:db8:77::1" "$(map6 "$f6")"
+check "d. и поддельный IPv6 — снова в наборе канала" "1" "$(in6 "${set_c6}6" "$f6")"
+check "d. AAAA — тот же поддельный адрес" "$f6" "$(ask6 v6.io)"
+
+nft delete map inet steer fakeip6
+nft add map inet steer fakeip6 '{ type ipv6_addr : ipv4_addr; }'
+check "e. карта fakeip6 не того типа — пустой AAAA, не настоящий" "empty" "$(ask6 v6b.io)"
+kill "$DPID6" "$UPID6" 2>/dev/null; wait "$DPID6" 2>/dev/null
+nft delete table inet steer
+
 if [ "$fail" -gt 0 ]; then
     echo "--- nft monitor"; cat "$tmp/mon"; echo "--- dnsd"; tail -n 20 "$tmp/log"
+    echo "--- dnsd (IPv6)"; tail -n 20 "$tmp/log6"
 fi
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi

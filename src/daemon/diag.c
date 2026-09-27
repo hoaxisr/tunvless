@@ -39,6 +39,23 @@
  * which made `steer explain '$(...)'` a command-injection hole; there is no shell
  * here now, and this refuses anything that is not address-shaped regardless. */
 int addr_ok(const char *a) {
+    /* IPv6 (1.9): адрес или префикс, проверенный разбором, а не набором знаков — у IPv6 в
+     * набор входят буквы a-f, и «beef» без двоеточия адресом не считается. */
+    if (strchr(a, ':')) {
+        char buf[64];
+        size_t n = strlen(a);
+        if (n >= sizeof(buf)) return 0;
+        memcpy(buf, a, n + 1);
+        char *sl = strchr(buf, '/');
+        if (sl) {
+            *sl = '\0';
+            char *end = NULL;
+            long l = strtol(sl + 1, &end, 10);
+            if (!sl[1] || *end || l < 0 || l > 128) return 0;
+        }
+        struct in6_addr x;
+        return inet_pton(AF_INET6, buf, &x) == 1;
+    }
     size_t n = 0;
     for (const char *p = a; *p; p++, n++) {
         if (!((*p >= '0' && *p <= '9') || *p == '.' || *p == '/')) return 0;

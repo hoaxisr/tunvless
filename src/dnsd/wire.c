@@ -61,10 +61,14 @@ static int parse_name_adv(const uint8_t *pkt, size_t len, size_t pos, char *out,
  * unparseable. Returns the number of A-record IPs found, or -1 on a
  * malformed/short/multi-question packet (caller must still relay the raw
  * bytes to the client regardless). */
+/* Записи AAAA (класс IN) — в ips6, до max_ips6, их число — в *n6 (fake-IP v6 и real-ip v6,
+ * docs/architecture.md, «4б»); ips6 == NULL — не собираются. Возвращаемое значение по-прежнему
+ * считает только A. */
 int parse_response(const uint8_t *pkt, size_t len, char *out_qname,
                     size_t qname_len, uint16_t *out_qtype,
                     size_t *out_qend, struct answer_ip *ips,
-                    int max_ips) {
+                    int max_ips, struct answer_ip6 *ips6, int max_ips6, int *n6) {
+    if (n6) *n6 = 0;
     if (len < 12) return -1;
     uint16_t qdcount = (pkt[4] << 8) | pkt[5];
     uint16_t ancount = (pkt[6] << 8) | pkt[7];
@@ -102,6 +106,12 @@ int parse_response(const uint8_t *pkt, size_t len, char *out_qname,
             ips[found].addr = addr;
             ips[found].ttl = ttl;
             found++;
+        }
+        if (rtype == DNS_TYPE_AAAA && rclass == 1 && rdlen == 16 && ips6 && n6 &&
+            *n6 < max_ips6) {
+            memcpy(ips6[*n6].addr, pkt + pos, 16);
+            ips6[*n6].ttl = ttl;
+            (*n6)++;
         }
         pos += rdlen;
     }
@@ -169,5 +179,23 @@ size_t build_rewritten_response(const uint8_t *orig, size_t qend,
         memcpy(out + pos, &addr_net, 4);
         pos += 4;
     }
+    return pos;
+}
+
+/* То же с одной записью AAAA — поддельным адресом IPv6 (fake-IP v6). Голова и вопрос — как у
+ * build_rewritten_response, запись — 28 байт. */
+size_t build_rewritten_response6(const uint8_t *orig, size_t qend,
+                                  uint8_t *out, size_t out_cap, const uint8_t fake6[16]) {
+    size_t pos = build_rewritten_response(orig, qend, out, out_cap, 0, 0);
+    if (!pos || pos + 28 > out_cap) return 0;
+    out[7] = 1;                                              /* ancount */
+    out[pos++] = 0xC0; out[pos++] = 0x0C;
+    out[pos++] = 0x00; out[pos++] = DNS_TYPE_AAAA;
+    out[pos++] = 0x00; out[pos++] = 0x01;
+    out[pos++] = 0x00; out[pos++] = 0x00;
+    out[pos++] = 0x00; out[pos++] = FAKEIP_ANSWER_TTL;
+    out[pos++] = 0x00; out[pos++] = 0x10;                    /* rdlength 16 */
+    memcpy(out + pos, fake6, 16);
+    pos += 16;
     return pos;
 }

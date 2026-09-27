@@ -72,6 +72,11 @@ struct group {
      * правило получает v6-двойника (docs/architecture.md, «4б»). Считает тот же
      * check_address_lists; ноль — набора IPv6 у группы нет вовсе. */
     size_t addrs6;
+    /* Доменная группа с половиной IPv6: резолвер кладёт в «<имя>6» поддельные адреса IPv6 или
+     * настоящие из ответов AAAA (dom6_ok, spec.h). Ставит build_groups по раскладке g_nftc — её
+     * вызывающий задаёт до build_groups. Набору тогда нужен флаг timeout (адреса real-ip — со
+     * сроком ответа). */
+    int dom6;
     /* Which channels fed it — reported so a counter still has names behind it. */
     const char *members[MAX_RULES];
     size_t members_n;
@@ -113,11 +118,10 @@ static inline int group_has_set(const struct group *g) {
 /* Есть ли у группы парный набор IPv6 «<имя>6» — по СОДЕРЖИМОМУ списков: строки IPv6 в файлах
  * и подсети IPv6 из наборов .srs. Считает check_address_lists, поэтому ответ верен только после
  * него (apply, план демона); status, diag и explain его не зовут, и для них ответ — «нет».
- * Набора без элементов не заводится: пустой поиск на каждом пакете IPv6 ничего бы не дал, а
- * адресов IPv6 доменных групп резолвер пока не выдаёт (AAAA для имён под правилом подавлены
- * до fake-IP v6). */
+ * Набора без элементов не заводится: пустой поиск на каждом пакете IPv6 ничего бы не дал. У
+ * доменной группы с dom6 набор есть всегда — его наполняет резолвер (fake-IP v6, real-ip v6). */
 static inline int group_has_set6(const struct group *g) {
-    return !g->extra && (g->addrs6 || g->srs_addrs6);
+    return !g->extra && (g->addrs6 || g->srs_addrs6 || g->dom6);
 }
 
 /* Имя парного набора IPv6: имя группы и «6». Имена групп рассчитаны на 31 символ старых ядер
@@ -151,6 +155,8 @@ int has_domains(const struct groups *gr);
 /* Есть ли в спеке выход zapret/tgws — вопросы к видам (kind.h: zapret_present, tgws_present),
  * не к группам; здесь не живут (общий код кроме src/kinds вид не сравнивает). */
 int has_fakeip(const struct groups *gr);
+/* Есть ли группа fake-IP с половиной IPv6 — тогда нужны карта fakeip6 и её dnat. */
+int has_fakeip6(const struct groups *gr);
 int is_mac(const char *s);
 int group_is_local(const struct group *g);
 int check_address_lists(struct groups *gr, struct err *e);

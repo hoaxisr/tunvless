@@ -15,10 +15,10 @@ void tabfmt_build(const struct spec *sp, FILE *out) {
     fprintf(out, "%zu\n", g_dch_n);
     for (size_t i = 0; i < g_dch_n; i++) {
         const struct dchan *c = &g_dch[i];
-        /* family — задел под 1.9 (владелец, IPv6): dch_build сегодня заводит только v4-каналы,
-         * поэтому здесь всегда "4". Место в формате и разбор — уже сейчас (см. шапку tabfmt.h),
-         * само семейство — тогда, когда появится. */
-        fprintf(out, "%s|%s|%d|4|%s", c->set, c->out, c->realip ? 1 : 0, c->chan);
+        /* family — по факту (1.9, IPv6): «46», когда у доменной группы есть половина IPv6
+         * (dom6_ok — парный набор «<set>6» и v6-двойник у компилятора), иначе «4». */
+        fprintf(out, "%s|%s|%d|%s|%s", c->set, c->out, c->realip ? 1 : 0,
+                (c->fam & DCH_V6) ? ((c->fam & DCH_V4) ? "46" : "6") : "4", c->chan);
         for (size_t k = 0; k < c->rules_n; k++)
             fprintf(out, "|%s", c->rules_path[k]);
         fputc('\n', out);
@@ -115,8 +115,6 @@ int tabfmt_parse(const char *buf, size_t len) {
 
     tabfmt_release_current();
 
-    /* out_n — сколько каналов ДЕЙСТВИТЕЛЬНО легло в g_dch: v6-только канал (family «6», см.
-     * ниже) в счёт не идёт вовсе, поэтому он может быть меньше want. */
     size_t out_n = 0;
     size_t pos = nl + 1;
     for (long i = 0; i < want; i++) {
@@ -125,30 +123,14 @@ int tabfmt_parse(const char *buf, size_t len) {
         struct dchan tmp;
         char family[8];
         if (parse_chan_line(buf, pos, line_end, &tmp, family, sizeof(family)) != 0) return -1;
-        /* Задел под IPv6 (1.9, решение владельца): family — «4», «6» или «46». dch_build
-         * сегодня пишет только «4» (tabfmt_build выше), но разбор обязан пережить будущий
-         * демон, который начнёт писать и остальные два, не дожидаясь, пока резолвер научится
-         * IPv6 сам, — иначе смена ФОРМАТА тоже потребовала бы синхронного апдейта обеих
-         * сторон, а решения владельца ровно этого и избегают (docs/architecture.md, раздел 2).
-         * Больше по IPv6 здесь не делается: набора для v6-адресов у резолвера ещё нет, фейковый
-         * пул — только v4 (fakeip.c, FAKEIP_POOL_BASE), а «принять и промолчать» означало бы,
-         * что канал, который человек считает работающим (домен показан в интерфейсе), на самом
-         * деле никого никуда не ведёт, — и без единой строки, почему. */
+        /* family — «4», «6» или «46» (1.9, IPv6): DCH_V6 — у канала есть парный набор «<set>6»,
+         * и на AAAA его имён резолвер отвечает адресом (fake-IP v6 или настоящим) вместо
+         * пустого ответа. Канал «6» (без IPv4) принимается так же: A его имён он не забирает
+         * (proxy.c, match_for). */
         int has4 = !strcmp(family, "4") || !strcmp(family, "46");
         int has6 = !strcmp(family, "6") || !strcmp(family, "46");
         if (!has4 && !has6) return -1; /* не «4», не «6», не «46» — испорченный текст */
-        if (has6)
-            fprintf(stderr, "steer[warn] dnsd: канал %s: семейство %s — IPv6 в этой версии "
-                            "резолвера не поддерживается\n",
-                    tmp.chan[0] ? tmp.chan : tmp.set, family);
-        if (!has4) {
-            /* Только v6 — участвовать резолверу нечем: ни набора, ни fake-IP под него нет.
-             * Пути уже strdup'нуты parse_chan_line — освобождаются здесь же, а не расширяют
-             * несуществующий канал. */
-            for (size_t k = 0; k < tmp.rules_n; k++) free((char *)tmp.rules_path[k]);
-            pos = line_end + 1;
-            continue;
-        }
+        tmp.fam = (has4 ? DCH_V4 : 0) | (has6 ? DCH_V6 : 0);
         g_dch[out_n++] = tmp;
         pos = line_end + 1;
     }

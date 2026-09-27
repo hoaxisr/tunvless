@@ -102,3 +102,37 @@ int ipv4_span(const char *t, uint32_t *lo, uint32_t *hi) {
     *hi = *lo | ~m;
     return 1;
 }
+
+/* То же для IPv6 (адрес, префикс, диапазон): границы — 16 байт в порядке сети, сравниваются
+ * memcmp. Нужна explain: адрес IPv6 ищется в парных наборах «<группа>6» дампом там, где
+ * одиночного запроса элемента нет (старое ядро, составной набор). */
+int ipv6_span(const char *t, uint8_t lo[16], uint8_t hi[16]) {
+    char buf[96];
+    size_t n = strlen(t);
+    if (!n || n >= sizeof(buf)) return 0;
+    memcpy(buf, t, n + 1);
+    char *dash = strchr(buf, '-');
+    if (dash) {
+        *dash = '\0';
+        if (inet_pton(AF_INET6, buf, lo) != 1 || inet_pton(AF_INET6, dash + 1, hi) != 1) return 0;
+        return memcmp(lo, hi, 16) <= 0;
+    }
+    char *sl = strchr(buf, '/');
+    int len = 128;
+    if (sl) {
+        *sl = '\0';
+        char *e;
+        long v = strtol(sl + 1, &e, 10);
+        if (*e || v < 0 || v > 128) return 0;
+        len = (int)v;
+    }
+    uint8_t a[16];
+    if (inet_pton(AF_INET6, buf, a) != 1) return 0;
+    for (int i = 0; i < 16; i++) {
+        int bits = len - i * 8;
+        uint8_t m = bits >= 8 ? 0xff : bits <= 0 ? 0 : (uint8_t)(0xff << (8 - bits));
+        lo[i] = a[i] & m;
+        hi[i] = (uint8_t)(lo[i] | (uint8_t)~m);
+    }
+    return 1;
+}

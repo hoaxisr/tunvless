@@ -46,6 +46,9 @@ int nft_compat(void);
  * если есть таблица ip движка (nat старой раскладки живёт там). Без проб `nft -c`: они решают,
  * что применять, а читателю нужно то, что применено. STEER_NFT_COMPAT — как у nft_compat. */
 int nft_compat_seen(void);
+/* nft_compat_seen с битом NFTC_IP6NAT (по цепочке nat в таблице ip6) — для таблицы каналов
+ * резолвера, без процессов (см. определение). */
+int nft_compat_seen6(void);
 /* Примет ли ядро составной интервальный набор ipv4_addr . inet_proto . inet_service — для
  * каналов со смешанным сужением списка (см. nftcompat.c). 1 — да, 0 — делить по группам. */
 int nft_concat_ok(void);

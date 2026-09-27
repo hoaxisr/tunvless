@@ -99,7 +99,12 @@ check "доменный набор — со сроками и без interval" "
 check "префикс доменного канала — в половине _n" "1" \
     "$(nft list set inet steer vpn_dom_n | grep -c '198.51.100.0/24')"
 check "правил разметки у доменной группы два" "2" \
-    "$(nft list chain inet steer prerouting_mark | grep -c 'comment "steer:vpn_dom"')"
+    "$(nft list chain inet steer prerouting_mark | grep 'comment "steer:vpn_dom"' | grep -vc 'ip6 ')"
+# Ядро с nat в ip6: у доменной группы fake-IP — половина IPv6 (hash со сроками «vpn_dom6»; без
+# строк IPv6 в списках статической половины у неё нет) и v6-двойник правила.
+check "  и v6-двойник по набору vpn_dom6" "1" \
+    "$(nft list chain inet steer prerouting_mark | grep 'comment "steer:vpn_dom"' | grep -c 'ip6 daddr @vpn_dom6 ')"
+check "  карта fakeip6 — в таблице ip6" "0" "$(nft list map ip6 steer fakeip6 >/dev/null 2>&1; echo $?)"
 
 # --- 2. Повторный apply ---------------------------------------------------------------------
 : > "$tmp/nft.log"
@@ -189,7 +194,10 @@ check "explain находит адрес во второй половине на
 STEER_NFT_COMPAT=legacy-min "$BIN" apply $S >/dev/null 2>"$tmp/err6"
 check "legacy-min: apply проходит" "0" "$?"
 check "legacy-min: таблицы ip6 нет" "0" "$(nft list tables | grep -c '^table ip6 steer$')"
-check "legacy-min: сказано про IPv6 и DNS" "1" "$(grep -c 'nat для IPv6' "$tmp/err6")"
+check "legacy-min: сказано про IPv6 и DNS" "1" "$(grep -c 'nat для IPv6: запросы DNS' "$tmp/err6")"
+check "legacy-min: и про fake-IP без IPv6" "1" "$(grep -c 'у доменных правил fake-IP нет IPv6' "$tmp/err6")"
+check "legacy-min: набора IPv6 у доменной группы fake-IP нет" "1" \
+    "$(nft list set inet steer vpn_dom6 >/dev/null 2>&1; echo $?)"
 
 # --- 7. Назад на современную раскладку --------------------------------------------------------
 STEER_NFT_COMPAT=legacy "$BIN" apply $S >/dev/null 2>&1

@@ -35,6 +35,13 @@ uint64_t dch_fakeip_only(uint64_t mask) {
     return mask;
 }
 
+int dch_all_v6(uint64_t mask) {
+    if (!mask) return 0;
+    for (size_t i = 0; i < g_dch_n && i < 64; i++)
+        if ((mask & (1ULL << i)) && !(g_dch[i].fam & DCH_V6)) return 0;
+    return 1;
+}
+
 /* Сборка таблицы объявлена заранее: подпись считается по ней, а сама сборка описана ниже —
  * рядом с доводами о слиянии каналов, где ей и место. */
 
@@ -57,10 +64,15 @@ uint64_t dch_fakeip_only(uint64_t mask) {
  * достаточно HUP и провала нет вовсе; разошлись — нужен перезапуск, и пауза procd в этом
  * случае оправдана: конфигурация стала другой.
  *
- * Формат нарочно текстовый и построчный: его сравнивает оболочка, а не мы. */
+ * Формат нарочно текстовый и построчный: его сравнивает оболочка, а не мы.
+ *
+ * Семейства канала (1.9) — в подписи тоже, тем же полем, что в таблице для демона («4» или
+ * «46»): HUP таблицу каналов не пересобирает, и правило, у которого появилась или пропала
+ * половина IPv6 (выход сменили на несущий IPv6), требует перезапуска. */
 static void dch_signature(FILE *out) {
     for (size_t i = 0; i < g_dch_n; i++) {
-        fprintf(out, "%s|%d", g_dch[i].set, g_dch[i].realip ? 1 : 0);
+        fprintf(out, "%s|%d|%s", g_dch[i].set, g_dch[i].realip ? 1 : 0,
+                (g_dch[i].fam & DCH_V6) ? "46" : "4");
         for (size_t k = 0; k < g_dch[i].rules_n; k++)
             fprintf(out, "|%s", g_dch[i].rules_path[k]);
         fprintf(out, "\n");
@@ -257,8 +269,22 @@ static int dch_join_domain_group(const struct spec *sp, const struct spec_rule *
     return 0;
 }
 
+/* Семейства набора канала: IPv4 всегда, IPv6 — если компилятор даёт этой доменной группе парный
+ * набор и v6-двойника (dom6_ok — одно решение на обоих; доп. группа набора .srs половины IPv6 не
+ * имеет, как и у компилятора, group_has_set6). Раскладка ядра — та, что стоит (nft_compat_seen6:
+ * по netlink, без пробы `nft -c` — таблицу собирает и демон в своём процессе), и спрашивается
+ * только когда от неё что-то зависит: fake-IP с выходом и клиентами, которые IPv6 допускают. */
+static int dch_fam(const struct spec *sp, const struct spec_rule *r, int realip, int extra) {
+    if (extra) return DCH_V4;
+    const struct spec_client *w = rule_who(sp, r);
+    const struct output *o = rule_out(sp, r);
+    if (!dom6_ok(sp, o, w->from, w->from_n, realip, 0)) return DCH_V4;
+    if (!realip && !dom6_ok(sp, o, w->from, w->from_n, realip, nft_compat_seen6())) return DCH_V4;
+    return DCH_V4 | DCH_V6;
+}
+
 /* Найти или завести канал резолвера под набор set. */
-static struct dchan *dch_slot(const char *set, int realip, const char *out) {
+static struct dchan *dch_slot(const char *set, int realip, const char *out, int fam) {
     size_t k = 0;
     for (; k < g_dch_n; k++)
         if (!strcmp(g_dch[k].set, set) && g_dch[k].realip == realip) return &g_dch[k];
@@ -267,6 +293,7 @@ static struct dchan *dch_slot(const char *set, int realip, const char *out) {
     snprintf(g_dch[g_dch_n].set, sizeof(g_dch[g_dch_n].set), "%s", set);
     snprintf(g_dch[g_dch_n].out, sizeof(g_dch[g_dch_n].out), "%.31s", out);
     g_dch[g_dch_n].realip = realip;
+    g_dch[g_dch_n].fam = fam;
     return &g_dch[g_dch_n++];
 }
 
@@ -295,7 +322,8 @@ static void dch_add_srs_channel(const struct spec *sp, size_t ci) {
         else if (!(p->own && l->prefixes_n && p->kind != SP_EXTRA) ||
                  !dch_join_domain_group(sp, c, p, set, sizeof(set), &realip))
             continue;
-        struct dchan *d = dch_slot(set, realip, rule_out(sp, c)->name);
+        struct dchan *d = dch_slot(set, realip, rule_out(sp, c)->name,
+                                   dch_fam(sp, c, realip, p->kind == SP_EXTRA));
         if (!d) return;
         dch_name_rule(d, c, p->has_dom);
         int composite = p->kind == SP_COMPOSITE;
@@ -384,6 +412,7 @@ void dch_build(const struct spec *sp) {
             snprintf(g_dch[g_dch_n].set, sizeof(g_dch[g_dch_n].set), "%s", set);
             snprintf(g_dch[g_dch_n].out, sizeof(g_dch[g_dch_n].out), "%.31s", rule_out(sp, r)->name);
             g_dch[g_dch_n].realip = realip;
+            g_dch[g_dch_n].fam = dch_fam(sp, r, realip, 0);
             k = g_dch_n++;
         }
         if (!g_dch[k].chan[0] || (!g_dch[k].chan_dom && l->domains_n)) {

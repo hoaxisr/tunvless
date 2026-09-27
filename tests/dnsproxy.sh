@@ -20,7 +20,7 @@ BIN="${STEER:-./build/steer}"
 command -v python3 >/dev/null 2>&1 || { echo "dnsproxy: python3 нет — пропускаю"; exit 0; }
 
 tmp="$(mktemp -d)"
-trap 'kill ${DPID:-0} ${UPID:-0} ${DPID2:-0} 2>/dev/null; exec 3>&- 2>/dev/null; rm -rf "$tmp"' EXIT
+trap 'kill ${DPID:-0} ${UPID:-0} ${DPID2:-0} ${DPID3:-0} ${UPID3:-0} 2>/dev/null; exec 3>&- 2>/dev/null; rm -rf "$tmp"' EXIT
 
 LPORT=15300
 UPORT=15353
@@ -275,13 +275,14 @@ check "TCP: наверх по TCP ушли ровно вопросы клиен�
 # не открывает вовсе.
 #
 # Сигнал «канал совпал или нет» — без единой нитки к nftables (этот стенд намеренно обходится
-# без root и без сети наружу, см. шапку файла): запрос AAAA на СОВПАВШЕЕ имя резолвер гасит в
-# NODATA прямо из вопроса, ни разу не спросив апстрим (dns_query, proxy.c, «Подавление — свойство
-# правила, а не данных из ответа») — ровно поэтому сигнал верен и без единой транзакции ядра.
-# Несовпавшее имя идёт напрямую, и апстрим здесь отвечает настоящей записью AAAA — значит
+# без root и без сети наружу, см. шапку файла): запрос HTTPS (тип 65) на СОВПАВШЕЕ имя резолвер
+# гасит в NODATA прямо из вопроса, ни разу не спросив апстрим (dns_query, proxy.c, «Подавление —
+# свойство правила, а не данных из ответа») — ровно поэтому сигнал верен и без единой транзакции
+# ядра. Несовпавшее имя идёт напрямую, и апстрим здесь отвечает настоящей записью — значит
 # ANCOUNT (число записей в ответе, байты 6-7 заголовка) 0 значит «канал забрал домен», 1 —
 # «домена в таблице нет». Разбор именно этого поля, а не адреса: NODATA не несёт вовсе
-# ресурсной записи, сравнивать в ней нечего.
+# ресурсной записи, сравнивать в ней нечего. (До 1.9 сигналом был AAAA; теперь на AAAA имени
+# под правилом с половиной IPv6 резолвер отвечает адресом — это проверяется ниже отдельно.)
 cat > "$tmp/upstream-aaaa.py" <<'PY'
 import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -298,9 +299,10 @@ PY
 cat > "$tmp/qaaaa.py" <<'PY'
 import socket, struct, sys
 port, name = int(sys.argv[1]), sys.argv[2]
+qtype = int(sys.argv[3]) if len(sys.argv) > 3 else 28   # 28 = AAAA, 65 = HTTPS
 q = struct.pack('>HHHHHH', 0x7a7a, 0x0100, 1, 0, 0, 0)
 for l in name.split('.'): q += bytes([len(l)]) + l.encode()
-q += b'\x00' + struct.pack('>HH', 28, 1)  # qtype 28 = AAAA
+q += b'\x00' + struct.pack('>HH', qtype, 1)
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
 s.sendto(q, ('127.0.0.1', port))
 try:
@@ -357,8 +359,8 @@ if ! kill -0 "$DPID2" 2>/dev/null; then
     echo "FAIL резолвер (--table-fd) не поднялся:"; cat "$tmp/log2"; exit 1
 fi
 
-tab_on_hit="$(python3 "$tmp/qaaaa.py" "$LPORT2" swap.test)"
-tab_on_miss="$(python3 "$tmp/qaaaa.py" "$LPORT2" other.test)"
+tab_on_hit="$(python3 "$tmp/qaaaa.py" "$LPORT2" swap.test 65)"
+tab_on_miss="$(python3 "$tmp/qaaaa.py" "$LPORT2" other.test 65)"
 
 # Тишина и здесь: труба таблицы в epoll — событие только на настоящей записи, не пустое
 # пробуждение по таймеру. Тот же счётчик, что у первого резолвера (тот же запас в 2 с — отдать
@@ -372,7 +374,7 @@ quiet2=$(( cs2_1 - cs2_0 ))
 
 "$BIN" dnsd-table --spec "$tabspec_off" --state-dir "$tmp/state2" >&3
 sleep 1
-tab_off_hit="$(python3 "$tmp/qaaaa.py" "$LPORT2" swap.test)"
+tab_off_hit="$(python3 "$tmp/qaaaa.py" "$LPORT2" swap.test 65)"
 # Тот же $DPID2, тот же PID в OS: не respawn под тем же именем переменной, а kill -0 на РОВНО
 # тот процесс, что подняли выше, — упал бы он и procd (здесь — никто) поднял бы замену, у
 # замены был бы другой PID, а мы всё ещё спрашиваем старый.
@@ -390,13 +392,55 @@ done
 kill "$DPID2" 2>/dev/null; wait "$DPID2" 2>/dev/null
 kill "$UPID2" 2>/dev/null; wait "$UPID2" 2>/dev/null
 
-check "table-fd: первая таблица — swap.test совпал (AAAA погашен, ANCOUNT 0)" "0" "$tab_on_hit"
+check "table-fd: первая таблица — swap.test совпал (HTTPS погашен, ANCOUNT 0)" "0" "$tab_on_hit"
 check "table-fd: первая таблица — чужое имя без канала (ANCOUNT 1)" "1" "$tab_on_miss"
 check "table-fd: в тишине резолвер не просыпается" "ok" "$quiet2"
 check "table-fd: после второй таблицы процесс тот же, не перезапустился" "up" "$still_up"
 check "table-fd: вторая таблица без каналов — swap.test больше не совпадает (ANCOUNT 1)" \
     "1" "$tab_off_hit"
 check "table-fd: закрытие трубы демоном — резолвер завершается сам" "exited" "$closed"
+
+# ---- AAAA имён под правилом (1.9, IPv6, docs/architecture.md, «4б») --------------------------
+# Три правила на один апстрим, который на всё отвечает настоящей записью AAAA:
+#   r6 — real-ip в выход с IPv6 (interface): настоящий AAAA уходит клиенту (и адрес — в набор
+#        «<канал>6», которого на этой машине нет: вставка отказывает, ответ от этого не зависит);
+#   f6 — fake-IP в выход с IPv6: поддельный IPv6 выдаётся только после ack ядра по карте fakeip6,
+#        а её здесь нет — ответ пустой, а не настоящий AAAA мимо выхода (сам fake6 — dnsnft.sh);
+#   t4 — выход без IPv6 (tgws): пустой ответ сразу, клиент идёт по IPv4;
+# имя вне правил — настоящий AAAA как есть.
+LPORT3=15302
+UPORT3=15365
+for n in r6 f6 t4; do printf '%s.test\n' "$n" > "$tmp/$n.lst"; done
+printf '{"schema":1,"from_default":["127.0.0.0/8"],'\
+'"outputs":{"vpn":{"kind":"interface","device":"lo"},"tg":{"kind":"tgws","domain":"example.com"}},'\
+'"channels":[{"name":"r6","match":{"domains_files":["%s/r6.lst"],"mode":"realip"},"out":"vpn"},'\
+'{"name":"f6","match":{"domains_files":["%s/f6.lst"]},"out":"vpn"},'\
+'{"name":"t4","match":{"domains_files":["%s/t4.lst"]},"out":"tg"}]}' \
+    "$tmp" "$tmp" "$tmp" > "$tmp/spec6.json"
+tab6="$(STEER_NFT_COMPAT=modern "$BIN" dnsd-table --spec "$tmp/spec6.json" 2>/dev/null)"
+python3 "$tmp/upstream-aaaa.py" "$UPORT3" & UPID3=$!
+sleep 1
+STEER_NFT_COMPAT=modern "$BIN" dnsd --spec "$tmp/spec6.json" --state-dir "$tmp/state3" \
+    --listen-port "$LPORT3" --upstream-port "$UPORT3" > "$tmp/log3" 2>&1 & DPID3=$!
+sleep 1
+if ! kill -0 "$DPID3" 2>/dev/null; then
+    echo "FAIL резолвер (AAAA) не поднялся:"; cat "$tmp/log3"; exit 1
+fi
+a_r6="$(python3 "$tmp/qaaaa.py" "$LPORT3" r6.test)"
+a_f6="$(python3 "$tmp/qaaaa.py" "$LPORT3" f6.test)"
+a_t4="$(python3 "$tmp/qaaaa.py" "$LPORT3" t4.test)"
+a_out="$(python3 "$tmp/qaaaa.py" "$LPORT3" out.test)"
+kill "$DPID3" 2>/dev/null; wait "$DPID3" 2>/dev/null
+kill "$UPID3" 2>/dev/null; wait "$UPID3" 2>/dev/null
+
+check "таблица: правила в выход с IPv6 — семейства 4 и 6" "2" \
+    "$(printf '%s\n' "$tab6" | grep -c '^vpn_dom[a-z0-9_]*|vpn|[01]|46|')"
+check "таблица: правило в выход без IPv6 — только 4" "1" \
+    "$(printf '%s\n' "$tab6" | grep -c '^tg_dom|tg|0|4|t4|')"
+check "AAAA: real-ip в выход с IPv6 — настоящий адрес (ANCOUNT 1)" "1" "$a_r6"
+check "AAAA: fake-IP без карты fakeip6 в ядре — пустой ответ, не настоящий AAAA" "0" "$a_f6"
+check "AAAA: правило в выход без IPv6 — пустой ответ" "0" "$a_t4"
+check "AAAA: имя вне правил — настоящий адрес" "1" "$a_out"
 
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
