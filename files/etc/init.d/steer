@@ -56,6 +56,10 @@ start_service() {
 # Правила снимает steerd down — после того, как демон вышел: пока он жив, сторож мог бы
 # привязать таблицу выхода заново посреди снятия. procd гасит экземпляр после stop_service
 # (procd_kill), поэтому здесь запоминается pid, а ждать и снимать — в service_stopped.
+#
+# Демон мог только что упасть (kill -9, OOM), и procd ещё не поднял его снова: тогда pid пуст,
+# ждать некого, а резолвер, переживший демона, ждёт нового до 60 с. Его гасит тот же `steerd
+# down` — находит по управляющему сокету каталога состояния (src/dnsd/adopt.c).
 stop_service() {
     _steerd_pid="$(ubus call service list '{"name":"steer"}' 2>/dev/null |
                    jsonfilter -e '@.steer.instances.steerd.pid' 2>/dev/null)"

@@ -444,15 +444,56 @@ static void dnsd_kill(int fd, pid_t pid) {
     close(fd);
 }
 
+/* Попросить резолвер этого каталога состояния выйти, если хозяина у него нет (просьба «down»,
+ * src/dnsd/adopt.c): решает сам резолвер, потому что только он знает, открыта ли его труба
+ * таблицы. «ok» — ждать его выхода (закрытие соединения), по сроку SIGKILL; «busy» — хозяин жив,
+ * не трогать. Ответа нет вовсе — резолвер прежней версии (просьбы не знает и закрывает
+ * соединение) или не отвечает: гасить сигналом, как прежде. 1 — погашен, pid в *pid; 0 —
+ * резолвера нет или у него живой хозяин. */
+static int dnsd_down(pid_t *pid) {
+    int fd = dnsd_connect(pid);
+    if (fd < 0) return 0;
+    if (send(fd, "down\n", 5, MSG_NOSIGNAL) != 5) {
+        dnsd_kill(fd, *pid);
+        return 1;
+    }
+    char b[16];
+    ssize_t m = -1;
+    struct pollfd p = { fd, POLLIN, 0 };
+    int r;
+    while ((r = poll(&p, 1, 2000)) < 0 && errno == EINTR) {}
+    if (r > 0) m = recv(fd, b, sizeof(b), MSG_DONTWAIT);
+    if (m >= 5 && !memcmp(b, "busy\n", 5)) {
+        close(fd);
+        return 0;
+    }
+    if (m >= 3 && !memcmp(b, "ok\n", 3)) {
+        if (!dnsd_gone(fd, 3000)) {
+            kill(*pid, SIGKILL);
+            dnsd_gone(fd, 1000);
+        }
+        close(fd);
+        return 1;
+    }
+    dnsd_kill(fd, *pid);
+    return 1;
+}
+
 /* Резолвер не нужен (спеки нет, движок выключен), а прежний демон оставил живой — погасить, а не
  * ждать, пока он выйдет по сроку сам: заворот DNS к нему этот демон уже не сопровождает. */
 static void orphan_stop(void) {
     pid_t pid;
-    int fd = dnsd_connect(&pid);
-    if (fd < 0) return;
-    dnsd_kill(fd, pid);
+    if (!dnsd_down(&pid)) return;
     fprintf(stderr, "steer[info] supervise: резолвер прежнего демона (pid %d) погашен — "
                     "резолвер не нужен\n", (int)pid);
+}
+
+int supd_orphan_down(void) {
+    pid_t pid;
+    if (!dnsd_down(&pid)) return 0;
+    fprintf(stderr, "steer[info] down: резолвер, оставшийся без демона (pid %d), погашен\n",
+            (int)pid);
+    return 1;
 }
 
 static void dn_conn_close(struct supd *s) {
