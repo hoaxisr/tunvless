@@ -36,6 +36,9 @@ struct recon_state {
     int valid;
     unsigned long long fp;
     uint64_t handle;                /* номер таблицы в ядре после нашего nft -f; 0 — ядро не даёт */
+    /* Отпечаток наших таблиц в ядре сразу после нашего nft -f (nfd_table_fp: цепочки, правила,
+     * заголовки наборов — без элементов и счётчиков): с ним сверяется ядро на каждом apply. */
+    uint64_t kfp;
     struct recon_out out[MAX_OUTPUTS];
     size_t n;
     /* Подписи сторожа — отдельно от применённого: их сверка нужна и тогда, когда в ядро ничего
@@ -54,14 +57,23 @@ struct recon_diff {
     struct { unsigned mark; int table; } drop[2 * MAX_OUTPUTS];
     size_t drop_n;
     int awg, masq;
-    int watch;                      /* сторожу внеочередной проход */
+    /* Сторожу внеочередной проход: в ядре нашлось расхождение, которое сверка вернула сама
+     * (проход подтвердит выбор устройств и карты раздачи), или то, что возвращает только он
+     * (маршрутизация выхода в отказе). */
+    int watch;
 };
 
+struct fo_store;
 void recon_init(struct recon_state *st);
 /* Разобрать вывод плана. 0 — годный. */
 int recon_plan_parse(const char *text, size_t n, struct recon_plan *p);
-/* Решить по плану и применённому. Состояние ядра (таблица на месте, та же ли) спрашивается здесь. */
-void recon_decide(const struct recon_state *st, const struct recon_plan *p, struct recon_diff *d);
+/* Решить по плану и применённому — и по ядру: таблица на месте и та же ли (номер), не изменены ли
+ * в ней цепочки, правила и наборы (отпечаток), стоят ли правила и маршруты выходов (rtnetlink).
+ * sp — спека в памяти демона (последняя применённая; NULL — нет, и маршруты по ядру не
+ * сверяются), outs — память сторожа (выбор устройств и отказы; NULL — файлы каталога состояния).
+ * Найденное расхождение — строкой в stderr. */
+void recon_decide(const struct recon_state *st, const struct recon_plan *p, const struct spec *sp,
+                  struct fo_store *outs, struct recon_diff *d);
 /* Есть ли что применять в ядро (набор правил или маршрутизация). */
 int recon_diff_any(const struct recon_diff *d);
 /* argv для `steer apply-commit` по решению: буферы — в buf (n байт), av — не меньше 20 мест. */

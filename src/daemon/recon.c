@@ -4,13 +4,15 @@
  * ЧАСТИ И КАК ОНИ СРАВНИВАЮТСЯ.
  *   Набор правил — отпечаток (FNV-1a 64) текста, который печатает generate по дереву, без
  *     счётчиков: план их из ядра не читает, поэтому текст зависит только от спеки, списков и
- *     раскладки. Совпал с отпечатком последнего нашего nft -f, и таблица в ядре — та самая (номер
- *     таблицы, NFT_MSG_GETTABLE по netlink, без запуска nft) — nft не зовётся вовсе: ни
+ *     раскладки. Совпал с отпечатком последнего нашего nft -f, таблица в ядре — та самая (номер
+ *     таблицы, NFT_MSG_GETTABLE по netlink, без запуска nft) и в ней ничего не изменено снаружи
+ *     (отпечаток таблицы в ядре, ниже «СВЕРКА С ЯДРОМ») — nft не зовётся вовсе: ни
  *     транзакции, ни сброса наборов, которые наполняет резолвер, ни пересчёта счётчиков. Не
  *     совпал — одной транзакцией, как у подкоманды (ruleset_load в apply.c: «добавить — удалить —
  *     новая таблица», счётчики переносятся), отказ ядра — прежний откат спеки.
  *   Маршрутизация — подпись по выходу: вид, метка, таблица, on_fail, пул устройств, файл awg
- *     (out_route_sig в apply.c). Привязываются заново только выходы с новой подписью и новые;
+ *     (out_route_sig в apply.c). Привязываются заново только выходы с новой подписью и новые —
+ *     и те, чьи правило или таблица в ядре разошлись с ожидаемым (ниже, «СВЕРКА С ЯДРОМ»);
  *     правило и таблица убранного выхода (или прежняя метка выхода, которому реестр дал другую)
  *     снимаются, как у cleanup_stale_routing, если метку не несёт никто из оставшихся.
  *   Помощники — сверка подписей в супервизоре (helpers_merge через supd_spec_changed): apply
@@ -28,6 +30,53 @@
  * init — меняет номер таблицы или убирает её, и сверка видит это по netlink: тогда тоже всё
  * заново. На ядре до 4.16 номера таблиц нет, и там видно только «таблица есть или нет»; init
  * телефона ставит ту же сохранённую спеку, что держит демон, так что разойтись им не на чем.
+ *
+ * СВЕРКА С ЯДРОМ, А НЕ ТОЛЬКО С ПАМЯТЬЮ. Прежде неизменная спека значила «в ядро не идём», если
+ * таблица та же (номер). Проверка на QEMU-роутере (docs/architecture.md, раздел 5, 2026-09-27)
+ * показала, чего это стоит: снятое руками правило канала в prerouting_mark (номер таблицы от
+ * этого не меняется) — трафик канала шёл напрямую, а `steer apply`, `steer reload` и reapply
+ * из init.d отвечали «менять нечего»; помог только перезапуск службы. Так же молча оставались
+ * снятые маршрут таблицы выхода вместе с его правилом (правило без таблицы страж правил за
+ * чужое снятие не считает — см. rulewd.c, — а маршрут вернул только проход сторожа через
+ * минуту). Явный apply и reload — ровно то, чем человек чинит «что-то не так», и отвечать
+ * «всё стоит» он обязан по ядру, а не по памяти. Поэтому на неизменной спеке сверяются ещё две
+ * вещи, обе по netlink, в процессе демона и без единого запуска nft или ip:
+ *
+ *   Набор правил — отпечаток таблицы в ядре (nfd_table_fp, src/lib/nftdump.c: цепочки, правила
+ *     по порядку, заголовки наборов; без номеров, счётчиков и элементов наборов) против
+ *     отпечатка, снятого сразу после нашего последнего nft -f (recon_applied). Разошлись — набор
+ *     ставится заново той же одной транзакцией, что при смене спеки.
+ *     Почему «как было сразу после загрузки», а не «как вышло бы из текста generate». Текст —
+ *     это язык nft, а ядро отдаёт атрибуты netlink; свести одно к другому — значит повторить
+ *     разбор и компиляцию nft (или звать `nft -j list` на каждый apply и сравнивать его печать,
+ *     которая зависит от версии nft). Снимок ядра после загрузки и есть ожидаемое: его поставил
+ *     наш nft -f из нашего текста, и с тех пор сами по себе в таблице меняются только элементы
+ *     наборов (резолвер, сторож) и счётчики — они в отпечаток не входят. Цена — два дампа
+ *     netlink на apply (цепочки и правила — сотни объектов, наборы — только заголовки), доли
+ *     миллисекунды на роутере.
+ *     Почему замена, а не точечная починка. Вернуть одно снятое правило на его место — это
+ *     свой nft с позицией и ссылками на безымянные наборы; замена таблицы у нас уже есть,
+ *     атомарна и проверена, счётчики каналов переносит, а наборы, которые наполняет резолвер,
+ *     он же и возвращает: демон после замены набора посылает ему таблицу и неизменной
+ *     (supd_spec_changed с replaced), и резолвер ставит заново постоянные элементы fake-IP и
+ *     элементы real-ip с оставшимся сроком (proxy.c, reassert_routes; realip.c). Карту fake-IP
+ *     generate засевает из файла состояния, метки «пущен напрямую» возвращает apply-commit по
+ *     таблицам выходов, карты раздачи balance — внеочередной проход сторожа (diff.watch).
+ *     Чего отпечаток не видит — элементов именованных наборов: снятый руками адрес из
+ *     адресного списка сверка не вернёт (почему их нет в отпечатке — в nftdump.c).
+ *
+ *   Маршрутизация выходов — правило fwmark и таблица каждого выхода с устройством, которого
+ *     сверка по подписи не тронула бы. Ожидаемое — по памяти сторожа (outs): выход, который
+ *     сторож признал неработающим («-» в записи active), должен стоять так, как ставит его
+ *     on_fail (routing_failed_ok, та же проверка, что у сторожа), — такой выход возвращает
+ *     внеочередной проход сторожа: перепривязка apply к устройству сняла бы его решение до
+ *     следующего прохода. Остальные — «правило стоит, а таблица ведёт в одно из устройств
+ *     выхода» или, если ни одного устройства нет, то, что ставит apply без устройства (запрет
+ *     при on_fail=drop, пустая таблица при direct и zapret). Не так — выход привязывается
+ *     заново (apply_routing_one, как при смене подписи), и сторожу — внеочередной проход. Какое
+ *     именно устройство группы несёт трафик, здесь не сверяется: это решение сторожа, и его
+ *     проход идёт сразу следом. Прочитать правила не вышло — маршруты не сверяются (по незнанию
+ *     перепривязывать живой выход хуже, чем не заметить поломку, — как у сторожа).
  *
  * ГДЕ ИДЁТ РАБОТА. Компиляция — не в процессе демона, а ребёнком на команду: `steer apply-plan`
  * (проверки dry-run и отпечатки частей) и, если есть что применять, `steer apply-commit` (только
@@ -56,12 +105,102 @@
 #include <endian.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+/* netinet/in.h — раньше linux/netfilter.h (он тянет linux/in.h): в обратном порядке glibc видит
+ * struct in_addr дважды, а rtnl.h ниже его требует. */
+#include <netinet/in.h>
 #include <linux/netlink.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter/nfnetlink.h>
 #include <linux/netfilter/nf_tables.h>
 
 #include "recon.h"
+#include "nftdump.h"
+#include "rtnl.h"
+#include "fostate.h"
+#include "failover_int.h"
+
+#define LOG_W "steer[warn] ctl: "
+
+static void fnv_mix(uint64_t *h, const void *p, size_t n) {
+    const unsigned char *b = p;
+    for (size_t i = 0; i < n; i++) { *h ^= b[i]; *h *= 1099511628211ULL; }
+}
+
+/* Отпечаток наших таблиц в ядре (nfd_table_fp): inet — всегда, ip и ip6 — те, что ставит
+ * раскладка старого ядра (legacy.c). Каждой — «есть или нет» и её отпечаток: появившаяся или
+ * пропавшая таблица раскладки — тоже расхождение. 0 — снят; -1 — ядро не ответило. */
+static int kernel_fp(uint64_t *out) {
+    static const uint8_t fams[3] = { NFD_INET, NFD_IP, NFD_IP6 };
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < sizeof(fams); i++) {
+        uint64_t f = 0;
+        int rc = nfd_table_fp(fams[i], nft_table(), &f);
+        if (rc < 0) return -1;
+        fnv_mix(&h, &fams[i], 1);
+        fnv_mix(&h, &rc, sizeof(rc));
+        fnv_mix(&h, &f, sizeof(f));
+    }
+    *out = h;
+    return 0;
+}
+
+/* Маршрутизация выхода в ядре против ожидаемого (шапка, «СВЕРКА С ЯДРОМ»). */
+enum { KR_OK, KR_REBIND, KR_WATCH };
+
+static int kernel_route(const struct spec *sp, const struct output *so, struct fo_store *outs,
+                        const char *rules, const char *rules6, const char **why) {
+    static char routes[8192];
+    if (rtnl_routes_text(so->table, routes, sizeof(routes)) != 0) return KR_OK;
+    struct route_facts f = route_facts_of(rules, routes, so->mark, so->table);
+    if (!f.known) return KR_OK;
+    char rec[32];
+    active_get_st(outs, so->name, rec, sizeof(rec));
+    if (!strcmp(rec, "-")) {
+        if (routing_failed_ok(&f, so->on_fail)) return KR_OK;
+        *why = "маршрутизация выхода в отказе — не та, что ставит его on_fail";
+        return KR_WATCH;
+    }
+    const struct output *m[MAX_MEMBERS];
+    size_t mn = out_members(sp, so, m, MAX_MEMBERS);
+    if (!mn) { m[0] = so; mn = 1; }
+    int present = 0, member = 0;
+    for (size_t k = 0; k < mn; k++) {
+        if (device_present(m[k]->device)) present = 1;
+        if (f.table == TBL_DEV && !strcmp(f.dev, m[k]->device)) member = 1;
+    }
+    if (!f.rule) { *why = "правила fwmark нет"; return KR_REBIND; }
+    /* Таблица ведёт в одно из устройств выхода — годится (TBL_OTHER — маршрут есть, но устройство
+     * из него не вычитать: не трогаем). Иначе годится только то, что ставит apply, когда ни
+     * одного устройства нет: запрет при on_fail=drop, пустая таблица при direct и zapret. */
+    int ok = member || f.table == TBL_OTHER ||
+             (!present && (so->on_fail == FAIL_DROP
+                               ? f.table == TBL_BLACKHOLE || (f.table == TBL_EMPTY && f.backstop)
+                               : f.table == TBL_EMPTY));
+    if (!ok) {
+        *why = f.table == TBL_EMPTY ? "таблица выхода пуста" : "таблица выхода ведёт не туда";
+        return KR_REBIND;
+    }
+    if (out_route6(so) && rules6[0]) {
+        static char routes6[8192];
+        if (rtnl_routes_text6(so->table, routes6, sizeof(routes6)) != 0) return KR_OK;
+        struct route_facts f6 = route_facts_of(rules6, routes6, so->mark, so->table);
+        if (!f6.known) return KR_OK;
+        if (!f6.rule) { *why = "правила fwmark IPv6 нет"; return KR_REBIND; }
+        /* При живом IPv4 половина IPv6 — маршрут в устройство или запрет (IPv6 на устройстве
+         * выключен), но не пустота: пустая таблица IPv6 пустила бы IPv6 выхода напрямую. */
+        if (member && f6.table == TBL_EMPTY && !f6.backstop) {
+            *why = "таблица IPv6 выхода пуста";
+            return KR_REBIND;
+        }
+    }
+    return KR_OK;
+}
+
+static const struct output *spec_out(const struct spec *sp, const char *name) {
+    for (size_t i = 0; sp && i < sp->out_n; i++)
+        if (!strcmp(sp->out[i].name, name)) return &sp->out[i];
+    return NULL;
+}
 
 void recon_init(struct recon_state *st) {
     memset(st, 0, sizeof(*st));
@@ -128,7 +267,8 @@ static void drop_add(struct recon_diff *d, const struct recon_plan *p, unsigned 
     d->drop_n++;
 }
 
-void recon_decide(const struct recon_state *st, const struct recon_plan *p, struct recon_diff *d) {
+void recon_decide(const struct recon_state *st, const struct recon_plan *p, const struct spec *sp,
+                  struct fo_store *outs, struct recon_diff *d) {
     memset(d, 0, sizeof(*d));
     int full = !st->valid;
     if (!full) {
@@ -139,11 +279,49 @@ void recon_decide(const struct recon_state *st, const struct recon_plan *p, stru
         if (rc != 0 || h != st->handle) full = 1;
     }
     d->ruleset = full || st->fp != p->fp;
+    if (!d->ruleset) {
+        /* Таблица та же, а внутри — то ли, что ставили мы (шапка, «СВЕРКА С ЯДРОМ»). Не
+         * прочиталось — как с номером таблицы: что стоит, не знаем, и набор ставится заново. */
+        uint64_t k = 0;
+        int rc = kernel_fp(&k);
+        if (rc != 0 || k != st->kfp) {
+            d->ruleset = 1;
+            d->watch = 1;
+            fprintf(stderr, LOG_W "%s — ставлю набор правил заново\n",
+                    rc ? "набор правил в ядре не прочитать"
+                       : "набор правил в ядре изменён снаружи (цепочки, правила или наборы "
+                         "не те, что ставил движок)");
+        }
+    }
+    /* Правила выходов — одним дампом на все выходы, и только если сверять есть что. */
+    static char rules[16384], rules6[16384];
+    int rules_read = 0;
     for (size_t i = 0; i < p->n; i++) {
         const struct recon_out *o = &p->out[i];
         if (!o->routed) continue;
         const struct recon_out *was = full ? NULL : out_find(st->out, st->n, o->name);
-        if (was && was->routed && was->rsig == o->rsig) continue;
+        if (was && was->routed && was->rsig == o->rsig) {
+            /* Подпись та же — сверить с ядром. Выход берётся из спеки в памяти: при той же
+             * подписи вид, метка, таблица, on_fail, устройства и IPv6 у неё те же, что в плане
+             * (сверяются ещё метка и таблица — на случай, если спека в памяти не та). */
+            const struct output *so = spec_out(sp, o->name);
+            if (!so || !out_has_device(so) || so->mark != o->mark || so->table != o->table)
+                continue;
+            if (!rules_read) {
+                rules_read = 1;
+                if (rtnl_rules_text(rules, sizeof(rules)) != 0) rules[0] = '\0';
+                if (rtnl_rules_text6(rules6, sizeof(rules6)) != 0) rules6[0] = '\0';
+            }
+            /* Пустой дамп правил — «спросить не вышло» (на живой коробке правил ядра три). */
+            if (!rules[0]) continue;
+            const char *why = "";
+            int kr = kernel_route(sp, so, outs ? outs : &fo_store_files, rules, rules6, &why);
+            if (kr == KR_OK) continue;
+            d->watch = 1;
+            fprintf(stderr, LOG_W "выход %s: %s — %s\n", o->name, why,
+                    kr == KR_REBIND ? "привязываю заново" : "сторожу внеочередной проход");
+            if (kr == KR_WATCH) continue;
+        }
         snprintf(d->route[d->route_n++], sizeof(d->route[0]), "%s", o->name);
         if (o->awg) d->awg = 1;
     }
@@ -205,11 +383,17 @@ void recon_commit_argv(const struct recon_diff *d, const char *exe, const char *
 
 void recon_applied(struct recon_state *st, const struct recon_plan *p, const struct recon_diff *d) {
     if (d->ruleset || !st->valid) {
-        uint64_t h = 0;
-        /* Номер нашей новой таблицы — чтобы следующий раз узнать, не подменил ли её кто. Не
-         * спросилось — применённое не запоминаем: следующий apply применит набор заново. */
-        if (recon_table_handle(nft_table(), &h) != 0) { recon_forget(st); return; }
+        uint64_t h = 0, k = 0;
+        /* Номер нашей новой таблицы — чтобы следующий раз узнать, не подменил ли её кто, — и её
+         * отпечаток: не изменил ли кто что-то внутри. Снимается сразу после загрузки, пока в
+         * таблице меняются только элементы (они в отпечаток не входят). Не спросилось —
+         * применённое не запоминаем: следующий apply применит набор заново. */
+        if (recon_table_handle(nft_table(), &h) != 0 || kernel_fp(&k) != 0) {
+            recon_forget(st);
+            return;
+        }
         st->handle = h;
+        st->kfp = k;
     }
     st->valid = 1;
     st->fp = p->fp;

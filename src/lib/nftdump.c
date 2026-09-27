@@ -322,6 +322,162 @@ int nfd_chain_exists(uint8_t family, const char *table, const char *chain) {
     return rc == 0;
 }
 
+/* ---- отпечаток таблицы --------------------------------------------------------------------- *
+ *
+ * Для apply-сверки демона (src/daemon/recon.c, «СВЕРКА С ЯДРОМ»): то, что в таблице меняет только
+ * nft -f, свёрнутое в одно число. Сравнивается отпечаток ядра с отпечатком, снятым сразу после
+ * нашей загрузки, — а не с текстом, который печатает generate: разобрать тот текст в атрибуты
+ * netlink значило бы повторить nft, а «что стояло сразу после нашего nft -f» и есть ожидаемое.
+ *
+ * ЧТО ВХОДИТ. Цепочки (имя, тип, хук, приоритет, политика), правила по порядку в цепочке
+ * (выражения целиком и комментарий), заголовки наборов и карт (имя, тип ключа и значения, флаги,
+ * срок, описание) — в том числе безымянных: их набор живёт и умирает вместе со своим правилом.
+ *
+ * ЧЕГО НЕ ВХОДИТ — всего, что меняется, пока таблица стоит, без нашего nft -f:
+ *   - номера (handle) таблицы, цепочек, правил и наборов: подменённую таблицу видит уже
+ *     recon_table_handle, а правило, снятое и поставленное заново тем же текстом, ничего не
+ *     ломает;
+ *   - состояние выражений: counter (пакеты и байты), quota (израсходованное), last (время), а у
+ *     цепочек — их счётчики и число ссылок на них (use — производное от правил, которые и так в
+ *     отпечатке);
+ *   - элементы именованных наборов и карт. Их кладут не только nft -f: резолвер — адреса
+ *     доменных каналов, fake-IP и real-ip, сторож — метки «пущен напрямую» и карты раздачи
+ *     balance. В доменном наборе постоянные элементы адресных списков лежат вперемешку с
+ *     постоянными элементами резолвера (поддельные адреса без срока), и отличить их по ядру
+ *     нечем. А адресные списки — это сотни тысяч элементов: дамп на каждый apply стоил бы
+ *     сотен миллисекунд цикла демона. Элементы безымянных наборов не нужны тоже: ядро их не
+ *     меняет (набор постоянный), а снять их можно только вместе с правилом.
+ *
+ * Порядок атрибутов и их байты ядро отдаёт одни и те же, пока объект тот же, поэтому свёртка —
+ * прямо по байтам ответа, без разбора выражений по видам. Правила и цепочки — в порядке дампа (он
+ * порядок таблицы). */
+
+/* Номера атрибутов — числами (заголовки тулчейна бывают старше ядра, ABI не меняется). */
+#define NFD_RULE_HANDLE    3
+#define NFD_RULE_POSITION  6
+#define NFD_RULE_PAD       8
+#define NFD_RULE_ID        9
+#define NFD_RULE_POS_ID   10
+#define NFD_RULE_CHAIN_ID 11
+#define NFD_CHAIN_HANDLE   2
+#define NFD_CHAIN_USE      6
+#define NFD_CHAIN_COUNTERS 8
+#define NFD_CHAIN_PAD      9
+#define NFD_CHAIN_ID      11
+#define NFD_SET_ID        10
+#define NFD_SET_PAD       14
+#define NFD_SET_HANDLE    16
+#define NFD_SET_EXPR      17
+#define NFD_SET_EXPRS     18
+
+#define NFD_FNV_INIT 14695981039346656037ULL
+
+static void fp_mix(uint64_t *h, const void *p, size_t n) {
+    const uint8_t *b = p;
+    for (size_t i = 0; i < n; i++) { *h ^= b[i]; *h *= 1099511628211ULL; }
+}
+
+/* Атрибут целиком: номер, длина, данные. */
+static void fp_attr(uint64_t *h, const struct nlattr *a) {
+    uint16_t t = a->nla_type & NLA_TYPE_MASK, l = (uint16_t)nla_size(a);
+    fp_mix(h, &t, sizeof(t));
+    fp_mix(h, &l, sizeof(l));
+    fp_mix(h, nla_ptr(a), l);
+}
+
+/* Выражения правила: имя каждого и его данные — кроме данных выражений с состоянием. */
+static void fp_exprs(uint64_t *h, const struct nlattr *list) {
+    const struct nlattr *e;
+    NLA_FOR_EACH(e, list) {
+        const struct nlattr *et[NFTA_EXPR_MAX + 1];
+        nfd_nested(e, et, NFTA_EXPR_MAX);
+        char name[32];
+        nla_cstr(et[NFTA_EXPR_NAME], name, sizeof(name));
+        fp_mix(h, name, strlen(name) + 1);
+        if (!strcmp(name, "counter") || !strcmp(name, "quota") || !strcmp(name, "last")) continue;
+        if (et[NFTA_EXPR_DATA]) fp_attr(h, et[NFTA_EXPR_DATA]);
+    }
+}
+
+struct tfp_ctx {
+    const char *table;
+    uint8_t family;
+    uint16_t msg;                   /* NFT_MSG_NEW* объектов этого дампа */
+    uint32_t skip;                  /* маска номеров атрибутов, которые не входят */
+    uint64_t h;
+    unsigned n;
+};
+
+static void tfp_cb(const struct nlmsghdr *m, void *arg) {
+    struct tfp_ctx *c = arg;
+    if (!msg_is(m, c->msg) || msg_family(m) != c->family) return;
+    size_t hl = NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(struct nfgenmsg));
+    if (m->nlmsg_len < hl) return;
+    /* Таблица — первый атрибут у всех трёх видов (NFTA_*_TABLE == 1): фильтр дампа по таблице
+     * старое ядро не понимает, поэтому отбор здесь. */
+    const struct nlattr *tb[2];
+    nfd_parse((const uint8_t *)m + hl, m->nlmsg_len - hl, tb, 1);
+    char t[64];
+    if (!tb[1] || strcmp(nla_cstr(tb[1], t, sizeof(t)), c->table) != 0) return;
+    uint64_t h = NFD_FNV_INIT;
+    const uint8_t *q = (const uint8_t *)m + hl;
+    size_t len = m->nlmsg_len - hl;
+    while (len >= NLA_HDRLEN) {
+        const struct nlattr *a = (const struct nlattr *)q;
+        if (a->nla_len < NLA_HDRLEN || a->nla_len > len) break;
+        int ty = a->nla_type & NLA_TYPE_MASK;
+        if (ty >= 32 || !(c->skip & (1u << ty))) {
+            if (c->msg == NFT_MSG_NEWRULE && ty == NFTA_RULE_EXPRESSIONS) fp_exprs(&h, a);
+            else fp_attr(&h, a);
+        }
+        size_t al = NLA_ALIGN(a->nla_len);
+        if (al >= len) break;
+        q += al;
+        len -= al;
+    }
+    fp_mix(&c->h, &h, sizeof(h));
+    c->n++;
+}
+
+static void tfp_reset(void *arg) {
+    struct tfp_ctx *c = arg;
+    c->h = NFD_FNV_INIT;
+    c->n = 0;
+}
+
+int nfd_table_fp(uint8_t family, const char *table, uint64_t *fp) {
+    *fp = 0;
+    int fd = nfd_open();
+    if (fd < 0) return -1;
+    int rc = nfd_talk(fd, NFT_MSG_GETTABLE, 0, family, NFTA_TABLE_NAME, table, 0, NULL, NULL, NULL);
+    if (rc == ENOENT) { close(fd); return 1; }
+    if (rc != 0) { close(fd); return -1; }
+    static const struct { uint16_t get, add, attr; uint32_t skip; } kinds[3] = {
+        { NFT_MSG_GETCHAIN, NFT_MSG_NEWCHAIN, NFTA_CHAIN_TABLE,
+          1u << NFD_CHAIN_HANDLE | 1u << NFD_CHAIN_USE | 1u << NFD_CHAIN_COUNTERS |
+          1u << NFD_CHAIN_PAD | 1u << NFD_CHAIN_ID },
+        { NFT_MSG_GETSET, NFT_MSG_NEWSET, NFTA_SET_TABLE,
+          1u << NFD_SET_ID | 1u << NFD_SET_PAD | 1u << NFD_SET_HANDLE | 1u << NFD_SET_EXPR |
+          1u << NFD_SET_EXPRS },
+        { NFT_MSG_GETRULE, NFT_MSG_NEWRULE, NFTA_RULE_TABLE,
+          1u << NFD_RULE_HANDLE | 1u << NFD_RULE_POSITION | 1u << NFD_RULE_PAD |
+          1u << NFD_RULE_ID | 1u << NFD_RULE_POS_ID | 1u << NFD_RULE_CHAIN_ID },
+    };
+    uint64_t h = NFD_FNV_INIT;
+    for (int k = 0; k < 3; k++) {
+        struct tfp_ctx c = { table, family, kinds[k].add, kinds[k].skip, NFD_FNV_INIT, 0 };
+        rc = nfd_dump(fd, kinds[k].get, family, kinds[k].attr, table, 0, NULL, tfp_cb, &c,
+                      tfp_reset);
+        if (rc != 0 && rc != ENOENT) { close(fd); return -1; }
+        fp_mix(&h, &k, sizeof(k));
+        fp_mix(&h, &c.n, sizeof(c.n));
+        fp_mix(&h, &c.h, sizeof(c.h));
+    }
+    close(fd);
+    *fp = h;
+    return 0;
+}
+
 /* ---- redirect на порт ---------------------------------------------------------------------- */
 
 /* Регистр выражения — в номер 32-битной ячейки (NFT_REG_1..4 — по четыре ячейки). -1 — не данные. */

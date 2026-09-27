@@ -2,7 +2,8 @@
 # Apply-сверка демона (src/daemon/recon.c, docs/ctl.md, поле changed): apply и reload трогают
 # только изменившиеся части.
 #
-# Демон — `steer daemon --supervise` в своём сетевом пространстве с настоящим nft; помощники —
+# Демон — `steer daemon --supervise` в своём сетевом пространстве (и со своим /sys, если его
+# удаётся смонтировать) с настоящим nft; помощники —
 # заглушка через шов STEER_SUPERVISE_EXE (пишет «obfs выход pid»), резолвер — настоящий, на
 # таблице от демона. nft и ip — обёртки в PATH, которые записывают каждый запуск.
 #
@@ -12,6 +13,12 @@
 #     таблица в ядре та же (номер таблицы), элемент, положенный в набор со стороны (как кладёт
 #     резолвер), на месте; помощники и резолвер — те же процессы, таблица резолверу не
 #     отправлялась; changed — пустой. То же — reload.
+# 2а. Сверка с ядром (recon.c, «СВЕРКА С ЯДРОМ»): снятые снаружи правило канала или цепочка, чужой
+#     набор в нашей таблице — apply (reload) той же спеки ставит набор правил заново, в журнале
+#     демона — почему, а элементы резолвера после замены снова на месте: fake-IP (карта и набор
+#     канала) и real-ip со сроком; помощники и резолвер те же. Снятые маршрут и правило таблицы
+#     выхода, правило IPv6, один маршрут — выход привязывается заново, набор правил не трогается.
+#     Без расхождения apply и reload в ядро не идут, как в п. 2.
 #  3. Изменился только канал: набор правил новой транзакцией, маршруты, помощники и резолвер не
 #     тронуты; резолверу — та же таблица ещё раз (вернуть элементы fake-IP в новые наборы); адрес
 #     из ответа DNS канала real-ip, лежавший в наборе со сроком, снова в новом наборе — со сроком.
@@ -158,15 +165,24 @@ handle() { "$real_nft" -a list table inet steer 2>/dev/null | sed -n '1s/.*# han
 dnsd_pid() { grep -o 'supervise: dnsd запущен (pid [0-9]*' "$tmp/d.err" | tail -1 | grep -o '[0-9]*$'; }
 tabs() { grep -c "channel b_dom: .*rule(s)" "$tmp/d.err"; }
 nft_runs() { [ -f "$tmp/nft.log" ] && wc -l < "$tmp/nft.log" | tr -d ' ' || echo 0; }
-nft_loads() { [ -f "$tmp/nft.log" ] && grep -c '^-f ' "$tmp/nft.log" || echo 0; }
+nft_loads() { [ -f "$tmp/nft.log" ] && { grep -c '^-f ' "$tmp/nft.log" || true; } || echo 0; }
 ip_changes() { [ -f "$tmp/ip.log" ] && grep -E 'route (replace|add|flush|del)|rule (add|del)' "$tmp/ip.log" |
                sed -n 's/.* table \([0-9]*\).*/\1/p' | sort -u | tr '\n' ' ' | sed 's/ $//'; }
 fresh() { : > "$tmp/nft.log"; : > "$tmp/ip.log"; }
 
-STEER_SUPERVISE_EXE="$tmp/helper" "$BIN" daemon --supervise --socket "$tmp/s.sock" \
-    --spec "$tmp/spec.json" --state-dir "$tmp/st" \
-    --dnsd-flag --listen-port --dnsd-flag 15411 --dnsd-flag --upstream-port --dnsd-flag 15475 \
-    2>"$tmp/d.err" &
+DARGS="daemon --supervise --socket $tmp/s.sock --spec $tmp/spec.json --state-dir $tmp/st
+    --dnsd-flag --listen-port --dnsd-flag 15411 --dnsd-flag --upstream-port --dnsd-flag 15475"
+# Свой /sys, как у daemonmatch: сверка маршрутов с ядром (шаг 2а) спрашивает, есть ли устройство
+# выхода (/sys/class/net), а /sys хоста о dummy этого сетевого пространства не знает. Не
+# смонтировать — демон как прежде, а проверка, которой нужно устройство, пропускается.
+SYSFS=0
+if unshare -m sh -c 'mount -t sysfs sysfs /sys' 2>/dev/null; then
+    SYSFS=1
+    STEER_SUPERVISE_EXE="$tmp/helper" unshare -m sh -c \
+        "mount -t sysfs sysfs /sys && exec \"$BIN\" $(echo $DARGS)" 2>"$tmp/d.err" &
+else
+    STEER_SUPERVISE_EXE="$tmp/helper" "$BIN" $DARGS 2>"$tmp/d.err" &
+fi
 D=$!
 wait_for '[ -S "$tmp/s.sock" ] && [ -n "$(pid_of a)" ] && [ -n "$(pid_of b)" ] && [ -n "$(dnsd_pid)" ]' 5
 wait_for '[ "$(tabs)" -ge 1 ]' 5
@@ -211,6 +227,100 @@ r="$(ctl reload)"
 check "reload без изменений: changed пустой, nft не запускался" "0 false [] [] false 0" \
     "$(printf '%s' "$r" | j code | tr -d '\n') $(ch "$r") $(nft_runs)"
 check "  маршруты не тронуты, таблица та же" " $H1" "$(ip_changes) $(handle)"
+
+# ---- 2а. сверка с ядром: изменённое снаружи возвращает apply той же спеки ---------------------
+# Правило канала, цепочка, чужой набор в нашей таблице — набор правил ставится заново (номер
+# таблицы тот же, отличие видно только по отпечатку содержимого), и элементы, которые кладёт
+# резолвер, после замены снова на месте: fake-IP (адрес в карте и в наборе канала) и real-ip (со
+# сроком). Снятые правило и маршрут таблицы выхода — выход привязывается заново, набор правил не
+# трогается. После сверки apply той же спеки снова не идёт в ядро.
+FAKE="$(python3 "$tmp/qa.py" 15411 example.com)"
+fk_map() { "$real_nft" list map inet steer fakeip 2>/dev/null | grep -cF "$FAKE : 203.0.113.9"; }
+fk_set() { "$real_nft" list set inet steer b_dom 2>/dev/null | grep -cF "$FAKE"; }
+wait_for '[ "$(fk_map)" = 1 ] && [ "$(fk_set)" = 1 ]' 3
+check "сверка: fake-IP — адрес в карте и в наборе доменного канала" "1 1" "$(fk_map) $(fk_set)"
+# Новый поддельный адрес резолвер записал в файл состояния, а generate засевает из него карту
+# fake-IP — текст набора правил от этого другой. Этот apply его и примет; расхождения с ядром
+# считаются дальше, после него.
+sleep 0.5
+ctl apply < "$tmp/S1.json" >/dev/null
+drift_n() { grep -c 'набор правил в ядре изменён снаружи' "$tmp/d.err"; }
+DR0="$(drift_n)"
+elems_back() {
+    wait_for '[ "$(fk_map)" = 1 ] && [ "$(fk_set)" = 1 ] && [ "$(rip_in)" = 1 ]' 5
+    echo "$(fk_map) $(fk_set) $(rip_in)"
+}
+has_rule() { "$real_nft" list chain inet steer prerouting_mark 2>/dev/null | grep -c 'comment "steer:a_ip"'; }
+rh="$("$real_nft" -a list chain inet steer prerouting_mark |
+      sed -n 's/.*comment "steer:a_ip" # handle \([0-9]*\).*/\1/p')"
+"$real_nft" delete rule inet steer prerouting_mark handle "$rh"
+check "  правило канала снято снаружи" "0" "$(has_rule)"
+fresh
+T0="$(tabs)"
+r="$(ctl apply < "$tmp/S1.json")"
+check "снятое правило канала: apply той же спеки ставит набор правил заново" "0 true [] [] false 1" \
+    "$(printf '%s' "$r" | j code | tr -d '\n') $(ch "$r") $(nft_loads)"
+check "  правило канала на месте, маршруты не тронуты" "1 " "$(has_rule) $(ip_changes)"
+check "  в журнале демона — почему" "$((DR0 + 1))" "$(drift_n)"
+wait_for '[ "$(tabs)" -gt "$T0" ]' 5
+check "  резолверу — таблица ещё раз" "yes" "$([ "$(tabs)" -gt "$T0" ] && echo yes || echo no)"
+check "  fake-IP (карта и набор) и real-ip — снова на месте" "1 1 1" "$(elems_back)"
+check "  помощники и резолвер — те же процессы" "$PA $PB $DN" "$(pid_of a) $(pid_of b) $(dnsd_pid)"
+
+"$real_nft" flush chain inet steer postrouting_down
+"$real_nft" delete chain inet steer postrouting_down
+fresh
+r="$(ctl reload)"
+check "снятая цепочка: reload ставит набор правил заново" "0 true 1 1 $((DR0 + 2))" \
+    "$(printf '%s' "$r" | j code | tr -d '\n') $(ch "$r" | awk '{print $1}') $(nft_loads) \
+$("$real_nft" list chain inet steer postrouting_down 2>/dev/null | grep -c 'steer-down:a_ip') $(drift_n)"
+check "  fake-IP и real-ip — на месте" "1 1 1" "$(elems_back)"
+
+"$real_nft" add set inet steer junk '{ type ipv4_addr; }'
+fresh
+r="$(ctl apply < "$tmp/S1.json")"
+check "чужой набор в нашей таблице: набор правил заново, чужого нет" "true 1 0 $((DR0 + 3))" \
+    "$(ch "$r" | awk '{print $1}') $(nft_loads) \
+$("$real_nft" list sets inet 2>/dev/null | grep -c 'set junk') $(drift_n)"
+
+fresh
+r="$(ctl apply < "$tmp/S1.json")"
+check "после сверки apply той же спеки — снова ничего" "0 false [] [] false 0" \
+    "$(printf '%s' "$r" | j code | tr -d '\n') $(ch "$r") $(nft_runs)"
+check "  маршруты не тронуты" "" "$(ip_changes)"
+
+rule_n() { "$real_ip" $1 rule show table "$2" 2>/dev/null | grep -c fwmark; }
+route_n() { "$real_ip" $1 route show table "$2" 2>/dev/null | grep -c "^default dev $3"; }
+"$real_ip" route del default dev wga table "$TA"
+"$real_ip" rule del table "$TA"
+check "  маршрут и правило выхода a сняты снаружи" "0 0" "$(route_n -4 "$TA" wga) $(rule_n -4 "$TA")"
+fresh
+r="$(ctl apply < "$tmp/S1.json")"
+check "снятые маршрут и правило выхода: привязан заново только a, набор правил не тронут" \
+    "0 false [a] [] false 0" \
+    "$(printf '%s' "$r" | j code | tr -d '\n') $(ch "$r") $(nft_loads)"
+check "  маршрут и правило a — на месте" "1 1" "$(route_n -4 "$TA" wga) $(rule_n -4 "$TA")"
+check "  в журнале демона — почему" "1" \
+    "$(grep -c 'выход a: правила fwmark нет — привязываю заново' "$tmp/d.err")"
+
+"$real_ip" -6 rule del table "$TB"
+fresh
+r="$(ctl reload)"
+check "снятое правило IPv6 выхода b: reload привязывает заново только b" "false [b] 1" \
+    "$(ch "$r" | awk '{print $1, $2}') $(rule_n -6 "$TB")"
+
+if [ "$SYSFS" = 1 ]; then
+    "$real_ip" route del default dev wga table "$TA"
+    fresh
+    r="$(ctl apply < "$tmp/S1.json")"
+    check "снятый маршрут выхода (правило на месте): привязан заново a" "false [a] 1" \
+        "$(ch "$r" | awk '{print $1, $2}') $(route_n -4 "$TA" wga)"
+fi
+fresh
+r="$(ctl reload)"
+check "после сверки маршрутов reload — ничего" "0 false [] [] false 0" \
+    "$(printf '%s' "$r" | j code | tr -d '\n') $(ch "$r") $(nft_runs)"
+T0="$(tabs)"
 
 # ---- 3. только канал ---------------------------------------------------------------------------
 fresh
