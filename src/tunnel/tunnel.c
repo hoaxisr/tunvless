@@ -2882,10 +2882,17 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
  */
 #define MAX_NODES 128
 static struct vless_node g_nodes[MAX_NODES];
-/* Спека — значение, а не глобалы (правило 6, docs/architecture.md, раздел 2): один экземпляр
- * на подкоманды vless (nodes/probe/подъём) — их всегда ровно одна на процесс, и load_nodes,
- * общий для всех трёх, это единственное место, где спека разбирается. */
-static struct spec g_spec;
+/* Спека — значение, а не глобалы (правило 6, docs/architecture.md, раздел 2): экземпляр
+ * заводит каждая точка входа (cmd_vless, cmd_vless_nodes, cmd_vless_probe) и передаёт его
+ * параметром в load_nodes и underlay_setup. Выделяется по требованию, а не static в каждой из
+ * трёх: struct spec — под 300 КБ, и три статических экземпляра заняли бы в bss втрое больше
+ * того одного, что был общим на файл, хотя на процесс команда всегда одна. Не освобождается:
+ * живёт до конца процесса, как и прежний static. */
+static struct spec *spec_new(void) {
+    struct spec *sp = calloc(1, sizeof(*sp));
+    if (!sp) die("нет памяти под спеку", NULL);
+    return sp;
+}
 
 /* Найти выход и разобрать его подписку. Одно место на все три команды: иначе «как
  * читается подписка» разошлось бы между подъёмом, списком и проверкой — а расхождение
@@ -2909,13 +2916,13 @@ static int load_nodes_file(const char *path, size_t *cnt, struct vless_sub_stats
     return 0;
 }
 
-static int load_nodes(const char *spec_path, const char *out_name, struct output **out,
-                      size_t *cnt, struct vless_sub_stats *st) {
+static int load_nodes(struct spec *sp, const char *spec_path, const char *out_name,
+                      struct output **out, size_t *cnt, struct vless_sub_stats *st) {
     /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
      * die() изнутри load_spec. */
     struct err e = {0};
-    if (load_spec(spec_path, &g_spec, &e) < 0) err_die(&e);
-    struct output *o = out_by_name(&g_spec, out_name);
+    if (load_spec(spec_path, sp, &e) < 0) err_die(&e);
+    struct output *o = out_by_name(sp, out_name);
     if (!o) { fprintf(stderr, LOG_W2 "выхода %s нет в спеке\n", out_name); return 2; }
     /* Настройку своего выхода спрашиваем у вида: не vless — не наш. */
     const struct vless_cfg *vc = out_vless(o);
@@ -2935,13 +2942,13 @@ static int load_nodes(const char *spec_path, const char *out_name, struct output
  * Реестр — только при via: у цели метка появляется там, а без via этот процесс реестра до
  * подъёма не трогал, и трогать его ради метки «мимо каналов» незачем. Без выхода (проба
  * файла подписки) метка — обычная «мимо каналов»: её отдаёт та же функция для выхода без via. */
-static void underlay_setup(const struct output *o) {
+static void underlay_setup(struct spec *sp, const struct output *o) {
     static const struct output none;
     if (o && o->over[0]) {
         struct err e = {0};
-        if (registry_assign(&g_spec, &e) < 0) err_die(&e);
+        if (registry_assign(sp, &e) < 0) err_die(&e);
     }
-    vless_set_sock_mark(out_underlay_mark(&g_spec, o ? o : &none), o && o->over[0]);
+    vless_set_sock_mark(out_underlay_mark(sp, o ? o : &none), o && o->over[0]);
 }
 
 static void node_json(const struct vless_node *n, int index) {
@@ -2994,7 +3001,7 @@ int cmd_vless_nodes(const char *spec_path, const char *out_name) {
      * спутать нечего. Тогда спека не нужна вовсе, а `chosen` пуст: выбора ещё не было. */
     int by_file = out_name && out_name[0] == '/';
     int rc = by_file ? load_nodes_file(out_name, &cnt, &st)
-                     : load_nodes(spec_path, out_name, &o, &cnt, &st);
+                     : load_nodes(spec_new(), spec_path, out_name, &o, &cnt, &st);
     if (rc) return rc;
 
     printf("{\"output\":");
@@ -3037,10 +3044,12 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
      * порядка предпочтения, поэтому `--node -1` здесь значит «все по порядку подписки», а
      * не «как поднимется выход». */
     int by_file = out_name && out_name[0] == '/';
+    /* Спека нужна и пробе файла: метку «мимо каналов» underlay_setup спрашивает у неё же. */
+    struct spec *sp = spec_new();
     int rc = by_file ? load_nodes_file(out_name, &cnt, &st)
-                     : load_nodes(spec_path, out_name, &o, &cnt, &st);
+                     : load_nodes(sp, spec_path, out_name, &o, &cnt, &st);
     if (rc) return rc;
-    underlay_setup(o);
+    underlay_setup(sp, o);
     if (!cnt) {
         printf("{\"ok\":false,\"error\":\"в подписке нет пригодных узлов\","
                "\"skipped\":%zu,\"foreign\":%zu", st.skipped, st.foreign);
@@ -3109,9 +3118,10 @@ int cmd_vless(const char *spec_path, const char *out_name) {
     struct output *o = NULL;
     size_t cnt = 0;
     struct vless_sub_stats st;
-    int rc = load_nodes(spec_path, out_name, &o, &cnt, &st);
+    struct spec *sp = spec_new();
+    int rc = load_nodes(sp, spec_path, out_name, &o, &cnt, &st);
     if (rc) return rc;
-    underlay_setup(o);
+    underlay_setup(sp, o);
     struct vless_node *nodes = g_nodes;
     if (!cnt) {
         /* Приговор — не только в журнал. Диагностика без него говорила «устройства нет,
@@ -3136,7 +3146,7 @@ int cmd_vless(const char *spec_path, const char *out_name) {
     /* Кандидаты в порядке предпочтения. Пустой `nodes` (и прежнее `node: -1`) означает «вся
      * подписка», выбранное подмножество — только его узлы и только в написанном порядке. Одна
      * функция на подъём и на `vless-probe`: покажи диагностика другой порядок, она объясняла
-     * бы не тот перебор, который случится (см. out_node_list в spec.c). */
+     * бы не тот перебор, который случится (см. out_node_list в kinds/vless.c). */
     static int sel[MAX_NODES];
     size_t sel_n = out_node_list(o, cnt, sel, MAX_NODES);
     if (!sel_n) {
@@ -3214,6 +3224,6 @@ int cmd_vless(const char *spec_path, const char *out_name) {
      * docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал die()
      * изнутри registry_assign. */
     struct err e = {0};
-    if (registry_assign(&g_spec, &e) < 0) err_die(&e);
+    if (registry_assign(sp, &e) < 0) err_die(&e);
     return tunnel_run(o, &nodes[chosen]);
 }

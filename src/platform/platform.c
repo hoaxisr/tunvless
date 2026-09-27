@@ -12,6 +12,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "platform.h"
+#include "profile.h"
 
 /* Прежний ключ сборки телефона. Код его больше не читает, и сборка с ним молча стала бы
  * бинарником без умолчания — на машине без признаков Android (стенды на обычном Linux) это
@@ -63,15 +64,29 @@ static const struct platform_ops *plat_choose(void) {
     return &plat_openwrt;
 }
 
+/* Поле метки, заданное профилем сборки (src/profile/profile.h): мини-сборка tgws живёт на роутере
+ * в своём бите. Таблица платформы — константа, поэтому поправка кладётся в копию, одну на
+ * процесс; у платформы, которой профиль не касается, остаётся её собственная таблица. */
+static const struct platform_ops *plat_profiled(const struct platform_ops *p) {
+    static struct platform_ops copy;
+    const struct profile *pr = prof();
+    if (!pr->mark_bits || !pr->mark_platform || strcmp(pr->mark_platform, p->name)) return p;
+    copy = *p;
+    copy.mark_base = pr->mark_base;
+    copy.mark_bits = pr->mark_bits;
+    copy.mark_mask = PLAT_MARK_MASK(pr->mark_base, pr->mark_bits);
+    return &copy;
+}
+
 const struct platform_ops *plat(void) {
-    if (!g_plat) g_plat = plat_choose();
+    if (!g_plat) g_plat = plat_profiled(plat_choose());
     return g_plat;
 }
 
 int plat_select(const char *name) {
     const struct platform_ops *p = plat_by_name(name);
     if (!p) return -1;
-    g_plat = p;
+    g_plat = plat_profiled(p);
     setenv("STEER_PLATFORM", p->name, 1);
     return 0;
 }

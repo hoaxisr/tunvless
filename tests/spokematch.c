@@ -30,7 +30,7 @@
 #include "../src/proto/xsteer/xsclient.c"
 #include "unit.h"
 
-/* Заглушки того, что живёт в src/daemon/steer.c: ни команд, ни устройств стенду не нужно. */
+/* Заглушки того, что живёт в src/lib/run.c и src/daemon/failover.c: ни команд, ни устройств стенду не нужно. */
 int run_quiet(const char *const argv[]) { (void)argv; return 0; }
 void bind_device(struct output *o, const char *dev) { (void)o; (void)dev; }
 

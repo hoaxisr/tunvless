@@ -37,7 +37,7 @@
  * переменной STEER_NFT_COMPAT: modern, legacy (необязательное — нат в ip6 и notrack — всё
  * равно спрашивается у ядра) или legacy-min (без них и без проб: ровно то, что умеет ядро
  * телефона в конфиге LineageOS, и один и тот же текст для стендов). Ответ запоминается на
- * процесс. Определена в spec.c. */
+ * процесс. Определена в nftcompat.c. */
 #define NFTC_LEGACY 1   /* раскладка для 4.9: nat в ip/ip6, наборы со сроками отдельно */
 #define NFTC_IP6NAT 2   /* при NFTC_LEGACY: ядро принимает nat в ip6 (заворот DNS по IPv6) */
 #define NFTC_NOTRACK 4  /* при NFTC_LEGACY: ядро знает выражение notrack (Debian перенёс его в 4.9) */

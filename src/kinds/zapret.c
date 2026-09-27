@@ -35,7 +35,7 @@ static int zapret_parse(struct output *o, const struct out_keys *k, struct err *
     /* На телефоне zapret нет (решение владельца: «zapret не надо», plat()->zapret) — см.
      * out_skips_zapret в spec.h. */
     if (!plat()->zapret)
-        return err_set(e, "outputs.%s: kind zapret — в сборке под Android zapret нет", o->name);
+        return err_set(e, "outputs.%s: kind zapret — на телефоне zapret нет", o->name);
     snprintf(o->zp.opts, sizeof(o->zp.opts), "%s", k->opts_file);
     /* Устройства нет и не будет: трафик уходит обычным маршрутом, а выход меняет
      * только то, ЧТО с ним по дороге сделает nfqws. Названное устройство здесь —

@@ -380,12 +380,10 @@ static void report_legacy_gaps(const struct spec *sp, const struct groups *gr) {
     if (sp->traceroute_hops && has_domains(gr) && !(g_nftc & NFTC_NOTRACK))
         fprintf(stderr, LOG_W "ядро не знает notrack: traceroute_hops на нём не действует, "
                         "промежуточные узлы будут видны как прежде\n");
-#ifndef STEER_TGWS
-    if (!(g_nftc & NFTC_IP6NAT))
+    if (!prof()->no_resolver && !(g_nftc & NFTC_IP6NAT))
         fprintf(stderr, LOG_W "ядро не умеет nat для IPv6: запросы DNS клиентов по IPv6 идут "
                         "мимо резолвера движка, и доменные каналы видят только тех, кто "
                         "спрашивает по IPv4\n");
-#endif
     /* fake-IP v6 держится на dnat в ip6 (карта fakeip6): без него у доменных правил fake-IP
      * половины IPv6 нет (dom6_ok), и AAAA их имён резолвер гасит. */
     if (!(g_nftc & NFTC_IP6NAT) && has_fakeip(gr))
@@ -495,13 +493,11 @@ static void apply_prepare(const char *spec, struct spec *cfg, struct groups *gr,
      * не работала: имена не разрешаются нами, fake-адрес не появляется, канал стоит
      * пустым. Молчаливое применение здесь хуже отказа — искать причину пришлось бы на
      * роутере. */
-#ifdef STEER_TGWS
-    for (size_t i = 0; i < gr->n; i++)
+    for (size_t i = 0; prof()->no_resolver && i < gr->n; i++)
         if (gr->g[i].domains)
             die("канал «%s» доменный, а эта сборка резолвера не поднимает: разрешать имена "
                 "ей нечем. Переведите канал на адресный список или поставьте полный движок",
                 gr->g[i].name);
-#endif
     /* Устройство выхода — то, что несёт трафик сейчас, а не первое в списке кандидатов.
      * Иначе применение настройки уводило бы таблицу с работающего запасного устройства на
      * неработающее основное, а при on_fail=drop ещё и ставило запрет — то есть каждое

@@ -33,7 +33,9 @@ in_dirs() { for _d in $1; do ls "$_d"/*.c 2>/dev/null; done; }
 # Сторонний код (THIRD_DIRS, сейчас libyaml) собирается в ядре целиком: из библиотеки в дерево
 # взято только то, что входит в сборку, — поэтому его каталоги сверяются вместе с каталогами
 # ядра, и лишний .c, положенный туда «на всякий случай», не пройдёт так же, как в src/lib.
-disk_base="$(in_dirs "$(profile_var CORE_DIRS) $(profile_var THIRD_DIRS)" | names)"
+# Умолчания профиля (src/profile/profile.c) — тоже ядро: они в каждой сборке; остальные файлы
+# src/profile принадлежат своим профилям и сверяются ниже, у правила 3.
+disk_base="$( { in_dirs "$(profile_var CORE_DIRS) $(profile_var THIRD_DIRS)"; echo src/profile/profile.c; } | names)"
 disk_ext="$(in_dirs "$(profile_var EXT_DIRS)" | names)"
 
 # ---- что перечислено в манифесте -------------------------------------------
@@ -116,6 +118,39 @@ for p in base server tgws; do
     check "sources.mk: видов расширенной части нет в профиле $p" "$(profile_var KINDS_EXT_SRC)" \
         "$(missing_in "$p" "$(profile_var KINDS_EXT_SRC)" | sed 's/ $//')"
 done
+
+# ---- правило 3 (docs/architecture.md, раздел 2): сборка — набор модулей, а не набор макросов ----
+#
+# Профиль решает всё составом файлов: команды и виды — наличием их файлов (слабые ссылки), а
+# данные профиля — файлом src/profile/<профиль>.c (src/profile/profile.h). Файл профиля обязан
+# быть ровно у своего профиля: чужой дал бы бинарнику чужое имя, а мини-сборке — раскладку
+# полного движка (или наоборот), и компоновка этого не заметила бы — у base файла нет вовсе, и
+# его отсутствие законно. Умолчания (profile.c) идут с платформой в каждую сборку.
+prof_files() { profile_src "$1" | words | grep '^src/profile/' | grep -v '^src/profile/profile\.c$' | tr '\n' ' '; }
+for p in base extended server tgws android; do
+    case "$p" in base) want="" ;; android) want="src/profile/extended.c " ;; *) want="src/profile/$p.c " ;; esac
+    check "sources.mk: файл профиля $p — ровно свой" "$want" "$(prof_files "$p")"
+done
+check "sources.mk: умолчания профиля — в PLATFORM_SRC" "1" \
+    "$(profile_var PLATFORM_SRC | words | grep -c '^src/profile/profile\.c$')"
+check "каждый файл src/profile — в каком-то профиле" "" \
+    "$(for f in src/profile/*.c; do
+         case " $(profile_src base) $(profile_src extended) $(profile_src server) $(profile_src tgws) " in
+           *" $f "*) ;; *) printf '%s ' "$f" ;; esac
+       done)"
+# Прежние ключи профилей сняты: ни кода под ними в src (комментарии не в счёт — в прозе история
+# упоминается законно), ни -D в путях сборки. Появись такой ключ снова, путь, который его
+# забыл, собрал бы бинарник соседнего профиля — ровно то, от чего избавлял переход.
+profbad=""
+for f in $(find src \( -name '*.c' -o -name '*.h' \)); do
+    n=$(grep -vE '^[[:space:]]*(\*|//|/\*)' "$f" | grep -cE '\<STEER_(EXTENDED|SERVER|TGWS)\>')
+    [ "$n" -gt 0 ] && profbad="$profbad$f:$n "
+done
+check "в src нет макросов профилей STEER_EXTENDED/SERVER/TGWS (правило 3)" "" "$profbad"
+check "пути сборки не передают ключей профилей -DSTEER_EXTENDED/SERVER/TGWS" "0" \
+    "$(grep -hvE '^[[:space:]]*(#|//)' Makefile Android.bp build/sources.mk build.sh build/build-ext.sh \
+         build/build-ext-sdk.sh build/build-ext-native.sh tests/ext-test.sh |
+       grep -cE -- '-DSTEER_(EXTENDED|SERVER|TGWS)\>'; true)"
 
 # Сценарии сборки не перечисляют исходники сами: копия списка — ровно то, что расходилось
 # молча (у рецептов SDK и нативного к моменту перевода на манифест не хватало шести файлов).
@@ -347,8 +382,11 @@ check "в релизе нет комментария об отсутствии e
 # перечня держат проверки выше.
 #
 # Замыкание, а не один шаг: файл, притянутый включением, тянет за собой свои включения.
+# Файлы профилей (src/profile) включением не притягиваются: заголовок у них общий (profile.h), а
+# какой файл взять, решает профиль — это сверено выше («файл профиля — ровно свой»). Умолчания
+# (profile.c) идут с платформой в каждую сборку и считаются присутствующими, как ядро.
 closure_missing() {  # СПИСОК ФАЙЛОВ -> те, которых в нём нет, а включают их те, что есть
-    _cm_core="$(in_dirs "$(profile_var CORE_DIRS)" | tr '\n' ' ')"
+    _cm_core="$(in_dirs "$(profile_var CORE_DIRS)" | tr '\n' ' ') src/profile/profile.c"
     _cm_have=" $(printf '%s' "$1" | tr '\n' ' ') $_cm_core "
     _cm_work="$1 $_cm_core"
     _cm_seen=" "
@@ -364,6 +402,7 @@ closure_missing() {  # СПИСОК ФАЙЛОВ -> те, которых в нё
                 _cm_b="${_cm_h%.h}"
                 for _cm_c in $(for _cm_d in $(profile_var INC_DIRS); do echo "$_cm_d/$_cm_b.c"; done); do
                     [ -f "$_cm_c" ] || continue
+                    case "$_cm_c" in src/profile/*) continue ;; esac
                     case "$_cm_have" in *" $_cm_c "*) continue ;; esac
                     case " $_cm_need" in *" $_cm_c "*) continue ;; esac
                     _cm_need="$_cm_need$_cm_c "

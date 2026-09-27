@@ -137,14 +137,14 @@ static struct spec g_spec;
 int load_spec(const char *path, struct spec *s, struct err *e) { (void)path; (void)e; *s = g_spec; return 0; }
 int registry_assign(struct spec *s, struct err *e) { (void)s; (void)e; return 0; }
 
-/* Ход подъёма выхода читается из файла в state_dir (src/model/spec.c). Здесь он задаётся прямо:
+/* Ход подъёма выхода читается из файла в state_dir (probe_read, src/model/probe.c). Здесь он задаётся прямо:
  * стенду нужен не разбор файла — его проверяет specmatch, — а поведение сторожа при каждом
  * из состояний. Особенно при «номер узла вне подписки»: ждать там нечего, и сторож обязан
  * это знать, а не обещать подъём. */
 struct probe_status g_probe_stub;
 struct probe_status probe_read(const char *out_name) { (void)out_name; return g_probe_stub; }
 
-/* Снятие соединений самим движком (ctnl_evict_mark, dnsd.c) подменено записью в тот же
+/* Снятие соединений самим движком (ctnl_evict_mark, src/lib/ctnl.c) подменено записью в тот же
  * журнал команд: настоящее полезло бы в conntrack машины, на которой идёт make test, и сняло
  * бы там записи с меткой из стенда. Ответ задаётся стендом: -1 — «ctnetlink недоступен»,
  * тогда сторож обязан взять внешний conntrack; 0 и больше — «снято», и внешний не нужен. По
@@ -588,7 +588,7 @@ int main(void) {
      *    ничего), а пустая таблица — это не «нет пути», а «ищи дальше»: помеченный пакет
      *    проваливается в следующую таблицу и уходит НАПРЯМУЮ, то есть ровно туда, куда его
      *    не пускали. При on_fail=drop обязан встать запрет. Ровно это решение принято в
-     *    apply_routing (steer.c) — здесь оно обязано совпадать. */
+     *    apply_routing (src/daemon/apply.c) — здесь оно обязано совпадать. */
     out_set("lo", FAIL_DROP);
     state_write("active", "vl -\n");
     g_route_add_fails = 1;

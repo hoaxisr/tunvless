@@ -79,7 +79,7 @@ struct v1_ctx {
  * ПРОВЕРЯЕТСЯ на месте: отложить проверку до генерации значило бы отдать негодный элемент
  * в `nft -f`, а тот отвергает НАБОР ПРАВИЛ ЦЕЛИКОМ. На роутере это выглядит как «мой выбор
  * не подействовал» — прежние правила остались, отказа человек не видел. Тот же довод, что у
- * check_address_lists в steer.c, и та же беда, которую он лечит.
+ * check_address_lists в compile/groups.c, и та же беда, которую он лечит.
  *
  * Пересечения тоже отвергаются здесь: множество nftables с накладывающимися интервалами
  * (`{ 1-100, 50-60 }`) ядро не принимает, а повтор (`{ 443, 443 }`) — тем более. Отказать
@@ -297,7 +297,7 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
                 else if (!strcmp(m, "direct")) o.on_fail = FAIL_DIRECT;
                 /* zapret на телефоне нет — см. out_skips_zapret в spec.h. */
                 else if (!strcmp(m, "zapret") && !plat()->zapret)
-                    return err_set(e, "outputs.%s: on_fail zapret — в сборке под Android zapret нет "
+                    return err_set(e, "outputs.%s: on_fail zapret — на телефоне zapret нет "
                         "(want drop or direct)", o.name);
                 else if (!strcmp(m, "zapret")) o.on_fail = FAIL_ZAPRET;
                 else if (!plat()->zapret)
@@ -860,7 +860,7 @@ int spec_parse_v1(const char *text, struct spec *s, struct err *e) {
      * оболочки — тот самый, через который имя устройства однажды уезжало в popen.
      *
      * Явный `from_default` при этом остался и значит ровно то же, что значил: он и выбирает
-     * клиентов, а устройства тогда не участвуют (см. emit_from в steer.c). */
+     * клиентов, а устройства тогда не участвуют (см. x_from в compile/generate.c). */
     /* Пустая спека законна, и отказ на ней запирал настройку наглухо: чтобы завести
      * канал, нужен выход, а сохранить выход без каналов движок не давал — тупик, из
      * которого нельзя выйти изнутри интерфейса.
@@ -954,7 +954,7 @@ int spec_parse_v1(const char *text, struct spec *s, struct err *e) {
         for (size_t k = 0; k < cf->from_n; k++) if (from_is_local(cf->from[k])) local++;
         if (local) {
             if (!plat()->local_channels)
-                return err_set(e, "канал %s: «self» и «uid:» в from — только в сборке под Android", c->name);
+                return err_set(e, "канал %s: «self» и «uid:» в from — только на телефоне", c->name);
             if (local != cf->from_n)
                 return err_set(e, "канал %s: в «кому» смешаны сам телефон и клиенты раздачи — это разные "
                     "пути пакета, разделите на два канала", c->name);

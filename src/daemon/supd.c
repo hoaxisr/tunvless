@@ -688,11 +688,7 @@ static void child_cb(struct loop *l, pid_t pid, int status, void *arg) {
  * перенаправления DNS не ставит. Два ответа обязаны совпадать, иначе init-скрипт однажды поднимет
  * резолвер без правила или, хуже, правило останется без резолвера. */
 int dnsd_wanted(void) {
-#ifdef STEER_TGWS
-    return 0;
-#else
-    return 1;
-#endif
+    return !prof()->no_resolver;
 }
 
 /* ---- состав -------------------------------------------------------------------------------- */

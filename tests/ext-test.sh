@@ -298,7 +298,7 @@ $CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.
 # разошёлся бы с первым. Стенд требует root и сетевых пространств и без них ГРОМКО
 # пропускается, поэтому в ext-test он безопасен.
 #
-# Бинарник СЕРВЕРНЫЙ (-DSTEER_SERVER): хаб живёт только в нём, у роутерной сборки подкоманда
+# Бинарник СЕРВЕРНЫЙ (профиль server): хаб живёт только в нём, у роутерной сборки подкоманда
 # xsteer-hub — штатная заглушка «ставится из архива steer-hub». Список исходников — профиль
 # server манифеста, тот же, что у build/build-ext.sh (раньше он был переписан здесь руками — см.
 # ниже, чем это кончилось).
@@ -309,7 +309,7 @@ $CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.
 # запустит цель, а её не запускали: она требует настоящей mbedtls и потому не входит в `make
 # test`. Урок ровно про это: барьер, который нужно ЗАПУСТИТЬ РУКАМИ, не барьер.
 echo "ext-test: собираю серверный бинарник для стенда зондирования..."
-$CC -O1 -w $STEER_INC $MBED_INC "$PRIV" -DSTEER_SERVER -o "$BUILD/steer-hub-native" \
+$CC -O1 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/steer-hub-native" \
 	$(profile_src server) \
 	$MBED_LIB -lpthread
 echo "ext-test: прогоняю probe (зондирование порта хаба)..."
