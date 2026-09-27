@@ -29,6 +29,8 @@
 #include "groups.h"
 #include "generate.h"
 #include "run.h"
+#include "failover_int.h"
+#include "fogroup.h"
 
 static void iptables_masq_drop_all(void);   /* ниже, у apply_routing */
 /* ---- apply ---------------------------------------------------------------- */
@@ -289,6 +291,17 @@ static void iptables_masq_sync(const struct spec *sp) {
  * изменилась (apply-сверка, src/daemon/recon.c). */
 static void apply_routing_one(const struct output *o) {
     if (!out_has_device(o)) return;
+    /* Группа спеки v2, у которой по известным приговорам членов взять некого (у manual — не
+     * работает выбранный член): подхват outputs_adopt_active_st принял то же решение, что примет
+     * проход, и это решение — on_fail. Ставится сразу и тем же кодом, что у прохода, а не
+     * устройство, которое проход через секунды сменит на запрет: иначе после старта (или
+     * restart) трафик группы до первого прохода шёл бы через член, которого человек не
+     * выбирал. У выхода с одним устройством и у пула v1 `failed` — прошлый приговор пробы, и
+     * apply по-прежнему привязывает устройство: судить его может только новая проба. */
+    if (o->failed && group_named(out_group(o))) {
+        fo_fail_apply(o);
+        return;
+    }
     char table[16];
     snprintf(table, sizeof(table), "%d", o->table);
     /* Маршрут — заменой, правило — не снимая стоящего (table_bind и rule_ensure в
@@ -654,6 +667,9 @@ int cmd_apply(const char *spec, int dry) {
      * без устройства (blackhole при on_fail=drop), а причина уже названа в журнале. */
     awg_apply_all(&cfg);
     apply_routing(&cfg);
+    /* Карта balance из набора правил — «все члены живы»; сразу к живым по подхвату, как её
+     * поставил бы проход (fog_balance_adopt в fogroup.c). */
+    fog_balance_adopt(&cfg);
     if (plat()->iptables_masq) iptables_masq_sync(&cfg);
     cleanup_stale_routing(&cfg);
     apply_done_reports(&cfg);
@@ -707,6 +723,11 @@ static void recon_args_parse(int argc, char **argv, struct recon_args *a, const 
         i += val;
     }
     if (a->state_dir) steer_set_state_dir(a->state_dir);
+    /* Выбор select — рядом со спекой, как у демона и подкоманд (steer_keep_dir, platform.h):
+     * подхват группы manual (outputs_adopt_active_st) решает по нему, к какому члену привязать её
+     * таблицу. Без этого ребёнок демона читал бы файл из каталога платформы, а не рядом со спекой
+     * демона: на роутере это один и тот же /etc/steer, а при спеке в другом месте — нет. */
+    steer_set_keep_dir_of(plat_spec_resolve(a->spec));
 }
 
 /* Отпечаток набора правил без самого текста: generate пишет в поток, поток считает FNV-1a и
@@ -884,6 +905,8 @@ int cmd_apply_commit(int argc, char **argv) {
     if (a.awg) awg_apply_all(&cfg);
     for (size_t i = 0; i < cfg.out_n; i++)
         if (name_in_list(a.route, cfg.out[i].name)) apply_routing_one(&cfg.out[i]);
+    /* Новый набор правил принёс карты balance со всеми членами — к живым, как у подкоманды. */
+    if (a.ruleset) fog_balance_adopt(&cfg);
     if (a.ruleset)
         for (size_t i = 0; i < cfg.out_n; i++) {
             const struct output *o = &cfg.out[i];
