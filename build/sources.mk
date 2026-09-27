@@ -93,7 +93,7 @@ DNSD_TABLE_SRC := src/dnsd/table.c src/dnsd/tabfmt.c
 
 DNSD_SRC := src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c \
             src/dnsd/rules.c src/dnsd/wire.c src/dnsd/origdst.c src/dnsd/fakeip.c $(DNSD_TABLE_SRC) \
-            src/dnsd/dlog.c src/dnsd/proxy.c src/dnsd/main.c
+            src/dnsd/dlog.c src/dnsd/realip.c src/dnsd/adopt.c src/dnsd/proxy.c src/dnsd/main.c
 
 # Виды выхода (src/kinds, docs/architecture.md, раздел 2, правило 1): вид — это файл, и какие виды
 # есть в сборке, решает профиль. Реестр (kind.c) ссылается на записи видов слабо, поэтому вид,

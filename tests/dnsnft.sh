@@ -207,6 +207,8 @@ kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null
 #  d. Перезапуск: карта и набор восстановлены из файла, AAAA отвечается сразу тем же адресом.
 #  e. Карта fakeip6 не того типа — пустой AAAA, а не настоящий.
 #  f. Набор правил заменён, затем HUP — поддельные адреса обоих семейств снова в наборах каналов.
+#  g. То же для real-ip: настоящие адреса обоих семейств снова в наборах канала — со сроком, и срок
+#     — оставшийся, а не TTL ответа заново (память резолвера, src/dnsd/realip.c).
 nft add table inet steer
 nft add map inet steer fakeip '{ type ipv4_addr : ipv4_addr; }'
 nft add map inet steer fakeip6 '{ type ipv6_addr : ipv6_addr; }'
@@ -320,6 +322,28 @@ kill -HUP "$DPID6"
 sleep 0.5
 check "f. после замены набора и HUP поддельный IPv6 снова в наборе канала" "1" "$(in6 "${set_c6}6" "$f6")"
 check "f. и поддельный IPv4 — в наборе канала IPv4" "1" "$(in6 "$set_c6" "$f4")"
+
+# g. real-ip: адреса из ответов (A и AAAA) лежат в наборах канала со сроком ответа (60 с). Набор
+#    правил заменён — наборы пусты; HUP (как и таблица от демона) возвращает их из памяти с
+#    оставшимся сроком: через 2 с после ответа — меньше минуты, в секундах.
+nft add set inet steer "$set_r6" '{ type ipv4_addr; flags interval,timeout; }'
+echo 203.0.113.71 > "$tmp/ip4"
+echo 2001:db8:77::7 > "$tmp/ip6"
+r4="$(python3 "$tmp/client.py" "$LPORT6" r6.io)"
+r6="$(ask6 r6.io)"
+check "g. real-ip: клиенту — настоящие адреса обоих семейств" "203.0.113.71 2001:db8:77::7" "$r4 $r6"
+sleep 2
+nft flush set inet steer "$set_r6"
+nft flush set inet steer "${set_r6}6"
+check "g. набор правил заменён — наборы real-ip пусты" "0 0" \
+    "$(in6 "$set_r6" 203.0.113.71) $(in6 "${set_r6}6" 2001:db8:77::7)"
+kill -HUP "$DPID6"
+sleep 0.5
+left_of() { nft list set inet steer "$1" | grep -o "$2 timeout [0-9a-z]*" | awk '{ print $3 }'; }
+check "g. после HUP адрес IPv4 снова в наборе, срок оставшийся (меньше минуты)" "yes" \
+    "$(left_of "$set_r6" 203.0.113.71 | grep -qx '[1-5]\{0,1\}[0-9]s' && echo yes || echo "no:$(left_of "$set_r6" 203.0.113.71)")"
+check "g. и адрес IPv6 — в наборе «<канал>6», срок оставшийся" "yes" \
+    "$(left_of "${set_r6}6" 2001:db8:77::7 | grep -qx '[1-5]\{0,1\}[0-9]s' && echo yes || echo "no:$(left_of "${set_r6}6" 2001:db8:77::7)")"
 
 nft delete map inet steer fakeip6
 nft add map inet steer fakeip6 '{ type ipv6_addr : ipv4_addr; }'

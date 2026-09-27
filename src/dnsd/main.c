@@ -184,7 +184,10 @@ void dnsd_usage_flags(FILE *out) {
           "  --table-fd N             таблицу доменных каналов брать из дескриптора N (труба\n"
           "                           демона, docs/architecture.md, раздел 4а), а не читать\n"
           "                           спеку самому; следующая полная таблица в той же трубе\n"
-          "                           заменяет текущую без перезапуска, закрытие трубы — выход\n"
+          "                           заменяет текущую без перезапуска\n"
+          "  --orphan-timeout СЕК     труба таблицы закрылась (демона нет) — отвечать по\n"
+          "                           последней таблице и ждать нового демона СЕК секунд\n"
+          "                           (по умолчанию 60; 0 — выйти сразу)\n"
           "\n"
           "Разовые проверки, вместо запуска резолвера:\n"
           "  --selftest               прогнать разбор и сборку пакетов на своих фикстурах\n"
@@ -225,6 +228,8 @@ int dnsd_main(int argc, char **argv) {
             g_origdst = 1;
         } else if (strcmp(argv[i], "--table-fd") == 0 && i + 1 < argc) {
             g_table_fd = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--orphan-timeout") == 0 && i + 1 < argc) {
+            g_orphan_sec = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--fakeip-state") == 0 && i + 1 < argc) {
             g_fakeip_state_path = argv[++i];
         } else if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc) {

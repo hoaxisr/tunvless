@@ -13,7 +13,8 @@
 #     резолвер), на месте; помощники и резолвер — те же процессы, таблица резолверу не
 #     отправлялась; changed — пустой. То же — reload.
 #  3. Изменился только канал: набор правил новой транзакцией, маршруты, помощники и резолвер не
-#     тронуты; резолверу — та же таблица ещё раз (вернуть элементы fake-IP в новые наборы).
+#     тронуты; резолверу — та же таблица ещё раз (вернуть элементы fake-IP в новые наборы); адрес
+#     из ответа DNS канала real-ip, лежавший в наборе со сроком, снова в новом наборе — со сроком.
 #  4. Изменился режим отказа одного выхода: привязан заново только он.
 #  5. Изменился сервер обфускации одного выхода: перезапущен только его помощник, маршруты не
 #     тронуты.
@@ -46,8 +47,8 @@ for d in wga wgb; do "$real_ip" link add $d type dummy && "$real_ip" link set $d
 
 tmp="$(mktemp -d)"
 mkdir -p "$tmp/st" "$tmp/st2" "$tmp/bin"
-D="" D2="" W="" AP=""
-trap 'kill $D $D2 $W $AP 2>/dev/null; rm -rf "$tmp"' EXIT
+D="" D2="" W="" AP="" UPR=""
+trap 'kill $D $D2 $W $AP $UPR 2>/dev/null; rm -rf "$tmp"' EXIT
 pass=0 fail=0
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); else
@@ -99,6 +100,37 @@ printf '10.1.0.0/16\n' > "$tmp/p1.lst"
 printf '10.2.0.0/16\n' > "$tmp/p2.lst"
 printf 'example.com\n' > "$tmp/d1.lst"
 printf 'example.org\n' > "$tmp/d2.lst"
+printf 'rip.test\n' > "$tmp/r.lst"
+# Апстрим резолвера: на A — 203.0.113.9 со сроком 300 с (канал real-ip кладёт его в набор).
+cat > "$tmp/up.py" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+while True:
+    data, addr = s.recvfrom(2048)
+    qend = 12
+    while data[qend]: qend += 1 + data[qend]
+    qend += 5
+    hdr = data[:2] + b'\x81\x80' + data[4:6] + b'\x00\x01\x00\x00\x00\x00'
+    ans = b'\xc0\x0c\x00\x01\x00\x01\x00\x00\x01\x2c\x00\x04' + bytes([203, 0, 113, 9])
+    s.sendto(hdr + data[12:qend] + ans, addr)
+PY
+cat > "$tmp/qa.py" <<'PY'
+import socket, struct, sys
+port, name = int(sys.argv[1]), sys.argv[2]
+q = struct.pack('>HHHHHH', 0x4242, 0x0100, 1, 0, 0, 0)
+for l in name.split('.'): q += bytes([len(l)]) + l.encode()
+q += b'\x00' + struct.pack('>HH', 1, 1)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
+s.sendto(q, ('127.0.0.1', port))
+try:
+    d, _ = s.recvfrom(2048)
+    print(".".join(str(b) for b in d[-4:]))
+except socket.timeout:
+    print("timeout")
+PY
+python3 "$tmp/up.py" 15475 &
+UPR=$!
 # spec ФАЙЛ СПИСОК_P ON_FAIL_A СЕРВЕР_B ДОМЕННЫЕ_ФАЙЛЫ
 spec() {
     cat > "$tmp/$1" <<EOF
@@ -108,7 +140,8 @@ spec() {
  "b":{"kind":"interface","device":"wgb",
       "obfs":{"mode":"wg-over-tcp","server":"$4","listen":"127.0.0.1:5102"}}},
  "channels":[{"name":"p","match":{"prefixes_file":"$tmp/$2"},"out":"a"},
-             {"name":"d","match":{"domains_files":[$5]},"out":"b"}]}
+             {"name":"d","match":{"domains_files":[$5]},"out":"b"},
+             {"name":"r","match":{"domains_files":["$tmp/r.lst"],"mode":"realip"},"out":"b"}]}
 EOF
 }
 D1="\"$tmp/d1.lst\"" D12="\"$tmp/d1.lst\",\"$tmp/d2.lst\""
@@ -150,6 +183,12 @@ H1="$(handle)"
 check "  таблица в ядре" "yes" "$([ -n "$H1" ] && echo yes || echo no)"
 SET="$("$real_nft" list table inet steer | awk '/^\tset /{s=$2} /10\.1\.0\.0\/16/{print s; exit}')"
 "$real_nft" add element inet steer "$SET" "{ 10.77.0.1 }"
+# Канал real-ip: имя из его списка — настоящий адрес клиенту и в набор канала со сроком.
+RSET="$("$real_nft" list table inet steer | awk '/^\tset .*_c[0-9]*r /{ print $2; exit }')"
+check "  real-ip: клиенту — настоящий адрес" "203.0.113.9" "$(python3 "$tmp/qa.py" 15411 rip.test)"
+rip_in() { "$real_nft" list set inet steer "$RSET" 2>/dev/null | grep -c '203\.0\.113\.9 timeout'; }
+wait_for '[ "$(rip_in)" = 1 ]' 3
+check "  real-ip: адрес — в наборе канала со сроком" "1" "$(rip_in)"
 PA="$(pid_of a)" PB="$(pid_of b)" DN="$(dnsd_pid)" T0="$(tabs)"
 
 # ---- 2. та же спека — ничего ---------------------------------------------------------------
@@ -164,7 +203,7 @@ check "  элемент, положенный в набор со стороны,
     "$("$real_nft" list set inet steer "$SET" | grep -c '10\.77\.0\.1')"
 check "  помощники и резолвер — те же процессы" "$PA $PB $DN" "$(pid_of a) $(pid_of b) $(dnsd_pid)"
 check "  таблица резолверу не отправлялась" "$T0" "$(tabs)"
-check "  stdout — прежняя строка итога" "steer: applied 2 channel(s), 2 output(s)" \
+check "  stdout — прежняя строка итога" "steer: applied 3 channel(s), 2 output(s)" \
     "$(printf '%s' "$r" | j stdout | head -n 1)"
 
 fresh
@@ -188,6 +227,8 @@ check "  помощники и резолвер — те же" "$PA $PB $DN" "$(
 wait_for '[ "$(tabs)" -gt "$T0" ]' 5
 check "  резолверу — та же таблица ещё раз, changed.dnsd — нет" "$((T0 + 1)) false" \
     "$(tabs) $(ch "$r" | awk '{print $4}')"
+wait_for '[ "$(rip_in)" = 1 ]' 3
+check "  real-ip: адрес из ответа снова в новом наборе со сроком, без нового запроса" "1" "$(rip_in)"
 
 # ---- 4. режим отказа выхода a ----------------------------------------------------------------
 fresh

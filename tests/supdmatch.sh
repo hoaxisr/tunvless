@@ -38,8 +38,8 @@ fi
 
 tmp="$(mktemp -d)"
 mkdir -p "$tmp/st"
-D="" SUB="" UP="" WD=""
-trap 'kill $D $SUB $UP $WD 2>/dev/null; rm -rf "$tmp"' EXIT
+D="" SUB="" UP="" WD="" DN5="" Q5=""
+trap 'kill $D $SUB $UP $WD $DN5 $Q5 2>/dev/null; rm -rf "$tmp"' EXIT
 pass=0 fail=0
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); else
@@ -235,6 +235,103 @@ check "  помощники — по одному, в обратном поря�
 check "  журнал демона — с уровнем" "0" \
     "$(grep -v '^steer\[\(warn\|info\)\]' "$tmp/d.err" | grep -v '^steer dnsd: ' | grep -c .)"
 D=""
+
+# ---- резолвер переживает демона (src/dnsd/adopt.c) ------------------------------------------
+# kill -9 демона: резолвер отвечает дальше по последней таблице — запросы каждые 100 мс, ни
+# одного без ответа; новый демон на том же каталоге состояния забирает тот же процесс (pid тот
+# же), и его таблица до резолвера доходит; SIGTERM новому гасит резолвер; без нового демона
+# резолвер выходит сам через --orphan-timeout; демон, которому резолвер не нужен (спеки нет),
+# гасит оставшийся сразу. Спека без помощников: после kill -9 они остались бы сиротами.
+mkdir -p "$tmp/st5"
+LPORT5=15312
+printf 'swap.test\n' > "$tmp/l5a.lst"
+printf 'swap.test\nnew.test\n' > "$tmp/l5b.lst"
+spec5() {
+    printf '{"schema":2,"from_default":["127.0.0.0/8"],"outputs":{"t":{"kind":"interface","device":"wgt"}},'\
+'"channels":[{"name":"c","match":{"domains_files":["%s"]},"out":"t"}]}\n' "$1" > "$tmp/spec5.json"
+}
+d5() {   # d5 ЖУРНАЛ [СПЕКА] — демон стенда в фоне, pid — в $!
+    "$BIN" daemon --supervise --socket "$tmp/s5.sock" --spec "${2:-$tmp/spec5.json}" \
+        --state-dir "$tmp/st5" \
+        --dnsd-flag --listen-port --dnsd-flag "$LPORT5" --dnsd-flag --upstream-port --dnsd-flag "$UPORT" \
+        --dnsd-flag --orphan-timeout --dnsd-flag 4 2>"$tmp/$1" &
+}
+dn5() { grep -o "supervise: dnsd $2 (pid [0-9]*" "$tmp/$1" | tail -1 | grep -o '[0-9]*$'; }
+gone() { kill -0 "$1" 2>/dev/null && echo alive || echo gone; }
+cat > "$tmp/q5.py" <<'PY'
+import socket, struct, sys, time
+port, dur = int(sys.argv[1]), float(sys.argv[2])
+ok = bad = 0
+end = time.time() + dur
+i = 0
+while time.time() < end:
+    i += 1
+    q = struct.pack('>HHHHHH', i & 0xffff, 0x0100, 1, 0, 0, 0) + b'\x05other\x04test\x00' + \
+        struct.pack('>HH', 28, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1)
+    try:
+        s.sendto(q, ('127.0.0.1', port))
+        d, _ = s.recvfrom(2048)
+        if d[:2] == q[:2]: ok += 1
+        else: bad += 1
+    except Exception:
+        bad += 1
+    s.close()
+    time.sleep(0.1)
+print(ok, bad)
+PY
+spec5 "$tmp/l5a.lst"
+d5 d5a.err; D=$!
+wait_for '[ -n "$(dn5 d5a.err запущен)" ] && [ "$(python3 "$tmp/qaaaa.py" "$LPORT5" other.test)" = 1 ]' 5
+DN5="$(dn5 d5a.err запущен)"
+check "переживание: резолвер поднят, канал из таблицы — swap.test, new.test ещё нет" "0 1" \
+    "$(python3 "$tmp/qaaaa.py" "$LPORT5" swap.test) $(python3 "$tmp/qaaaa.py" "$LPORT5" new.test)"
+python3 "$tmp/q5.py" "$LPORT5" 6 > "$tmp/q5.out" & Q5=$!
+sleep 1
+kill -KILL "$D"; wait "$D" 2>/dev/null; D=""
+sleep 1
+check "  kill -9 демона: резолвер жив и сказал, что ждёт нового" "alive 1" \
+    "$(gone "$DN5") $(grep -c 'steer\[warn\] dnsd: демон пропал' "$tmp/d5a.err")"
+check "  и отвечает по последней таблице" "0 1" \
+    "$(python3 "$tmp/qaaaa.py" "$LPORT5" swap.test) $(python3 "$tmp/qaaaa.py" "$LPORT5" new.test)"
+spec5 "$tmp/l5b.lst"
+d5 d5b.err; D=$!
+wait_for '[ -n "$(dn5 d5b.err подхвачен)" ]' 5
+check "  новый демон забрал тот же резолвер" "$DN5" "$(dn5 d5b.err подхвачен)"
+check "  своего не запускал" "" "$(dn5 d5b.err запущен)"
+wait_for '[ "$(python3 "$tmp/qaaaa.py" "$LPORT5" new.test)" = 0 ]' 5
+check "  таблица нового демона дошла: new.test теперь в канале" "0" \
+    "$(python3 "$tmp/qaaaa.py" "$LPORT5" new.test)"
+check "  журнал резолвера — в stderr нового демона" "1" \
+    "$(grep -c 'steer\[info\] dnsd: новый демон забрал резолвер' "$tmp/d5b.err")"
+wait "$Q5"; Q5=""
+check "  DNS без перерыва: ни одного запроса без ответа (запрос каждые 100 мс)" "ok 0" \
+    "$(awk '{ print ($1 >= 40 ? "ok" : "мало:" $1), $2 }' "$tmp/q5.out")"
+kill -TERM "$D"; wait "$D" 2>/dev/null; D=""
+check "  SIGTERM новому демону гасит и забранный резолвер" "gone no" \
+    "$(gone "$DN5") $([ -S "$tmp/st5/dnsd-ctl.sock" ] && echo yes || echo no)"
+
+d5 d5c.err; D=$!
+wait_for '[ -n "$(dn5 d5c.err запущен)" ]' 5
+DN5="$(dn5 d5c.err запущен)"
+wait_for '[ "$(python3 "$tmp/qaaaa.py" "$LPORT5" other.test)" = 1 ]' 5
+kill -KILL "$D"; wait "$D" 2>/dev/null; D=""
+sleep 2
+check "без нового демона: через 2 с резолвер ещё жив" "alive" "$(gone "$DN5")"
+wait_for '[ "$(gone "$DN5")" = gone ]' 6
+check "  через срок (--orphan-timeout 4) вышел сам" "gone 1" \
+    "$(gone "$DN5") $(grep -c 'нового демона нет 4 с — выхожу' "$tmp/d5c.err")"
+
+d5 d5d.err; D=$!
+wait_for '[ -n "$(dn5 d5d.err запущен)" ]' 5
+DN5="$(dn5 d5d.err запущен)"
+kill -KILL "$D"; wait "$D" 2>/dev/null; D=""
+sleep 0.5
+d5 d5e.err "$tmp/nospec.json"; D=$!
+wait_for '[ "$(gone "$DN5")" = gone ]' 5
+check "демон без спеки гасит оставшийся резолвер сразу" "gone 1" \
+    "$(gone "$DN5") $(grep -c "резолвер прежнего демона (pid $DN5) погашен" "$tmp/d5e.err")"
+kill -TERM "$D"; wait "$D" 2>/dev/null; D="" DN5=""
 
 # ---- сторож и супервизор вместе (--watch --supervise) --------------------------------------
 # Выход-пул vpn из устройств xa и xb — устройств выходов kind=xsteer, чьи помощники (заглушки) пишут

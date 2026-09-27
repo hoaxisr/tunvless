@@ -167,7 +167,7 @@ done
 # Голое «steer: » законно ровно в двух случаях: die() — отказ вызывающему, и разбор
 # аргументов. Оба заканчиваются кодом 2 и до журнала не доходят, о чём сказано в контракте.
 bare=""
-for f in src/daemon/main.c src/daemon/failover.c src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c src/dnsd/rules.c src/dnsd/wire.c src/dnsd/origdst.c src/dnsd/fakeip.c src/dnsd/table.c src/dnsd/dlog.c src/dnsd/proxy.c src/dnsd/main.c src/proto/obfs/obfs.c src/tools/srsread.c src/model/srs.c src/model/srsplan.c; do
+for f in src/daemon/main.c src/daemon/failover.c src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c src/dnsd/rules.c src/dnsd/wire.c src/dnsd/origdst.c src/dnsd/fakeip.c src/dnsd/table.c src/dnsd/dlog.c src/dnsd/realip.c src/dnsd/adopt.c src/dnsd/proxy.c src/dnsd/main.c src/proto/obfs/obfs.c src/tools/srsread.c src/model/srs.c src/model/srsplan.c; do
     # grep -c печатает 0 и выходит с кодом 1, когда совпадений нет, — поэтому «|| echo 0»
     # добавлял бы вторую строку и ломал сравнение числа.
     n=$(grep -c 'fprintf(stderr, "steer: ' "$f" 2>/dev/null); [ -n "$n" ] || n=0
