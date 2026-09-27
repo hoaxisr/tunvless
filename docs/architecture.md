@@ -210,7 +210,8 @@ steer-tools <команда>    ссылка на steerd: отвечает то�
 src/
   lib/        общие кирпичи, о спеке не знают
               sys.c (run, моно-время, атомарная запись), jsonw.c, jsonr.c, yaml.c (обёртка libyaml),
-              nlbuf.h, nftnl.c (nf_tables по netlink), ctnl.c (conntrack), sindex.c
+              nlbuf.h, nftnl.c (nf_tables по netlink), ctnl.c (conntrack), sindex.c,
+              ir.c (дерево ruleset: его строят и compile, и виды через emit)
   model/      spec.h (struct spec, struct output с union видов, rule, client, list),
               v2.c (чтение YAML/JSON v2), v1.c (перевод legacy v1 в ту же модель),
               check.c (сквозные проверки), registry.c, marks.c
@@ -218,7 +219,7 @@ src/
               direct.c interface.c awg.c tunnel.c xsteer.c zapret.c tgws.c group.c
   platform/   platform.h, openwrt.c, android.c
   profile/    profile.h, profile.c (умолчания), extended.c, server.c, tgws.c — данные профиля
-  compile/    groups.c, ir.c (дерево ruleset), print.c (текущая раскладка), legacy.c (ядра 4.9),
+  compile/    groups.c, generate.c, print.c (текущая раскладка), legacy.c (ядра 4.9),
               nftcompat.c
   daemon/     main.c, ctl.c (сокет, протокол), apply.c (сверка), watch.c (сторож),
               supervise.c, events.c, status.c, diag.c, explain.c, fwcheck.c
@@ -863,8 +864,10 @@ procd держит один `steerd daemon --watch --supervise --apply`; на т
 - **`inet ingress`** вынесен из 1.7 в отдельный шаг: он меняет ruleset, conntrack в хуке
   ingress ещё недоступен (метка соединения по-прежнему ставится в prerouting), а выигрыш
   по критериям раздела 2 нужно сначала замерить на QEMU-стенде.
-- `compile/ir.h` подключают и `compile`, и `kinds` (через `emit`) — само дерево стоит опустить
-  ниже по слоям.
+- ~~`compile/ir.h` подключают и `compile`, и `kinds` (через `emit`) — само дерево стоит опустить
+  ниже по слоям.~~ Сделано: дерево — `src/lib/ir.{c,h}`. Это структура данных nftables без
+  знания о спеке и видах (только libc), поэтому lib, а не model; с моделью оно компонуется
+  (`MODEL_SRC`), как `nftdump`/`rtnl`/`procscan`, которые тоже нужны видам.
 - ~~Макросы профилей `STEER_EXTENDED`, `STEER_SERVER`, `STEER_TGWS` ещё в коде — их заменит
   состав файлов профиля.~~ Сделано: команды — слабые ссылки, данные профиля — `src/profile`
   (правило 3 раздела 2); `tests/buildmatch.sh` следит, что макросов нет ни в `src`, ни в путях
@@ -872,9 +875,13 @@ procd держит один `steerd daemon --watch --supervise --apply`; на т
 - ~~Тексты отказов «в сборке под Android» не переписаны под выбор платформы при запуске —
   правка вместе с перезаписью снимка.~~ Сделано: «на телефоне zapret нет» (kind и on_fail
   zapret), «self и uid: в from — только на телефоне»; в снимке сменились ровно две строки stderr.
-- `static struct spec` в ветке masquerade `daemon/watch.c` добавляет ~230 КБ к bss роутера
-  (страницы не трогаются, но место в адресном пространстве занято).
-- В `src/tunnel/tunnel.c` экземпляр `struct spec` — статический на весь файл.
+- ~~`static struct spec` в ветке masquerade `daemon/watch.c` добавляет ~230 КБ к bss роутера
+  (страницы не трогаются, но место в адресном пространстве занято).~~ Закрыто ещё `96b0d45`
+  (сторож без fork на проход): отдельного экземпляра в ветке masquerade нет, она берёт спеку
+  прохода (`g_loop_spec`), которая нужна самому проходу на обеих платформах.
+- ~~В `src/tunnel/tunnel.c` экземпляр `struct spec` — статический на весь файл.~~ Сделано:
+  экземпляр заводит каждая из трёх команд vless (выделение по требованию, bss не растёт) и
+  передаёт параметром в `load_nodes`/`underlay_setup`.
 - В комментариях по дереву ещё встречаются прежние имена `steer.c`, `dnsd.c`, `spec.c`.
 - Стенды протоколов (`proto/*`, `tunnel/*`) и `awgmatch` подключают исходники целиком;
   храповик не даёт их числу расти.

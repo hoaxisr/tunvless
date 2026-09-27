@@ -39,7 +39,7 @@ cc_defaults {
         "src/compile/groups.c",
         "src/compile/generate.c",
         "src/compile/balance.c",
-        "src/compile/ir.c",
+        "src/lib/ir.c",
         "src/compile/print.c",
         "src/compile/legacy.c",
         "src/daemon/fwcheck.c",

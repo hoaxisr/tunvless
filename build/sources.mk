@@ -78,7 +78,11 @@ YAML_SRC := src/lib/ynode.c $(LIBYAML_SRC)
 # без процессов: их задают status и diag, но и виды (interface — маршрут к серверу обфускации и
 # живость обфускатора, zapret — живость обработчика очереди) и nftcompat (раскладка по ядру), а
 # виды идут со всякой моделью. Поэтому здесь, а не в CORE_SRC.
-MODEL_SRC := $(PLATFORM_SRC) src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/v1.c \
+#
+# lib/ir.c — дерево набора правил (lib/ir.h) — здесь по той же причине: его строят не только
+# компилятор (src/compile), но и виды (kind_ops.emit у zapret и tgws), а о спеке и видах дерево
+# не знает ничего (только libc), то есть это кирпич lib, а не часть компилятора.
+MODEL_SRC := $(PLATFORM_SRC) src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/lib/ir.c src/model/parse.c src/model/v1.c \
              src/model/check.c src/model/v2.c src/model/v2print.c src/model/registry.c \
              src/model/probe.c src/compile/nftcompat.c src/lib/puff.c src/model/srs.c src/model/srsplan.c \
              src/lib/nftdump.c src/lib/rtnl.c src/lib/procscan.c $(YAML_SRC)
@@ -118,7 +122,7 @@ KINDS_EXT_SRC  := src/kinds/vless.c src/kinds/xsteer.c
 # src/daemon/steer.c нарезан на модули (docs/architecture.md, раздел 2, «Слои и каталоги»):
 # компиляция спеки в правила — в src/compile, остальное ядро — в src/daemon, порядок ниже
 # такой же, как был в steer.c (lib/run.c раньше всех — на него ссылаются и compile, и daemon).
-CORE_SRC := src/lib/run.c src/lib/jsonw.c src/lib/evline.c src/compile/groups.c src/compile/generate.c src/compile/balance.c src/compile/ir.c src/compile/print.c src/compile/legacy.c src/daemon/fwcheck.c \
+CORE_SRC := src/lib/run.c src/lib/jsonw.c src/lib/evline.c src/compile/groups.c src/compile/generate.c src/compile/balance.c src/compile/print.c src/compile/legacy.c src/daemon/fwcheck.c \
             src/daemon/apply.c src/daemon/status.c src/daemon/nftquery.c src/daemon/diag.c \
             src/daemon/explain.c src/daemon/helpers.c src/daemon/supervise.c src/daemon/supd.c src/daemon/watch.c src/daemon/main.c \
             $(MODEL_SRC) $(DNSD_SRC) src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
