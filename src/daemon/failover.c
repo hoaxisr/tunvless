@@ -773,7 +773,7 @@ void failopen_mark(const struct output *o, int on) {
  * длится, а состояние в ядре с тех пор разъехалось (см. сверку ниже). Строку «живых
  * устройств нет» в этом случае печатает вызывающий, и печатает вместе с причиной
  * расхождения — иначе журнал раз в минуту повторял бы одно и то же без новостей. */
-static void apply_failed(struct output *o, int announce) {
+static void apply_failed(const struct output *o, int announce) {
     char tbl[16];
     snprintf(tbl, sizeof(tbl), "%d", o->table);
 
@@ -834,7 +834,7 @@ static void apply_failed(struct output *o, int announce) {
                 o->on_fail == FAIL_ZAPRET ? "zapret" : "direct");
 }
 
-void fo_fail_apply(struct output *o) {
+void fo_fail_apply(const struct output *o) {
     apply_failed(o, 1);
 }
 
@@ -1382,12 +1382,28 @@ static void active_save(struct fo_store *st, const struct spec *sp, const int *s
  *
  * Одна функция на apply и на отчёты не ради краткости: apply ПРИВЯЗЫВАЕТ таблицу к тому,
  * что вернули здесь, а status и diag рассказывают о том же самом. Разойдись они — и
- * интерфейс снова показывал бы не то, что применено. */
+ * интерфейс снова показывал бы не то, что применено.
+ *
+ * ГРУППА СПЕКИ v2 (именованные члены) идёт не по этим ступеням, а по правилу своего pick — тому
+ * же решению, что принимает проход, только без проб (fog_pick_known в fogroup.c): жив ли член —
+ * его последний приговор (запись `active` члена не «-») и наличие его устройства; manual — член
+ * из `select`, balance — первый живой, order и latency — живой текущий, иначе первый живой (у
+ * latency — лучший по последнему замеру). Живого, которого можно взять, нет — `failed`, и apply
+ * ставит группе её on_fail сразу (apply_routing_one), а не устройство до первого прохода. Прежние
+ * ступени здесь не годились: запись сторожа у группы — это его прошлое решение, а не правило, и
+ * после перезагрузки (каталог состояния — tmpfs) её нет вовсе. Группа manual с выбором,
+ * пережившим перезагрузку в файле `select`, тогда до первого прохода вела трафик через первого
+ * члена, а при лежащем выбранном — тоже через первого живого вместо on_fail; запись, оставшаяся от
+ * прежнего выбора (select сменили при выключенном движке или правкой файла), вела бы через
+ * прежний член. Подробно — у fog_pick_known. */
 void outputs_adopt_active(struct spec *sp) {
     outputs_adopt_active_st(sp, &fo_store_files);
 }
 
 void outputs_adopt_active_st(struct spec *sp, struct fo_store *st) {
+    /* Состояние групп из записей (выбранный член, живые, выбор человека, замеры) — первым: у
+     * группы v2 ниже выбранный член и живые считаются заново и ложатся поверх записи. */
+    fog_adopt(sp, st);
     /* В порядке прохода (fog_order): у вложенной группы устройство — лист её выбора, и внешней
      * оно нужно уже выбранным. */
     size_t ord[MAX_OUTPUTS];
@@ -1408,6 +1424,34 @@ void outputs_adopt_active_st(struct spec *sp, struct fo_store *st) {
 
         const struct output *m[MAX_MEMBERS];
         size_t mn = out_members(sp, o, m, MAX_MEMBERS);
+        struct group_cfg *g = &o->grp;
+        if (group_named(g)) {
+            /* Приговор члена — его проход в том же обходе, и член стоит в порядке раньше группы:
+             * его failed и device (у вложенной группы — её лист) выше уже подхвачены. */
+            unsigned alive = 0;
+            for (size_t k = 0; k < mn; k++)
+                if (!m[k]->failed && device_present(m[k]->device)) alive |= 1u << k;
+            /* Несущий член — как у прохода: по записи groups, пока группа не в отказе; записи
+             * groups нет — по устройству из active. */
+            int cur = -1;
+            if (rec[0] && strcmp(rec, "-") != 0) {
+                cur = g->cur;
+                for (size_t k = 0; k < mn && cur < 0; k++)
+                    if (!strcmp(m[k]->device, rec)) cur = (int)k;
+            }
+            int k = fog_pick_known(sp, st, o, alive, cur);
+            g->alive = alive;
+            g->cur = k;
+            o->failed = k < 0;
+            /* В отказе устройство — то, о котором status и diag скажут «не отвечает»: у manual —
+             * лист выбранного члена (трафик группы ждёт именно его), у остальных — первый
+             * существующий член, как прежде. */
+            if (k < 0 && g->pick == PICK_MANUAL) k = fog_manual_pick(sp, st, o);
+            for (size_t j = 0; j < mn && k < 0; j++)
+                if (device_present(m[j]->device)) k = (int)j;
+            if (k >= 0 && (size_t)k < mn) snprintf(o->device, sizeof(o->device), "%s", m[k]->device);
+            continue;
+        }
         const char *pick = NULL;
         if (rec[0] && strcmp(rec, "-") != 0 && device_present(rec))
             for (size_t k = 0; k < mn && !pick; k++)
@@ -1416,8 +1460,6 @@ void outputs_adopt_active_st(struct spec *sp, struct fo_store *st) {
             if (device_present(m[k]->device)) pick = m[k]->device;
         if (pick) snprintf(o->device, sizeof(o->device), "%s", pick);
     }
-    /* Состояние групп (выбранный член, живые, выбор человека, замеры) — для status. */
-    fog_adopt(sp, st);
 }
 
 /* Поднять залипший туннель.
@@ -2328,25 +2370,19 @@ static void fo_step(struct fo_run *r) {
                 if (m < MAX_OUTPUTS && r->alive[m]) r->galive |= 1u << k;
             }
             /* manual — член, выбранный человеком (select), или default. Не отвечает — отказ группы
-             * с её on_fail: переключиться на другого значило бы решить за человека. */
-            if (g && r->named && g->pick == PICK_MANUAL) {
-                int k = fog_manual_pick(sp, r->st, o);
-                if (k >= 0 && ((r->galive >> k) & 1u)) {
+             * с её on_fail: переключиться на другого значило бы решить за человека.
+             * balance — соединения раздаёт ядро по карте живых членов (fog_balance_sync в
+             * out_finish); таблица самой группы — у первого живого члена: по ней идут сокеты с
+             * меткой группы (over на группу). Живых нет — отказ группы, карта пуста.
+             * Оба решения — fog_pick_known (fogroup.c): ту же функцию зовёт подхват
+             * outputs_adopt_active_st, по которому apply привязывает таблицу группы до первого
+             * прохода, и решение при старте не расходится с решением прохода. */
+            if (g && r->named && (g->pick == PICK_MANUAL || g->pick == PICK_BALANCE)) {
+                int k = fog_pick_known(sp, r->st, o, r->galive, r->cur);
+                if (k >= 0 && (size_t)k < r->cand_n) {
                     r->chosen = r->cand[k]->device;
                     r->pk = k;
                 }
-                r->s = S_FIN;
-                continue;
-            }
-            /* balance — соединения раздаёт ядро по карте живых членов (fog_balance_sync в
-             * out_finish); таблица самой группы — у первого живого члена: по ней идут сокеты с
-             * меткой группы (over на группу). Живых нет — отказ группы, карта пуста. */
-            if (g && r->named && g->pick == PICK_BALANCE) {
-                for (size_t k = 0; k < r->cand_n && !r->chosen; k++)
-                    if ((r->galive >> k) & 1u) {
-                        r->chosen = r->cand[k]->device;
-                        r->pk = (int)k;
-                    }
                 r->s = S_FIN;
                 continue;
             }

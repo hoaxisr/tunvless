@@ -166,6 +166,62 @@ const char *fog_lat_key(const struct output *m) {
     return m->name[0] ? m->name : m->device;
 }
 
+/* ОДНО РЕШЕНИЕ НА ПРОХОД И НА СТАРТ.
+ *
+ * До этой функции выбор члена группы v2 принимали в двух местах, и по-разному. Проход (fo_step в
+ * failover.c) выбирал по правилам pick: у manual — член из `select`, у balance — первый живой. А
+ * подхват outputs_adopt_active_st, по которому apply привязывает таблицу группы и status о ней
+ * рассказывает, знал одно правило на всех: запись `active` сторожа, а нет её — первый
+ * существующий кандидат. Каталог состояния на роутере — tmpfs, и после перезагрузки записи нет:
+ * группа manual с выбором `man wg1` (файл select рядом со спекой перезагрузку пережил) несколько
+ * секунд до первого прохода вела трафик через wg0 — первого члена, а не выбранного; status в это
+ * окно говорил `"selected":null,"select":"wg1"`, и первый DNS-запрос клиента ушёл через wg0.
+ * Выбранный член лежит — таблица получала первого живого, а не on_fail, который обещан для
+ * manual (docs/spec-v2.md). Найдено проверкой долгов на QEMU-роутере с настоящим procd.
+ *
+ * Правило теперь одно, и оно — правило прохода, только без проб: жив ли член, решил приговор его
+ * собственного прохода (у подхвата — последний записанный приговор и наличие устройства), а
+ * группа своих устройств и так не пробует (шапка файла, «ЧЛЕНЫ v2»). Поэтому у manual и balance
+ * решение прохода и есть эта функция целиком — он её и зовёт. У order и latency проходу есть что
+ * добавить: гистерезис возврата (серия проходов подряд) и свежий замер. Подхвату ни того, ни
+ * другого делать нельзя — status зовёт его на каждый запрос, и он обязан только читать, — поэтому
+ * здесь живой текущий держится (таблица и так на нём, а уйти с него — дело прохода), а без
+ * текущего берётся то, что взял бы проход по уже известному: у latency — лучший по последнему
+ * замеру (тот же group_latency_pick с тем же допуском), без замеров — первый живой, как у прохода,
+ * когда не измерился никто (S_LAT_C → S_HYST). После перезагрузки замеров нет (они в том же
+ * tmpfs), и latency до первого замера идёт по порядку — это сказано в docs/ctl.md. */
+int fog_pick_known(const struct spec *sp, struct fo_store *st, const struct output *go,
+                   unsigned alive, int cur) {
+    const struct group_cfg *g = out_group(go);
+    if (!g || !g->members_n) return -1;
+    size_t n = g->members_n;
+    int first = -1;
+    for (size_t k = 0; k < n && first < 0; k++)
+        if ((alive >> k) & 1u) first = (int)k;
+    if (g->pick == PICK_MANUAL) {
+        /* Не работает выбранный — отказ группы с её on_fail: переключиться на другого значило бы
+         * решить за человека. */
+        int k = fog_manual_pick(sp, st, go);
+        return k >= 0 && ((alive >> k) & 1u) ? k : -1;
+    }
+    if (g->pick == PICK_BALANCE) return first;
+    if (cur >= 0 && (size_t)cur < n && ((alive >> cur) & 1u)) return cur;
+    if (g->pick == PICK_LATENCY && first >= 0) {
+        int ms[MAX_MEMBERS], best = -1;
+        for (size_t k = 0; k < n; k++) {
+            struct folat_rec rc;
+            ms[k] = -1;
+            if (((alive >> k) & 1u) &&
+                folat_rec_get(st, go->name, fog_lat_key(&sp->out[g->members[k]]), &rc))
+                ms[k] = rc.ms;
+        }
+        int tol = g->lat_tolerance_ms > 0 ? g->lat_tolerance_ms : FOLAT_TOLERANCE_MS;
+        int p = group_latency_pick(ms, n, tol, &best);
+        if (p >= 0) return p;
+    }
+    return first;
+}
+
 /* ---- простой группы (idle_timeout) --------------------------------------------------------- */
 
 int fog_idle_limit(const struct output *go) {
@@ -252,6 +308,21 @@ int fog_balance_sync(const struct spec *sp, const struct output *go, unsigned al
         return -1;
     }
     return 1;
+}
+
+/* Карта после загрузки набора правил. Компилятор ставит карту balance со всеми членами (набор
+ * правил от живости членов не зависит — иначе его отпечаток менялся бы с каждым упавшим туннелем, и
+ * apply-сверка перезагружала бы набор без смены спеки). До этой сверки упавший член получал новые
+ * соединения до первого прохода сторожа после apply — при старте несколько секунд, а после apply,
+ * менявшего только набор правил (списки), до периода сторожа: такой apply внеочередного прохода не
+ * зовёт. Сверяется тем же fog_balance_sync, что у прохода, по той же маске, что подхват выдал
+ * status (group_cfg.alive), — то есть карта сразу та, что поставил бы проход. */
+void fog_balance_adopt(const struct spec *sp) {
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct group_cfg *g = out_group(&sp->out[i]);
+        if (g && g->pick == PICK_BALANCE && group_named(g))
+            fog_balance_sync(sp, &sp->out[i], g->alive);
+    }
 }
 
 /* ---- запись groups ------------------------------------------------------------------------- */
@@ -408,6 +479,17 @@ int fog_select(struct spec *sp, struct fo_store *st, const char *gname, const ch
         fprintf(stderr, "steer: select: %s — не член группы %s\n", mname, gname);
         return 2;
     }
+    /* ЧТО НЕСЁТ ТАБЛИЦА ГРУППЫ СЕЙЧАС — по подхвату, а не по записи active сторожа, и до того, как
+     * новый выбор ляжет в запись select: подхват решает по прежнему выбору ровно то, к чему apply
+     * привязал таблицу (outputs_adopt_active_st, fog_pick_known). Запись сторожа отстаёт от ядра
+     * до первого прохода: после старта с файлом select, сменённым при остановленном демоне, apply
+     * ведёт группу на член из файла, а запись всё ещё называет прежний. Сравнивая с записью,
+     * команда приняла бы «выбран тот же, что в записи» за «ничего не меняется» и не переписала бы
+     * таблицу, которая на самом деле ведёт на другой член. Спеку команде дают свежей копией
+     * (ctl.c, mem_select; cmd_select), так что устройства здесь переписывать можно. */
+    outputs_adopt_active_st(sp, st);
+    char was[32];
+    snprintf(was, sizeof(was), "%s", go->failed ? "-" : go->device);
     char line[80];
     snprintf(line, sizeof(line), "%s %s", gname, mname);
     rec_set(st, "select", gname, line);
@@ -420,14 +502,13 @@ int fog_select(struct spec *sp, struct fo_store *st, const char *gname, const ch
     /* Лист члена и жив ли он — по памяти сторожа: приговор последнего прохода члена (запись
      * active: «-» — отказ). Записи нет (сторож ещё не проходил) — по наличию устройства. */
     const struct output *m = &sp->out[g->members[k]];
-    char mdev[32], was[32];
+    char mdev[32];
     active_of(st, m->name, mdev, sizeof(mdev), NULL);
     int alive = strcmp(mdev, "-") != 0;
     if (!mdev[0]) {
         snprintf(mdev, sizeof(mdev), "%s", m->device);
         alive = dev_up(mdev);
     }
-    active_of(st, go->name, was, sizeof(was), NULL);
     char gline[96];
     if (alive) {
         int moved = strcmp(was, mdev) != 0;
