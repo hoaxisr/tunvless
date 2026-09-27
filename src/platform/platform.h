@@ -110,5 +110,11 @@ const char *plat_etc_path(char *buf, size_t n, const char *name);
  * который пишет управляющий слой). Обе сразу — отказ «две спеки» у load_spec, а не выбор. */
 const char *plat_spec_yaml(void);
 const char *plat_spec_default(void);
+/* Файл спеки за путём, названным явно: путь из пары по умолчанию (spec.json или spec.yaml — так
+ * их называет init-скрипт, `--spec /etc/steer/spec.json`) значит «какая из двух лежит сейчас»
+ * (plat_spec_default), любой другой путь и NULL (→ умолчание) — как есть. Так же поступает
+ * load_spec; нужно тем, кто открывает файл спеки сам: демон (куда ctl apply кладёт тело, что
+ * отвечает version) и клиент (тот ли это демон, что читать для apply). */
+const char *plat_spec_resolve(const char *path);
 
 #endif

@@ -118,3 +118,9 @@ const char *plat_spec_default(void) {
     const char *js = plat()->spec_path, *ym = plat_spec_yaml();
     return access(js, F_OK) != 0 && access(ym, F_OK) == 0 ? ym : js;
 }
+
+const char *plat_spec_resolve(const char *path) {
+    if (!path || !strcmp(path, plat()->spec_path) || !strcmp(path, plat_spec_yaml()))
+        return plat_spec_default();
+    return path;
+}

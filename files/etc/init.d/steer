@@ -22,7 +22,12 @@ EXTRA_HELP="	reload_zapret	Перечитать стратегии обхода,
 	reload_dnsd	Перечитать списки резолвером, не снимая правил
 	reapply		Пересобрать и применить правила, не трогая остального"
 
+# Спека — spec.json или spec.yaml рядом (спека v2 в YAML, docs/spec-v2.md, «Файл спеки»). Движку
+# передаётся путь spec.json и тогда, когда лежит только spec.yaml: этот путь по умолчанию он
+# сам заменяет на spec.yaml (plat_spec_default), а обе сразу — отказ «две спеки». Проверять же,
+# есть ли спека, здесь нужно по обоим именам (steer_spec_present).
 SPEC=/etc/steer/spec.json
+SPEC_YAML=/etc/steer/spec.yaml
 # Абсолютные пути: команду экземпляра запускает procd, а не эта оболочка, и его PATH — не наш.
 STEERD=/usr/sbin/steerd
 STEER=/usr/sbin/steer
@@ -127,8 +132,12 @@ reload_service() {
 # Пересобрать правила после смены настройки сети (триггер ниже): подсети клиентов выводятся из
 # адреса lan_device, и набор правил меняется, хотя спека та же — сверка это увидит. Демона нет —
 # применить движком, как прежде.
+steer_spec_present() {
+    [ -f "$SPEC" ] || [ -f "$SPEC_YAML" ]
+}
+
 reapply() {
-    [ -f "$SPEC" ] || return 0
+    steer_spec_present || return 0
     steer_reload && return 0
     "$STEERD" apply --spec "$SPEC" || echo "steer: apply failed — see the message above"
 }
