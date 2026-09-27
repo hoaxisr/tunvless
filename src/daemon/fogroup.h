@@ -18,6 +18,26 @@ size_t fog_order(const struct spec *sp, size_t *ord);
  * иначе default, иначе первый. */
 int fog_manual_pick(const struct spec *sp, struct fo_store *st, const struct output *g);
 
+/* ВЫБОР ЧЛЕНА ГРУППЫ v2 ПО УЖЕ ИЗВЕСТНЫМ ПРИГОВОРАМ ЧЛЕНОВ — без проб и без замеров. alive —
+ * маска живых членов (бит на член по порядку members), cur — член, который несёт трафик сейчас
+ * (-1 — никто: записи нет или группа в отказе). Возврат — номер выбранного члена или -1: живого,
+ * которого можно взять, нет, и группа применяет свой on_fail. Правила — те же, что у прохода:
+ *   manual  — выбор человека (fog_manual_pick), если он жив; иначе -1, а не другой член;
+ *   balance — первый живой (таблица группы; соединения раздаёт карта по alive);
+ *   order   — живой текущий держится (возврат на верхний — дело гистерезиса прохода), иначе
+ *             первый живой;
+ *   latency — живой текущий держится; иначе лучший по последнему замеру среди живых (с допуском,
+ *             group_latency_pick), а без замеров — первый живой.
+ * Зовут её проход (manual и balance: там это всё решение) и подхват outputs_adopt_active_st
+ * (apply и status до первого прохода) — одно решение на оба пути; доводы — у определения. */
+int fog_pick_known(const struct spec *sp, struct fo_store *st, const struct output *g,
+                   unsigned alive, int cur);
+
+/* balance: привести карты всех групп pick: balance в ядре к живым членам по состоянию подхвата
+ * (group_cfg.alive, outputs_adopt_active_st). Зовёт apply после загрузки набора правил: тот
+ * ставит карту «все члены живы». */
+void fog_balance_adopt(const struct spec *sp);
+
 /* Сколько секунд без трафика через группу замер urltest не делается: idle_timeout спеки, а без
  * него — умолчание платформы (телефон — 1800, роутер — 0, то есть мерить всегда). */
 int fog_idle_limit(const struct output *g);

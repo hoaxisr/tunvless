@@ -14,6 +14,11 @@
 #     и selected; выбор переживает перезапуск демона и «перезагрузку» (чистый каталог состояния,
 #     та же спека: файл select лежит рядом со спекой, а не в tmpfs); select мёртвого члена — отказ
 #     группы по on_fail (blackhole), а не другой член; отказы команды (не член, не manual).
+#  1а. До первого прохода — то же решение, что у прохода: демон без сторожа (стартовый apply и ни
+#     одного прохода) после «перезагрузки» ставит таблицу группы на выбранный член, а не на первый;
+#     выбранный член лежит — сразу on_fail (blackhole), и карта balance сразу без упавшего члена;
+#     запись сторожа, устаревшая относительно файла select (файл сменили при остановленном
+#     демоне), выбор не перебивает.
 #  2. latency = urltest: через двух членов с разной задержкой выбирается быстрый, хотя он второй
 #     по порядку; запрос идёт именно через члена (ответчик видит адрес его устройства); гистерезис:
 #     выигрыш меньше tolerance — остаётся на текущем; больше — уходит.
@@ -249,6 +254,22 @@ start_daemon() {
 }
 starts=0
 stop_daemon() { kill "$D" 2>/dev/null; wait "$D" 2>/dev/null; D=""; rm -f "$tmp/steer.sock"; }
+# Демон без сторожа (1а): стартовый apply и ни одного прохода — таблицы выходов ровно те, что
+# поставил apply при старте, то есть то, что видит клиент в окно до первого прохода.
+start_bare() {
+    n0="$(grep -c 'спека применена при старте' "$tmp/d.err" 2>/dev/null)"
+    unshare -m sh -c "mount -t sysfs sysfs /sys && mount --bind \"$tmp/hosts\" /etc/hosts && \
+        exec \"$BIN\" daemon --apply --socket \"$tmp/steer.sock\" $S" >>"$tmp/d.out" 2>>"$tmp/d.err" &
+    D=$!
+    wait_for '[ -S "$tmp/steer.sock" ] && [ "$(grep -c "спека применена при старте" "$tmp/d.err")" -gt "${n0:-0}" ]' 15
+}
+# «Перезагрузка»: каталог состояния пуст (tmpfs), таблица группы в ядре пуста; спека и файл select
+# рядом с ней — на месте.
+reboot_state() {
+    t="$(reg "$1" 3)"
+    [ -n "$tmp" ] && [ -d "$tmp/st" ] && rm -rf "$tmp/st" && mkdir -p "$tmp/st"
+    [ -n "$t" ] && ip route flush table "$t"
+}
 reg() { awk -v o="$1" '$1 == o { print $'"$2"' }' "$tmp/st/registry"; }
 tdev() { ip route show table "$(reg "$1" 3)" | awk '$1 == "default" && $2 == "dev" { print $3 }' | head -n 1; }
 tbh() { ip route show table "$(reg "$1" 3)" | grep -c '^blackhole default *$'; }
@@ -298,6 +319,47 @@ start_daemon
 wait_for '[ "$(tdev man)" = sw2 ]' 10
 check "  после «перезагрузки» (чистый каталог состояния) выбор тот же" "b sw2" \
     "$(st outputs.man.group.select) $(tdev man)"
+
+# ---- 1а. до первого прохода ----
+# Проверка выше смотрит после прохода; здесь — окно до него. Прежде подхват брал группе запись
+# сторожа, а без неё — первого существующего члена: после перезагрузки таблица man несколько секунд
+# вела в sw1 при выборе b, а при лежащем b — тоже в sw1 вместо on_fail.
+bal_targets() { nft list map inet steer "balmap_$(reg bal 3)" 2>/dev/null | grep -o 'goto mark_[0-9]*' | sort -u | tr '\n' ' '; }
+stop_daemon
+reboot_state man
+start_bare
+check "до первого прохода после «перезагрузки»: таблица группы — на выбранном b, не на первом" "sw2" \
+    "$(tdev man)$([ "$(tdev man)" = sw2 ] || troutes man)"
+check "  status до прохода: select b, selected b, не в отказе" "b b -" \
+    "$(st outputs.man.group.select) $(st outputs.man.group.selected) $(st outputs.man.failed)"
+check "  balance до прохода: в карте оба живых члена" "4" "$(bal_targets | wc -w)"
+# Запись сторожа устарела относительно select: файл выбора сменили, пока демон стоял (select через
+# демон пишет запись active «man sw2» — она остаётся в каталоге состояния).
+out="$(c select man b 2>&1)"
+stop_daemon
+printf 'man a\n' > "$tmp/select"
+start_bare
+check "запись active устарела (select сменён при остановленном демоне): таблица — на a по select" \
+    "sw1 a a" "$(tdev man) $(st outputs.man.group.select) $(st outputs.man.group.selected)"
+out="$(c select man b 2>&1)"
+check "  select b обратно" "sw2" "$(tdev man)"
+# Выбранный член лежит при старте — сразу on_fail группы (drop: blackhole), а не первый живой; карта
+# balance — сразу без него.
+stop_daemon
+ip link set sw2 down
+reboot_state man
+start_bare
+check "выбранный b лежит при старте: сразу on_fail (blackhole), не a" "1 " \
+    "$(tbh man) $(tdev man)$([ "$(tbh man)" = 1 ] || troutes man)"
+check "  status до прохода: selected null, select b, в отказе" "- b True" \
+    "$(st outputs.man.group.selected) $(st outputs.man.group.select) $(st outputs.man.failed)"
+check "  balance до прохода: в карте только живой a" "goto mark_$(reg a 3) " "$(bal_targets)"
+check "  latency до прохода: первый живой по порядку (b лежит — a)" "sw1" "$(tdev lat)"
+stop_daemon
+ip link set sw2 up
+start_daemon
+wait_for '[ "$(tdev man)" = sw2 ]' 20
+check "  член поднялся — проход возвращает группу на него" "sw2" "$(tdev man)"
 
 ip link set sw2 down
 wait_for '[ "$(tbh man)" = 1 ]' 40
