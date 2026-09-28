@@ -15,7 +15,11 @@
 # после смены спеки (reload) ведёт себя по новой таблице тем же процессом; SIGTERM демону гасит
 # помощников по одному в обратном порядке подъёма и резолвер — детей после демона не остаётся;
 # резолвер переживает kill -9 демона, а `steerd down` после него (stop в окне до respawn) гасит его
-# сразу, при живом же демоне не трогает.
+# сразу, при живом же демоне не трогает. Строки резолвера, оставшегося без читателя stderr (труба
+# журнала закрыта), приходят в syslog — в приёмник стенда вместо /dev/log (шов STEER_SYSLOG_SOCK) —
+# с заголовком syslog(3): уровень по началу строки, метка времени, тег steer[pid], текст целиком, и
+# разбирается этот заголовок по правилам logd OpenWrt и journald; забравший резолвер демон получает
+# строки снова в свой stderr; последняя строка перед выходом (срок ожидания, `steerd down`) доходит.
 #
 # Сторож и супервизор вместе (--watch --supervise; root, своё сетевое пространство и свой /sys,
 # демон build/steer-xk — базовая сборка с видами vless и xsteer): здоровье выходов xsteer сторож
@@ -43,8 +47,13 @@ fi
 
 tmp="$(mktemp -d)"
 mkdir -p "$tmp/st"
-D="" SUB="" UP="" WD="" DN5="" Q5=""
-trap 'kill $D $SUB $UP $WD $DN5 $Q5 2>/dev/null; rm -rf "$tmp"' EXIT
+D="" SUB="" UP="" WD="" DN5="" Q5="" SL="" CAT=""
+trap 'kill $D $SUB $UP $WD $DN5 $Q5 $SL $CAT 2>/dev/null; rm -rf "$tmp"' EXIT
+# Резолвер без читателя stderr пишет в syslog (src/dnsd/adopt.c, stderr_rescue) — у стенда это
+# свой приёмник, а не /dev/log машины: в системный журнал стенд не пишет ни строки. Шов — на весь
+# стенд, чтобы ни один резолвер отсюда, даже там, где проверка его не ждёт, до /dev/log не дошёл
+# (приёмника нет — резолвер пишет в /dev/null).
+export STEER_SYSLOG_SOCK="$tmp/log.sock"
 pass=0 fail=0
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); else
@@ -375,6 +384,146 @@ check "демон без спеки гасит оставшийся резолв
     "$(gone "$DN5") $(grep -c "резолвер прежнего демона (pid $DN5) погашен" "$tmp/d5e.err")"
 kill -TERM "$D"; wait "$D" 2>/dev/null; D="" DN5=""
 
+# ---- stderr резолвера без демона — в syslog с заголовком (src/dnsd/adopt.c, stderr_rescue) -------
+# На роутере stderr резолвера — труба журнала procd, и после остановки службы её читателя нет.
+# Здесь это FIFO, чей читатель (cat) убит до kill -9 демона: пропажу демона резолвер замечает уже
+# без читателя stderr, и строки идут в приёмник syslog стенда. Приёмник пишет по датаграмме на
+# строку (перевод строки внутри — как \n). Проверка разбирает заголовок трижды: как RFC 3164
+# (syslog(3) glibc/musl: `<PRI>Mmm dd hh:mm:ss ТЕГ[pid]: `, время — местное, сейчас), как logd
+# OpenWrt (ubox, logd/syslog.c: число после '<' до '>' — приоритет, без него 0, то есть
+# kern.emerg; метка снимается, если на [3] и [6] пробел, на [9] и [12] двоеточие, на [15] пробел)
+# и как journald (syslog_parse_priority, syslog_skip_timestamp — буква, буква, буква, пробел,
+# пробел-или-цифра, цифра, …; syslog_parse_identifier — тег и pid до «: »). Итог — «PRI ok ok ok ok»
+# или, вместо ok, чем не сошлось.
+cat > "$tmp/slog.py" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.bind(sys.argv[1])
+with open(sys.argv[2], 'ab', buffering=0) as f:
+    while True:
+        d = s.recv(65536)
+        f.write(d.replace(b'\\', b'\\\\').replace(b'\n', b'\\n') + b'\n')
+PY
+cat > "$tmp/slogchk.py" <<'PY'
+import re, sys, time
+path, pid, text = sys.argv[1], sys.argv[2], sys.argv[3]
+MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+grams = [l.rstrip(b'\n').replace(b'\\n', b'\n').replace(b'\\\\', b'\\')
+         for l in open(path, 'rb')]
+got = [g for g in grams if text.encode() in g]
+if len(got) != 1:
+    print('датаграмм с этим текстом: %d' % len(got)); sys.exit()
+d = got[0]
+want = ('steer[%s]: %s' % (pid, text)).encode()
+
+def rfc(d):
+    m = re.fullmatch(rb'<(\d{1,3})>(' + '|'.join(MON).encode() + rb') ( [1-9]|[12]\d|3[01]) '
+                     rb'([01]\d|2[0-3]):([0-5]\d):([0-5]\d) (.*)', d, re.S)
+    if not m: return 'не RFC 3164'
+    return 'ok' if m.group(7) == want else 'текст: %r' % m.group(7)
+
+def stamp(d):
+    if b'>' not in d: return 'метки нет'
+    stamp = d[d.index(b'>') + 1:][:15].decode(errors='replace')
+    now = time.time()
+    for t in range(int(now) - 60, int(now) + 2):
+        tm = time.localtime(t)
+        if '%s %2d %02d:%02d:%02d' % (MON[tm.tm_mon - 1], tm.tm_mday, tm.tm_hour, tm.tm_min,
+                                      tm.tm_sec) == stamp: return 'ok'
+    return 'время не местное-сейчас: %s' % stamp
+
+def logd(d):                   # ubox logd/syslog.c, syslog_handle_log
+    p, pri = d.rstrip(b'\0\n'), 0
+    if p[:1] == b'<':
+        i = 1
+        while i < len(p) and p[i:i + 1].isdigit():
+            pri = pri * 10 + p[i] - 48; i += 1
+        if p[i:i + 1] == b'>': i += 1
+        p = p[i:]
+    if len(p) > 16 and p[3:4] == b' ' and p[6:7] == b' ' and p[9:10] == b':' and \
+       p[12:13] == b':' and p[15:16] == b' ':
+        p = p[16:]
+    if pri >> 3 != 1: return 'facility %d (pri %d)' % (pri >> 3, pri)
+    return 'ok' if p == want else 'logread: %r' % p
+
+def journald(d):               # systemd, journald-syslog.c
+    p = d
+    if p[:1] != b'<' or b'>' not in p: return 'нет <PRI>'
+    k = next((k for k in (2, 3, 4) if p[k:k + 1] == b'>'), 0)
+    if not k or not p[1:k].isdigit(): return 'PRI не разобран'
+    pri, p = int(p[1:k]), p[k + 1:]
+    if pri >> 3 != 1: return 'facility %d' % (pri >> 3)
+    seq = 'LLLSsNSsN:sN:sNS'
+    if len(p) < len(seq): return 'коротко'
+    for c, want_c in zip(p[:len(seq)], seq):
+        ch = bytes([c])
+        ok = {'L': ch.isalpha(), 'S': ch == b' ', 'N': ch.isdigit(),
+              's': ch == b' ' or ch.isdigit(), ':': ch == b':'}[want_c]
+        if not ok: return 'метка времени не снята'
+    p = p[len(seq):]
+    p = p.lstrip(b' \t\n\r')
+    l = len(re.match(rb'[^ \t\n\r]*', p).group(0))
+    if l <= 0 or p[l - 1:l] != b':': return 'тега нет'
+    e, l = l, l - 1
+    ident, jpid = p[:l], None
+    if l > 0 and p[l - 1:l] == b']':
+        k = p.rfind(b'[', 0, l - 1)
+        if k >= 0: jpid, ident = p[k + 1:l - 1], p[:k]
+    if p[e:e + 1] in (b' ', b'\t', b'\n', b'\r'): e += 1
+    msg = p[e:]
+    if (ident, jpid, msg) != (b'steer', pid.encode(), text.encode()):
+        return 'тег %r pid %r текст %r' % (ident, jpid, msg)
+    return 'ok'
+
+pri = re.match(rb'<(\d+)>', d)
+print(pri.group(1).decode() if pri else '-', rfc(d), stamp(d), logd(d), journald(d))
+PY
+slogchk() { python3 "$tmp/slogchk.py" "$tmp/log.out" "$@"; }
+mkfifo "$tmp/err.fifo"
+: > "$tmp/log.out"
+python3 "$tmp/slog.py" "$tmp/log.sock" "$tmp/log.out" & SL=$!
+wait_for '[ -S "$tmp/log.sock" ]' 5
+d5fifo() {   # d5fifo ЖУРНАЛ — демон, чей stderr — FIFO с читателем cat в ЖУРНАЛ (pid — $CAT)
+    cat "$tmp/err.fifo" > "$tmp/$1" & CAT=$!
+    d5 err.fifo
+}
+cutlog() { kill "$CAT"; wait "$CAT" 2>/dev/null; CAT=""; }
+
+# Демон пропал уже без читателя stderr: «демон пропал» — в syslog, warn (12); новый демон забрал
+# резолвер — строки снова в его stderr, и в syslog больше ничего не приходит.
+d5fifo d5h.err; D=$!
+wait_for '[ -n "$(dn5 d5h.err запущен)" ] && [ -S "$tmp/st5/dnsd-ctl.sock" ]' 5
+DN5="$(dn5 d5h.err запущен)"
+cutlog
+kill -KILL "$D"; wait "$D" 2>/dev/null; D=""
+wait_for 'grep -q . "$tmp/log.out"' 3
+# Эту строку и glibc, и musl пишут двумя write (кусок до %d и остаток) — приходит она одной
+# датаграммой и целой.
+lost="steer[warn] dnsd: демон пропал (труба таблицы закрыта) — отвечаю по последней таблице"
+lost="$lost и жду нового демона 4 с"
+check "stderr без читателя: строка резолвера — в syslog, warn, заголовок разбирается" \
+    "12 ok ok ok ok" "$(slogchk "$DN5" "$lost")"
+d5 d5i.err; D=$!
+wait_for '[ -n "$(dn5 d5i.err подхвачен)" ]' 5
+sleep 0.3
+check "  забравший демон получает строки резолвера в свой stderr, в syslog — больше ничего" \
+    "$DN5 1 1" "$(dn5 d5i.err подхвачен) \
+$(grep -c 'steer\[info\] dnsd: новый демон забрал резолвер' "$tmp/d5i.err") $(grep -c . "$tmp/log.out")"
+kill -TERM "$D"; wait "$D" 2>/dev/null; D=""
+wait_for '[ "$(gone "$DN5")" = gone ]' 2
+
+# Срок ожидания нового демона вышел: последняя строка перед выходом дочитана и дошла.
+: > "$tmp/log.out"
+d5fifo d5j.err; D=$!
+wait_for '[ -n "$(dn5 d5j.err запущен)" ] && [ -S "$tmp/st5/dnsd-ctl.sock" ]' 5
+DN5="$(dn5 d5j.err запущен)"
+cutlog
+kill -KILL "$D"; wait "$D" 2>/dev/null; D=""
+wait_for '[ "$(gone "$DN5")" = gone ]' 8
+check "  срок ожидания вышел: последняя строка перед выходом — в syslog" "gone 12 ok ok ok ok" \
+    "$(gone "$DN5") $(slogchk "$DN5" "steer[warn] dnsd: нового демона нет 4 с — выхожу")"
+DN5=""
+
 # stop в окне после падения демона: kill -9 и сразу `steerd down` (его зовёт service_stopped
 # init.d), пока procd не поднял демон, — резолвер, ждущий нового демона, гаснет сразу, а не через
 # --orphan-timeout: сокета нет, и новому демону забирать нечего (свой резолвер он запускает). При
@@ -403,6 +552,23 @@ $(grep -c 'служба остановлена без демона (steerd down)
     check "  новому демону забирать нечего: свой резолвер" "yes " \
         "$([ -n "$(dn5 d5g.err запущен)" ] && echo yes || echo no) $(dn5 d5g.err подхвачен)"
     kill -TERM "$D"; wait "$D" 2>/dev/null; D="" DN5=""
+
+    # То же без читателя stderr (на роутере так и есть: stop закрыл трубу журнала procd) —
+    # последняя строка резолвера, info (14), дочитана перед выходом и дошла до syslog.
+    : > "$tmp/log.out"
+    d5fifo d5k.err; D=$!
+    wait_for '[ -n "$(dn5 d5k.err запущен)" ] && [ -S "$tmp/st5/dnsd-ctl.sock" ]' 5
+    DN5="$(dn5 d5k.err запущен)"
+    cutlog
+    kill -KILL "$D"; wait "$D" 2>/dev/null; D=""
+    sleep 0.5
+    "$BIN" down --state-dir "$tmp/st5" 2>"$tmp/down3.err"
+    wait_for '[ "$(gone "$DN5")" = gone ]' 3
+    check "  без читателя stderr: строка о выходе по steerd down — в syslog, info" \
+        "gone 14 ok ok ok ok" \
+        "$(gone "$DN5") $(slogchk "$DN5" \
+            "steer[info] dnsd: служба остановлена без демона (steerd down) — выхожу")"
+    DN5=""
 fi
 
 # ---- сторож и супервизор вместе (--watch --supervise) --------------------------------------

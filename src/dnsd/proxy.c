@@ -2023,6 +2023,10 @@ int run_proxy(int listen_port, int upstream_port) {
                 adopt_accept();
             } else if (events[i].data.ptr == &g_adopt_conn || events[i].data.ptr == &g_adopt_owner) {
                 adopt_conn_event(events[i].data.ptr);
+            } else if (events[i].data.ptr == &g_slog_rd) {
+                /* Строки stderr после stderr_rescue — в syslog (adopt.c). Труба могла уйти в
+                 * этой же пачке (adopt раньше по массиву) — тогда событие прежней пустое. */
+                if (g_slog_rd >= 0) slog_pump();
             } else if (tcp_event(events[i].data.ptr, events[i].events)) {
                 /* соединение TCP — клиента или наверх; всё сделано внутри */
             } else {
@@ -2043,6 +2047,10 @@ int run_proxy(int listen_port, int upstream_port) {
     if (g_up_fd >= 0) close(g_up_fd);
     if (g_table_fd >= 0) close(g_table_fd);
     close(g_listen_fd);
+    /* Последняя строка резолвера без демона («… — выхожу») записана прямо перед выходом из
+     * цикла и лежит в трубе stderr → syslog непрочитанной: дочитать её здесь (adopt.c), после
+     * всего, что при уборке ещё могло что-то сказать. */
+    slog_stop();
     close(g_epfd);
     for (size_t i = 0; i < g_dch_n; i++) {
         ruleset_free(&g_dch[i].rules);
