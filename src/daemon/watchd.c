@@ -95,7 +95,17 @@
  * MASQUERADE НА ТЕЛЕФОНЕ (plat()->iptables_masq): netd при перезапуске перестраивает iptables, и
  * правило masquerade пропадает — сторож его возвращает (iptables_masq_ensure в apply.c). Это
  * `iptables -C` на устройство, то есть процессы, и потому не на каждом проходе: после прохода
- * по событию сети или смене спеки и не реже раза в WATCH_MASQ_S (watch_masq_due в watch.c). */
+ * по событию сети или смене спеки и не реже раза в WATCH_MASQ_S (watch_masq_due в watch.c).
+ *
+ * СВЕРКА НАБОРА ПРАВИЛ (решение владельца 2026-09-28). Перед каждым проходом сторож зовёт
+ * watchd_conf.kcheck — сервер сокета сверяет номер и отпечаток наших таблиц nftables с тем, что
+ * стояло сразу после последнего нашего nft -f (recon_kernel_drift: четыре обмена netlink, без
+ * элементов наборов и без процессов). Снятое снаружи правило канала раньше жило до ближайшего
+ * `steer apply` человека; теперь — до ближайшего прохода. Сам сторож набор правил не ставит:
+ * расхождение сервер ставит починкой в очередь изменяющих команд (reload без соединения, тот
+ * же путь, что apply той же спеки), и проход тогда откладывается, как при любой изменяющей
+ * команде, — до её конца и успокоения. Устройство и доводы — в шапке recon.c, «СВЕРКА НА ПРОХОДЕ
+ * СТОРОЖА». У `steer failover` (без демона) сверки нет: применённое помнит только демон. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -313,6 +323,14 @@ static void watchd_timer(struct loop *l, struct loop_timer *t, void *arg) {
     if (!w->d->have) return;
     if (w->cf.enabled && !w->cf.enabled()) { watchd_enable(w, 0); return; }
     if (w->cf.busy && w->cf.busy(w->cf.busy_arg)) { watchd_settle(w); return; }
+    /* Набор правил против ядра — перед каждым проходом (шапка, «СВЕРКА НАБОРА ПРАВИЛ»): сейчас,
+     * когда своей изменяющей команды нет. Нашлось расхождение — починка встала в очередь и,
+     * скорее всего, уже идёт; проход тогда откладывается, как при любой изменяющей команде:
+     * он и она пишут одни и те же таблицы. */
+    if (w->cf.kcheck) {
+        w->cf.kcheck(w->cf.busy_arg);
+        if (w->cf.busy && w->cf.busy(w->cf.busy_arg)) { watchd_settle(w); return; }
+    }
     if (w->nl >= 0) watch_nl_drain(w->nl);   /* пачка, ради которой ждали, — в этот проход */
     watchd_pass_start(w);
 }
@@ -514,8 +532,13 @@ static int watchd_traffic(void *arg, const struct spec *sp, const struct output 
         *pkts = 0;
         return 0;
     }
-    static const char *const chains[] = { "prerouting_mark", "output_mark" };
-    if (nfd_chain_rules(NFD_INET, nft_table(), chains, 2, wtraffic_rule, &t) != 0) return -1;
+    /* ingress_mark — разметка каналов раздачи на хуке ingress (compile/generate.c, «разметка на
+     * ingress»): там растут счётчики каналов раздачи, а запасные правила prerouting_mark их
+     * пакеты уже не проходят. Цепочки нет (ingress не ставился) — nfd_chain_rules её просто не
+     * находит. Пакет, который разметили оба хука (чужая перезапись метки между ними), здесь
+     * засчитывается дважды: вопрос «шёл ли трафик» от этого не меняется. */
+    static const char *const chains[] = { "ingress_mark", "prerouting_mark", "output_mark" };
+    if (nfd_chain_rules(NFD_INET, nft_table(), chains, 3, wtraffic_rule, &t) != 0) return -1;
     *pkts = t.pkts;
     return 0;
 }

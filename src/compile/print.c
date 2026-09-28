@@ -842,8 +842,10 @@ static void print_chain(FILE *f, const struct nft_table *t, const struct nft_cha
     if (c->type) {
         char prio[48];
         ir_prio_str(c, prio, sizeof(prio));
-        fprintf(f, "        type %s hook %s priority %s; policy %s;\n",
-                c->type, c->hook, prio, c->policy ? c->policy : "accept");
+        /* Устройства — между хуком и приоритетом, как их пишет и печатает nft. */
+        fprintf(f, "        type %s hook %s%s%s priority %s; policy %s;\n",
+                c->type, c->hook, c->devices ? " " : "", c->devices ? c->devices : "", prio,
+                c->policy ? c->policy : "accept");
     }
     for (const struct nft_rule *r = c->rules; r; r = r->next) print_rule(f, t, r);
     fprintf(f, "    }\n");

@@ -9,6 +9,11 @@ pass=0 fail=0
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 S="--state-dir $tmp/state"
+# Разметка каналов на ingress (compile/generate.c, «разметка на ingress») зависит от ядра и от
+# того, есть ли на машине устройства раздачи; золотые тексты стенда — раскладка без неё, явно,
+# чтобы вывод не менялся от машины к машине (на машине с br-lan и новым ядром ingress встал бы
+# сам). Раскладку с ingress проверяет свой раздел в конце — с STEER_NFT_INGRESS=all.
+STEER_NFT_INGRESS=0; export STEER_NFT_INGRESS
 
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); else
@@ -1703,6 +1708,131 @@ mout="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run --spec "$tmp/legacy.json"
         --state-dir "$tmp/st-legacy" 2>/dev/null)"
 check "modern: одна таблица inet" "1" "$(printf '%s\n' "$mout" | grep -c '^table ')"
 check "modern: exthdr frag exists на месте" "1" "$(printf '%s\n' "$mout" | grep -c 'exthdr frag exists')"
+
+# ---- разметка на ingress (compile/generate.c, «разметка на ingress») -----------------------
+# STEER_NFT_INGRESS=all — ядро «принимает» inet ingress, и устройства раздачи «есть»: текст не
+# зависит от машины. Что ingress ставится только на существующие устройства, проверяет
+# ingressns.sh на настоящем ядре; здесь — устройство, которого точно нет, при STEER_NFT_INGRESS=1.
+chain_of() { printf '%s\n' "$1" | sed -n "/^    chain $2 {/,/^    }/p"; }
+spec <<'EOF'
+{ "schema": 1,
+  "from_default": ["192.168.1.0/24"],
+  "outputs": {
+    "direct": { "kind": "direct" },
+    "vpn":    { "kind": "interface", "device": "wg0" }
+  },
+  "channels": [
+    { "name": "keep",    "match": { "prefixes_file": "TMP/b.lst" }, "out": "direct" },
+    { "name": "blocked", "match": { "prefixes_file": "TMP/a.lst" }, "out": "vpn" }
+  ] }
+EOF
+iout="$(STEER_NFT_INGRESS=all "$BIN" apply --dry-run --spec "$tmp/spec.json" $S)"
+want="$(cat <<'EOF'
+    chain ingress_mark {
+        type filter hook ingress device "br-lan" priority filter + 10; policy accept;
+        meta mark and 0x0ff00000 == 0x00000000 meta mark set mark and 0xf00fffff or 0x0f000000 comment "steer-ingress"
+        ip saddr { 192.168.1.0/24 } ip daddr @direct_ip counter return comment "steer:direct_ip"
+        ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set mark and 0xf00fffff or 0x40100000 counter return comment "steer:vpn_ip"
+    }
+    chain prerouting_mark {
+        type filter hook prerouting priority mangle + 1; policy accept;
+        iifname "br-lan" meta mark and 0x0ff00000 vmap { 0x0f000000 : goto ingress_seen, 0x00100000 : goto ingress_ct } comment "steer-ingress"
+        ip saddr { 192.168.1.0/24 } ip daddr @direct_ip counter return comment "steer:direct_ip"
+        ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:vpn_ip"
+    }
+    chain ingress_seen {
+        meta mark set mark and 0xf00fffff
+    }
+    chain ingress_ct {
+        ct mark set mark
+    }
+EOF
+)"
+check "ingress: разметка на ingress моста, метка соединения и «разобран» — в prerouting" "$want" \
+    "$(printf '%s\n' "$iout" | sed -n '/^    chain ingress_mark {/,/^    chain ingress_ct {/p;/^    chain ingress_ct {/,/^    }/p' | uniq)"
+check "ingress: на ingress нет ни одного выражения ct" "0" \
+    "$(chain_of "$iout" ingress_mark | grep -c ' ct ')"
+
+# Сложная спека: MAC и адреса обоих семейств в «кому», несколько устройств раздачи, сужение по
+# портам, доменный канал, «весь трафик», группы order/latency/balance, zapret, мост Telegram.
+printf '10.20.0.0/16\n2001:db8:20::/48\n' > "$tmp/ing-w.lst"
+printf 'work.example\n' > "$tmp/ing-w.dom"
+printf '149.154.160.0/20\n' > "$tmp/ing-t.lst"
+cat > "$tmp/ing.yaml" <<EOF
+version: 2
+lan: { devices: [br-lan, tailscale0] }
+clients:
+  kids: { mac: [aa:bb:cc:dd:ee:01] }
+  tv:   { addr: [192.168.1.50, fd00::50] }
+lists:
+  work:  { prefixes_file: $tmp/ing-w.lst, domains_file: $tmp/ing-w.dom }
+  voice: { prefixes_file: $tmp/ing-w.lst, proto: udp, ports: [50000-65535] }
+  tgl:   { prefixes_file: $tmp/ing-t.lst }
+  keep:  { prefixes_file: $tmp/b.lst }
+outputs:
+  wg0:  { kind: interface, device: wg0 }
+  wg1:  { kind: interface, device: wg1 }
+  res:  { kind: group, pick: order, members: [wg0, wg1], on_fail: drop }
+  fast: { kind: group, pick: latency, members: [wg0, wg1], tolerance: 50 }
+  bal:  { kind: group, pick: balance, members: [wg0, wg1] }
+  dpi:  { kind: zapret }
+  tg:   { kind: tgws, domain: ex.co.uk }
+  dir:  { kind: direct }
+rules:
+  - { name: keep,  to: [keep], out: dir }
+  - { name: kids,  for: [kids], to: all, out: res }
+  - { name: work,  to: [work], out: fast }
+  - { name: voice, for: tv, to: voice, out: res }
+  - { name: bulk,  for: tv, to: all, out: bal }
+  - { name: zap,   to: [keep], out: dpi }
+  - { name: tgr,   to: [tgl], out: tg }
+EOF
+IS="--spec $tmp/ing.yaml --state-dir $tmp/st-ing"
+iout="$(STEER_NFT_INGRESS=all "$BIN" apply --dry-run $IS 2>/dev/null)"
+check "ingress, сложная спека: компилируется" "0" "$?"
+pout="$(STEER_NFT_INGRESS=0 "$BIN" apply --dry-run $IS 2>/dev/null)"
+check "ingress: цепочка на всех устройствах раздачи" "1" \
+    "$(printf '%s\n' "$iout" | grep -c 'type filter hook ingress devices = { "br-lan", "tailscale0" } priority filter + 10;')"
+# Запасные правила prerouting — те же, что без ingress, до байта: весь prerouting_mark без
+# первого правила (узнавание разобранного).
+check "ingress: запасные правила prerouting — прежние до байта" \
+    "$(chain_of "$pout" prerouting_mark)" \
+    "$(chain_of "$iout" prerouting_mark | grep -v 'comment "steer-ingress"$')"
+# Правила ingress — те же правила каналов в том же порядке, без метки соединения; у balance —
+# метка группы вместо перехода в её цепочку (ниже отдельно).
+check "ingress: правила каналов — те же, в том же порядке, без ct mark" \
+    "$(chain_of "$pout" prerouting_mark | sed '1,2d;$d' | grep -v 'goto bal_' | sed 's/ ct mark set mark//')" \
+    "$(chain_of "$iout" ingress_mark | sed '1,3d;$d' | grep -v 'comment "steer:bal_all')"
+regmark() { printf '0x%08x' "0x$(awk -v o="$1" '$1 == o { print $2 }' "$tmp/st-ing/registry")"; }
+bmark="$(regmark bal)"
+bchain="$(chain_of "$pout" prerouting_mark | sed -n 's/.*counter goto \(bal_[0-9]*\).*/\1/p' | head -n 1)"
+check "ingress: balance — метка группы на ingress (IPv4 и IPv6)" "2" \
+    "$(chain_of "$iout" ingress_mark | grep -c "meta mark set mark and 0xf00fffff or $bmark counter return comment \"steer:bal_all")"
+check "ingress: balance — prerouting по метке группы идёт в её цепочку" "1" \
+    "$(chain_of "$iout" prerouting_mark | grep -c "$bmark : goto $bchain")"
+# Ключи карты — ровно метки, которые ставит ingress_mark (поле метки), и «разобран».
+keys_set="$(chain_of "$iout" ingress_mark | sed -n 's/.* or 0x\(.\)\(..\)\(.....\) .*/0x0\2\3/p' | sort -u)"
+keys_map="$(chain_of "$iout" prerouting_mark | sed -n 's/.*vmap { \(.*\) }.*/\1/p' | tr ',' '\n' |
+    sed -n 's/^ *\(0x[0-9a-f]*\) : .*/\1/p' | sort -u)"
+check "ingress: ключи карты — метки ingress и «разобран»" "$keys_set" "$keys_map"
+check "ingress: мост Telegram (без метки соединения) — просто выход" "1" \
+    "$(chain_of "$iout" prerouting_mark | grep -c "$(regmark tg) : return")"
+check "ingress: zapret — с меткой соединения (очередь узнаёт соединение по ней)" "1" \
+    "$(chain_of "$iout" prerouting_mark | grep -c "$(regmark dpi) : goto ingress_ct")"
+
+# Откаты: там, где ingress не ставится, текст — прежний, до байта.
+sed 's/devices: \[br-lan, tailscale0\]/devices: [nosuch-steer0]/' "$tmp/ing.yaml" > "$tmp/ing-nodev.yaml"
+check "ingress: устройства раздачи нет — ingress не ставится, текст прежний" \
+    "$(STEER_NFT_INGRESS=0 "$BIN" apply --dry-run --spec "$tmp/ing-nodev.yaml" --state-dir "$tmp/st-ing" 2>/dev/null)" \
+    "$(STEER_NFT_INGRESS=1 "$BIN" apply --dry-run --spec "$tmp/ing-nodev.yaml" --state-dir "$tmp/st-ing" 2>/dev/null)"
+check "ingress: старое ядро (legacy-min) — ingress нет" "0" \
+    "$(STEER_NFT_INGRESS=all STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run $IS 2>/dev/null | grep -c 'hook ingress')"
+sed 's/tolerance: 50 }/tolerance: 50, idle_timeout: 600 }/' "$tmp/ing.yaml" > "$tmp/ing-idle.yaml"
+check "ingress: группа latency с idle_timeout — тоже на ingress (сторож считает трафик и в ingress_mark)" "1" \
+    "$(STEER_NFT_INGRESS=all "$BIN" apply --dry-run --spec "$tmp/ing-idle.yaml" --state-dir "$tmp/st-ing" 2>/dev/null |
+       grep -c 'hook ingress')"
+# Телефон (устройства раздачи по требованию) — androidmatch.sh: здесь платформа — у бинарника
+# стенда (platmatch гоняет этот стенд и сборкой под телефон с платформой openwrt).
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

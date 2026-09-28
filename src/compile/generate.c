@@ -16,11 +16,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <net/if.h>
 
 #include "spec.h"
 #include "generate.h"
 #include "srs.h"
 #include "nftdump.h"
+#include "nftcompat.h"
 #include "balance.h"
 
 /* Короткий строковый буфер для выражений-перечней («ip saddr { a, b }», «th dport { … }»).
@@ -373,9 +375,14 @@ void counters_load(void) {
      * разметки на хуке output), скачанное — в input_down (см. nft_emit_output_mark). Без них
      * status не отдавал для таких каналов ни одного байта, и экран приложения показывал пустой
      * «трафик по правилам» при живом туннеле. На роутере этих цепочек нет, и ядро просто
-     * отвечает, что их нет. */
+     * отвечает, что их нет.
+     *
+     * ingress_mark — разметка на хуке ingress (ниже, «разметка на ingress»): там считает правило
+     * канала, когда пакет пришёл с устройства раздачи, а prerouting_mark — когда пакет разобран
+     * заново там (устройство без хука, чужая перезапись метки). Одно имя — одна сумма (ctr_take),
+     * так что объём канала — оба вместе. */
     static const char *const chains[] = {
-        "prerouting_mark", "postrouting_down", "output_mark", "input_down",
+        "ingress_mark", "prerouting_mark", "postrouting_down", "output_mark", "input_down",
     };
     nfd_chain_rules(NFD_INET, nft_table(), chains, sizeof(chains) / sizeof(chains[0]),
                     ctr_take, NULL);
@@ -402,6 +409,14 @@ static void x_mark(struct nft_rule *r, const struct output *o, unsigned mark) {
     if (!out_needs_mark(o)) return;
     ir_markset(r, "meta mark set mark and 0x%08x or 0x%08x", ~STEER_MARK_MASK, mark);
     if (out_needs_ctmark(o)) ir_x(r, "ct mark set mark");
+}
+
+/* То же на хуке ingress: только метка пакета. Записи conntrack на ingress ещё нет (её заводит
+ * conntrack на prerouting, приоритет -200), и `ct mark set` там ядро не выполнит; метку
+ * соединения ставит prerouting_mark по готовой метке пакета (цепочка ingress_ct). */
+static void x_mark_ingress(struct nft_rule *r, const struct output *o, unsigned mark) {
+    if (!out_needs_mark(o)) return;
+    ir_markset(r, "meta mark set mark and 0x%08x or 0x%08x", ~STEER_MARK_MASK, mark);
 }
 
 /* ---- наборы групп ----------------------------------------------------------------------- */
@@ -587,13 +602,25 @@ static void x_dest(struct nft_rule *r, const struct group *g, int reverse, int l
 /* ---- разметка: prerouting_mark ------------------------------------------------------------
  *
  * mangle + 1: the mark must exist before the routing decision, and staying one
- * step after mangle leaves room for anything that legitimately wants to run first. */
+ * step after mangle leaves room for anything that legitimately wants to run first.
+ *
+ * Где стоят правила каналов — mh (ниже, «разметка на ingress»): только здесь (MH_PREROUTING,
+ * прежний набор до байта), на ingress (MH_INGRESS) или здесь же запасными к ingress
+ * (MH_FALLBACK). */
+enum mark_hook { MH_PREROUTING, MH_INGRESS, MH_FALLBACK };
+
+/* Счётчик правила канала. Запасное правило prerouting рядом с ingress начинает с нуля: прежний
+ * объём канала переносится один раз — в правило ingress, которое и считает его трафик, — иначе
+ * каждый apply удваивал бы сумму (counters_load складывает правила с одним именем). */
+static void x_counter_mh(struct nft_rule *r, const char *name, enum mark_hook mh) {
+    if (mh == MH_FALLBACK) ir_counter(r, 0, 0);
+    else x_counter_carried(r, name, 0);
+}
+
 static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const struct group *g,
-                             const struct output *o);
-static int build_prerouting_mark(struct nft_table *t, const struct spec *sp,
-                                 const struct groups *gr, struct err *e) {
-    struct nft_chain *c = ir_base_chain_add(t, "prerouting_mark", "filter", "prerouting",
-                                            "mangle", 1);
+                             const struct output *o, enum mark_hook mh);
+static int build_mark_rules(struct nft_chain *c, const struct spec *sp, const struct groups *gr,
+                            enum mark_hook mh, struct err *e) {
     for (size_t i = 0; i < gr->n; i++) {
         const struct group *g = &gr->g[i];
         struct output *o = out_by_name(sp, g->out);
@@ -606,7 +633,7 @@ static int build_prerouting_mark(struct nft_table *t, const struct spec *sp,
         int carried = 0;
         if (who4_ok(g)) {
             carried = 1;
-            build_mark_rule4(c, sp, g, o);
+            build_mark_rule4(c, sp, g, o, mh);
         }
         if (group_needs6(sp, g)) {
             struct nft_rule *r6 = ir_rule(c);
@@ -614,12 +641,18 @@ static int build_prerouting_mark(struct nft_table *t, const struct spec *sp,
             x_from6(r6, sp, g, 0, !group_has_set6(g));
             x_dest6(r6, g, 0);
             /* balance: двойник переходит в ту же цепочку группы — карта и метка соединения
-             * семейству безразличны (IPv6 группы без IPv6 там же уходит в отказ, balance.c). */
+             * семейству безразличны (IPv6 группы без IPv6 там же уходит в отказ, balance.c). На
+             * ingress — метка самой группы, как у правила IPv4 (build_mark_rule4). */
             char bc[32] = "";
-            if (out_balanced(o)) group_bal_chain(o, bc, sizeof(bc));
-            else x_mark(r6, o, out_skips_zapret(o) ? (o->mark | ZAPRET_SKIP_MARK) : o->mark);
+            unsigned mk = out_skips_zapret(o) ? (o->mark | ZAPRET_SKIP_MARK) : o->mark;
+            if (out_balanced(o) && mh == MH_INGRESS)
+                ir_markset(r6, "meta mark set mark and 0x%08x or 0x%08x", ~STEER_MARK_MASK,
+                           o->mark);
+            else if (out_balanced(o)) group_bal_chain(o, bc, sizeof(bc));
+            else if (mh == MH_INGRESS) x_mark_ingress(r6, o, mk);
+            else x_mark(r6, o, mk);
             if (carried) ir_counter(r6, 0, 0);
-            else x_counter_carried(r6, g->name, 0);
+            else x_counter_mh(r6, g->name, mh);
             if (bc[0]) ir_x(r6, "goto %s", bc);
             else ir_x(r6, "return");
             ir_comment(r6, "steer:%s", g->name);
@@ -628,9 +661,10 @@ static int build_prerouting_mark(struct nft_table *t, const struct spec *sp,
     return 0;
 }
 
-/* Правило IPv4 группы в prerouting_mark — прежнее, до байта (снимок tests/golden/ruleset). */
+/* Правило IPv4 группы в prerouting_mark — прежнее, до байта (снимок tests/golden/ruleset); на
+ * ingress — без метки соединения, а у группы balance — с меткой самой группы вместо перехода. */
 static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const struct group *g,
-                             const struct output *o) {
+                             const struct output *o, enum mark_hook mh) {
     {
         struct nft_rule *r = ir_rule(c);
         x_from(r, sp, g);
@@ -669,21 +703,214 @@ static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const s
         /* Группа pick: balance метку не ставит здесь: правило переходит в её цепочку, и метку
          * члена выбирает карта (compile/balance.c). goto, а не jump: конец цепочки группы — это
          * конец и этой цепочки, как `return` ниже, — первое совпавшее правило решает. */
+        /* На ingress записи conntrack ещё нет, и карта раздачи с её памятью соединения (`ct
+         * mark and … goto mark_…`) там не работает. Поэтому правило канала ставит метку САМОЙ
+         * группы, а prerouting_mark по ней переходит в цепочку группы (ingress_trust ниже):
+         * дальше всё как без ingress — восстановление по метке соединения, карта, отказ. */
+        if (out_balanced(o) && mh == MH_INGRESS) {
+            ir_markset(r, "meta mark set mark and 0x%08x or 0x%08x", ~STEER_MARK_MASK, o->mark);
+            x_counter_mh(r, g->name, mh);
+            ir_x(r, "return");
+            ir_comment(r, "steer:%s", g->name);
+            return;
+        }
         if (out_balanced(o)) {
             char bc[32];
             group_bal_chain(o, bc, sizeof(bc));
-            x_counter_carried(r, g->name, 0);
+            x_counter_mh(r, g->name, mh);
             ir_x(r, "goto %s", bc);
             ir_comment(r, "steer:%s", g->name);
             return;
         }
-        x_mark(r, o, out_skips_zapret(o) ? (o->mark | ZAPRET_SKIP_MARK) : o->mark);
+        unsigned mk = out_skips_zapret(o) ? (o->mark | ZAPRET_SKIP_MARK) : o->mark;
+        if (mh == MH_INGRESS) x_mark_ingress(r, o, mk);
+        else x_mark(r, o, mk);
         /* `return` and not `accept`: it ends OUR chain, letting the rest of the
          * firewall proceed, while making the first matching group the winner. */
-        x_counter_carried(r, g->name, 0);
+        x_counter_mh(r, g->name, mh);
         ir_x(r, "return");
         ir_comment(r, "steer:%s", g->name);
     }
+}
+
+/* ---- разметка на ingress ------------------------------------------------------------------
+ *
+ * РЕШЕНИЕ ВЛАДЕЛЬЦА (опрос 2026-09-28): «inet ingress — делаем сразу», по правилу раздела 2
+ * docs/architecture.md — «чем ближе к L2, тем лучше, когда это даёт пользу». Классификация
+ * пакета по наборам каналов — самая дорогая работа движка на пакет (поиск в наборах на десятки
+ * тысяч префиксов), и она переезжает на хук ingress устройств раздачи: пакет получает метку
+ * выхода ещё до conntrack, до чужих цепочек prerouting и до решения маршрутизации.
+ *
+ * ЧТО НЕ ПЕРЕЕЗЖАЕТ И ПОЧЕМУ. На ingress нет записи conntrack — её заводит conntrack на
+ * prerouting (-200). Значит там нельзя ни поставить метку соединения (`ct mark set mark`: на неё
+ * опираются снятие соединений выхода сторожем, очередь kind=zapret и счёт телефона), ни
+ * прочитать её (память выбора группы balance, balance.c). Эти две вещи остаются в
+ * prerouting_mark, и делает их там правило ingress_trust ниже по готовой метке пакета. Заворот
+ * DNS, dnat fake-IP и перехват моста — цепочки nat, на ingress их нет вовсе; они на месте.
+ *
+ * УСТРОЙСТВО.
+ *   ingress_mark (hook ingress, устройства раздачи, приоритет filter + 10): первым правилом
+ *     пакет с пустым полем получает значение «разобран, выхода нет» (STEER_INGRESS_SEEN,
+ *     marks.h), дальше — правила каналов в том же порядке и с тем же «кто» и «куда», что в
+ *     prerouting, с меткой пакета без метки соединения. Совпавший канал ставит метку выхода
+ *     (у balance — метку группы); direct и «ничего не совпало» оставляют «разобран».
+ *   prerouting_mark первым правилом узнаёт пакет, пришедший с устройства ingress, по значению
+ *     поля — картой вердиктов (ingress_trust): «разобран» — снять значение и выйти (цепочка
+ *     ingress_seen), метка выхода с меткой соединения — `ct mark set mark` (ingress_ct), без неё
+ *     — выйти, метка группы balance — в цепочку группы. Одно сравнение имени устройства и один
+ *     поиск в хеше из десятка значений вместо поиска по наборам.
+ *   Остальные правила prerouting_mark — те же правила каналов, что и без ingress, до байта
+ *     (кроме переноса счётчика — x_counter_mh). Они запасные, и доходит до них пакет, который
+ *     ingress не разбирал: пришедший с устройства, на котором хука нет (ниже, «устройство»), с
+ *     другого устройства (клиент, заданный адресом, за туннелем, которого нет в lan_devices) и
+ *     пакет, чью метку между ingress и нами переписал чужой (pbr, Tailscale: `and 0xff00ffff`
+ *     обнуляет метки выходов 1-15 — почему ни одна из них не становится другой нашей меткой, у
+ *     STEER_INGRESS_SEEN). Незнакомое значение поля — не наше, и пакет разбирается заново, как
+ *     до ingress. Поэтому хуже прежнего не становится ни в одном из этих случаев: в худшем
+ *     классификация стоит в prerouting, как стояла.
+ *
+ * ПРИОРИТЕТ filter + 10 — ПОСЛЕ flowtable. Выгрузка потоков fw4 (flow_offloading) висит на том
+ *   же хуке ingress с приоритетом filter (0) и забирает пакеты выгруженного соединения себе
+ *   (NF_STOLEN). До нас такой пакет не доходит, как не доходил и до prerouting: цепочка разметки
+ *   по-прежнему видит единицы пакетов соединения, а не тысячи (замер у conntrack_evict в
+ *   daemon/failover.c). Встань мы раньше flowtable, каждый выгруженный пакет проходил бы поиск по
+ *   наборам впустую — это ровно та обработка, от которой выгрузка и избавляет.
+ *
+ * УСТРОЙСТВО, КОТОРОГО НЕТ. Цепочку ingress ядро принимает только на существующие устройства:
+ *   одно несуществующее в списке — и отвергнута вся транзакция (проверено на 6.8, «No such file
+ *   or directory»), то есть apply снял бы и наборы, и заворот DNS. Поэтому в цепочку идут
+ *   только те устройства раздачи, что есть сейчас (if_nametoindex); остальных ведёт prerouting,
+ *   как раньше. Исчезнувшее потом устройство ядро из цепочки вынимает (снова созданное — не
+ *   возвращает), а с последним снимает всю цепочку. Для трафика это не поломка — prerouting
+ *   видит пустое поле и разбирает пакет сам, — а отпечаток таблицы в ядре (nfd_table_fp, хук
+ *   входит в него целиком) расходится с применённым, и следующий apply или reload (apply-сверка,
+ *   daemon/recon.c) ставит набор заново уже на новое устройство (стенд ingressns). SIGHUP от
+ *   hotplug (files/etc/hotplug.d) набор не ставит: он перечитывает спеку и зовёт проход сторожа.
+ *   До apply теряется только выигрыш ingress, а не маршрутизация.
+ *
+ * МОСТ. Цепочка висит на самом мосту (br-lan), а не на его портах: пакет с порта в стек
+ *   маршрутизации мост отдаёт вверх через свой приёмник (br_pass_frame_up), и ingress моста его
+ *   видит — с тем же ether saddr клиента (стенд ingressns). Пакеты между портами моста в стек
+ *   не поднимаются и нас не касаются, как и раньше.
+ *
+ * ФРАГМЕНТЫ. На ingress пакеты ещё не собраны (сборка — defrag на prerouting, -400), и у
+ *   фрагмента без начала портов нет: правило канала с сужением по портам его не узнаёт. Это
+ *   безвредно: собранный пакет наследует метаданные первого фрагмента (inet_frag_reasm_prepare:
+ *   skb_morph от головы очереди), а первый фрагмент порты несёт и разобран верно. Без сборки
+ *   (conntrack выключен) фрагменты шли по отдельности и без ingress — prerouting тоже видел их
+ *   без портов.
+ *
+ * ГДЕ INGRESS НЕ СТАВИТСЯ (ingress_devs): старое ядро и ядро без inet ingress (NFTC_INGRESS,
+ *   проба nft_ingress_ok), платформа, где устройства раздачи появляются по требованию
+ *   (lan_devs_persist — телефон), поле метки без места под «разобран» (мини-сборка tgws), спека
+ *   без правил для раздачи, и ни одного существующего устройства раздачи. Каналы на сам телефон (from self, uid) —
+ *   хук output, их это не касается вовсе.
+ *
+ * ЦЕНА. Выигрыша в работе на пакет нет: поиск по наборам тот же, только раньше, а к нему
+ *   добавляется второй хук (ingress) и правило ingress_trust в prerouting. Замер в сетевых
+ *   пространствах (стенд ingressns, INGRESSNS_BENCH=1, UDP по 64 байта, девять кругов, медианы):
+ *   91,8 тыс. пакетов/с с ingress против 93,4 тыс. только в prerouting и 134,7 тыс. без движка
+ *   (серия из семи кругов — 94,1, 98,9 и 139,9) — пересылка пакета на 2-5 % дороже, разбросы
+ *   перекрываются; TCP на veth с GRO — в пределах разброса.
+ *   Числа и доводы — docs/architecture.md, раздел 5, «inet ingress». */
+static size_t ingress_devs(const struct spec *sp, const struct groups *gr, const char **devs) {
+    if (!(g_nftc & NFTC_INGRESS) || (g_nftc & NFTC_LEGACY)) return 0;
+    if (!plat()->lan_devs_persist || !steer_ingress_seen_ok()) return 0;
+    int any = 0;
+    for (size_t i = 0; i < gr->n && !any; i++) any = !group_is_local(&gr->g[i]);
+    if (!any) return 0;
+    size_t n = 0;
+    for (size_t i = 0; i < sp->lan_dev_n && n < MAX_LAN_DEV; i++)
+        if (nft_ingress_all_devs() || if_nametoindex(sp->lan_dev[i]))
+            devs[n++] = sp->lan_dev[i];
+    return n;
+}
+
+/* «device "a"» или «devices = { "a", "b" }» — как пишет nft. */
+static void devs_text(struct sbuf *b, const char *const *devs, size_t n) {
+    if (n == 1) { sb_add(b, "device \"%s\"", devs[0]); return; }
+    sb_add(b, "devices = { ");
+    for (size_t i = 0; i < n; i++) sb_add(b, "%s\"%s\"", i ? ", " : "", devs[i]);
+    sb_add(b, " }");
+}
+
+/* Первое правило prerouting_mark рядом с ingress: пакет с устройства ingress — по значению поля
+ * метки. Ключи — ровно те значения, что ставят правила ingress_mark; прочие (пустое поле — хука
+ * на устройстве нет; чужая перезапись) карта не узнаёт, и пакет идёт к запасным правилам. */
+static void ingress_trust(struct nft_table *t, struct nft_chain *pm, const struct spec *sp,
+                          const struct groups *gr, const char *const *devs, size_t nd) {
+    struct sbuf b = { .n = 0 };
+    sb_add(&b, "meta mark and 0x%08x vmap { 0x%08x : goto ingress_seen", STEER_MARK_MASK,
+           STEER_INGRESS_SEEN);
+    uint32_t keys[MAX_OUTPUTS];
+    size_t nk = 0;
+    int ct = 0;
+    for (size_t i = 0; i < gr->n; i++) {
+        const struct group *g = &gr->g[i];
+        if (group_is_local(g)) continue;
+        const struct output *o = out_by_name(sp, g->out);
+        if (!o || (!out_balanced(o) && !out_needs_mark(o))) continue;
+        size_t k = 0;
+        while (k < nk && keys[k] != o->mark) k++;
+        if (k < nk || nk >= MAX_OUTPUTS) continue;
+        keys[nk++] = o->mark;
+        char bc[32];
+        if (out_balanced(o)) {
+            group_bal_chain(o, bc, sizeof(bc));
+            sb_add(&b, ", 0x%08x : goto %s", o->mark, bc);
+        } else if (out_needs_ctmark(o)) {
+            sb_add(&b, ", 0x%08x : goto ingress_ct", o->mark);
+            ct = 1;
+        } else {
+            sb_add(&b, ", 0x%08x : return", o->mark);
+        }
+    }
+    sb_add(&b, " }");
+    struct nft_rule *r = ir_rule(pm);
+    struct sbuf d = { .n = 0 };
+    if (nd == 1) sb_add(&d, "iifname \"%s\"", devs[0]);
+    else {
+        sb_add(&d, "iifname { ");
+        for (size_t i = 0; i < nd; i++) sb_add(&d, "%s\"%s\"", i ? ", " : "", devs[i]);
+        sb_add(&d, " }");
+    }
+    ir_x(r, "%s", d.s);
+    ir_x(r, "%s", b.s);
+    ir_comment(r, "steer-ingress");
+    /* «Разобран, выхода нет» — снять значение: дальше пакет идёт с тем же пустым полем, что без
+     * ingress (его видят чужие правила postrouting, сторож, очередь zapret). */
+    ir_markset(ir_rule(ir_chain_add(t, "ingress_seen")), "meta mark set mark and 0x%08x",
+               ~STEER_MARK_MASK);
+    if (ct) ir_x(ir_rule(ir_chain_add(t, "ingress_ct")), "ct mark set mark");
+}
+
+/* Разметка каналов раздачи: prerouting_mark, а где можно — ingress_mark перед ним. */
+static int build_mark(struct nft_table *t, const struct spec *sp, const struct groups *gr,
+                      struct err *e) {
+    const char *devs[MAX_LAN_DEV];
+    size_t nd = ingress_devs(sp, gr, devs);
+    if (nd) {
+        struct nft_chain *ic = ir_base_chain_add(t, "ingress_mark", "filter", "ingress",
+                                                 "filter", 10);
+        struct sbuf d = { .n = 0 };
+        devs_text(&d, devs, nd);
+        ir_chain_devices(ic, d.s);
+        struct nft_rule *r = ir_rule(ic);
+        ir_x(r, "meta mark and 0x%08x == 0x00000000", STEER_MARK_MASK);
+        ir_markset(r, "meta mark set mark and 0x%08x or 0x%08x", ~STEER_MARK_MASK,
+                   STEER_INGRESS_SEEN);
+        ir_comment(r, "steer-ingress");
+        if (build_mark_rules(ic, sp, gr, MH_INGRESS, e) != 0) return -1;
+    }
+    struct nft_chain *pm = ir_base_chain_add(t, "prerouting_mark", "filter", "prerouting",
+                                             "mangle", 1);
+    if (!nd) return build_mark_rules(pm, sp, gr, MH_PREROUTING, e);
+    /* Правило ingress_trust — первым в prerouting_mark, запасные правила каналов — за ним.
+     * Цепочки ingress_seen и ingress_ct ingress_trust заводит сразу, и в тексте они встают прямо
+     * за prerouting_mark (порядок объектов дерева — порядок печати, а правила принадлежат своей
+     * цепочке, где бы ни стояли объекты после неё). */
+    ingress_trust(t, pm, sp, gr, devs, nd);
+    return build_mark_rules(pm, sp, gr, MH_FALLBACK, e);
 }
 
 /* ВЫХОД УПАЛ И ПУЩЕН НАПРЯМУЮ — бит «не для zapret» снимается. Правило разметки выше
@@ -1298,7 +1525,7 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
               struct err *e) {
     struct nft_table *t = ir_table_add(rs, NFT_FAM_INET, nft_table());
     build_group_sets(t, gr);
-    if (build_prerouting_mark(t, sp, gr, e) != 0) return -1;
+    if (build_mark(t, sp, gr, e) != 0) return -1;
     /* Группы balance: цепочки, карты и цепочки меток (compile/balance.c). Без таких групп — ничего,
      * и текст прежний до байта. */
     if (nft_emit_balance(t, sp, gr) != 0) return err_set(e, "out of memory building the ruleset", NULL);

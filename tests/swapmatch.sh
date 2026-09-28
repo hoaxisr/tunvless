@@ -27,7 +27,8 @@
 #     стоит за dnat.
 #  2. Ядро и трафик, подкоманда: apply с непустым fakeip.state без резолвера — набор канала уже
 #     содержит засеянный адрес, пакеты клиента — в туннель, у провайдера ноль; пять замен набора
-#     правил (снятое руками правило канала и apply) под трафиком — у провайдера ноль.
+#     правил под трафиком — у провайдера ноль, метку ставит ingress_mark (клиент — устройство
+#     раздачи); ещё три замены с STEER_NFT_INGRESS=0 (метку ставит prerouting_mark) — тоже ноль.
 #  3. Поддельный адрес без подмены не уходит никуда: ни к провайдеру, ни в туннель; счётчик правила
 #     steer-fakeip-nomap растёт.
 #  4. Старт демона с непустым fakeip.state (после `steer down`, то есть без правил fwmark и таблиц
@@ -275,8 +276,11 @@ check "без движка: поддельный адрес уходит про�
     "$(burst 198.18.0.1 5; [ "$(cnt "$IW" pool)" -ge 5 ] && echo yes || echo no)"
 
 printf 's19.test\n' > "$tmp/d.lst"
+# Клиенты — устройство раздачи r0: так метку каналов ставит цепочка ingress_mark на хуке ingress
+# (generate.c, «разметка на ingress»); без неё (STEER_NFT_INGRESS=0) — prerouting_mark. Засев и
+# правило без подмены от этого не зависят — ниже проверяется и то, и другое.
 cat > "$tmp/spec.json" <<EOF
-{ "schema": 1, "from_default": ["10.77.1.0/24"],
+{ "schema": 2, "lan_devices": ["r0"],
   "outputs": { "wg": { "kind": "interface", "device": "t0", "on_fail": "drop" } },
   "channels": [ { "name": "s", "match": { "domains_files": ["$tmp/d.lst"], "mode": "fakeip" },
                   "out": "wg" } ] }
@@ -312,6 +316,26 @@ check "пять замен под трафиком: у провайдера ни
 check "  и ни одного к поддельному" "0" "$(($(cnt "$IW" pool) - WP0))"
 check "  туннель получал (отправлено $sent)" "yes" \
     "$([ $(($(cnt "$IT" real) - T0)) -gt 100 ] && echo yes || echo "no:$(($(cnt "$IT" real) - T0))")"
+check "  метку ставила цепочка ingress_mark" "yes" \
+    "$("$real_nft" list chain inet steer ingress_mark 2>/dev/null | grep -q 'counter packets [1-9]' &&
+       echo yes || echo no)"
+
+# То же без ingress: метку ставит prerouting_mark.
+W0="$(cnt "$IW" real)" WP0="$(cnt "$IW" pool)" T0="$(cnt "$IT" real)"
+send_start 198.18.0.1
+sleep 0.3
+for k in 1 2 3; do
+    STEER_NFT_INGRESS=0 "$BIN" apply $S >/dev/null 2>&1
+    sleep 0.1
+done
+sent="$(send_stop)"
+check "без ingress (STEER_NFT_INGRESS=0): цепочки ingress_mark нет" "no" \
+    "$("$real_nft" list chain inet steer ingress_mark >/dev/null 2>&1 && echo yes || echo no)"
+check "  три замены под трафиком: у провайдера ни одного пакета" "0 0" \
+    "$(($(cnt "$IW" real) - W0)) $(($(cnt "$IW" pool) - WP0))"
+check "  туннель получал (отправлено $sent)" "yes" \
+    "$([ $(($(cnt "$IT" real) - T0)) -gt 50 ] && echo yes || echo "no:$(($(cnt "$IT" real) - T0))")"
+"$BIN" apply $S >/dev/null 2>&1
 
 # ---- 3. поддельный адрес без подмены --------------------------------------------------------
 nomap() { "$real_nft" list chain inet steer prerouting_dnat | grep 'steer-fakeip-nomap' |

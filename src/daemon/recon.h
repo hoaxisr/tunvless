@@ -5,6 +5,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "spec.h"
 
@@ -28,6 +29,10 @@ struct recon_plan {
     size_t n;
     struct { unsigned mark; int table; } stale[MAX_OUTPUTS];
     size_t stale_n;
+    /* Сводка элементов статических наборов в ядре на момент плана (строка kelems, только с
+     * --kernel-elems): kel_ok 0 — не спрашивали или снять не вышло. */
+    int kel_ok;
+    uint64_t kel, kel_n;
 };
 
 /* Что демон знает о применённом. valid=0 — ничего: следующий apply применяет всё, как
@@ -37,8 +42,14 @@ struct recon_state {
     unsigned long long fp;
     uint64_t handle;                /* номер таблицы в ядре после нашего nft -f; 0 — ядро не даёт */
     /* Отпечаток наших таблиц в ядре сразу после нашего nft -f (nfd_table_fp: цепочки, правила,
-     * заголовки наборов — без элементов и счётчиков): с ним сверяется ядро на каждом apply. */
+     * заголовки наборов — без элементов и счётчиков): с ним сверяется ядро на каждом apply и на
+     * каждом проходе сторожа. */
     uint64_t kfp;
+    /* Сводка элементов статических наборов сразу после нашего nft -f (recon_kernel_elems): с ней
+     * сверяется ядро на apply и reload (на проходе сторожа — нет). kel_ok 0 — снять не вышло,
+     * элементы до следующего nft -f не сверяются. */
+    int kel_ok;
+    uint64_t kel, kel_n;
     struct recon_out out[MAX_OUTPUTS];
     size_t n;
     /* Подписи сторожа — отдельно от применённого: их сверка нужна и тогда, когда в ядро ничего
@@ -63,12 +74,22 @@ struct recon_diff {
     int watch;
 };
 
+/* Ядро сразу после нашего nft -f — как его снял ребёнок apply-commit (recon_kernel_print) и
+ * передал демону строкой своего вывода. */
+struct recon_kernel {
+    int ok;                         /* номер и отпечаток сняты */
+    uint64_t handle, kfp;
+    int el_ok;                      /* сводка элементов снята */
+    uint64_t el, el_n;
+};
+
 struct fo_store;
 void recon_init(struct recon_state *st);
 /* Разобрать вывод плана. 0 — годный. */
 int recon_plan_parse(const char *text, size_t n, struct recon_plan *p);
 /* Решить по плану и применённому — и по ядру: таблица на месте и та же ли (номер), не изменены ли
- * в ней цепочки, правила и наборы (отпечаток), стоят ли правила и маршруты выходов (rtnetlink).
+ * в ней цепочки, правила и наборы (отпечаток) и элементы статических наборов (сводка из плана),
+ * стоят ли правила и маршруты выходов (rtnetlink).
  * sp — спека в памяти демона (последняя применённая; NULL — нет, и маршруты по ядру не
  * сверяются), outs — память сторожа (выбор устройств и отказы; NULL — файлы каталога состояния).
  * Найденное расхождение — строкой в stderr. */
@@ -79,12 +100,32 @@ int recon_diff_any(const struct recon_diff *d);
 /* argv для `steer apply-commit` по решению: буферы — в buf (n байт), av — не меньше 20 мест. */
 void recon_commit_argv(const struct recon_diff *d, const char *exe, const char *spec,
                        const char *state_dir, int nftc, char *buf, size_t n, char **av);
-/* Применение прошло: запомнить план как применённое (ruleset — ставился ли набор правил). */
-void recon_applied(struct recon_state *st, const struct recon_plan *p, const struct recon_diff *d);
+/* Применение прошло: запомнить план как применённое (ruleset — ставился ли набор правил). k —
+ * ядро после nft -f от apply-commit (NULL или !ok — снимает сам демон, без сводки элементов). */
+void recon_applied(struct recon_state *st, const struct recon_plan *p, const struct recon_diff *d,
+                   const struct recon_kernel *k);
 /* Подписи сторожа по плану: 1 — изменились (или прежних нет). Запоминает новые. */
 int recon_watch_changed(struct recon_state *st, const struct recon_plan *p);
 /* Применённое больше не известно (движок выключен, применение не прошло). */
 void recon_forget(struct recon_state *st);
+
+/* Сверка на проходе сторожа (шапка recon.c, «СВЕРКА НА ПРОХОДЕ СТОРОЖА»): номер и отпечаток
+ * наших таблиц в ядре против снятых после нашего последнего nft -f — четыре обмена netlink, без
+ * элементов. 0 — всё то же; 1 — разошлось (почему — в *why); 2 — таблицы нет (движок снят:
+ * `steer down`, чинить нечего); -1 — сверять не с чем (применённое неизвестно) или ядро не
+ * ответило. */
+int recon_kernel_drift(const struct recon_state *st, const char **why);
+
+/* Сводка элементов статических наборов наших таблиц в ядре (шапка recon.c, «СВЕРКА ЭЛЕМЕНТОВ»):
+ * *sum — свёртка, не зависящая от порядка элементов, *n — сколько элементов вошло. 0 — снята;
+ * -1 — ядро не ответило или доменный набор менялся на глазах. */
+int recon_kernel_elems(uint64_t *sum, uint64_t *n);
+/* Ребёнок apply-commit сразу после nft -f: номер, отпечаток и сводка элементов наших таблиц —
+ * строкой `recon-kernel …` в f. */
+void recon_kernel_print(FILE *f);
+/* Найти в выводе apply-commit строку recon-kernel, разобрать в *k и вырезать (в ответ
+ * человеку она не идёт). *n — новая длина. */
+void recon_kernel_take(char *text, size_t *n, struct recon_kernel *k);
 
 /* Номер таблицы inet ИМЯ в ядре (NFT_MSG_GETTABLE по netlink, без запуска nft): 0 — есть, номер
  * в *h (0 — ядро номеров таблиц не отдаёт, до Linux 4.16); 1 — таблицы нет; -1 — не спросить. */

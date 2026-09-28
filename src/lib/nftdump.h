@@ -47,12 +47,59 @@ long nfd_set_count(uint8_t family, const char *table, const char *set);
 int nfd_table_exists(uint8_t family, const char *table);
 int nfd_chain_exists(uint8_t family, const char *table, const char *chain);
 
-/* Отпечаток таблицы для apply-сверки демона (src/daemon/recon.c): FNV-1a 64 по цепочкам, правилам
- * по порядку и заголовкам наборов — без номеров объектов, без состояния выражений (counter, quota,
- * last) и без элементов наборов (их кладут резолвер и сторож; что входит и почему — в nftdump.c).
- * Одинаков, пока таблицу меняют только элементами. 0 — таблица есть, отпечаток в *fp; 1 — таблицы
- * нет; -1 — ядро не ответило. */
-int nfd_table_fp(uint8_t family, const char *table, uint64_t *fp);
+/* Отпечаток таблиц ИМЯ для сверки демона с ядром (src/daemon/recon.c): FNV-1a 64 по цепочкам,
+ * правилам по порядку и заголовкам наборов — без номеров объектов, без состояния выражений
+ * (counter, quota, last) и без элементов наборов (их кладут резолвер и сторож; что входит и
+ * почему — в nftdump.c). Одинаков, пока таблицу меняют только элементами.
+ *
+ * Сразу во всех семействах, где таблица с этим именем бывает у движка: inet — всегда, ip и ip6 —
+ * у раскладки старого ядра (legacy.c). Появившаяся или пропавшая таблица семейства — тоже другой
+ * отпечаток. Четыре обмена с ядром на все семейства вместе (таблицы, цепочки, наборы, правила —
+ * по дампу на вид, без фильтра по семейству): сверка идёт на каждом проходе сторожа демона, и
+ * дамп на семейство утроил бы её. Номер таблицы inet (NFTA_TABLE_HANDLE, с Linux 4.16; 0 — ядро
+ * его не отдаёт) — из того же дампа таблиц.
+ *
+ * 0 — снят (в том числе когда таблиц нет вовсе: fams 0); -1 — ядро не ответило. */
+struct nfd_tfp {
+    uint64_t fp;
+    uint64_t handle;            /* номер таблицы inet; 0 — нет таблицы или ядро номеров не даёт */
+    unsigned fams;              /* какие таблицы есть: 1 — inet, 2 — ip, 4 — ip6 */
+};
+int nfd_table_fp(const char *table, struct nfd_tfp *out);
+
+/* Именованные наборы и карты таблиц ИМЯ во всех семействах — заголовком: семейство, имя, флаги
+ * (NFT_SET_*), длина ключа. Безымянные (флаг NFT_SET_ANONYMOUS) тоже приходят: отбирает
+ * вызывающий. Один дамп на все семейства, как у nfd_table_fp. 0 — прочитаны; иначе errno. */
+struct nfd_set {
+    uint8_t family;
+    char name[64];
+    uint32_t flags;
+    uint32_t klen;
+};
+typedef void (*nfd_set_fn)(void *arg, const struct nfd_set *s);
+int nfd_sets(const char *table, nfd_set_fn fn, void *arg);
+
+/* Элементы одного набора — по одному, как их отдаёт ядро: ключ (и конец диапазона у набора из
+ * нескольких полей — NFTA_SET_ELEM_KEY_END), флаги элемента (NFT_SET_ELEM_INTERVAL_END — маркер
+ * конца у интервального набора из одного поля), есть ли у элемента срок и данные. Порядок —
+ * порядок хранилища ядра, он не обещан. reset — перед повтором дампа, который ядро прервало
+ * (NLM_F_DUMP_INTR): накопленное надо сбросить. *stable (NULL — не нужно) — 1, если у всех ответов
+ * дампа один номер поколения набора правил (nfgenmsg.res_id), то есть посреди дампа не прошло ни
+ * одной транзакции и снимок цельный; 0 — кто-то писал, и элементы могли выпасть или прийти
+ * дважды (ядро обходит набор, пропуская уже отданное по счёту). 0 — прочитаны; иначе errno
+ * (ENOENT — набора нет). */
+struct nfd_elem {
+    const uint8_t *key;
+    size_t klen;
+    const uint8_t *key_end;     /* NULL — нет */
+    size_t kelen;
+    uint32_t flags;
+    int timeout;                /* у элемента свой срок (NFTA_SET_ELEM_TIMEOUT или EXPIRATION) */
+    int data;                   /* у элемента данные (карта) */
+};
+typedef void (*nfd_elem_fn)(void *arg, const struct nfd_elem *e);
+int nfd_set_elems(uint8_t family, const char *table, const char *set, nfd_elem_fn fn,
+                  void (*reset)(void *arg), void *arg, int *stable);
 
 /* Есть ли в таблице правило `redirect to :PORT` (выражение redir с портом из immediate).
  * 1 — есть, 0 — нет. */

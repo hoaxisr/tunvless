@@ -343,14 +343,36 @@ int nfd_chain_exists(uint8_t family, const char *table, const char *chain) {
  *   - элементы именованных наборов и карт. Их кладут не только nft -f: резолвер — адреса
  *     доменных каналов, fake-IP и real-ip, сторож — метки «пущен напрямую» и карты раздачи
  *     balance. В доменном наборе постоянные элементы адресных списков лежат вперемешку с
- *     постоянными элементами резолвера (поддельные адреса без срока), и отличить их по ядру
- *     нечем. А адресные списки — это сотни тысяч элементов: дамп на каждый apply стоил бы
- *     сотен миллисекунд цикла демона. Элементы безымянных наборов не нужны тоже: ядро их не
- *     меняет (набор постоянный), а снять их можно только вместе с правилом.
+ *     постоянными элементами резолвера (поддельные адреса без срока). А адресные списки — это
+ *     сотни тысяч элементов: отпечаток снимается на каждом проходе сторожа, и дамп элементов
+ *     стоил бы ему сотен миллисекунд. Элементы статических наборов сверяются отдельно и только
+ *     на apply и reload — сводкой, которую снимает ребёнок демона (nfd_sets и nfd_set_elems
+ *     ниже; что сверяется и почему — в recon.c, «СВЕРКА ЭЛЕМЕНТОВ»). Элементы безымянных
+ *     наборов не нужны вовсе: ядро их не меняет (набор постоянный), а снять их можно только
+ *     вместе с правилом.
  *
  * Порядок атрибутов и их байты ядро отдаёт одни и те же, пока объект тот же, поэтому свёртка —
  * прямо по байтам ответа, без разбора выражений по видам. Правила и цепочки — в порядке дампа (он
- * порядок таблицы). */
+ * порядок таблицы).
+ *
+ * ВСЕ СЕМЕЙСТВА — ЧЕТЫРЬМЯ ОБМЕНАМИ. С 2026-09-28 отпечаток снимается не только на apply, но и на
+ * каждом проходе сторожа демона (recon.c, «СВЕРКА НА ПРОХОДЕ СТОРОЖА»), и число обменов с ядром
+ * стало ценой прохода. Прежде каждое из трёх семейств (inet, ip, ip6 — у раскладки старого
+ * ядра) стоило своего запроса таблицы и трёх дампов, а номер таблицы — ещё одного запроса: до
+ * тринадцати обменов. Теперь дамп на вид объекта один на все семейства (nfgen_family =
+ * NFPROTO_UNSPEC), а раскладка по семействам — по семейству ответа:
+ *   таблицы  — дамп всех таблиц (их на машине единицы): есть ли наши в каждом семействе и номер
+ *              таблицы inet;
+ *   цепочки  — дамп всех цепочек: фильтра по таблице у дампа цепочек в ядре нет, отбор по имени
+ *              таблицы — здесь (у fw4 роутера цепочек десятки — это заголовки, килобайты);
+ *   наборы   — дамп всех наборов без атрибута таблицы: с NFPROTO_UNSPEC ядро ищет таблицу по
+ *              имени И семейству (nft_ctx_init_from_setattr) и отвечает ENOENT, поэтому фильтр
+ *              — здесь; ответ — только заголовки;
+ *   правила  — дамп с атрибутом таблицы: этот фильтр новое ядро понимает и при NFPROTO_UNSPEC
+ *              (на 4.9 его нет вовсе, и отбор всё равно повторяется здесь).
+ * Нет наших таблиц ни в одном семействе — остальные три дампа не нужны. Цепочки берутся любые:
+ * имена и хуки не разбираются, так что цепочка на любом хуке (в том числе inet ingress, со своим
+ * списком устройств) входит в отпечаток так же, как prerouting_mark. */
 
 /* Номера атрибутов — числами (заголовки тулчейна бывают старше ядра, ABI не меняется). */
 #define NFD_RULE_HANDLE    3
@@ -399,18 +421,28 @@ static void fp_exprs(uint64_t *h, const struct nlattr *list) {
     }
 }
 
+/* Семейства таблиц движка: номер в отпечатке и бит в nfd_tfp.fams. -1 — не наше семейство. */
+static const uint8_t g_tfp_fams[3] = { NFD_INET, NFD_IP, NFD_IP6 };
+
+static int tfp_fam(uint8_t f) {
+    for (int i = 0; i < 3; i++)
+        if (g_tfp_fams[i] == f) return i;
+    return -1;
+}
+
 struct tfp_ctx {
     const char *table;
-    uint8_t family;
     uint16_t msg;                   /* NFT_MSG_NEW* объектов этого дампа */
     uint32_t skip;                  /* маска номеров атрибутов, которые не входят */
-    uint64_t h;
-    unsigned n;
+    uint64_t h[3];                  /* по семейству (g_tfp_fams) */
+    unsigned n[3];
 };
 
 static void tfp_cb(const struct nlmsghdr *m, void *arg) {
     struct tfp_ctx *c = arg;
-    if (!msg_is(m, c->msg) || msg_family(m) != c->family) return;
+    if (!msg_is(m, c->msg)) return;
+    int fi = tfp_fam(msg_family(m));
+    if (fi < 0) return;
     size_t hl = NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(struct nfgenmsg));
     if (m->nlmsg_len < hl) return;
     /* Таблица — первый атрибут у всех трёх видов (NFTA_*_TABLE == 1): фильтр дампа по таблице
@@ -435,47 +467,220 @@ static void tfp_cb(const struct nlmsghdr *m, void *arg) {
         q += al;
         len -= al;
     }
-    fp_mix(&c->h, &h, sizeof(h));
-    c->n++;
+    fp_mix(&c->h[fi], &h, sizeof(h));
+    c->n[fi]++;
 }
 
 static void tfp_reset(void *arg) {
     struct tfp_ctx *c = arg;
-    c->h = NFD_FNV_INIT;
-    c->n = 0;
+    for (int i = 0; i < 3; i++) { c->h[i] = NFD_FNV_INIT; c->n[i] = 0; }
 }
 
-int nfd_table_fp(uint8_t family, const char *table, uint64_t *fp) {
-    *fp = 0;
+/* Дамп отпечатка — с повтором прерванного, но без «годится любой снимок», как у nfd_dump:
+ * прерывает дамп (NLM_F_DUMP_INTR) любая транзакция посреди него, в том числе элемент, который
+ * кладёт резолвер, — а снимок, склеенный из двух состояний таблицы, дал бы другой отпечаток и
+ * ложное «изменено снаружи», то есть замену набора правил на пустом месте. Пять попыток подряд
+ * прерваны — «ядро не ответило»: проход сторожа тогда ничего не решает (решит следующий), apply
+ * ставит набор заново, как при любом незнании. */
+static int tfp_dump(int fd, uint16_t msg, uint16_t attr, const char *table, struct tfp_ctx *c) {
+    int rc = EINTR;
+    for (int i = 0; i < 5 && rc == EINTR; i++) {
+        tfp_reset(c);
+        rc = nfd_talk(fd, msg, 1, NFPROTO_UNSPEC, attr, attr ? table : NULL, 0, NULL, tfp_cb, c);
+    }
+    return rc;
+}
+
+struct ttab_ctx {
+    const char *table;
+    unsigned fams;
+    uint64_t handle;
+};
+
+#define NFD_TABLE_HANDLE 4          /* NFTA_TABLE_HANDLE, 4.16 */
+
+static void ttab_cb(const struct nlmsghdr *m, void *arg) {
+    struct ttab_ctx *c = arg;
+    if (!msg_is(m, NFT_MSG_NEWTABLE)) return;
+    int fi = tfp_fam(msg_family(m));
+    if (fi < 0) return;
+    const struct nlattr *tb[NFD_TABLE_HANDLE + 1];
+    msg_attrs(m, tb, NFD_TABLE_HANDLE);
+    char t[64];
+    if (strcmp(nla_cstr(tb[NFTA_TABLE_NAME], t, sizeof(t)), c->table) != 0) return;
+    c->fams |= 1u << fi;
+    if (fi == 0) c->handle = nla_be64(tb[NFD_TABLE_HANDLE]);
+}
+
+static void ttab_reset(void *arg) {
+    struct ttab_ctx *c = arg;
+    c->fams = 0;
+    c->handle = 0;
+}
+
+int nfd_table_fp(const char *table, struct nfd_tfp *out) {
+    memset(out, 0, sizeof(*out));
     int fd = nfd_open();
     if (fd < 0) return -1;
-    int rc = nfd_talk(fd, NFT_MSG_GETTABLE, 0, family, NFTA_TABLE_NAME, table, 0, NULL, NULL, NULL);
-    if (rc == ENOENT) { close(fd); return 1; }
+    struct ttab_ctx tt = { table, 0, 0 };
+    int rc = EINTR;
+    for (int i = 0; i < 5 && rc == EINTR; i++) {
+        ttab_reset(&tt);
+        rc = nfd_talk(fd, NFT_MSG_GETTABLE, 1, NFPROTO_UNSPEC, 0, NULL, 0, NULL, ttab_cb, &tt);
+    }
     if (rc != 0) { close(fd); return -1; }
+    uint64_t h = NFD_FNV_INIT;
+    fp_mix(&h, &tt.fams, sizeof(tt.fams));
+    if (!tt.fams) {
+        close(fd);
+        out->fp = h;
+        return 0;
+    }
+    /* attr — фильтр дампа по таблице (0 — без него, см. шапку раздела). */
     static const struct { uint16_t get, add, attr; uint32_t skip; } kinds[3] = {
-        { NFT_MSG_GETCHAIN, NFT_MSG_NEWCHAIN, NFTA_CHAIN_TABLE,
+        { NFT_MSG_GETCHAIN, NFT_MSG_NEWCHAIN, 0,
           1u << NFD_CHAIN_HANDLE | 1u << NFD_CHAIN_USE | 1u << NFD_CHAIN_COUNTERS |
           1u << NFD_CHAIN_PAD | 1u << NFD_CHAIN_ID },
-        { NFT_MSG_GETSET, NFT_MSG_NEWSET, NFTA_SET_TABLE,
+        { NFT_MSG_GETSET, NFT_MSG_NEWSET, 0,
           1u << NFD_SET_ID | 1u << NFD_SET_PAD | 1u << NFD_SET_HANDLE | 1u << NFD_SET_EXPR |
           1u << NFD_SET_EXPRS },
         { NFT_MSG_GETRULE, NFT_MSG_NEWRULE, NFTA_RULE_TABLE,
           1u << NFD_RULE_HANDLE | 1u << NFD_RULE_POSITION | 1u << NFD_RULE_PAD |
           1u << NFD_RULE_ID | 1u << NFD_RULE_POS_ID | 1u << NFD_RULE_CHAIN_ID },
     };
-    uint64_t h = NFD_FNV_INIT;
+    struct tfp_ctx c[3];
     for (int k = 0; k < 3; k++) {
-        struct tfp_ctx c = { table, family, kinds[k].add, kinds[k].skip, NFD_FNV_INIT, 0 };
-        rc = nfd_dump(fd, kinds[k].get, family, kinds[k].attr, table, 0, NULL, tfp_cb, &c,
-                      tfp_reset);
+        c[k].table = table;
+        c[k].msg = kinds[k].add;
+        c[k].skip = kinds[k].skip;
+        rc = tfp_dump(fd, kinds[k].get, kinds[k].attr, table, &c[k]);
         if (rc != 0 && rc != ENOENT) { close(fd); return -1; }
-        fp_mix(&h, &k, sizeof(k));
-        fp_mix(&h, &c.n, sizeof(c.n));
-        fp_mix(&h, &c.h, sizeof(c.h));
     }
     close(fd);
-    *fp = h;
+    /* По семейству: есть ли таблица, затем три вида объектов — число и свёртка. */
+    for (int f = 0; f < 3; f++) {
+        if (!(tt.fams & (1u << f))) continue;
+        fp_mix(&h, &g_tfp_fams[f], 1);
+        for (int k = 0; k < 3; k++) {
+            fp_mix(&h, &k, sizeof(k));
+            fp_mix(&h, &c[k].n[f], sizeof(c[k].n[f]));
+            fp_mix(&h, &c[k].h[f], sizeof(c[k].h[f]));
+        }
+    }
+    out->fp = h;
+    out->handle = tt.handle;
+    out->fams = tt.fams;
     return 0;
+}
+
+/* ---- наборы и их элементы (сверка элементов статических наборов, recon.c) ------------------ */
+
+#define NFD_SET_KEY_LEN      5      /* NFTA_SET_KEY_LEN */
+#define NFD_SET_ELEM_TIMEOUT 4      /* NFTA_SET_ELEM_TIMEOUT */
+#define NFD_SET_ELEM_EXPIRE  5      /* NFTA_SET_ELEM_EXPIRATION */
+
+struct sets_ctx {
+    const char *table;
+    nfd_set_fn fn;
+    void *arg;
+};
+
+static void sets_list_cb(const struct nlmsghdr *m, void *arg) {
+    struct sets_ctx *c = arg;
+    if (!msg_is(m, NFT_MSG_NEWSET)) return;
+    const struct nlattr *tb[NFTA_SET_MAX + 1];
+    msg_attrs(m, tb, NFTA_SET_MAX);
+    char t[64];
+    if (strcmp(nla_cstr(tb[NFTA_SET_TABLE], t, sizeof(t)), c->table) != 0) return;
+    struct nfd_set s;
+    memset(&s, 0, sizeof(s));
+    s.family = msg_family(m);
+    nla_cstr(tb[NFTA_SET_NAME], s.name, sizeof(s.name));
+    s.flags = nla_be32(tb[NFTA_SET_FLAGS]);
+    s.klen = nla_be32(tb[NFD_SET_KEY_LEN]);
+    c->fn(c->arg, &s);
+}
+
+int nfd_sets(const char *table, nfd_set_fn fn, void *arg) {
+    int fd = nfd_open();
+    if (fd < 0) return errno ? errno : EIO;
+    struct sets_ctx c = { table, fn, arg };
+    /* Без атрибута таблицы и без фильтра по семейству — почему, в шапке раздела отпечатка.
+     * Без повтора: заголовки наборов меняет только nft -f, а набор, которого к дампу его
+     * элементов уже нет, вызывающий (сверка элементов) и так считает «не прочитать». */
+    int rc = nfd_talk(fd, NFT_MSG_GETSET, 1, NFPROTO_UNSPEC, 0, NULL, 0, NULL, sets_list_cb, &c);
+    close(fd);
+    return rc;
+}
+
+struct elems_ctx {
+    nfd_elem_fn fn;
+    void *arg;
+    int msgs;
+    uint16_t gen;                   /* res_id первого ответа */
+    int gen_moved;                  /* у какого-то ответа res_id другой */
+};
+
+static void elems_list_cb(const struct nlmsghdr *m, void *arg) {
+    struct elems_ctx *c = arg;
+    if (!msg_is(m, NFT_MSG_NEWSETELEM)) return;
+    /* Номер поколения набора правил (nfgenmsg.res_id: младшие 16 бит base_seq — так отвечает и
+     * 4.9, проверено на tools/vm49): растёт с каждой транзакцией, в том числе с элементом
+     * резолвера. Разный у ответов одного дампа — посреди дампа кто-то писал. */
+    uint16_t g = ((const struct nfgenmsg *)NLMSG_DATA(m))->res_id;
+    if (!c->msgs++) c->gen = g;
+    else if (g != c->gen) c->gen_moved = 1;
+    const struct nlattr *tb[NFTA_SET_ELEM_LIST_MAX + 1];
+    msg_attrs(m, tb, NFTA_SET_ELEM_LIST_MAX);
+    if (!tb[NFTA_SET_ELEM_LIST_ELEMENTS]) return;
+    const struct nlattr *e;
+    NLA_FOR_EACH(e, tb[NFTA_SET_ELEM_LIST_ELEMENTS]) {
+        const struct nlattr *et[NFD_SET_ELEM_KEY_END + 1];
+        nfd_nested(e, et, NFD_SET_ELEM_KEY_END);
+        struct nfd_elem x;
+        memset(&x, 0, sizeof(x));
+        static const uint8_t none[1];
+        x.key = none;
+        if (et[NFTA_SET_ELEM_KEY]) {
+            const struct nlattr *dt[NFTA_DATA_MAX + 1];
+            nfd_nested(et[NFTA_SET_ELEM_KEY], dt, NFTA_DATA_MAX);
+            if (dt[NFTA_DATA_VALUE]) {
+                x.key = nla_ptr(dt[NFTA_DATA_VALUE]);
+                x.klen = nla_size(dt[NFTA_DATA_VALUE]);
+            }
+        }
+        if (et[NFD_SET_ELEM_KEY_END]) {
+            const struct nlattr *dt[NFTA_DATA_MAX + 1];
+            nfd_nested(et[NFD_SET_ELEM_KEY_END], dt, NFTA_DATA_MAX);
+            if (dt[NFTA_DATA_VALUE]) {
+                x.key_end = nla_ptr(dt[NFTA_DATA_VALUE]);
+                x.kelen = nla_size(dt[NFTA_DATA_VALUE]);
+            }
+        }
+        x.flags = nla_be32(et[NFTA_SET_ELEM_FLAGS]);
+        x.timeout = et[NFD_SET_ELEM_TIMEOUT] || et[NFD_SET_ELEM_EXPIRE];
+        x.data = et[NFTA_SET_ELEM_DATA] != NULL;
+        c->fn(c->arg, &x);
+    }
+}
+
+int nfd_set_elems(uint8_t family, const char *table, const char *set, nfd_elem_fn fn,
+                  void (*reset)(void *arg), void *arg, int *stable) {
+    int fd = nfd_open();
+    if (fd < 0) return errno ? errno : EIO;
+    struct elems_ctx c;
+    int rc = EINTR;
+    for (int i = 0; i < 3 && rc == EINTR; i++) {
+        if (i && reset) reset(arg);
+        memset(&c, 0, sizeof(c));
+        c.fn = fn;
+        c.arg = arg;
+        rc = nfd_talk(fd, NFT_MSG_GETSETELEM, 1, family, NFTA_SET_ELEM_LIST_TABLE, table,
+                      NFTA_SET_ELEM_LIST_SET, set, elems_list_cb, &c);
+    }
+    close(fd);
+    if (stable) *stable = !c.gen_moved;
+    return rc;
 }
 
 /* ---- redirect на порт ---------------------------------------------------------------------- */

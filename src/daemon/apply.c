@@ -33,6 +33,7 @@
 #include "failover_int.h"
 #include "fogroup.h"
 #include "fpseed.h"
+#include "recon.h"
 
 static void iptables_masq_drop_all(void);   /* ниже, у apply_routing */
 static int table_has_default(int table);    /* ниже, у apply-commit */
@@ -510,6 +511,13 @@ static void apply_prepare(const char *spec, struct spec *cfg, struct groups *gr,
      * dry-run'ом, и печатать ему надо то, что реально встанет на этом ядре. И до build_groups:
      * от неё зависит половина IPv6 доменных групп (fake-IP v6 — только где есть nat в ip6). */
     g_nftc = nftc >= 0 ? nftc : nft_compat();
+    /* Хук ingress (NFTC_INGRESS) — тем же разом, что раскладка, и ходит вместе с ней (--nftc):
+     * проба `nft -c` на каждый apply была бы процессом на каждое сохранение настройки. Где
+     * ingress не будет всё равно — телефон с устройствами раздачи по требованию, поле метки без
+     * места под «разобран на ingress» (мини-сборка tgws), — ядро не спрашивается вовсе. */
+    if (nftc < 0 && !(g_nftc & NFTC_LEGACY) && plat()->lan_devs_persist &&
+        steer_ingress_seen_ok() && nft_ingress_ok())
+        g_nftc |= NFTC_INGRESS;
     if (build_groups(cfg, gr, &e) < 0) err_die(&e);
     /* ДОМЕННЫЙ КАНАЛ В МИНИ-СБОРКЕ — ОТКАЗ, А НЕ ПРЕДУПРЕЖДЕНИЕ.
      *
@@ -798,6 +806,7 @@ struct recon_args {
     const char *spec, *state_dir;
     int nftc;                  /* -1 — спросить ядро */
     int ruleset, awg, masq, masq_ensure;
+    int kelems;                /* apply-plan: сводка элементов статических наборов ядра */
     const char *route, *drop;  /* через запятую; NULL — нет */
     const char *rule;          /* только правило выхода, таблицу не трогать (починка демона) */
 };
@@ -821,6 +830,7 @@ static void recon_args_parse(int argc, char **argv, struct recon_args *a, const 
             else if (!strcmp(k, "--awg")) a->awg = 1;
             else if (!strcmp(k, "--masq")) a->masq = 1;
             else if (!strcmp(k, "--masq-ensure")) a->masq_ensure = 1;
+            else if (!strcmp(k, "--kernel-elems")) a->kelems = 1;
             else {
                 fprintf(stderr, "steer %s: непонятное слово %s\n", who, k);
                 exit(2);
@@ -900,7 +910,7 @@ static unsigned long long out_watch_sig(const struct output *o, unsigned long lo
     return h;
 }
 
-/* apply-plan --spec ПУТЬ [--state-dir …] [--nftc N]: всё, что делает `apply --dry-run` (те же
+/* apply-plan --spec ПУТЬ [--state-dir …] [--nftc N] [--kernel-elems]: всё, что делает `apply --dry-run` (те же
  * проверки, те же предупреждения в stderr, тот же код отказа), только набор правил не печатается,
  * а сворачивается в отпечаток. Счётчики из ядра не читаются нарочно: план не зовёт ни одного
  * процесса (раскладку демон передаёт готовой), а перенос счётчиков — дело apply-commit, который
@@ -909,7 +919,12 @@ static unsigned long long out_watch_sig(const struct output *o, unsigned long lo
  *   ruleset ОТПЕЧАТОК           FNV-1a 64 текста набора правил без счётчиков
  *   counts КАНАЛОВ ВЫХОДОВ
  *   out ИМЯ МЕТКА ТАБЛИЦА С_УСТРОЙСТВОМ AWG ПОДПИСЬ_МАРШРУТА ПОДПИСЬ_СТОРОЖА
- *   stale МЕТКА ТАБЛИЦА         метка из прежнего реестра, которую не несёт ни один выход */
+ *   stale МЕТКА ТАБЛИЦА         метка из прежнего реестра, которую не несёт ни один выход
+ *   kelems СВОДКА ЧИСЛО         с --kernel-elems: сводка элементов статических наборов в ядре
+ *                               (recon_kernel_elems; «kelems -» — снять не вышло). Дамп —
+ *                               сотни тысяч элементов на больших списках, поэтому здесь, в
+ *                               ребёнке, а не в цикле демона (шапка recon.c, «СВЕРКА
+ *                               ЭЛЕМЕНТОВ»); процессов он не запускает. */
 int cmd_apply_plan(int argc, char **argv) {
     struct recon_args a;
     recon_args_parse(argc, argv, &a, "apply-plan");
@@ -953,6 +968,13 @@ int cmd_apply_plan(int argc, char **argv) {
             if (out_needs_mark(&cfg.out[k]) && cfg.out[k].mark == g_oldreg[i].mark) live = 1;
         if (!live) printf("stale %x %d\n", g_oldreg[i].mark, g_oldreg[i].table);
     }
+    if (a.kelems) {
+        uint64_t el = 0, en = 0;
+        if (recon_kernel_elems(&el, &en) == 0)
+            printf("kelems %016llx %llu\n", (unsigned long long)el, (unsigned long long)en);
+        else
+            printf("kelems -\n");
+    }
     return 0;
 }
 
@@ -989,6 +1011,8 @@ static int name_in_list(const char *list, const char *name) {
  * плану (recon.c).
  *   --ruleset  набор правил одной транзакцией, со счётчиками из ядра — тем же ruleset_load, что у
  *              подкоманды; отказ ядра — код 1, прежняя таблица стоит, остальное не трогается;
+ *              принят — строка `recon-kernel НОМЕР ОТПЕЧАТОК` в stdout (ожидаемое сверки демона
+ *              с ядром, снятое сразу после nft -f, — recon_kernel_print);
  *   --route    привязать таблицы и правила этих выходов (apply_routing_one);
  *   --drop     снять правило и таблицу меток, которых больше не несёт ни один выход (как
  *              cleanup_stale_routing);
@@ -1019,6 +1043,16 @@ int cmd_apply_commit(int argc, char **argv) {
     if (a.ruleset) {
         counters_load();
         if (ruleset_load(&cfg, &gr) != 0) return 1;
+        /* Ожидаемое для сверки демона с ядром — сразу после nft -f: правка таблицы снаружи за то
+         * время, что идёт остальное, иначе вошла бы в ожидаемое (шапка recon.c, «СВЕРКА С
+         * ЯДРОМ»). Строка — в stdout; демон вырезает её из ответа. Вместе с отпечатком — сводка
+         * элементов статических наборов, и это дамп всех элементов (на 200 тысячах подсетей —
+         * около 0,5 с машины разработки); привязка выходов теперь идёт ДО загрузки, так что он её
+         * не задерживает, а откладывает только отметки «пущен напрямую» и карту balance ниже.
+         * Засеянные в набор правил поддельные адреса (fpseed.c) и элементы real-ip, которые
+         * резолвер вернул по просьбе загрузчика внутри ruleset_load, в сводку не входят: у
+         * доменного набора она берёт только элементы без срока вне пула fake-IP (recon.c). */
+        recon_kernel_print(stdout);
         /* Новый набор правил принёс пустой набор «пущен напрямую» и карты balance со всеми
          * членами: отметки — по таблицам выходов (и тех, что привязаны выше: их отметку приняла
          * прежняя таблица), карты — к живым, как у подкоманды. */
