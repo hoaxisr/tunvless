@@ -67,6 +67,40 @@ struct nfd_tfp {
 };
 int nfd_table_fp(const char *table, struct nfd_tfp *out);
 
+/* Именованные наборы и карты таблиц ИМЯ во всех семействах — заголовком: семейство, имя, флаги
+ * (NFT_SET_*), длина ключа. Безымянные (флаг NFT_SET_ANONYMOUS) тоже приходят: отбирает
+ * вызывающий. Один дамп на все семейства, как у nfd_table_fp. 0 — прочитаны; иначе errno. */
+struct nfd_set {
+    uint8_t family;
+    char name[64];
+    uint32_t flags;
+    uint32_t klen;
+};
+typedef void (*nfd_set_fn)(void *arg, const struct nfd_set *s);
+int nfd_sets(const char *table, nfd_set_fn fn, void *arg);
+
+/* Элементы одного набора — по одному, как их отдаёт ядро: ключ (и конец диапазона у набора из
+ * нескольких полей — NFTA_SET_ELEM_KEY_END), флаги элемента (NFT_SET_ELEM_INTERVAL_END — маркер
+ * конца у интервального набора из одного поля), есть ли у элемента срок и данные. Порядок —
+ * порядок хранилища ядра, он не обещан. reset — перед повтором дампа, который ядро прервало
+ * (NLM_F_DUMP_INTR): накопленное надо сбросить. *stable (NULL — не нужно) — 1, если у всех ответов
+ * дампа один номер поколения набора правил (nfgenmsg.res_id), то есть посреди дампа не прошло ни
+ * одной транзакции и снимок цельный; 0 — кто-то писал, и элементы могли выпасть или прийти
+ * дважды (ядро обходит набор, пропуская уже отданное по счёту). 0 — прочитаны; иначе errno
+ * (ENOENT — набора нет). */
+struct nfd_elem {
+    const uint8_t *key;
+    size_t klen;
+    const uint8_t *key_end;     /* NULL — нет */
+    size_t kelen;
+    uint32_t flags;
+    int timeout;                /* у элемента свой срок (NFTA_SET_ELEM_TIMEOUT или EXPIRATION) */
+    int data;                   /* у элемента данные (карта) */
+};
+typedef void (*nfd_elem_fn)(void *arg, const struct nfd_elem *e);
+int nfd_set_elems(uint8_t family, const char *table, const char *set, nfd_elem_fn fn,
+                  void (*reset)(void *arg), void *arg, int *stable);
+
 /* Есть ли в таблице правило `redirect to :PORT` (выражение redir с портом из immediate).
  * 1 — есть, 0 — нет. */
 int nfd_has_redirect(uint8_t family, const char *table, uint16_t port);

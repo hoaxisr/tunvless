@@ -1389,6 +1389,9 @@ static int plan_start(struct conn *c, const char *path, job_done_fn done) {
         av[n++] = "--nftc";
         av[n++] = nb;
     }
+    /* Сводка элементов статических наборов ядра — только когда есть с чем её сравнить
+     * (recon.c, «СВЕРКА ЭЛЕМЕНТОВ»): дамп больших списков стоит своих миллисекунд. */
+    if (s->rec.valid && s->rec.kel_ok) av[n++] = "--kernel-elems";
     av[n] = NULL;
     return job_start(c, av, 120, CTL_OUT_MAX, CTL_ERR_MAX, done);
 }

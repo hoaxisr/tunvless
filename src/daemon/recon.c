@@ -43,8 +43,9 @@
  * снятые маршрут таблицы выхода вместе с его правилом (правило без таблицы страж правил за
  * чужое снятие не считает — см. rulewd.c, — а маршрут вернул только проход сторожа через
  * минуту). Явный apply и reload — ровно то, чем человек чинит «что-то не так», и отвечать
- * «всё стоит» он обязан по ядру, а не по памяти. Поэтому на неизменной спеке сверяются ещё две
- * вещи, обе по netlink, в процессе демона и без единого запуска nft или ip:
+ * «всё стоит» он обязан по ядру, а не по памяти. Поэтому на неизменной спеке сверяются ещё три
+ * вещи, все по netlink и без единого запуска nft или ip (две — в процессе демона, сводка
+ * элементов — в ребёнке-плане):
  *
  *   Набор правил — отпечаток таблицы в ядре (nfd_table_fp, src/lib/nftdump.c: цепочки, правила
  *     по порядку, заголовки наборов; без номеров, счётчиков и элементов наборов) против
@@ -73,8 +74,11 @@
  *     элементы real-ip с оставшимся сроком (proxy.c, reassert_routes; realip.c). Карту fake-IP
  *     generate засевает из файла состояния, метки «пущен напрямую» возвращает apply-commit по
  *     таблицам выходов, карты раздачи balance — внеочередной проход сторожа (diff.watch).
- *     Чего отпечаток не видит — элементов именованных наборов: снятый руками адрес из
- *     адресного списка сверка не вернёт (почему их нет в отпечатке — в nftdump.c).
+ *     Чего отпечаток не видит — элементов именованных наборов (почему — в nftdump.c): их
+ *     сверяет сводка ниже, «СВЕРКА ЭЛЕМЕНТОВ».
+ *
+ *   Элементы статических наборов — сводка (recon_kernel_elems) против снятой после нашего
+ *     nft -f; разошлась — та же замена набора одной транзакцией. Ниже, «СВЕРКА ЭЛЕМЕНТОВ».
  *
  *   Маршрутизация выходов — правило fwmark и таблица каждого выхода с устройством, которого
  *     сверка по подписи не тронула бы. Ожидаемое — по памяти сторожа (outs): выход, который
@@ -122,6 +126,52 @@
  *     входит в тот же отпечаток теми же четырьмя дампами.
  * Прочитать ядро не вышло — проход ничего не решает (решит следующий): незнание здесь не повод
  * компилировать и ставить набор заново, как на явном apply.
+ *
+ * СВЕРКА ЭЛЕМЕНТОВ СТАТИЧЕСКИХ НАБОРОВ (решение владельца, 2026-09-28). Отпечаток элементов
+ * именованных наборов не видит, и снятый руками адрес адресного списка apply прежде не
+ * возвращал. Теперь на apply и reload (не на проходе сторожа: сотни тысяч элементов — дорого)
+ * сверяется ещё сводка элементов (recon_kernel_elems):
+ *   Какие наборы — те, чьи элементы целиком задаёт наш nft -f: именованные, не карты (fake-IP,
+ *     раздача balance — MAP), не объекты (OBJECT), не наполняемые правилами (EVAL) и не набор
+ *     «пущен напрямую» (FAILOPEN_SET: метки в нём ставят сторож и apply-commit). Отбор — по
+ *     заголовку набора в ядре, а не по именам генератора: набор новой цепочки или раскладки
+ *     попадает в сверку сам.
+ *   Доменные наборы (флаг timeout) — сверяется часть, которую можно отличить. В них вперемешку
+ *     лежат элементы списков и .srs канала (из nft -f, без срока), адреса real-ip (резолвер,
+ *     всегда со сроком: set_ttl_clamp нуля не даёт) и поддельные адреса fake-IP (резолвер, без
+ *     срока, но всегда из пула 198.18.0.0/15 или fdfe:dcba:9876::/96; ключ набора начинается с
+ *     адреса и у составного набора). В сводку идут элементы без срока с адресом вне пула — то
+ *     есть элементы списков. Маркеры конца диапазона (флаг INTERVAL_END) здесь не сверяются: у
+ *     элемента real-ip маркер конца ядро хранит без срока (nftnl.c), и отнести маркер к списку
+ *     или к резолверу по ядру нечем, — так что снятый или добавленный диапазон виден, а
+ *     суженный с тем же началом нет. Адрес списка внутри пула fake-IP не сверяется тоже (пул —
+ *     зарезервированный диапазон RFC 2544, спискам в нём делать нечего). Исключить доменные
+ *     наборы целиком было бы нечестно: у выхода, куда ведут и адресный, и доменный каналы,
+ *     генератор кладёт подсети списка в доменный набор, и на роутере это обычный случай.
+ *   Резолвер пишет в доменный набор и посреди дампа, а ядро обходит набор, пропуская уже
+ *     отданное по счёту: вставка перед курсором сдвигает его, и склеенный дамп дал бы ложное
+ *     расхождение — замену набора правил на пустом месте. Поэтому у доменного набора смотрится
+ *     номер поколения в ответах дампа (nfd_set_elems, *stable: он растёт с каждой транзакцией, и
+ *     так отвечает и 4.9): у всех ответов один — снимок цельный; разный — дамп заново, три таких
+ *     подряд — «не прочитать», и элементы в этот раз не сверяются. Сначала было «два дампа до
+ *     совпадения», но дамп набора в 200 тысяч подсетей стоит секунды (замер ниже), и второй
+ *     удваивал цену ровно в обычном случае. Статический набор, кроме нас, не пишет никто — там
+ *     номер поколения не смотрится: его двигают и элементы резолвера в других наборах.
+ *   Хэш, а не счётчик: счётчик не видит замены одного элемента другим. Сводка — сумма по модулю
+ *     2^64 перемешанных хэшей элементов (FNV-1a по ключу, концу ключа и флагу конца, затем
+ *     fmix64): от порядка, в котором ядро отдаёт элементы (у rbtree, hash и pipapo он свой), она
+ *     не зависит, считается за один проход без памяти под элементы, а совпасть у двух разных
+ *     множеств может с вероятностью порядка 2^-64. Сумма, а не xor: xor гасит пару одинаковых.
+ *     По наборам — такая же сумма от (семейство, имя, число, сумма); число элементов — ещё и для
+ *     строки журнала.
+ *   Ожидаемое — сразу после нашего nft -f, ребёнком apply-commit (строка recon-kernel), как и
+ *     отпечаток: свести текст generate к элементам ядра значило бы повторить nft (auto-merge
+ *     склеивает соседние подсети, интервалы ядро хранит по-своему). Текущее — ребёнок apply-plan
+ *     (флаг --kernel-elems; демон передаёт его, когда ожидаемое есть): дамп сотен тысяч
+ *     элементов идёт не в цикле демона, status отвечает сразу. Разошлось — та же замена набора
+ *     правил одной транзакцией; адреса fake-IP и real-ip после неё возвращает резолвер, как при
+ *     любой замене.
+ *   Цена — замер на 200 тысячах подсетей в docs/architecture.md (раздел 5, 2026-09-28).
  *
  * ГДЕ ИДЁТ РАБОТА. Компиляция — не в процессе демона, а ребёнком на команду: `steer apply-plan`
  * (проверки dry-run и отпечатки частей) и, если есть что применять, `steer apply-commit` (только
@@ -268,6 +318,13 @@ int recon_plan_parse(const char *text, size_t n, struct recon_plan *p) {
                        &o->routed, &o->awg, &o->rsig, &o->wsig) != 7)
                 return -1;
             p->n++;
+        } else if (!strncmp(line, "kelems ", 7)) {
+            unsigned long long el, en;
+            if (sscanf(line + 7, "%llx %llu", &el, &en) == 2) {
+                p->kel_ok = 1;
+                p->kel = el;
+                p->kel_n = en;
+            }
         } else if (!strncmp(line, "stale ", 6)) {
             if (p->stale_n >= MAX_OUTPUTS) continue;
             if (sscanf(line + 6, "%x %d", &p->stale[p->stale_n].mark,
@@ -320,6 +377,15 @@ void recon_decide(const struct recon_state *st, const struct recon_plan *p, cons
         d->watch = 1;
         fprintf(stderr, LOG_W "набор правил в ядре изменён снаружи (цепочки, правила или наборы "
                               "не те, что ставил движок) — ставлю набор правил заново\n");
+    }
+    /* Элементы статических наборов (шапка, «СВЕРКА ЭЛЕМЕНТОВ»): сводку ядра снял план. Нет её
+     * у плана или у применённого — элементы не сверяются. */
+    if (!d->ruleset && st->kel_ok && p->kel_ok && (p->kel != st->kel || p->kel_n != st->kel_n)) {
+        d->ruleset = 1;
+        d->watch = 1;
+        fprintf(stderr, LOG_W "элементы статических наборов в ядре не те, что ставил движок (в "
+                              "ядре %llu, после загрузки было %llu) — ставлю набор правил заново\n",
+                (unsigned long long)p->kel_n, (unsigned long long)st->kel_n);
     }
     /* Правила выходов — одним дампом на все выходы, и только если сверять есть что. */
     static char rules[16384], rules6[16384];
@@ -419,9 +485,15 @@ void recon_applied(struct recon_state *st, const struct recon_plan *p, const str
          * (он не дошёл до неё или ядро ему не ответило) — снимаем сами, как прежде. Не
          * спросилось и так — применённое не запоминаем: следующий apply применит набор заново. */
         struct nfd_tfp t;
+        /* Сводку элементов сам демон не снимает: дамп сотен тысяч элементов — не для его
+         * цикла; без строки ребёнка элементы до следующего nft -f не сверяются. */
+        st->kel_ok = 0;
         if (k && k->ok) {
             st->handle = k->handle;
             st->kfp = k->kfp;
+            st->kel_ok = k->el_ok;
+            st->kel = k->el;
+            st->kel_n = k->el_n;
         } else if (kernel_fp(&t) == 0 && (t.fams & 1)) {
             st->handle = t.handle;
             st->kfp = t.fp;
@@ -452,9 +524,120 @@ int recon_kernel_drift(const struct recon_state *st, const char **why) {
     return 0;
 }
 
-/* Строка ребёнка apply-commit: `recon-kernel НОМЕР ОТПЕЧАТОК` (шестнадцатеричные) или
- * `recon-kernel -` — снять не вышло. Слово своё и в начале строки: человеку в ответе apply она не
- * показывается (recon_kernel_take вырезает её в демоне). */
+/* ---- сводка элементов статических наборов (шапка, «СВЕРКА ЭЛЕМЕНТОВ») ---------------------- */
+
+/* Флаги наборов (NFT_SET_*) — числами: заголовки тулчейна бывают старше ядра, ABI не меняется. */
+#define KEL_ANONYMOUS 0x01
+#define KEL_MAP       0x08
+#define KEL_TIMEOUT   0x10
+#define KEL_EVAL      0x20
+#define KEL_OBJECT    0x40
+
+#define KEL_FNV_INIT  14695981039346656037ULL
+
+static void kel_mix(uint64_t *h, const void *p, size_t n) {
+    const unsigned char *b = p;
+    for (size_t i = 0; i < n; i++) { *h ^= b[i]; *h *= 1099511628211ULL; }
+}
+
+/* Перемешивание перед суммой (fmix64 из MurmurHash3): у FNV-1a соседние ключи дают близкие
+ * младшие биты, и сумма таких хэшей хуже различала бы множества. */
+static uint64_t kel_fmix(uint64_t k) {
+    k ^= k >> 33;
+    k *= 0xff51afd7ed558ccdULL;
+    k ^= k >> 33;
+    k *= 0xc4ceb9fe1a85ec53ULL;
+    k ^= k >> 33;
+    return k;
+}
+
+/* Адрес из пула fake-IP в начале ключа: 198.18.0.0/15 (ключ IPv4 — 4 байта, у составного набора
+ * «адрес . протокол . порт» — 12) или fdfe:dcba:9876::/96 (16 и 24). Пул — src/dnsd/dnsd_int.h
+ * (FAKEIP_POOL_BASE) и FAKEIP6_PREFIX_BYTES в spec.h. */
+static int kel_fake(const uint8_t *k, size_t n) {
+    static const uint8_t p6[12] = { FAKEIP6_PREFIX_BYTES };
+    if (n == 4 || n == 12) return k[0] == 198 && (k[1] & 0xfe) == 18;
+    if (n == 16 || n == 24) return !memcmp(k, p6, sizeof(p6));
+    return 0;
+}
+
+struct kel_sum {
+    int partial;                    /* доменный набор: только элементы списков */
+    uint64_t sum, n;
+};
+
+static void kel_elem(void *arg, const struct nfd_elem *e) {
+    struct kel_sum *s = arg;
+    if (e->data) return;            /* у набора данных нет; карта сюда не попадает */
+    int end = (e->flags & NFT_SET_ELEM_INTERVAL_END) != 0;
+    if (s->partial && (e->timeout || end || kel_fake(e->key, e->klen))) return;
+    uint64_t h = KEL_FNV_INIT;
+    uint32_t kl = (uint32_t)e->klen, el = (uint32_t)e->kelen;
+    kel_mix(&h, &kl, sizeof(kl));
+    kel_mix(&h, e->key, e->klen);
+    kel_mix(&h, &el, sizeof(el));
+    if (e->key_end) kel_mix(&h, e->key_end, e->kelen);
+    kel_mix(&h, &end, sizeof(end));
+    s->sum += kel_fmix(h);
+    s->n++;
+}
+
+static void kel_reset(void *arg) {
+    struct kel_sum *s = arg;
+    s->sum = s->n = 0;
+}
+
+struct kel_sets {
+    struct nfd_set v[256];
+    size_t n;
+    int over;
+};
+
+static void kel_set(void *arg, const struct nfd_set *s) {
+    struct kel_sets *c = arg;
+    if (s->flags & (KEL_ANONYMOUS | KEL_MAP | KEL_EVAL | KEL_OBJECT)) return;
+    if (!strcmp(s->name, FAILOPEN_SET)) return;
+    if (c->n == sizeof(c->v) / sizeof(c->v[0])) { c->over = 1; return; }
+    c->v[c->n++] = *s;
+}
+
+int recon_kernel_elems(uint64_t *sum, uint64_t *n) {
+    *sum = *n = 0;
+    static struct kel_sets sets;
+    memset(&sets, 0, sizeof(sets));
+    if (nfd_sets(nft_table(), kel_set, &sets) != 0 || sets.over) return -1;
+    uint64_t total = 0, total_n = 0;
+    for (size_t i = 0; i < sets.n; i++) {
+        const struct nfd_set *st = &sets.v[i];
+        struct kel_sum s = { (st->flags & KEL_TIMEOUT) != 0, 0, 0 };
+        /* Доменный набор пишет и резолвер — дамп, посреди которого прошла транзакция, заново
+         * (шапка); три таких подряд — «не прочитать». */
+        int stable = 0;
+        for (int tries = 0; !stable; tries++) {
+            if (tries == 3) return -1;
+            kel_reset(&s);
+            if (nfd_set_elems(st->family, nft_table(), st->name, kel_elem, kel_reset, &s,
+                              &stable) != 0)
+                return -1;
+            if (!s.partial) stable = 1;
+        }
+        uint64_t h = KEL_FNV_INIT;
+        kel_mix(&h, &st->family, sizeof(st->family));
+        kel_mix(&h, st->name, strlen(st->name) + 1);
+        kel_mix(&h, &s.n, sizeof(s.n));
+        kel_mix(&h, &s.sum, sizeof(s.sum));
+        total += kel_fmix(h);
+        total_n += s.n;
+    }
+    *sum = total;
+    *n = total_n;
+    return 0;
+}
+
+/* Строка ребёнка apply-commit: `recon-kernel НОМЕР ОТПЕЧАТОК СВОДКА ЧИСЛО` (шестнадцатеричные,
+ * число — десятичное; «-» вместо сводки и числа — сводку снять не вышло) или `recon-kernel -` —
+ * не вышло ничего. Слово своё и в начале строки: человеку в ответе apply она не показывается
+ * (recon_kernel_take вырезает её в демоне). */
 #define RK_WORD "recon-kernel "
 
 void recon_kernel_print(FILE *f) {
@@ -463,8 +646,12 @@ void recon_kernel_print(FILE *f) {
         fprintf(f, RK_WORD "-\n");
         return;
     }
-    fprintf(f, RK_WORD "%016llx %016llx\n", (unsigned long long)t.handle,
-            (unsigned long long)t.fp);
+    fprintf(f, RK_WORD "%016llx %016llx", (unsigned long long)t.handle, (unsigned long long)t.fp);
+    uint64_t el = 0, en = 0;
+    if (recon_kernel_elems(&el, &en) == 0)
+        fprintf(f, " %016llx %llu\n", (unsigned long long)el, (unsigned long long)en);
+    else
+        fprintf(f, " - -\n");
 }
 
 void recon_kernel_take(char *text, size_t *n, struct recon_kernel *k) {
@@ -480,11 +667,17 @@ void recon_kernel_take(char *text, size_t *n, struct recon_kernel *k) {
             size_t bl = len - wl < sizeof(buf) - 1 ? len - wl : sizeof(buf) - 1;
             memcpy(buf, ln + wl, bl);
             buf[bl] = '\0';
-            unsigned long long h, f;
-            if (sscanf(buf, "%llx %llx", &h, &f) == 2) {
+            unsigned long long h, f, el, en;
+            int got = sscanf(buf, "%llx %llx %llx %llu", &h, &f, &el, &en);
+            if (got >= 2) {
                 k->ok = 1;
                 k->handle = h;
                 k->kfp = f;
+            }
+            if (got == 4) {
+                k->el_ok = 1;
+                k->el = el;
+                k->el_n = en;
             }
             memmove(ln, ln + len, *n - i - len);
             *n -= len;

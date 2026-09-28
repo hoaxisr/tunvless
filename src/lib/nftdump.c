@@ -345,8 +345,11 @@ int nfd_chain_exists(uint8_t family, const char *table, const char *chain) {
  *     balance. В доменном наборе постоянные элементы адресных списков лежат вперемешку с
  *     постоянными элементами резолвера (поддельные адреса без срока). А адресные списки — это
  *     сотни тысяч элементов: отпечаток снимается на каждом проходе сторожа, и дамп элементов
- *     стоил бы ему сотен миллисекунд. Элементы безымянных наборов не нужны вовсе: ядро их не
- *     меняет (набор постоянный), а снять их можно только вместе с правилом.
+ *     стоил бы ему сотен миллисекунд. Элементы статических наборов сверяются отдельно и только
+ *     на apply и reload — сводкой, которую снимает ребёнок демона (nfd_sets и nfd_set_elems
+ *     ниже; что сверяется и почему — в recon.c, «СВЕРКА ЭЛЕМЕНТОВ»). Элементы безымянных
+ *     наборов не нужны вовсе: ядро их не меняет (набор постоянный), а снять их можно только
+ *     вместе с правилом.
  *
  * Порядок атрибутов и их байты ядро отдаёт одни и те же, пока объект тот же, поэтому свёртка —
  * прямо по байтам ответа, без разбора выражений по видам. Правила и цепочки — в порядке дампа (он
@@ -568,6 +571,116 @@ int nfd_table_fp(const char *table, struct nfd_tfp *out) {
     out->handle = tt.handle;
     out->fams = tt.fams;
     return 0;
+}
+
+/* ---- наборы и их элементы (сверка элементов статических наборов, recon.c) ------------------ */
+
+#define NFD_SET_KEY_LEN      5      /* NFTA_SET_KEY_LEN */
+#define NFD_SET_ELEM_TIMEOUT 4      /* NFTA_SET_ELEM_TIMEOUT */
+#define NFD_SET_ELEM_EXPIRE  5      /* NFTA_SET_ELEM_EXPIRATION */
+
+struct sets_ctx {
+    const char *table;
+    nfd_set_fn fn;
+    void *arg;
+};
+
+static void sets_list_cb(const struct nlmsghdr *m, void *arg) {
+    struct sets_ctx *c = arg;
+    if (!msg_is(m, NFT_MSG_NEWSET)) return;
+    const struct nlattr *tb[NFTA_SET_MAX + 1];
+    msg_attrs(m, tb, NFTA_SET_MAX);
+    char t[64];
+    if (strcmp(nla_cstr(tb[NFTA_SET_TABLE], t, sizeof(t)), c->table) != 0) return;
+    struct nfd_set s;
+    memset(&s, 0, sizeof(s));
+    s.family = msg_family(m);
+    nla_cstr(tb[NFTA_SET_NAME], s.name, sizeof(s.name));
+    s.flags = nla_be32(tb[NFTA_SET_FLAGS]);
+    s.klen = nla_be32(tb[NFD_SET_KEY_LEN]);
+    c->fn(c->arg, &s);
+}
+
+int nfd_sets(const char *table, nfd_set_fn fn, void *arg) {
+    int fd = nfd_open();
+    if (fd < 0) return errno ? errno : EIO;
+    struct sets_ctx c = { table, fn, arg };
+    /* Без атрибута таблицы и без фильтра по семейству — почему, в шапке раздела отпечатка.
+     * Без повтора: заголовки наборов меняет только nft -f, а набор, которого к дампу его
+     * элементов уже нет, вызывающий (сверка элементов) и так считает «не прочитать». */
+    int rc = nfd_talk(fd, NFT_MSG_GETSET, 1, NFPROTO_UNSPEC, 0, NULL, 0, NULL, sets_list_cb, &c);
+    close(fd);
+    return rc;
+}
+
+struct elems_ctx {
+    nfd_elem_fn fn;
+    void *arg;
+    int msgs;
+    uint16_t gen;                   /* res_id первого ответа */
+    int gen_moved;                  /* у какого-то ответа res_id другой */
+};
+
+static void elems_list_cb(const struct nlmsghdr *m, void *arg) {
+    struct elems_ctx *c = arg;
+    if (!msg_is(m, NFT_MSG_NEWSETELEM)) return;
+    /* Номер поколения набора правил (nfgenmsg.res_id: младшие 16 бит base_seq — так отвечает и
+     * 4.9, проверено на tools/vm49): растёт с каждой транзакцией, в том числе с элементом
+     * резолвера. Разный у ответов одного дампа — посреди дампа кто-то писал. */
+    uint16_t g = ((const struct nfgenmsg *)NLMSG_DATA(m))->res_id;
+    if (!c->msgs++) c->gen = g;
+    else if (g != c->gen) c->gen_moved = 1;
+    const struct nlattr *tb[NFTA_SET_ELEM_LIST_MAX + 1];
+    msg_attrs(m, tb, NFTA_SET_ELEM_LIST_MAX);
+    if (!tb[NFTA_SET_ELEM_LIST_ELEMENTS]) return;
+    const struct nlattr *e;
+    NLA_FOR_EACH(e, tb[NFTA_SET_ELEM_LIST_ELEMENTS]) {
+        const struct nlattr *et[NFD_SET_ELEM_KEY_END + 1];
+        nfd_nested(e, et, NFD_SET_ELEM_KEY_END);
+        struct nfd_elem x;
+        memset(&x, 0, sizeof(x));
+        static const uint8_t none[1];
+        x.key = none;
+        if (et[NFTA_SET_ELEM_KEY]) {
+            const struct nlattr *dt[NFTA_DATA_MAX + 1];
+            nfd_nested(et[NFTA_SET_ELEM_KEY], dt, NFTA_DATA_MAX);
+            if (dt[NFTA_DATA_VALUE]) {
+                x.key = nla_ptr(dt[NFTA_DATA_VALUE]);
+                x.klen = nla_size(dt[NFTA_DATA_VALUE]);
+            }
+        }
+        if (et[NFD_SET_ELEM_KEY_END]) {
+            const struct nlattr *dt[NFTA_DATA_MAX + 1];
+            nfd_nested(et[NFD_SET_ELEM_KEY_END], dt, NFTA_DATA_MAX);
+            if (dt[NFTA_DATA_VALUE]) {
+                x.key_end = nla_ptr(dt[NFTA_DATA_VALUE]);
+                x.kelen = nla_size(dt[NFTA_DATA_VALUE]);
+            }
+        }
+        x.flags = nla_be32(et[NFTA_SET_ELEM_FLAGS]);
+        x.timeout = et[NFD_SET_ELEM_TIMEOUT] || et[NFD_SET_ELEM_EXPIRE];
+        x.data = et[NFTA_SET_ELEM_DATA] != NULL;
+        c->fn(c->arg, &x);
+    }
+}
+
+int nfd_set_elems(uint8_t family, const char *table, const char *set, nfd_elem_fn fn,
+                  void (*reset)(void *arg), void *arg, int *stable) {
+    int fd = nfd_open();
+    if (fd < 0) return errno ? errno : EIO;
+    struct elems_ctx c;
+    int rc = EINTR;
+    for (int i = 0; i < 3 && rc == EINTR; i++) {
+        if (i && reset) reset(arg);
+        memset(&c, 0, sizeof(c));
+        c.fn = fn;
+        c.arg = arg;
+        rc = nfd_talk(fd, NFT_MSG_GETSETELEM, 1, family, NFTA_SET_ELEM_LIST_TABLE, table,
+                      NFTA_SET_ELEM_LIST_SET, set, elems_list_cb, &c);
+    }
+    close(fd);
+    if (stable) *stable = !c.gen_moved;
+    return rc;
 }
 
 /* ---- redirect на порт ---------------------------------------------------------------------- */
