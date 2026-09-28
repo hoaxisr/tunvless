@@ -381,11 +381,37 @@ int dch_add(size_t i, const char *domain, uint32_t addr_host, uint32_t ttl) {
     return rc;
 }
 
+/* Пул fake-IP как отрезок ключей в порядке сети — для nft_elem_carve: вырезать адрес можно только
+ * из отрезка, целиком лежащего в пуле (засев), а не из префикса адресного списка. Первый и
+ * последний адреса пула не выдаются (fakeip_lookup_or_alloc), и в засев они не попадают. */
+static void pool_bounds4(uint8_t lo[4], uint8_t hi[4]) {
+    uint32_t a = htonl(FAKEIP_POOL_BASE + 1), b = htonl(FAKEIP_POOL_BASE + FAKEIP_POOL_SIZE - 2);
+    memcpy(lo, &a, 4);
+    memcpy(hi, &b, 4);
+}
+
+static void pool_bounds6(uint8_t lo[16], uint8_t hi[16]) {
+    fakeip6_of(FAKEIP_POOL_BASE + 1, lo);
+    fakeip6_of(FAKEIP_POOL_BASE + FAKEIP_POOL_SIZE - 2, hi);
+}
+
+/* Снятие из обычного набора канала: точным ключом, а на ENOENT — вырезая адрес из слитого отрезка.
+ * Засев набора правил кладёт соседние поддельные адреса одного канала, и auto-merge при загрузке
+ * сливает их в отрезок (print.c, src/dnsd/fpseed.c); точного элемента [F, F+1) тогда в ядре нет,
+ * и без вырезания имя, ушедшее из канала, оставалось бы в его наборе до следующей замены таблицы
+ * (nft_elem_carve, nftnl.c). ENOENT и после этого — адреса в наборе нет вовсе: перезапуск, или он
+ * туда и не лёг, — желаемое состояние. Составной набор засев не сливает (seed_edge4 в print.c), и
+ * там точного ключа хватает. */
 void dch_del(size_t i, const char *domain, uint32_t addr_host) {
     if (!g_dch[i].composite) {
         uint32_t k_net = htonl(addr_host);
         int drc = nftlk_elem_msg(NFT_MSG_DELSETELEM, g_nft_table, g_dch[i].set,
                                  &k_net, g_nft_sets_interval, NULL, 0);
+        if (drc == -ENOENT && g_nft_sets_interval) {
+            uint8_t lo[4], hi[4];
+            pool_bounds4(lo, hi);
+            drc = nft_elem_carve(g_dch[i].set, (const uint8_t *)&k_net, 4, lo, hi);
+        }
         if (drc != 0 && drc != -ENOENT && dbg())
             fprintf(stderr, "nftlk: channel-move delete from %s rc=%d\n", g_dch[i].set, drc);
         return;
@@ -419,6 +445,11 @@ void dch_del6(size_t i, const char *domain, const uint8_t addr[16]) {
     if (!g_dch[i].composite) {
         int drc = nftlk_elem_msg6(NFT_MSG_DELSETELEM, g_nft_table, s6, addr,
                                   g_nft_sets_interval, NULL, 0);
+        if (drc == -ENOENT && g_nft_sets_interval) {
+            uint8_t lo[16], hi[16];
+            pool_bounds6(lo, hi);
+            drc = nft_elem_carve(s6, addr, 16, lo, hi);
+        }
         if (drc != 0 && drc != -ENOENT && dbg())
             fprintf(stderr, "nftlk: channel-move delete from %s rc=%d\n", s6, drc);
         return;
@@ -546,10 +577,31 @@ static void route_reassert6(struct fakeip_entry *e, uint64_t want) {
  * таблице ядра (netlink не открылся, таблица снесена) клиент получал fake-IP в чёрную дыру,
  * пока свежие домены честно шли наверх. Теперь несостоявшееся отображение обнуляет поле, и
  * такой домен идёт долгим путём — как обещает шапка файла про fail-open. */
+/* ПОРЯДОК В ЗАПИСИ — СНАЧАЛА НАБОРЫ КАНАЛОВ, ПОТОМ КАРТА. Подмена без метки — это утечка: пакет
+ * клиента с поддельным адресом в кэше разворачивается картой в настоящий адрес и, не найдя себя в
+ * наборе канала, уходит по таблице main в WAN (перепроверка на QEMU, 2026-09-28,
+ * docs/architecture.md, раздел 5). Метка без подмены — нет: помеченный пакет к поддельному адресу
+ * подмены не находит и дальше правила за dnat не идёт (generate.c, fakeip_nomap_drop). Поэтому
+ * между двумя транзакциями одной записи наборы уже стоят, а карта — ещё нет, а не наоборот. После
+ * замены набора правил оба уже засеяны текстом (src/dnsd/fpseed.c), и здесь всё — EEXIST; порядок
+ * решает там, где засева не было: первый запуск резолвера, старый набор правил, засев не
+ * собрался. Не встала карта IPv6 — элементы IPv6 снимаются обратно (адресом AAAA на такое имя
+ * больше не отвечают, как и прежде). */
 size_t fakeip_rehydrate(int nk_open, size_t *routed_out) {
     size_t restored = 0, routed = 0;
     for (size_t i = 0; i < g_fakeip.n; i++) {
         struct fakeip_entry *e = &g_fakeip.entries[i];
+        uint64_t all = 0, m = 0;
+        if (nk_open == 0) {
+            /* Re-derive the channels for the stored domain and re-assert the permanent route
+             * elements — БЕЗ дросселя и во все каналы, а не только в новые (route_reassert ниже):
+             * этот проход зовут и после замены набора правил, когда наборы в ядре пересозданы
+             * пустыми, а память резолвера помнит элементы «уже стоящими». */
+            all = dch_match_mask(e->domain);
+            m = dch_fakeip_only(all);
+            if (m || e->sets) route_reassert(e, m);
+            if (m) routed++;
+        }
         if (e->real_host) {
             /* known_real = 0: after a restart the kernel map is empty as far as we know, so
              * this is a plain add (and an EEXIST just means the map survived). */
@@ -558,28 +610,25 @@ size_t fakeip_rehydrate(int nk_open, size_t *routed_out) {
             else
                 e->real_host = 0;
         }
-        /* Половина IPv6 — тем же правилом: настоящий IPv6 остаётся у записи, только если ядро
-         * приняло элемент карты fakeip6; иначе быстрый путь AAAA закрыт до нового ответа. */
+        if (nk_open != 0) {
+            e->has_real6 = 0;
+            continue;
+        }
+        /* Половина IPv6 — тем же порядком. Поддельный IPv6 ложится в наборы, только если он у имени
+         * был выдан (есть настоящий IPv6) и все совпавшие каналы по-прежнему несут IPv6; иначе
+         * прежние элементы IPv6 снимаются — на AAAA такого имени адресом больше не отвечают.
+         * Настоящий IPv6 остаётся у записи, только если ядро приняло элемент карты fakeip6; иначе
+         * быстрый путь AAAA закрыт до нового ответа, и элементы IPv6 снимаются тоже. */
+        uint64_t m6 = e->has_real6 && m && dch_all_v6(all) ? m : 0;
+        if (m6 || e->sets6) route_reassert6(e, m6);
         if (e->has_real6) {
             uint8_t f6[16];
             fakeip6_of(e->addr, f6);
-            if (nk_open != 0 || nft_map_set_element6(g_fakeip6_map, f6, e->real6, NULL) != 0)
+            if (nft_map_set_element6(g_fakeip6_map, f6, e->real6, NULL) != 0) {
                 e->has_real6 = 0;
+                if (e->sets6) route_reassert6(e, 0);
+            }
         }
-        if (nk_open != 0) continue;
-        /* Re-derive the channels for the stored domain and re-assert the permanent route
-         * elements — БЕЗ дросселя и во все каналы, а не только в новые (route_reassert ниже):
-         * этот проход зовут и после замены набора правил, когда наборы в ядре пересозданы
-         * пустыми, а память резолвера помнит элементы «уже стоящими». */
-        uint64_t all = dch_match_mask(e->domain);
-        uint64_t m = dch_fakeip_only(all);
-        if (m || e->sets) route_reassert(e, m);
-        if (m) routed++;
-        /* Поддельный IPv6 ложится в наборы, только если он у имени был выдан (есть настоящий
-         * IPv6) и все совпавшие каналы по-прежнему несут IPv6; иначе прежние элементы IPv6
-         * снимаются — на AAAA такого имени адресом больше не отвечают. */
-        uint64_t m6 = e->has_real6 && m && dch_all_v6(all) ? m : 0;
-        if (m6 || e->sets6) route_reassert6(e, m6);
     }
     if (routed_out) *routed_out = routed;
     return restored;

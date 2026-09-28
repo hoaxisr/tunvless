@@ -496,6 +496,36 @@ int supd_orphan_down(void) {
     return 1;
 }
 
+/* Сразу после загрузки набора правил — попросить резолвер вернуть элементы real-ip (просьба
+ * «reassert», src/dnsd/adopt.c; зачем — у ruleset_load в apply.c). Зовёт загрузчик — ребёнок
+ * демона apply-commit или подкоманда `steer apply`, — а не демон: демон узнаёт о загрузке только
+ * по выходу ребёнка, а ребёнок после nft -f ещё ставит метки «пущен напрямую», карту balance и
+ * проверки (сотни миллисекунд), и всё это время адреса real-ip шли бы без метки.
+ *
+ * Ответ ждётся недолго (500 мс): резолвер отвечает из своего цикла, и если он в этот миг
+ * перечитывает списки, просьба дождётся очереди и без нас — загрузчику незачем стоять. 1 —
+ * резолвер ответил; 0 — резолвера нет (сокета нет: без демона и без пережившего его резолвера)
+ * или ответ не пришёл вовремя; -1 — резолвер прежней версии, просьбы не знает (закрыл
+ * соединение молча): тогда элементы вернёт таблица от демона, как прежде. */
+int supd_dnsd_reassert(void) {
+    pid_t pid;
+    int fd = dnsd_connect(&pid);
+    if (fd < 0) return 0;
+    if (send(fd, "reassert\n", 9, MSG_NOSIGNAL) != 9) {
+        close(fd);
+        return 0;
+    }
+    char b[16];
+    ssize_t m = -1;
+    struct pollfd p = { fd, POLLIN, 0 };
+    int r;
+    while ((r = poll(&p, 1, 500)) < 0 && errno == EINTR) {}
+    if (r > 0) m = recv(fd, b, sizeof(b), MSG_DONTWAIT);
+    close(fd);
+    if (m >= 3 && !memcmp(b, "ok\n", 3)) return 1;
+    return m == 0 ? -1 : 0;
+}
+
 static void dn_conn_close(struct supd *s) {
     if (s->dn_conn < 0) return;
     loop_fd_del(s->l, s->dn_conn);

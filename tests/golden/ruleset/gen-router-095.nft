@@ -66,6 +66,7 @@ table ip steer {
         ip saddr 192.168.1.0/24 udp dport 53 counter redirect to :5300
         ip saddr 192.168.1.0/24 tcp dport 53 counter redirect to :5300
         ip daddr 198.18.0.0/15 counter dnat to ip daddr map @fakeip
+        ip daddr 198.18.0.0/15 counter drop comment "steer-fakeip-nomap"
         meta mark and 0x0ff00000 == 0x00300000 tcp dport { 443, 80, 5222 } counter redirect to :8482 comment "steer:tgws:tg"
     }
     chain postrouting_nat {

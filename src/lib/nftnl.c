@@ -660,3 +660,218 @@ int nft_map_set_element6(const char *map_name, const uint8_t fake[16], const uin
     return map_set(g_nft_map6_table, map_name, fake, real, 16,
                    known_real && memcmp(known_real, real, 16) != 0);
 }
+
+/* ---- вырезать один адрес из слитого отрезка интервального набора -----------------------------
+ *
+ * ОТКУДА ОТРЕЗКИ. Поддельные адреса каналов fake-IP засеваются в наборы каналов текстом набора
+ * правил (src/dnsd/fpseed.c), а доменный набор объявлен с auto-merge: nft при загрузке сливает
+ * соседние адреса одного канала в отрезок — «198.18.0.1-198.18.0.3» вместо трёх элементов (пул
+ * раздаётся подряд, так что соседи — обычное дело). Резолвер же снимает адрес имени, ушедшего из
+ * канала (перечитанные списки, правило сменилось, dch_del в fakeip.c), точным ключом «начало +
+ * маркер конца», и на слитом отрезке ядро отвечает ENOENT: элемента [F, F+1) нет, есть [s, e).
+ * Адрес оставался бы в наборе, и имя, переехавшее в другой канал, продолжало бы уходить в прежний
+ * выход (порядок цепочки) до следующей замены таблицы.
+ *
+ * КАК. Ядро отдаёт отрезок, в котором лежит ключ: NFT_MSG_GETSETELEM с ключом — его начало, с
+ * флагом NFT_SET_ELEM_INTERVAL_END — его маркер конца (rbtree ищет ближайшую границу нужного вида
+ * — так `nft get element` находит отрезок по адресу внутри него). Дальше ОДНОЙ транзакцией: снять
+ * [s, e) и положить [s, F) и [F+1, e), те из них, что не пусты. Одной — чтобы соседи F ни на миг
+ * не выпали из набора: снятие без вставок оставило бы их без метки, то есть в WAN.
+ *
+ * Только отрезок, который целиком лежит в [lo, hi] (пул fake-IP — его передаёт вызывающий) и без
+ * срока. Слитый засев — ровно такой: постоянные элементы внутри пула. Отрезок шире пула — это
+ * префикс адресного списка (список «bogon» с 198.18.0.0/15 законно покрывает весь пул), и
+ * вырезать из него адрес значило бы молча поменять список человека; со сроком — не наш засев.
+ * Тогда — ENOENT, как прежде. Старая раскладка (hash, g_nft_sets_interval = 0) не сливает ничего,
+ * и туда эта функция не нужна. */
+
+/* Найти атрибут type в потоке атрибутов [p, p+len). */
+static const struct nlattr *nla_find(const uint8_t *p, size_t len, uint16_t type) {
+    while (len >= sizeof(struct nlattr)) {
+        const struct nlattr *a = (const struct nlattr *)p;
+        if (a->nla_len < sizeof(*a) || a->nla_len > len) return NULL;
+        if ((a->nla_type & NLA_TYPE_MASK) == type) return a;
+        size_t step = NLA_ALIGN(a->nla_len);
+        if (step >= len) return NULL;
+        p += step;
+        len -= step;
+    }
+    return NULL;
+}
+#define NLA_PAY(a) ((const uint8_t *)(a) + NLA_HDRLEN)
+#define NLA_PLEN(a) ((size_t)(a)->nla_len - NLA_HDRLEN)
+
+/* Граница отрезка, в котором лежит key: end = 0 — его начало, 1 — его маркер конца (исключающий).
+ * 0 — найдено, ключ в out, *timed — у элемента есть срок; -ENOENT — адрес ни в каком отрезке; иное
+ * — отказ ядра или ответа нет (-ETIMEDOUT). Обычный запрос, не транзакция: GET в пакет не входит. */
+static int nftlk_get_bound(const char *table, const char *set, const uint8_t *key, size_t alen,
+                           int end, uint8_t *out, int *timed) {
+    if (g_nlk_fd < 0) return -ENOTCONN;
+    const char *fam_str, *tbl_str;
+    nftlk_split_table(table, &fam_str, &tbl_str);
+    uint8_t buf[NFTLK_MSG_CAP];
+    struct nlbuf b;
+    nlbuf_init(&b, buf, sizeof(buf));
+    struct nlmsghdr *nh = (struct nlmsghdr *)b.p;
+    b.p += NLMSG_ALIGN(sizeof(*nh));
+    struct nfgenmsg *nfg = (struct nfgenmsg *)b.p;
+    b.p += NLMSG_ALIGN(sizeof(*nfg));
+    nlbuf_put_str(&b, NFTA_SET_ELEM_LIST_TABLE, tbl_str);
+    nlbuf_put_str(&b, NFTA_SET_ELEM_LIST_SET, set);
+    struct nlattr *elems = nlbuf_begin_nested(&b, NFTA_SET_ELEM_LIST_ELEMENTS);
+    struct nlattr *elem = nlbuf_begin_nested(&b, NFTA_LIST_ELEM);
+    struct nlattr *k = nlbuf_begin_nested(&b, NFTA_SET_ELEM_KEY);
+    nlbuf_put_data(&b, NFTA_DATA_VALUE, key, alen);
+    nlbuf_end_nested(&b, k);
+    if (end) nlbuf_put_be32(&b, NFTA_SET_ELEM_FLAGS, NFT_SET_ELEM_INTERVAL_END);
+    nlbuf_end_nested(&b, elem);
+    nlbuf_end_nested(&b, elems);
+    uint32_t seq = nftlk_seq_reserve(1);
+    nh->nlmsg_len = (uint32_t)(b.p - buf);
+    nh->nlmsg_type = (uint16_t)((NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_GETSETELEM);
+    nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    nh->nlmsg_seq = seq;
+    nh->nlmsg_pid = 0;
+    nfg->nfgen_family = nftlk_family(fam_str);
+    nfg->version = NFNETLINK_V0;
+    nfg->res_id = 0;
+    struct sockaddr_nl dst = { .nl_family = AF_NETLINK };
+    if (sendto(g_nlk_fd, buf, nh->nlmsg_len, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0)
+        return -ETIMEDOUT;
+    /* Ответ — сообщение NEWSETELEM с найденным элементом и за ним подтверждение (NLM_F_ACK); на
+     * отказ — одно подтверждение с кодом. Чужие номера — хвосты прежних запросов, мимо. */
+    int found = 0;
+    uint8_t rbuf[2048];
+    for (;;) {
+        ssize_t r = recv(g_nlk_fd, rbuf, sizeof(rbuf), 0);
+        if (r < (ssize_t)NLMSG_HDRLEN) return found ? 0 : -ETIMEDOUT;
+        size_t left = (size_t)r;
+        for (struct nlmsghdr *rh = (struct nlmsghdr *)rbuf; NLMSG_OK(rh, left);
+             rh = NLMSG_NEXT(rh, left)) {
+            if (rh->nlmsg_seq != seq) continue;
+            if (rh->nlmsg_type == NLMSG_ERROR) {
+                int err = ((struct nlmsgerr *)NLMSG_DATA(rh))->error;
+                if (err) return err;
+                return found ? 0 : -ENOENT;
+            }
+            if (rh->nlmsg_type != ((NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWSETELEM)) continue;
+            size_t hl = NLMSG_ALIGN(sizeof(struct nfgenmsg));
+            if (rh->nlmsg_len < NLMSG_HDRLEN + hl) continue;
+            const uint8_t *p = (const uint8_t *)NLMSG_DATA(rh) + hl;
+            size_t pl = rh->nlmsg_len - NLMSG_HDRLEN - hl;
+            const struct nlattr *es = nla_find(p, pl, NFTA_SET_ELEM_LIST_ELEMENTS);
+            const struct nlattr *e1 = es ? nla_find(NLA_PAY(es), NLA_PLEN(es), NFTA_LIST_ELEM) : NULL;
+            const struct nlattr *ka = e1 ? nla_find(NLA_PAY(e1), NLA_PLEN(e1), NFTA_SET_ELEM_KEY) : NULL;
+            const struct nlattr *kv = ka ? nla_find(NLA_PAY(ka), NLA_PLEN(ka), NFTA_DATA_VALUE) : NULL;
+            if (!kv || NLA_PLEN(kv) != alen) continue;
+            memcpy(out, NLA_PAY(kv), alen);
+            *timed = nla_find(NLA_PAY(e1), NLA_PLEN(e1), NFTA_SET_ELEM_TIMEOUT) != NULL;
+            /* Флаг вида границы у найденного — тот, что спрашивали (ядро отдаёт границу нужного
+             * вида или ничего), но проверить дёшево. */
+            const struct nlattr *fl = nla_find(NLA_PAY(e1), NLA_PLEN(e1), NFTA_SET_ELEM_FLAGS);
+            uint32_t f = 0;
+            if (fl && NLA_PLEN(fl) >= 4) {
+                memcpy(&f, NLA_PAY(fl), 4);
+                f = ntohl(f);
+            }
+            if (((f & NFT_SET_ELEM_INTERVAL_END) != 0) != (end != 0)) return -ENOENT;
+            found = 1;
+        }
+    }
+}
+
+/* Отрезок [lo, hi) интервального набора одним сообщением: начало и маркер конца (как у
+ * nftlk_elem_build, но с явным концом), без срока. */
+static size_t nftlk_range_build(uint8_t *buf, size_t cap, uint32_t seq, uint16_t type,
+                                const char *table, const char *set, const uint8_t *lo,
+                                const uint8_t *hi, size_t alen) {
+    const char *fam_str, *tbl_str;
+    nftlk_split_table(table, &fam_str, &tbl_str);
+    struct nlbuf b;
+    nlbuf_init(&b, buf, cap);
+    struct nlmsghdr *nh = (struct nlmsghdr *)b.p;
+    b.p += NLMSG_ALIGN(sizeof(*nh));
+    struct nfgenmsg *nfg = (struct nfgenmsg *)b.p;
+    b.p += NLMSG_ALIGN(sizeof(*nfg));
+    nlbuf_put_str(&b, NFTA_SET_ELEM_LIST_TABLE, tbl_str);
+    nlbuf_put_str(&b, NFTA_SET_ELEM_LIST_SET, set);
+    struct nlattr *elems = nlbuf_begin_nested(&b, NFTA_SET_ELEM_LIST_ELEMENTS);
+    struct nlattr *e1 = nlbuf_begin_nested(&b, NFTA_LIST_ELEM);
+    struct nlattr *k1 = nlbuf_begin_nested(&b, NFTA_SET_ELEM_KEY);
+    nlbuf_put_data(&b, NFTA_DATA_VALUE, lo, alen);
+    nlbuf_end_nested(&b, k1);
+    nlbuf_end_nested(&b, e1);
+    struct nlattr *e2 = nlbuf_begin_nested(&b, NFTA_LIST_ELEM);
+    struct nlattr *k2 = nlbuf_begin_nested(&b, NFTA_SET_ELEM_KEY);
+    nlbuf_put_data(&b, NFTA_DATA_VALUE, hi, alen);
+    nlbuf_end_nested(&b, k2);
+    nlbuf_put_be32(&b, NFTA_SET_ELEM_FLAGS, NFT_SET_ELEM_INTERVAL_END);
+    nlbuf_end_nested(&b, e2);
+    nlbuf_end_nested(&b, elems);
+    nh->nlmsg_len = (uint32_t)(b.p - buf);
+    nh->nlmsg_type = (uint16_t)((NFNL_SUBSYS_NFTABLES << 8) | type);
+    nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | (type == NFT_MSG_NEWSETELEM ? NLM_F_CREATE : 0);
+    nh->nlmsg_seq = seq;
+    nh->nlmsg_pid = 0;
+    nfg->nfgen_family = nftlk_family(fam_str);
+    nfg->version = NFNETLINK_V0;
+    nfg->res_id = 0;
+    return nh->nlmsg_len;
+}
+
+/* Сравнение и шаг ключа — по всей длине, big-endian. */
+static void key_step(uint8_t *k, size_t alen, int up) {
+    for (size_t i = alen; i-- > 0;) {
+        if (up) { if (++k[i] != 0) return; }
+        else if (k[i]-- != 0) return;
+    }
+}
+
+int nft_elem_carve(const char *set, const uint8_t *key, size_t alen, const uint8_t *lo,
+                   const uint8_t *hi) {
+    if (!g_nft_sets_interval || (alen != 4 && alen != 16)) return -ENOENT;
+    uint8_t s[16], e[16];
+    int ts = 0, te = 0;
+    int rc = nftlk_get_bound(g_nft_table, set, key, alen, 0, s, &ts);
+    if (rc) return rc;
+    rc = nftlk_get_bound(g_nft_table, set, key, alen, 1, e, &te);
+    if (rc) return rc;
+    /* s <= key < e — иначе ядро нашло не тот отрезок (адрес между отрезками). */
+    if (ts || te || memcmp(s, key, alen) > 0 || memcmp(e, key, alen) <= 0) return -ENOENT;
+    uint8_t last[16];
+    memcpy(last, e, alen);
+    key_step(last, alen, 0);
+    if (memcmp(s, lo, alen) < 0 || memcmp(last, hi, alen) > 0) return -ENOENT;
+    uint8_t next[16];
+    memcpy(next, key, alen);
+    key_step(next, alen, 1);
+    uint8_t m[3][NFTLK_MSG_CAP];
+    size_t lens[3];
+    uint8_t *msgs[3];
+    int n = 0;
+    uint32_t seq = nftlk_seq_reserve(3);
+    lens[n] = nftlk_range_build(m[n], sizeof(m[n]), seq + (uint32_t)n, NFT_MSG_DELSETELEM,
+                                g_nft_table, set, s, e, alen);
+    msgs[n] = m[n];
+    n++;
+    if (memcmp(s, key, alen) < 0) {
+        lens[n] = nftlk_range_build(m[n], sizeof(m[n]), seq + (uint32_t)n, NFT_MSG_NEWSETELEM,
+                                    g_nft_table, set, s, key, alen);
+        msgs[n] = m[n];
+        n++;
+    }
+    if (memcmp(next, e, alen) < 0) {
+        lens[n] = nftlk_range_build(m[n], sizeof(m[n]), seq + (uint32_t)n, NFT_MSG_NEWSETELEM,
+                                    g_nft_table, set, next, e, alen);
+        msgs[n] = m[n];
+        n++;
+    }
+    int errs[3] = { 0, 0, 0 };
+    if (nftlk_txn(msgs, lens, n, seq, errs) != 0) return -ETIMEDOUT;
+    for (int i = 0; i < n; i++)
+        if (errs[i]) {
+            if (dbg()) fprintf(stderr, "nftlk: carve %s: part %d error=%d\n", set, i, errs[i]);
+            return errs[i];
+        }
+    return 0;
+}

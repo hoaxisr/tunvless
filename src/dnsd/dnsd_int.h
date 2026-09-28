@@ -365,8 +365,14 @@ int table_pipe_take(int fd, long *waited);
  * выходит (цикл кончится на этом обороте); -1 — хозяин жив (труба открыта), резолвер остаётся. */
 int table_pipe_release(void);
 /* adopt.c: stderr резолвера сломан (труба журнала procd закрыта: службу остановили, а резолвер
- * пережил демона) — дальше писать в syslog (/dev/log), иначе в /dev/null. */
+ * пережил демона) — fd 2 становится своей трубой, чьи строки уходят в syslog (/dev/log, шов
+ * STEER_SYSLOG_SOCK) с заголовком syslog(3); syslog нет — /dev/null. g_slog_rd — конец чтения
+ * этой трубы в epoll (событие — slog_pump); slog_stop — дочитать и убрать (выход резолвера,
+ * fd 2 заменён stderr нового демона). */
+extern int g_slog_rd;
 void stderr_rescue(void);
+void slog_pump(void);
+void slog_stop(void);
 
 /* Раскладка ответа SO_PEERCRED — своя, по той же причине, что dnsd_in6_pktinfo: struct ucred
  * libc показывает только с _GNU_SOURCE, а файлы резолвера включают стенды со своим порядком

@@ -45,5 +45,11 @@ int nft_concat_element6(int add, const char *set_name, const uint8_t addr[16],
                         const struct nftlk_box *box, uint32_t ttl);
 int nft_map_set_element6(const char *map_name, const uint8_t fake[16], const uint8_t real[16],
                          const uint8_t *known_real);
+/* Снять адрес key (alen — 4 или 16, порядок сети) из интервального набора g_nft_table, где он
+ * лежит внутри слитого отрезка (засев набора правил и auto-merge): отрезок заменяется его частями
+ * без key одной транзакцией. Только отрезок без срока, целиком внутри [lo, hi] (пул fake-IP). 0 —
+ * вырезан; -ENOENT — такого отрезка нет (или он не наш); иное — отказ ядра. Доводы — в nftnl.c. */
+int nft_elem_carve(const char *set, const uint8_t *key, size_t alen, const uint8_t *lo,
+                   const uint8_t *hi);
 
 #endif

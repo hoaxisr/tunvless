@@ -50,5 +50,7 @@ table inet steer {
         type nat hook prerouting priority dstnat; policy accept;
         ip daddr 198.18.0.0/15 counter dnat ip to ip daddr map @fakeip
         ip6 daddr fdfe:dcba:9876::/96 counter dnat ip6 to ip6 daddr map @fakeip6
+        ip daddr 198.18.0.0/15 counter drop comment "steer-fakeip-nomap"
+        ip6 daddr fdfe:dcba:9876::/96 counter drop comment "steer-fakeip-nomap"
     }
 }

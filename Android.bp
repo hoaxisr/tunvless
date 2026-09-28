@@ -85,6 +85,7 @@ cc_defaults {
         "src/dnsd/dlog.c",
         "src/dnsd/realip.c",
         "src/dnsd/adopt.c",
+        "src/dnsd/fpseed.c",
         "src/dnsd/proxy.c",
         "src/dnsd/main.c",
         "src/daemon/failover.c",

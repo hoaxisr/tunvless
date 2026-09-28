@@ -48,12 +48,14 @@ table ip steer {
         iifname "rndis0" udp dport 53 counter redirect to :5300
         iifname "rndis0" tcp dport 53 counter redirect to :5300
         ip daddr 198.18.0.0/15 counter dnat to ip daddr map @fakeip
+        ip daddr 198.18.0.0/15 counter drop comment "steer-fakeip-nomap"
     }
     chain output_nat {
         type nat hook output priority dstnat - 1; policy accept;
         meta mark and 0x0fc00000 != 0x0fc00000 udp dport 53 ct mark set mark counter redirect to :5300 comment "steer-dns-local"
         meta mark and 0x0fc00000 != 0x0fc00000 tcp dport 53 ct mark set mark counter redirect to :5300 comment "steer-dns-local-tcp"
         ip daddr 198.18.0.0/15 counter dnat to ip daddr map @fakeip comment "steer-fakeip-local"
+        ip daddr 198.18.0.0/15 counter drop comment "steer-fakeip-local-nomap"
     }
     chain output_reroute {
         type route hook output priority mangle + 2; policy accept;

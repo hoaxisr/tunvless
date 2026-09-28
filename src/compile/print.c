@@ -217,10 +217,53 @@ static void mx_print(FILE *f, const struct mx *m, uint64_t lo, uint64_t hi, uint
     }
 }
 
-static void emit_mixed(FILE *f, const struct ir_mixed *mix) {
+/* ЗАСЕВ В СОСТАВНОМ НАБОРЕ (g_print_seed, ir.h). Поддельный адрес ложится событиями той же оси
+ * с сужениями совпавших частей канала — их объединение и раскладку на ящики делает тот же проход,
+ * что и у списков, и результат совпадает с ящиками резолвера (dch_boxes), когда список канала сам
+ * этот адрес не покрывает.
+ *
+ * Одно отличие от списков: засеянный адрес НЕ сливается с соседними отрезками. Соседние
+ * поддельные адреса одного канала — обычное дело (пул раздаётся подряд), и слитый отрезок
+ * «198.18.0.1-198.18.0.3 . …» был бы для резолвера чужим элементом: снять адрес имени, ушедшего из
+ * канала (dch_del, точным ключом), он бы не смог, и имя продолжало бы уходить в прежний выход до
+ * следующей замены таблицы. Граница отрезков b соседствует с засеянным адресом F, когда b == F
+ * (отрезок начинается с него) или b == F + 1 (отрезок им кончается). Засев отсортирован по адресу
+ * (fpseed.c), поиск — бинарный. */
+static uint32_t seed_a4(const struct ir_seed *s) {
+    return ((uint32_t)s->a[0] << 24) | ((uint32_t)s->a[1] << 16) | ((uint32_t)s->a[2] << 8) |
+           s->a[3];
+}
+
+static int seed_edge4(const struct ir_seed *s, size_t n, uint64_t b) {
+    uint64_t lo_v = b ? b - 1 : 0;
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (seed_a4(&s[mid]) < lo_v) lo = mid + 1;
+        else hi = mid;
+    }
+    for (size_t i = lo; i < n && i < lo + 2; i++) {
+        uint64_t a = seed_a4(&s[i]);
+        if (a == b || a + 1 == b) return 1;
+    }
+    return 0;
+}
+
+static const struct l4match g_seed_none;
+
+static void mx_add_seed4(struct mx *m, const struct ir_seed *seed, size_t nseed) {
+    for (size_t i = 0; i < nseed; i++) {
+        uint32_t a = seed_a4(&seed[i]);
+        if (!seed[i].l4_n) { mx_add(m, a, a, mx_l4(m, &g_seed_none)); continue; }
+        for (size_t k = 0; k < seed[i].l4_n; k++) mx_add(m, a, a, mx_l4(m, seed[i].l4[k]));
+    }
+}
+
+static void emit_mixed(FILE *f, const struct ir_mixed *mix, const struct ir_seed *seed,
+                       size_t nseed) {
     struct mx m;
     memset(&m, 0, sizeof(m));
-    for (size_t i = 0; i < mix->n; i++) {
+    for (size_t i = 0; mix && i < mix->n; i++) {
         const struct ir_mixed_src *s = &mix->v[i];
         if (s->set) {
             struct mx_srs c = { &m, s->eff };
@@ -248,6 +291,7 @@ static void emit_mixed(FILE *f, const struct ir_mixed *mix) {
         }
         fclose(in);
     }
+    mx_add_seed4(&m, seed, nseed);
     if (m.over)
         fprintf(stderr, LOG_W "составной набор: вариантов сужения больше 64 — лишние не вошли\n");
     qsort(m.ev, m.n, sizeof(m.ev[0]), ev_cmp);
@@ -257,9 +301,11 @@ static void emit_mixed(FILE *f, const struct ir_mixed *mix) {
     size_t written = 0;
     for (size_t i = 0; i <= m.n; ) {
         uint64_t pos = i < m.n ? m.ev[i].pos : ((uint64_t)1 << 32);
-        /* Отрезок [prev, pos) с множеством act — к отложенному, если продолжает его. */
+        /* Отрезок [prev, pos) с множеством act — к отложенному, если продолжает его (и граница
+         * между ними — не край засеянного адреса, см. seed_edge4). */
         if (pos > prev && act) {
-            if (pend.have && pend.act == act && pend.hi + 1 == prev) {
+            if (pend.have && pend.act == act && pend.hi + 1 == prev &&
+                !(nseed && seed_edge4(seed, nseed, prev))) {
                 pend.hi = pos - 1;
             } else {
                 if (pend.have) mx_print(f, &m, pend.lo, pend.hi, pend.act, &written);
@@ -426,10 +472,30 @@ static void mx6_print(FILE *f, const struct mx *lm, struct a128 lo, struct a128 
     }
 }
 
-static void emit_mixed6(FILE *f, const struct ir_mixed *mix) {
+/* Засев IPv6 — тем же приёмом, что seed_edge4 и mx_add_seed4 у IPv4: засеянный адрес не
+ * сливается с соседями (граница prev соседствует с F, когда prev == F или prev == F + 1). */
+static int seed_edge6(const struct ir_seed *s, size_t n, struct a128 b) {
+    struct a128 bm = b;
+    if (bm.lo-- == 0) bm.hi--;
+    int b0 = !b.hi && !b.lo;
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (!b0 && a128_cmp(a128_from(s[mid].a), bm) < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    for (size_t i = lo; i < n && i < lo + 2; i++) {
+        struct a128 a = a128_from(s[i].a);
+        if (!a128_cmp(a, b) || (!b0 && !a128_cmp(a, bm))) return 1;
+    }
+    return 0;
+}
+
+static void emit_mixed6(FILE *f, const struct ir_mixed *mix, const struct ir_seed *seed,
+                        size_t nseed) {
     struct mx6 m;
     memset(&m, 0, sizeof(m));
-    for (size_t i = 0; i < mix->n; i++) {
+    for (size_t i = 0; mix && i < mix->n; i++) {
         const struct ir_mixed_src *s = &mix->v[i];
         if (s->set) {
             struct mx6_srs c = { &m, s->eff };
@@ -457,6 +523,11 @@ static void emit_mixed6(FILE *f, const struct ir_mixed *mix) {
         }
         fclose(in);
     }
+    for (size_t i = 0; i < nseed; i++) {
+        struct a128 a = a128_from(seed[i].a);
+        if (!seed[i].l4_n) { mx6_add(&m, a, a, mx_l4(&m.lm, &g_seed_none)); continue; }
+        for (size_t k = 0; k < seed[i].l4_n; k++) mx6_add(&m, a, a, mx_l4(&m.lm, seed[i].l4[k]));
+    }
     if (m.lm.over)
         fprintf(stderr, LOG_W "составной набор: вариантов сужения больше 64 — лишние не вошли\n");
     qsort(m.ev, m.n, sizeof(m.ev[0]), ev6_cmp);
@@ -477,6 +548,7 @@ static void emit_mixed6(FILE *f, const struct ir_mixed *mix) {
             else { last = pos; if (last.lo-- == 0) last.hi--; }
             struct a128 nx = pend.hi;
             int adj = pend.have && !(++nx.lo == 0 && ++nx.hi == 0) && !a128_cmp(nx, prev);
+            if (adj && nseed && seed_edge6(seed, nseed, prev)) adj = 0;
             if (pend.have && pend.act == act && adj) {
                 pend.hi = last;
             } else {
@@ -611,31 +683,77 @@ static void emit_fakeip_elements(FILE *f, const char *path, int fam) {
  * карта приходит засеянной из файла на момент замены. Сверку с ядром это не задевает: отпечаток
  * таблицы в ядре (nfd_table_fp) элементов именованных наборов не видит и так.
  *
- * Других засевов из состояния в тексте нет (проверено по генератору): наборы доменных каналов,
- * в том числе real-ip, несут в тексте только адресные списки и .srs самого канала, а поддельные
- * и настоящие адреса из ответов кладёт в ядро резолвер; набор «пущен напрямую» печатается пустым
- * (метки упавших выходов ставят сторож и apply-commit по таблицам выходов); карта раздачи
- * balance печатается «все члены живы» по спеке, а раздачу по живым меняет в ядре сторож, не
- * текст. Адресные списки и наборы .srs — выбор человека, и их смена — законная причина
- * заменить набор. */
+ * ЗАСЕВ НАБОРОВ КАНАЛОВ fake-IP (перепроверка на QEMU, 2026-09-28; docs/architecture.md, раздел
+ * 5). Карта одна закрывала только половину окна: подмена после замены стоит, а набор канала, по
+ * которому пакет к поддельному адресу получает метку выхода, приходил пустым до таблицы
+ * резолверу. Пакет клиента с поддельным адресом в кэше разворачивался в настоящий адрес и уходил
+ * без метки — по таблице main, в WAN, мимо выхода и мимо on_fail=drop (1-4 запроса на каждую
+ * замену на стенде). Теперь в набор канала fake-IP тем же текстом ложатся поддельные адреса из
+ * того же файла — те, что резолвер поставил бы туда после таблицы (решает его же код, fpseed.c;
+ * печатник получает их по имени набора, g_print_seed), и подмена и метка появляются одной
+ * транзакцией. Засев наборов идёт по тому же флагу, что засев карты, и в отпечаток плана не
+ * входит по той же причине. Не собрался засев наборов — apply не засевает и карту
+ * (g_print_state_seed = 0): подмена без решения о маршруте — ровно та утечка; поддельный адрес
+ * без подмены до резолвера не уходит никуда (правило за dnat, generate.c, build_fakeip).
+ *
+ * Как элементы ложатся. Обычный набор — адресами в той же строке elements, что списки (второй
+ * `elements =` в том же наборе nft молча ЗАМЕНЯЕТ первый — проверено на nftables 1.0.9).
+ * auto-merge сольёт соседние поддельные адреса одного канала в отрезок; резолвер, которому потом
+ * понадобится снять из набора один адрес, делит такой отрезок сам (dch_del, fakeip.c).
+ * Составной — событиями той же раскладки, что списки (emit_mixed), и засеянный адрес там не
+ * сливается с соседями (seed_edge4). Набор старой раскладки — hash (legacy.c, шаг 1): засев идёт в
+ * динамическую половину, чьё имя — имя группы; составной hash засева не получает — ящиков
+ * «протоколы × порты» hash не держит, и такой элемент отверг бы весь набор правил.
+ *
+ * Чего в тексте нет по-прежнему: элементов real-ip. Их память — только у резолвера (realip.c), а
+ * ложиться текстом со сроком в набор с auto-merge они не могут: nft сливает соседние элементы в
+ * один с timeout ПЕРВОГО (проверено: 10.0.0.4 со сроком 10 с и 10.0.0.5 со сроком час — один
+ * «10.0.0.4/31 timeout 10s»), а элемент со сроком рядом с префиксом списка превращает и префикс в
+ * истекающий. Их возвращает резолвер сразу после загрузки (apply.c, ruleset_load → supd_dnsd_reassert). Набор «пущен
+ * напрямую» печатается пустым (метки упавших выходов ставят сторож и apply-commit по таблицам
+ * выходов); карта раздачи balance — «все члены живы» по спеке, к живым её сразу после загрузки
+ * приводит fog_balance_adopt. Адресные списки и наборы .srs — выбор человека, и их смена —
+ * законная причина заменить набор. */
 int g_print_state_seed = 1;
+size_t (*g_print_seed)(const char *set, int fam, const struct ir_seed **out);
 
 static void print_elements(FILE *f, const struct nft_set *s) {
     /* Семейство набора — по его типу: парный набор IPv6 («<группа>6», docs/architecture.md,
      * «4б») берёт из тех же файлов и наборов .srs строки IPv6, обычный — IPv4. */
     int fam = s->key && !strncmp(s->key, "ipv6_addr", 9) ? 6 : 4;
+    /* Засев набора канала fake-IP (g_print_seed): спрашивается только у набора со сроками — такие
+     * заводит генератор доменной группе (и динамической половине старой раскладки), — и только
+     * при засеве вообще. Составной набор без интервалов (hash старой раскладки) засева не
+     * получает: ящики «протоколы × порты» — интервалы. */
+    int composite = s->key && strstr(s->key, " . ") != NULL;
+    const struct ir_seed *seed = NULL;
+    size_t nseed = 0;
+    if (g_print_state_seed && g_print_seed && !s->data && (s->flags & NFT_SET_TIMEOUT) &&
+        (!composite || (s->flags & NFT_SET_INTERVAL)))
+        nseed = g_print_seed(s->o.name, fam, &seed);
+    const struct ir_mixed *mix = NULL;
     int list = 0;
     for (const struct nft_elsrc *e = s->els; e; e = e->next) {
         if (e->k == NFT_EL_FAKEIP_STATE) {
             if (g_print_state_seed) emit_fakeip_elements(f, e->s, fam);
         }
-        else if (e->k == NFT_EL_MIXED) {
-            if (fam == 6) emit_mixed6(f, e->p);
-            else emit_mixed(f, e->p);
-        }
+        else if (e->k == NFT_EL_MIXED) mix = e->p;
         else list = 1;
     }
-    if (!list) return;
+    /* Составной набор — одной раскладкой: и его списки (источник у него один, NFT_EL_MIXED), и
+     * засев; без засева текст тот же, что прежде. */
+    if (composite) {
+        if (mix || nseed) {
+            if (fam == 6) emit_mixed6(f, mix, seed, nseed);
+            else emit_mixed(f, mix, seed, nseed);
+        }
+        return;
+    }
+    if (mix) {
+        if (fam == 6) emit_mixed6(f, mix, NULL, 0);
+        else emit_mixed(f, mix, NULL, 0);
+    }
+    if (!list && !nseed) return;
     fprintf(f, "        elements = { ");
     size_t written = 0;
     for (const struct nft_elsrc *e = s->els; e; e = e->next) {
@@ -645,6 +763,13 @@ static void print_elements(FILE *f, const struct nft_set *s) {
             if (written++) fputs(", ", f);
             fputs(e->s, f);
         }
+    }
+    /* Засев — в ту же строку: второй `elements =` в наборе заменил бы списки, а не дополнил. */
+    for (size_t i = 0; i < nseed; i++) {
+        char t[INET6_ADDRSTRLEN];
+        if (!inet_ntop(fam == 6 ? AF_INET6 : AF_INET, seed[i].a, t, sizeof(t))) continue;
+        if (written++) fputs(", ", f);
+        fputs(t, f);
     }
     fprintf(f, " }\n");
 }
