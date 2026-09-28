@@ -124,6 +124,20 @@ struct fakeip_entry {
     char *domain; /* lowercased, matches the ruleset's own lowercasing */
     uint32_t addr;      /* host byte order */
     uint32_t real_host; /* last-seen real backend, host order; 0 if unknown */
+    /* НАСТОЯЩИЙ АДРЕС, КОТОРЫЙ ЗНАЕМ, — отдельно от того, что стоит в ядре (проверка на QEMU
+     * 04664a5, docs/architecture.md, раздел 5). real_host — это «подмена в карте ядра стоит»: на
+     * нём держится быстрый путь (ответ поддельным адресом без похода наверх), и при отказе ядра
+     * он обязан обнуляться (fakeip_rehydrate). Но прежде он был и единственной памятью о
+     * настоящем адресе: резолвер, поднятый раньше набора правил (steer restart: таблицы ещё нет,
+     * отказ ENOENT), обнулял real_host у всех имён, первая же перезапись файла состояния писала
+     * их без настоящего адреса, и следующая замена набора правил засевала карту уже без них —
+     * клиент с поддельным адресом в кэше DNS упирался в «без подмены — никуда». real_saved —
+     * то, что пришло из файла или из последнего ответа, и неудачная запись в ядро его не
+     * трогает: его пишет файл состояния, по нему подмену ставит rehydrate, когда таблица
+     * появилась (reassert после загрузки), и его же видит карта как «установленное» значение
+     * (map_set: смена адреса одной транзакцией). has_real6_saved — то же для real6. */
+    uint32_t real_saved;
+    int has_real6_saved;
     /* В КАКИХ наборах доменных каналов сейчас лежит этот поддельный адрес — по биту
      * на канал (0 = ни в одном). Набор битов, а не один номер, и это разница по
      * существу: имя, названное в ДВУХ правилах сразу, обязано попасть в оба набора.
@@ -315,12 +329,17 @@ int fakeip_lookup_or_alloc(const char *domain_in, uint32_t *out_addr);
 void fakeip_state_load(const char *path);
 void fakeip_state_rewrite(void);
 uint32_t fakeip_entry_get_real(const char *domain);
+/* Настоящий адрес, который знаем: стоящий в ядре, а если не стоит — из файла или прошлого ответа
+ * (real_saved). 0 — не знаем. Им сверяется новый ответ и смена значения в карте. */
+uint32_t fakeip_entry_known_real(const char *domain);
 void fakeip_entry_set_real(const char *domain, uint32_t real_host);
 void fakeip_route_set(const char *domain, uint64_t want);
 size_t fakeip_rehydrate(int nk_open, size_t *routed_out);
 /* fake-IP v6: настоящий адрес под элементом карты fakeip6 (NULL — не знаем), его запись и
  * постоянный элемент поддельного IPv6 в наборах «<канал>6» из want. */
 const uint8_t *fakeip_entry_get_real6(const char *domain);
+/* То же, что fakeip_entry_known_real, для IPv6: стоящий в карте fakeip6 или сохранённый. */
+const uint8_t *fakeip_entry_known_real6(const char *domain);
 void fakeip_entry_set_real6(const char *domain, const uint8_t real6[16]);
 void fakeip_route_set6(const char *domain, uint64_t want);
 extern const char *g_fakeip6_map;

@@ -29,6 +29,13 @@
 #  A6. Шторм: правило снимают шесть раз подряд — каждый раз оно назад, в журнале одна строка о
 #      шторме (страж перешёл на возврат через секунду после пачки).
 #
+# B — резолвер поднят раньше набора правил (steer restart): его восстановление подмены уходит в
+# пустоту (ENOENT), затем набор правил, вопрос одного имени, перезапись файла состояния, снятое
+# правило и замена набора под трафиком клиента с поддельными адресами в кэше. Настоящие адреса
+# имён, которых не спрашивали (и IPv6), остаются в файле; новая карта (и fakeip6) — со всеми;
+# «без подмены» не отброшено ни одного пакета; по SIGHUP резолвер ставит подмену по сохранённым
+# адресам. Заодно: смена адреса у засеянного имени — одной транзакцией, а не EEXIST на засеве.
+#
 # Нужны root, unshare -nm, nsenter, ip, nft и python3. Чего-то нет — стенд пропускается вслух.
 set -u
 BIN="${STEER:-./build/steer}"
@@ -337,6 +344,100 @@ check "  в журнале — шторм, одной строкой" "1" "$(gre
 kill "$D" 2>/dev/null
 wait "$D" 2>/dev/null
 "$BIN" down --state-dir "$tmp/st" >/dev/null 2>&1
+
+# ---- B. резолвер поднят раньше набора правил ---------------------------------------------------
+# Как `steer restart` на QEMU: таблицы нет, резолвер восстанавливает подмену в пустоту (ENOENT).
+# Прежде он забывал при этом настоящие адреса, первая же перезапись файла состояния писала имена
+# без них, и следующая замена набора правил засевала карту без них — клиент с поддельным адресом
+# в кэше DNS упирался в «без подмены — никуда». n1 в файле — с устаревшим адресом (.99): его ответ
+# (.10) и есть повод перезаписать файл; n2 — ещё и с настоящим IPv6.
+cat > "$tmp/b.yaml" <<EOF
+version: 2
+lan: { devices: [br0] }
+lists:
+  f: { domains_file: $tmp/d.lst }
+outputs:
+  wg: { kind: interface, device: t0, on_fail: drop }
+rules:
+  - { name: f, to: f, out: wg }
+EOF
+mkdir -p "$tmp/bst"
+printf 'n1.s19.test\t198.18.0.1\t203.0.113.99\nn2.s19.test\t198.18.0.2\t203.0.113.10\t2001:db8:7::10\nn3.s19.test\t198.18.0.3\t203.0.113.10\n' \
+    > "$tmp/bst/fakeip.state"
+BS="--spec $tmp/b.yaml --state-dir $tmp/bst"
+cat > "$tmp/up.py" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+while True:
+    data, addr = s.recvfrom(2048)
+    qend = 12
+    while data[qend]: qend += 1 + data[qend]
+    qend += 5
+    hdr = data[:2] + b'\x81\x80' + data[4:6] + b'\x00\x01\x00\x00\x00\x00'
+    ans = b'\xc0\x0c\x00\x01\x00\x01\x00\x00\x01\x2c\x00\x04' + bytes([203, 0, 113, 10])
+    s.sendto(hdr + data[12:qend] + ans, addr)
+PY
+cat > "$tmp/qa.py" <<'PY'
+import socket, struct, sys
+port, name = int(sys.argv[1]), sys.argv[2]
+q = struct.pack('>HHHHHH', 0x4242, 0x0100, 1, 0, 0, 0)
+for l in name.split('.'): q += bytes([len(l)]) + l.encode()
+q += b'\x00' + struct.pack('>HH', 1, 1)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
+s.sendto(q, ('127.0.0.1', port))
+try:
+    d, _ = s.recvfrom(2048)
+    print(".".join(str(b) for b in d[-4:]))
+except socket.timeout:
+    print("timeout")
+PY
+python3 "$tmp/up.py" 15615 & UP=$!
+pids="$pids $UP"
+"$BIN" dnsd $BS --listen-port 15611 --upstream-port 15615 >"$tmp/dnsd.log" 2>&1 & DN=$!
+pids="$pids $DN"
+wait_for 'grep -q "listening on" "$tmp/dnsd.log"' 5
+check "B: резолвер поднят до набора правил — подмену ставить некуда" "yes" \
+    "$(grep -q '0 map rehydrated' "$tmp/dnsd.log" && echo yes || echo no)"
+"$BIN" apply $BS >/dev/null 2>&1
+check "  набор правил поставлен (карта засеяна из файла)" "1" \
+    "$("$real_nft" list map inet steer fakeip 2>/dev/null | grep -c '198.18.0.2 : 203.0.113.10')"
+check "  n1 спрошен — клиенту поддельный адрес" "198.18.0.1" "$(python3 "$tmp/qa.py" 15611 n1.s19.test)"
+wait_for 'grep -q "^n1.s19.test	198.18.0.1	203.0.113.10$" "$tmp/bst/fakeip.state"' 5
+check "  файл перезаписан новым адресом n1" "yes" \
+    "$(grep -q "^n1.s19.test	198.18.0.1	203.0.113.10$" "$tmp/bst/fakeip.state" && echo yes || echo no)"
+check "  а у имён, которых не спрашивали, настоящие адреса на месте (и IPv6)" "yes yes" \
+    "$(grep -q "^n2.s19.test	198.18.0.2	203.0.113.10	2001:db8:7::10$" "$tmp/bst/fakeip.state" && echo yes || echo no) $(grep -q "^n3.s19.test	198.18.0.3	203.0.113.10$" "$tmp/bst/fakeip.state" && echo yes || echo no)"
+check "  карта n1 — новый адрес (замена одной транзакцией, а не EEXIST на засеве)" "1" \
+    "$("$real_nft" list map inet steer fakeip | grep -c '198.18.0.1 : 203.0.113.10')"
+# Снять правило канала и поставить набор заново — под трафиком клиента с поддельными адресами в кэше.
+nomap() { "$real_nft" list chain inet steer prerouting_dnat | grep 'steer-fakeip-nomap' |
+          grep 'ip daddr' | sed -n 's/.*counter packets \([0-9]*\).*/\1/p'; }
+W0="$(cnt "$IW" real)" T0="$(cnt "$IT" real1)"
+send_start 198.18.0.3
+sleep 0.3
+h="$("$real_nft" -a list chain inet steer prerouting_mark | grep 'comment "steer:' | head -n 1 | sed -n 's/.*# handle \([0-9]*\).*/\1/p')"
+"$real_nft" delete rule inet steer prerouting_mark handle "$h"
+"$BIN" apply $BS >/dev/null 2>&1
+N0="$(nomap)"
+sleep 0.5
+burst 198.18.0.2 20
+sent="$(send_stop)"
+check "  после замены набора карта — со всеми именами" "3" \
+    "$("$real_nft" list map inet steer fakeip | grep -oE '198\.18\.0\.[123] : 203\.0\.113\.10' | wc -l | tr -d ' ')"
+check "  и карта fakeip6 — с настоящим IPv6 n2" "1" \
+    "$("$real_nft" list map inet steer fakeip6 2>/dev/null | grep -c 'fdfe:dcba:9876::c612:2 : 2001:db8:7::10')"
+check "  клиент с кэшем DNS не теряет связь: туннель получал (отправлено $sent), без подмены — ни одного" "yes 0" \
+    "$([ $(($(cnt "$IT" real1) - T0)) -gt 50 ] && echo yes || echo "no:$(($(cnt "$IT" real1) - T0))") $(($(nomap) - N0))"
+check "  у провайдера ни одного" "0" "$(($(cnt "$IW" real) - W0))"
+n0="$(grep -c 'map, .* routes re-asserted' "$tmp/dnsd.log")"
+kill -HUP "$DN"
+wait_for '[ "$(grep -c "map, .* routes re-asserted" "$tmp/dnsd.log")" -gt "$n0" ]' 5
+check "  SIGHUP (таблица появилась): резолвер ставит подмену по сохранённым адресам" "3" \
+    "$(grep 'map, .* routes re-asserted' "$tmp/dnsd.log" | tail -n 1 | sed -n 's/.*fake-IP: \([0-9]*\) map.*/\1/p')"
+kill "$DN" 2>/dev/null
+wait "$DN" 2>/dev/null
+"$BIN" down --state-dir "$tmp/bst" >/dev/null 2>&1
 
 echo "netrestart: $pass ok, $fail fail"
 [ "$fail" = 0 ]

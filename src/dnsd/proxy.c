@@ -1006,7 +1006,11 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
             return 1;
         }
         if (fakeip_lookup_or_alloc(qname, &fake_addr) == 0) {
-            const uint8_t *known = fakeip_entry_get_real6(qname);
+            /* «Установленное» — то, что знаем, а не только то, что подтвердило ядро: после
+             * резолвера, поднятого до набора правил, в карте лежит засев из файла (real_saved,
+             * struct fakeip_entry), и смена адреса обязана идти одной транзакцией «снять —
+             * положить», а не простым add, на который ядро ответит EEXIST и оставит прежний. */
+            const uint8_t *known = fakeip_entry_known_real6(qname);
             const uint8_t *real6 = ips6[0].addr;
             if (known)
                 for (int k = 0; k < n6; k++)
@@ -1055,7 +1059,8 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
              * backend всё ещё среди ответов, он всё ещё обслуживает домен —
              * оставляем его; настоящий переезд (адреса нет в ответе) по-прежнему
              * ведёт к замене. */
-            uint32_t known = fakeip_entry_get_real(qname);
+            /* Знаем, а не только стоит в ядре — см. то же у AAAA выше. */
+            uint32_t known = fakeip_entry_known_real(qname);
             uint32_t real_host = ntohl(ips[0].addr);
             if (known)
                 for (int k = 0; k < nips; k++)
