@@ -105,7 +105,24 @@
  * расхождение сервер ставит починкой в очередь изменяющих команд (reload без соединения, тот
  * же путь, что apply той же спеки), и проход тогда откладывается, как при любой изменяющей
  * команде, — до её конца и успокоения. Устройство и доводы — в шапке recon.c, «СВЕРКА НА ПРОХОДЕ
- * СТОРОЖА». У `steer failover` (без демона) сверки нет: применённое помнит только демон. */
+ * СТОРОЖА». У `steer failover` (без демона) сверки нет: применённое помнит только демон.
+ *
+ * УСТРОЙСТВА РАЗДАЧИ (проверка на QEMU 04664a5, docs/architecture.md, раздел 5). После
+ * `/etc/init.d/network restart` br-lan пересоздан, и цепочку ingress_mark (compile/generate.c,
+ * «разметка на ingress») ядро сняло вместе со старым устройством: на новое она сама не вешается.
+ * Трафик от этого не ломается — запасные правила prerouting_mark метят его сами, — но выигрыш
+ * ingress пропадает, а вернуть цепочку может только замена набора правил. Прежде её делала сверка
+ * на проходе сторожа, а проход после события сети идёт через WATCH_SETTLE_S: цепочка возвращалась
+ * через 3,6-8,6 с. Теперь тот же сокет событий сети читается с разбором: RTM_NEWLINK устройства
+ * из lan_devices спеки с новым номером (устройство пересоздано или создано впервые после apply) и
+ * RTM_DELLINK такого устройства сразу уходят серверу сокета (watchd_conf.lan), а тот ставит
+ * сверку набора правил в очередь без ожидания прохода (ctl.c, srv_lan). Номер, а не само
+ * событие: RTM_NEWLINK приходит и на каждую смену состояния (порт моста, carrier, up), и сверка
+ * на каждое такое была бы компиляцией на пустом месте; новый номер бывает только у нового
+ * устройства. Только там, где устройства раздачи постоянны (plat()->lan_devs_persist — роутер):
+ * на телефоне ingress не ставится вовсе. События за время прохода и перед ним по-прежнему
+ * выбрасываются для прохода (следы его же ifdown/ifup), но устройства раздачи из них разбираются
+ * всегда — выброшенное пересоздание моста оставило бы цепочку снятой до следующего прохода. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -114,6 +131,10 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/epoll.h>
+#include <sys/socket.h>
+#include <net/if.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 
 #include "platform.h"
 #include "spec.h"
@@ -288,9 +309,101 @@ struct watchd {
     struct fo_mem mem;
     struct fo_hmem hmem;          /* здоровье помощников — у супервизора демона (--supervise) */
     struct folat *lat;            /* замеры групп latency своими таймерами (folat.c) */
+    /* Устройства раздачи и их номера, какими их видел сторож (шапка, «УСТРОЙСТВА РАЗДАЧИ»);
+     * 0 — устройства нет. */
+    struct { char name[IFNAMSIZ]; int idx; } lan[MAX_LAN_DEV];
+    size_t lan_n;
 };
 
 static void watchd_pass_start(struct watchd *w);
+
+/* ---- устройства раздачи (шапка, «УСТРОЙСТВА РАЗДАЧИ») -------------------------------------- */
+
+static int watchd_lan_on(const struct watchd *w) {
+    return w->cf.lan && plat()->lan_devs_persist;
+}
+
+static int lan_in_spec(const struct watchd *w, const char *name) {
+    const struct spec *sp = w->d->have ? w->d->sp : NULL;
+    for (size_t i = 0; sp && i < sp->lan_dev_n; i++)
+        if (!strcmp(sp->lan_dev[i], name)) return 1;
+    return 0;
+}
+
+/* Место устройства name; нет — завести (create) с номером idx. NULL — не нашлось и не завелось. */
+static int *lan_slot(struct watchd *w, const char *name, int create, int idx, int *fresh) {
+    *fresh = 0;
+    for (size_t i = 0; i < w->lan_n; i++)
+        if (!strcmp(w->lan[i].name, name)) return &w->lan[i].idx;
+    if (!create || w->lan_n >= MAX_LAN_DEV || strlen(name) >= IFNAMSIZ) return NULL;
+    snprintf(w->lan[w->lan_n].name, IFNAMSIZ, "%s", name);
+    w->lan[w->lan_n].idx = idx;
+    *fresh = 1;
+    return &w->lan[w->lan_n++].idx;
+}
+
+/* Номера устройств раздачи спеки — как они есть сейчас; уже известные не трогаются (их смену
+ * скажет событие). Зовётся при открытии сокета и при смене спеки. */
+static void watchd_lan_seed(struct watchd *w) {
+    if (!watchd_lan_on(w) || !w->d->have) return;
+    const struct spec *sp = w->d->sp;
+    for (size_t i = 0; i < sp->lan_dev_n; i++) {
+        int fresh;
+        lan_slot(w, sp->lan_dev[i], 1, (int)if_nametoindex(sp->lan_dev[i]), &fresh);
+    }
+}
+
+/* Номер устройства name стал idx (0 — устройства нет): изменился — серверу сокета. */
+static void watchd_lan_set(struct watchd *w, const char *name, int idx) {
+    if (!lan_in_spec(w, name)) return;
+    int fresh;
+    int *cur = lan_slot(w, name, 1, idx, &fresh);
+    if (!cur || (!fresh && *cur == idx)) return;
+    if (fresh && !idx) return;        /* незнакомое и пропавшее — говорить не о чем */
+    *cur = idx;
+    w->cf.lan(w->cf.busy_arg, name, idx != 0);
+}
+
+static void watchd_lan_msg(struct watchd *w, const struct nlmsghdr *h) {
+    if (h->nlmsg_type != RTM_NEWLINK && h->nlmsg_type != RTM_DELLINK) return;
+    const struct ifinfomsg *ifi = NLMSG_DATA(h);
+    size_t hl = NLMSG_ALIGN(sizeof(*ifi));
+    if (h->nlmsg_len < NLMSG_HDRLEN + hl) return;
+    char name[IFNAMSIZ] = "";
+    const struct rtattr *a = (const struct rtattr *)((const char *)ifi + hl);
+    int left = (int)(h->nlmsg_len - NLMSG_HDRLEN - hl);
+    for (; RTA_OK(a, left); a = RTA_NEXT(a, left))
+        if (a->rta_type == IFLA_IFNAME) {
+            size_t n = RTA_PAYLOAD(a);
+            if (n >= sizeof(name)) n = sizeof(name) - 1;
+            memcpy(name, RTA_DATA(a), n);
+            name[n] = '\0';
+        }
+    if (!name[0]) return;
+    watchd_lan_set(w, name, h->nlmsg_type == RTM_NEWLINK ? ifi->ifi_index : 0);
+}
+
+/* Дочитать сокет событий сети: 1 — было хоть одно событие (как watch_nl_drain). Устройства
+ * раздачи разбираются всегда, даже когда событие для прохода выбрасывается. Переполнение
+ * (ENOBUFS: события потеряны) — номера устройств раздачи сверяются с ядром заново. */
+static int watchd_drain(struct watchd *w) {
+    if (w->nl < 0) return 0;
+    char buf[8192];
+    int any = 0, lost = 0;
+    ssize_t r;
+    while ((r = recv(w->nl, buf, sizeof(buf), 0)) > 0 || (r < 0 && errno == ENOBUFS)) {
+        any = 1;
+        if (r < 0) { lost = 1; continue; }
+        if (!watchd_lan_on(w)) continue;
+        size_t m = (size_t)r;
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, m); h = NLMSG_NEXT(h, m))
+            watchd_lan_msg(w, h);
+    }
+    if (lost && watchd_lan_on(w) && w->d->have)
+        for (size_t i = 0; i < w->d->sp->lan_dev_n; i++)
+            watchd_lan_set(w, w->d->sp->lan_dev[i], (int)if_nametoindex(w->d->sp->lan_dev[i]));
+    return any;
+}
 
 /* Сторож спит: движок выключен или первый проход ждёт стартового apply. Ни один таймер тогда
  * не заводится — ни успокоение, ни период (см. шапку, «ВЫКЛЮЧЕННЫЙ ДВИЖОК»). */
@@ -331,14 +444,15 @@ static void watchd_timer(struct loop *l, struct loop_timer *t, void *arg) {
         w->cf.kcheck(w->cf.busy_arg);
         if (w->cf.busy && w->cf.busy(w->cf.busy_arg)) { watchd_settle(w); return; }
     }
-    if (w->nl >= 0) watch_nl_drain(w->nl);   /* пачка, ради которой ждали, — в этот проход */
+    watchd_drain(w);                         /* пачка, ради которой ждали, — в этот проход */
     watchd_pass_start(w);
 }
 
 static void watchd_nl(struct loop *l, int fd, uint32_t ev, void *arg) {
     (void)l; (void)ev;
     struct watchd *w = arg;
-    if (!watch_nl_drain(fd)) return;
+    (void)fd;
+    if (!watchd_drain(w)) return;
     if (watchd_dormant(w)) return;
     /* Во время прохода: на роутере — следы его же ifdown/ifup (выбрасываются после прохода),
      * на телефоне — настоящее событие, и после прохода нужен ещё один. */
@@ -350,7 +464,11 @@ static void watchd_nl(struct loop *l, int fd, uint32_t ev, void *arg) {
 }
 
 void watchd_spec_changed(struct watchd *w) {
-    if (!w || watchd_dormant(w)) return;
+    if (!w) return;
+    /* Устройства раздачи новой спеки — с номерами, какие есть сейчас (шапка, «УСТРОЙСТВА
+     * РАЗДАЧИ»). Только при открытом сокете: без него событий и не будет. */
+    if (w->nl >= 0) watchd_lan_seed(w);
+    if (watchd_dormant(w)) return;
     if (w->run) w->pending = 1;
     else watchd_settle(w);
 }
@@ -450,7 +568,7 @@ static void watchd_after(struct watchd *w) {
      * получает свой, ушедшая теряет). */
     if (!watchd_dormant(w)) folat_sync(w->lat);
     /* На роутере события за время прохода — следы его же ifdown/ifup (см. шапку). */
-    if (plat()->netifd && w->nl >= 0) watch_nl_drain(w->nl);
+    if (plat()->netifd) watchd_drain(w);
     if (w->pending) {
         w->pending = 0;
         watchd_settle(w);
@@ -608,6 +726,8 @@ static void watchd_nl_up(struct watchd *w) {
     }
     if (w->nl < 0)
         fprintf(stderr, LOG_WW "события сети недоступны — проход только по периоду\n");
+    else
+        watchd_lan_seed(w);
 }
 
 static void watchd_nl_down(struct watchd *w) {
@@ -615,6 +735,7 @@ static void watchd_nl_down(struct watchd *w) {
     loop_fd_del(w->l, w->nl);
     close(w->nl);
     w->nl = -1;
+    w->lan_n = 0;                 /* без сокета номера устаревают — при включении заново */
 }
 
 struct watchd *watchd_start(struct steerd *d, const struct watchd_conf *c, int on, int hold) {

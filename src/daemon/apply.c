@@ -693,11 +693,17 @@ static int ruleset_load(const struct spec *cfg, const struct groups *gr) {
  * собой. Поэтому после загрузки — по таблице каждого выхода: маршрута по умолчанию нет — выход
  * пущен напрямую, и отметка возвращается (так же apply-commit делал это для выходов, которых
  * --route не касался). Выход с on_fail=drop сюда не попадает: у него в таблице запрет, и
- * напрямую он не пускается (out_failopen_capable). */
+ * напрямую он не пускается (out_releasable).
+ *
+ * С цепочкой postrouting_guard (generate.c, «ПОМЕЧЕННЫЙ ПАКЕТ НЕ ТУДА — НИКУДА») от загрузки до
+ * этой отметки — миллисекунды запуска ip и nft на выход — трафик выхода, уже пущенного напрямую,
+ * отбрасывается, а не идёт в WAN: окно закрыто в сторону «не работает», а не «мимо». Засевать
+ * отметки текстом (как карту fake-IP) нечем честно: план их отпечатка не видит, а решает о них
+ * таблица выхода в ядре, которую читает этот же проход. */
 static void failopen_after_load(const struct spec *cfg) {
     for (size_t i = 0; i < cfg->out_n; i++) {
         const struct output *o = &cfg->out[i];
-        if (!out_has_device(o) || !out_skips_zapret(o) || !out_failopen_capable(o)) continue;
+        if (!out_releasable(o)) continue;
         if (!table_has_default(o->table)) failopen_mark(o, 1);
     }
 }

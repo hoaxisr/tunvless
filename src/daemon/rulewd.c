@@ -5,21 +5,52 @@
  * вместе с ними пропадают правила fwmark наших выходов (приоритет 9000) и masquerade. До этого
  * их возвращал только очередной проход сторожа («маршрутизация разъехалась») — через минуту, а
  * masquerade — через десять; всё это время помеченный трафик уходил напрямую, мимо туннеля. На
- * роутере то же делает чужой `ip rule flush` (скрипт, другой пакет маршрутизации). Поэтому механизм
- * один на обе платформы и живёт в демоне-движке (`--watch`).
+ * роутере то же делает netifd при каждом своём старте (`/etc/init.d/network restart`: снимает все
+ * правила и ставит свои local, main, default — проверка на QEMU 04664a5, docs/architecture.md,
+ * раздел 5) и чужой `ip rule flush` (скрипт, другой пакет маршрутизации). Поэтому механизм один
+ * на обе платформы и живёт в демоне-движке (`--watch`).
  *
  * СОБЫТИЯ. Отдельный сокет rtnetlink на группы RTNLGRP_IPV4_RULE и RTNLGRP_IPV6_RULE (с 1.9 у
  * выходов с KC_IPV6 есть и правила IPv6 — docs/architecture.md, «4б», — и проверка ниже сверяет
- * оба семейства; починка `apply-commit --rule` возвращает оба). Фильтр BPF
- * на сокете пропускает из ядра только RTM_DELRULE: netd добавляет и снимает свои правила на каждой
- * смене сети, и будить демон ради чужих добавлений незачем. Из удалений повод — только наше
- * правило: метка в поле меток движка с нашей маской (STEER_MARK_MASK) или, где приоритет свой
- * (телефон, rule_pref), правило с меткой на этом приоритете. Правило пробы сторожа (from-правило
- * без метки) поводом не бывает.
+ * оба семейства). Фильтр BPF на сокете пропускает из ядра только RTM_DELRULE: netd добавляет и
+ * снимает свои правила на каждой смене сети, и будить демон ради чужих добавлений незачем. Из
+ * удалений повод — только наше правило: метка в поле меток движка с нашей маской
+ * (STEER_MARK_MASK) или, где приоритет свой (телефон, rule_pref), правило с меткой на этом
+ * приоритете. Правило пробы сторожа (from-правило без метки) поводом не бывает.
  *
- * ПАЧКА — ОДНА ПОЧИНКА. flush снимает правила по одному, и событий приходит пачка. Проверка
- * идёт через секунду после последнего события пачки, но не позже двух секунд после первого:
- * правило возвращается за три секунды даже тогда, когда кто-то снимает правила без остановки.
+ * СРАЗУ, А НЕ ЧЕРЕЗ СЕКУНДУ (проверка на QEMU 04664a5). Прежде проверка шла через секунду
+ * тишины после последнего события пачки (не позже двух после первого), а чинил ребёнок
+ * `apply-commit --rule`: после `network restart` правило возвращалось через 2-2,5 с, и в этом окне
+ * клиент открывал соединения мимо туннеля (docs/architecture.md, раздел 5). Теперь:
+ *   - проверка — через RULEWD_FAST_MS после последнего события (не позже RULEWD_FAST_MAX_MS после
+ *     первого). Сто миллисекунд — не тишина, а пачка: flush снимает правила по одному, и события
+ *     одного flush приходят за единицы миллисекунд; собрать их в одну проверку всё ещё стоит, а
+ *     ждать секунду — нет. Тот же запас покрывает и своё «снять правило, потом таблицу» у
+ *     подкоманды мимо очереди демона (`steer apply` без сокета, cleanup прежних меток): это два
+ *     запуска ip подряд, и к проверке таблица уже пуста — правило не возвращается туда, где его
+ *     сняли нарочно (см. «СВОИ УДАЛЕНИЯ»);
+ *   - возвращает сам демон, в своём процессе, одним сообщением rtnetlink на правило
+ *     (rtnl_rule_fwmark) — без ребёнка и без ip. Приоритет — тот, что был у снятого правила (его
+ *     несёт событие RTM_DELRULE): на роутере наше правило ставится без pref, и ядро выбирает
+ *     «перед первым ненулевым» по тому, что стоит в этот миг, — посреди чужого flush это мог бы
+ *     оказаться 0. На телефоне приоритет свой (STEER_RULE_PREF) всегда. Проверка после записи —
+ *     тем же rulewd_missing: не встало (нет прав, ядро отказало) — прежняя починка ребёнком в
+ *     очереди изменяющих команд;
+ *   - masquerade на телефоне (iptables — это процессы, и в цикле демона их не запускают)
+ *     возвращает внеочередной проход сторожа, который звучит после починки всегда: проход после
+ *     события считается «событийным», и masquerade он сверяет сразу (watch_masq_due).
+ * Окно сторожа теперь — десятки-сотни миллисекунд, и его закрывает набор правил: помеченный пакет,
+ * уходящий не в устройство своего выхода, отбрасывается (postrouting_guard, compile/generate.c),
+ * так что и эти миллисекунды — «не работает», а не «мимо».
+ *
+ * ШТОРМ. Кто снимает правила без остановки (скрипт в цикле, два пакета маршрутизации дерутся за
+ * `ip rule`), тому незачем отвечать мгновенно на каждое снятие: это была бы драка на скорости
+ * цикла. Больше RULEWD_STORM_N возвратов за RULEWD_STORM_WIN_MS — страж переходит на прежний
+ * порядок: проверка через секунду тишины после последнего события пачки и не позже двух секунд
+ * после первого (правило возвращается за три секунды даже тогда, когда кто-то снимает правила без
+ * остановки), — и говорит об этом в журнал один раз на окно. Одиночное снятие (netifd снимает наши
+ * правила один раз на свой старт — одна строка «возвращены» в журнале QEMU на `network restart`)
+ * шторма не делает.
  *
  * СВОИ УДАЛЕНИЯ — НЕ ПОВОД. Демон и сам снимает правила: apply-сверка — правило убранного выхода
  * (--drop) и лишние копии (rule_ensure), сторож — правило выхода в отказе с on_fail=direct, `steer
@@ -32,18 +63,21 @@
  *   снимаются, только когда верная стоит. Чужое снятие таблицу не трогает — netd правил своих
  *   таблиц не касается, `ip rule flush` маршрутов не снимает. «Правила нет, а таблица занята» —
  *   значит, правило сняли не мы.
+ * Отказ сторожа (apply_failed: снять правило, сбросить таблицу) идёт в цикле демона одним
+ * синхронным куском — событие своего снятия страж читает уже после сброса таблицы. `steer down`
+ * снимает таблицы nftables раньше правил — проверка видит «таблицы движка нет» и молчит.
  * Сверка — два дампа rtnetlink в процессе (rtnl_rules_text, rtnl_routes_text) и разбор тем же
  * route_facts_of, которым сверяет маршрутизацию сторож, — без единого процесса. Пока идёт своя
  * изменяющая команда (посреди apply-commit правило бывает уже снято, а таблица ещё не сброшена),
  * проверка ждёт её конца (rulewd_kick). Таблицы движка в ядре нет — движок снят целиком (`steer
  * down`), и возвращать правила, которые никуда не ведут, незачем.
  *
- * ЧИНИТ сервер сокета (ctl.c, починка в очереди изменяющих команд): ребёнок `apply-commit --rule
- * <выходы> --masq-ensure` — правило тем же rule_ensure, что у apply, masquerade тем же
- * iptables_masq_ensure, что у сторожа. Таблица не перепривязывается: она цела (это условие
- * починки), а в ней может стоять запрет сторожа при on_fail=drop, который перепривязка к
- * устройству сняла бы до следующего прохода. После починки — внеочередной проход сторожа, который
- * сверяет остальное, и событие repaired подписчикам.
+ * ЗАПАСНАЯ ПОЧИНКА — сервер сокета (ctl.c, починка в очереди изменяющих команд): ребёнок
+ * `apply-commit --rule <выходы> --masq-ensure` — правило тем же rule_ensure, что у apply, masquerade
+ * тем же iptables_masq_ensure, что у сторожа. Таблица не перепривязывается ни там, ни здесь: она
+ * цела (это условие починки), а в ней может стоять запрет сторожа при on_fail=drop, который
+ * перепривязка к устройству сняла бы до следующего прохода. После любой починки — внеочередной
+ * проход сторожа, который сверяет остальное, и событие repaired подписчикам.
  *
  * БАТАРЕЯ. Сокет открыт, только пока движок включён: выключенному стражу нечего стеречь (правила
  * снял init), и событие чужих правил не будит демон. Таймер — только на время пачки. */
@@ -70,9 +104,18 @@
 #include "failover_int.h"
 #include "rulewd.h"
 
-/* Тишина после последнего события пачки и предел от первого. */
+/* Обычный порядок: пачка событий — одна проверка через RULEWD_FAST_MS после последнего события,
+ * не позже RULEWD_FAST_MAX_MS после первого (см. шапку, «СРАЗУ, А НЕ ЧЕРЕЗ СЕКУНДУ»). */
+#define RULEWD_FAST_MS      100
+#define RULEWD_FAST_MAX_MS  300
+/* Шторм: тишина после последнего события пачки и предел от первого — прежние числа. */
 #define RULEWD_QUIET_MS 1000
 #define RULEWD_MAX_MS   2000
+/* Шторм — больше RULEWD_STORM_N возвратов за RULEWD_STORM_WIN_MS. */
+#define RULEWD_STORM_N      3
+#define RULEWD_STORM_WIN_MS 60000L
+/* Сколько приоритетов снятых правил помнить (выход — метка и семейство). */
+#define RULEWD_PREF_MAX (2 * MAX_OUTPUTS)
 
 struct rulewd {
     struct steerd *d;
@@ -83,6 +126,13 @@ struct rulewd {
     struct loop_timer *tm;
     int pending;                  /* было наше удаление — нужна проверка */
     long first;                   /* когда пришло первое событие пачки, мс монотонных */
+    /* Когда страж возвращал правила сам, по кругу (0 — не было): по ним узнаётся шторм. */
+    long back_at[RULEWD_STORM_N + 1];
+    int back_i;
+    long storm_said;              /* когда последний раз сказали о шторме в журнал */
+    /* Приоритеты снятых правил: с каким вернуть (см. шапку). */
+    struct { int fam; uint32_t mark; uint32_t prio; } pref[RULEWD_PREF_MAX];
+    size_t pref_n;
 };
 
 /* ---- проверка ------------------------------------------------------------------------------ */
@@ -98,8 +148,24 @@ static int rule6_missing(const struct output *o) {
     return f.known && !f.rule && !(f.table == TBL_EMPTY && !f.backstop);
 }
 
+/* Снято ли правило IPv4 выхода: 1 — снято, 0 — на месте или снято нами вместе с таблицей, -1 —
+ * ядро не спросить. rules — дамп правил IPv4, уже прочитанный. */
+static int rule4_missing(const char *rules, const struct output *o) {
+    static char routes[8192];
+    if (rtnl_routes_text(o->table, routes, sizeof(routes)) != 0) return -1;
+    struct route_facts f = route_facts_of(rules, routes, o->mark, o->table);
+    if (!f.known) return -1;
+    /* Таблица пуста — правило снято вместе с ней, и это наше решение (см. шапку). */
+    return !(f.rule || (f.table == TBL_EMPTY && !f.backstop));
+}
+
+static void list_add(char *list, size_t n, size_t *k, int cnt, const char *name) {
+    int w = snprintf(list + *k, n > *k ? n - *k : 0, "%s%s", cnt ? "," : "", name);
+    if (w > 0 && *k + (size_t)w < n) *k += (size_t)w;
+}
+
 int rulewd_missing(const struct spec *sp, char *list, size_t n) {
-    static char rules[16384], routes[8192];
+    static char rules[16384];
     if (n) list[0] = '\0';
     if (!sp) return 0;
     if (rtnl_rules_text(rules, sizeof(rules)) != 0 || !rules[0]) return -1;
@@ -108,17 +174,68 @@ int rulewd_missing(const struct spec *sp, char *list, size_t n) {
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
         if (!out_has_device(o) || !o->mark || !o->table) continue;
-        if (rtnl_routes_text(o->table, routes, sizeof(routes)) != 0) return -1;
-        struct route_facts f = route_facts_of(rules, routes, o->mark, o->table);
-        if (!f.known) return -1;
-        /* Таблица пуста — правило снято вместе с ней, и это наше решение (см. шапку). С 1.9 у
-         * выхода с маршрутом IPv6 так же сверяется и его правило IPv6. */
-        if ((f.rule || (f.table == TBL_EMPTY && !f.backstop)) && !rule6_missing(o)) continue;
-        int w = snprintf(list + k, n > k ? n - k : 0, "%s%s", cnt ? "," : "", o->name);
-        if (w > 0 && k + (size_t)w < n) k += (size_t)w;
+        int m4 = rule4_missing(rules, o);
+        if (m4 < 0) return -1;
+        /* С 1.9 у выхода с маршрутом IPv6 так же сверяется и его правило IPv6. */
+        if (!m4 && !rule6_missing(o)) continue;
+        list_add(list, n, &k, cnt, o->name);
         cnt++;
     }
     return cnt;
+}
+
+/* Приоритет, с которым вернуть правило семейства fam с меткой mark: свой у платформы, иначе тот,
+ * что был у снятого (0 — не знаем, ядро выберет само). */
+static uint32_t pref_of(const struct rulewd *r, int fam, uint32_t mark) {
+    if (STEER_RULE_PREF) return (uint32_t)STEER_RULE_PREF;
+    for (size_t i = 0; i < r->pref_n; i++)
+        if (r->pref[i].fam == fam && r->pref[i].mark == mark) return r->pref[i].prio;
+    return 0;
+}
+
+static void pref_note(struct rulewd *r, int fam, uint32_t mark, uint32_t prio) {
+    if (!prio) return;
+    size_t i = 0;
+    while (i < r->pref_n && !(r->pref[i].fam == fam && r->pref[i].mark == mark)) i++;
+    if (i == r->pref_n) {
+        if (r->pref_n >= RULEWD_PREF_MAX) return;
+        r->pref_n++;
+    }
+    r->pref[i].fam = fam;
+    r->pref[i].mark = mark;
+    r->pref[i].prio = prio;
+}
+
+/* Вернуть снятые правила сами, в процессе (см. шапку). Имена выходов, чьи правила ставились, — в
+ * list. Возврат — сколько выходов тронуто, -1 — ядро не спросить или не приняло. */
+static int rulewd_restore(struct rulewd *r, const struct spec *sp, char *list, size_t n) {
+    static char rules[16384];
+    if (n) list[0] = '\0';
+    if (rtnl_rules_text(rules, sizeof(rules)) != 0 || !rules[0]) return -1;
+    int cnt = 0, bad = 0;
+    size_t k = 0;
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct output *o = &sp->out[i];
+        if (!out_has_device(o) || !o->mark || !o->table) continue;
+        int m4 = rule4_missing(rules, o);
+        if (m4 < 0) return -1;
+        int m6 = rule6_missing(o);
+        if (!m4 && !m6) continue;
+        if (m4 && rtnl_rule_fwmark(4, o->mark, STEER_MARK_MASK, o->table,
+                                   (int)pref_of(r, 4, o->mark)) != 0) bad = 1;
+        if (m6 && rtnl_rule_fwmark(6, o->mark, STEER_MARK_MASK, o->table,
+                                   (int)pref_of(r, 6, o->mark)) != 0) bad = 1;
+        list_add(list, n, &k, cnt, o->name);
+        cnt++;
+    }
+    return bad ? -1 : cnt;
+}
+
+/* Шторм ли сейчас: больше RULEWD_STORM_N возвратов за окно (см. шапку, «ШТОРМ»). back_at — круг
+ * из RULEWD_STORM_N + 1 мест: самое старое место — back_at[back_i]. */
+static int rulewd_storm(const struct rulewd *r, long now) {
+    long oldest = r->back_at[r->back_i];
+    return oldest && now - oldest < RULEWD_STORM_WIN_MS;
 }
 
 static void rulewd_check(struct rulewd *r) {
@@ -130,7 +247,19 @@ static void rulewd_check(struct rulewd *r) {
     uint64_t h;
     if (recon_table_handle(nft_table(), &h) == 1) return;
     char list[512];
-    if (rulewd_missing(d->sp, list, sizeof(list)) > 0) r->cf.repair(r->cf.arg);
+    if (rulewd_missing(d->sp, list, sizeof(list)) <= 0) return;
+    if (!r->cf.restored) { r->cf.repair(r->cf.arg); return; }
+    long now = loop_now_ms();
+    r->back_at[r->back_i] = now;
+    r->back_i = (r->back_i + 1) % (RULEWD_STORM_N + 1);
+    int rc = rulewd_restore(r, d->sp, list, sizeof(list));
+    char left[512];
+    if (rc > 0 && rulewd_missing(d->sp, left, sizeof(left)) == 0) {
+        r->cf.restored(r->cf.arg, list);
+        return;
+    }
+    /* Сами не смогли — прежняя починка ребёнком (правило и masquerade тем же кодом, что apply). */
+    r->cf.repair(r->cf.arg);
 }
 
 static void rulewd_timer(struct loop *l, struct loop_timer *t, void *arg) {
@@ -144,8 +273,9 @@ static void rulewd_timer(struct loop *l, struct loop_timer *t, void *arg) {
 
 /* ---- события ------------------------------------------------------------------------------- */
 
-/* Наше ли снятое правило (см. шапку, «СОБЫТИЯ»). */
-static int rule_is_ours(const struct nlmsghdr *h) {
+/* Наше ли снятое правило (см. шапку, «СОБЫТИЯ»). Своё — семейство, метка и приоритет правила в
+ * *fam, *mark, *prio (приоритет 0 — событие его не несло). */
+static int rule_is_ours(const struct nlmsghdr *h, int *fam, uint32_t *markp, uint32_t *priop) {
     const struct fib_rule_hdr *fr = NLMSG_DATA(h);
     size_t hl = NLMSG_ALIGN(sizeof(*fr));
     if (h->nlmsg_len < NLMSG_HDRLEN + hl) return 0;
@@ -165,6 +295,9 @@ static int rule_is_ours(const struct nlmsghdr *h) {
         p += RTA_ALIGN(a->rta_len);
     }
     if (!have_mark || !(mark & STEER_MARK_MASK)) return 0;
+    *fam = fr->family == AF_INET6 ? 6 : 4;
+    *markp = mark;
+    *priop = prio;
     if (mask == STEER_MARK_MASK && !(mark & ~STEER_MARK_MASK)) return 1;
     return STEER_RULE_PREF && prio == (uint32_t)STEER_RULE_PREF;
 }
@@ -181,14 +314,29 @@ static void rulewd_nl(struct loop *l, int fd, uint32_t ev, void *arg) {
         if (m < 0 && errno == ENOBUFS) { ours = 1; continue; }
         if (m <= 0) break;
         for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, (size_t)m);
-             h = NLMSG_NEXT(h, m))
-            if (h->nlmsg_type == RTM_DELRULE && rule_is_ours(h)) ours = 1;
+             h = NLMSG_NEXT(h, m)) {
+            int fam = 4;
+            uint32_t mark = 0, prio = 0;
+            if (h->nlmsg_type == RTM_DELRULE && rule_is_ours(h, &fam, &mark, &prio)) {
+                ours = 1;
+                pref_note(r, fam, mark, prio);
+            }
+        }
     }
     if (!ours || !r->on) return;
     long now = loop_now_ms();
+    int storm = rulewd_storm(r, now);
+    if (storm && (!r->storm_said || now - r->storm_said >= RULEWD_STORM_WIN_MS)) {
+        r->storm_said = now;
+        fprintf(stderr, "steer[warn] rules: правила выходов снимают снаружи снова и снова (больше "
+                        "%d раз за %ld с) — возвращаю их через секунду после пачки, а не сразу\n",
+                RULEWD_STORM_N, RULEWD_STORM_WIN_MS / 1000);
+    }
+    long quiet = storm ? RULEWD_QUIET_MS : RULEWD_FAST_MS;
+    long most = storm ? RULEWD_MAX_MS : RULEWD_FAST_MAX_MS;
     if (!r->pending) { r->pending = 1; r->first = now; }
-    long left = r->first + RULEWD_MAX_MS - now;
-    loop_timer_set(r->tm, left < RULEWD_QUIET_MS ? (left > 0 ? left : 0) : RULEWD_QUIET_MS);
+    long left = r->first + most - now;
+    loop_timer_set(r->tm, left < quiet ? (left > 0 ? left : 0) : quiet);
 }
 
 /* Сокет на группы правил IPv4 и IPv6 с фильтром «только RTM_DELRULE». -1 — не открылся. */

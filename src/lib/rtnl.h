@@ -47,6 +47,12 @@ int rtnl_routes_text6(int table, char *out, size_t n);
 /* Правило `from SRC lookup TABLE priority PRIO`: add — поставить, иначе снять. 0 или errno. */
 int rtnl_rule_from(int add, struct in_addr src, int table, int prio);
 
+/* `ip [-6] rule add fwmark MARK/MASK table TABLE [priority PRIO]` (fam — 4 или 6; prio 0 — не
+ * передавать, ядро выберет само, как `ip rule add` без pref). Копия, которая уже стоит, — успех.
+ * 0 или errno. Этим страж правил демона возвращает снятое снаружи правило выхода сразу, без
+ * запуска ip (src/daemon/rulewd.c). */
+int rtnl_rule_fwmark(int fam, uint32_t mark, uint32_t mask, int table, int prio);
+
 /* `ip -4 route replace default dev <ifindex> table TABLE` (scope link, как у iproute2 без
  * шлюза). 0 или errno. */
 int rtnl_route_default_dev(int table, int ifindex);

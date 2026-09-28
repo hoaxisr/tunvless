@@ -31,6 +31,12 @@ table inet steer {
         oifname { "br-lan", "tailscale0", "ztrq4abcde" } ip saddr @geo_dom counter comment "steer-down:geo_dom"
         oifname { "br-lan", "tailscale0", "ztrq4abcde" } ip6 saddr @geo_dom6 counter comment "steer-down:geo_dom"
     }
+    chain postrouting_guard {
+        type filter hook postrouting priority filter; policy accept;
+        meta mark and 0x0ff00000 == 0x00000000 return
+        meta mark and 0x0ff00000 == 0x00100000 oifname != "wg0" counter drop comment "steer-guard:vpn"
+        meta mark and 0x0ff00000 == 0x00200000 oifname != "tun0" counter drop comment "steer-guard:geo"
+    }
     chain prerouting_dns {
         type nat hook prerouting priority dstnat; policy accept;
         iifname { "br-lan", "tailscale0", "ztrq4abcde" } udp dport 53 counter redirect to :5300

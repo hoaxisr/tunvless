@@ -42,6 +42,11 @@ table inet steer {
     chain postrouting_down {
         type filter hook postrouting priority srcnat + 10; policy accept;
     }
+    chain postrouting_guard {
+        type filter hook postrouting priority filter; policy accept;
+        meta mark and 0x0fc00000 == 0x00000000 return
+        meta mark and 0x0fc00000 == 0x00400000 oifname != "wg0" counter drop comment "steer-guard:vpn"
+    }
     chain prerouting_dns {
         type nat hook prerouting priority dstnat; policy accept;
         iifname "rndis0" udp dport 53 counter redirect to :5300

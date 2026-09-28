@@ -1,0 +1,342 @@
+#!/bin/sh
+# `/etc/init.d/network restart` под трафиком (проверка на QEMU 04664a5, OpenWrt 25.12.5;
+# docs/architecture.md, раздел 5, «Замечания проверки на QEMU 04664a5 (2026-09-28)»).
+#
+# Что было. netifd при старте снимает все правила ip rule и ставит свои (local, main, default) —
+# вместе с ними пропадает правило fwmark выхода, а br-lan пересоздаётся, и ядро снимает с него
+# цепочку ingress_mark. Разметка цела (запасной prerouting_mark метит), dnat fake-IP подменяет, а
+# правила нет — пакет идёт по main, masquerade, и он в WAN. Страж правил возвращал правило через
+# 2-2,5 с, сверка на проходе — цепочку ingress через 3,6-8,6 с.
+#
+# Сеть — как в swapmatch.sh: роутер (сам стенд, мост br0 с портом r0 — устройство раздачи),
+# клиент за r0, «туннель» T за t0 и t2 (пул выхода wg из двух устройств — группа) и «провайдер» W
+# за w0 (маршрут по умолчанию). Настоящий адрес 203.0.113.10 есть и за туннелем, и у провайдера;
+# пакет к нему у провайдера — утечка. Клиент шлёт UDP на поддельный 198.18.0.1 (карта и набор
+# канала засеяны из fakeip.state, резолвер не нужен) каждые 5 мс, каждый пакет — новое соединение.
+#
+# Что проверяется (A — набор правил и страж).
+#  A1. Без демона: снятое правило fwmark выхода — пакеты канала отбрасывает postrouting_guard, у
+#      провайдера ни одного; счётчик правила steer-guard растёт.
+#  A2. Демон (--watch): снятие всех правил, как netifd (`ip rule flush` + main и default), под
+#      трафиком — у провайдера ни одного; правило назад быстрее секунды, с прежним приоритетом, в
+#      журнале «возвращены», подписчику repaired.
+#  A3. Мост пересоздан и правила сняты одновременно — у провайдера ни одного; цепочка ingress_mark
+#      назад на новом br0 быстрее двух секунд, в журнале — сверка по новому устройству раздачи.
+#  A4. Законные пути не тронуты: канал в direct — к провайдеру; канал в выход, пущенный напрямую
+#      (устройства нет, on_fail=direct: отметка failopen), — тоже к провайдеру.
+#  A5. Группа переключилась (t0 упал, сторож увёл выход на t2) — трафик идёт в t2, а не
+#      отбрасывается; у провайдера ни одного.
+#  A6. Шторм: правило снимают шесть раз подряд — каждый раз оно назад, в журнале одна строка о
+#      шторме (страж перешёл на возврат через секунду после пачки).
+#
+# Нужны root, unshare -nm, nsenter, ip, nft и python3. Чего-то нет — стенд пропускается вслух.
+set -u
+BIN="${STEER:-./build/steer}"
+BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
+[ -x "$BIN" ] || { echo "not built: $BIN (make)"; exit 2; }
+skip() { echo "netrestart: $1 — пропускаю"; exit 0; }
+for t in ip nft unshare nsenter python3; do command -v $t >/dev/null 2>&1 || skip "нет $t"; done
+if [ "${NETRESTART_INNER:-}" != 1 ]; then
+    [ "$(id -u)" = 0 ] || skip "нужен root"
+    unshare -nm true 2>/dev/null || skip "unshare -nm недоступен"
+    NETRESTART_INNER=1 STEER="$BIN" exec unshare -nm sh "$0" "$@"
+fi
+mount --make-rprivate / 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null || skip "не смонтировать sysfs в своём пространстве"
+ip link set lo up
+sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 2>/dev/null
+sysctl -qw net.ipv4.ip_forward=1 2>/dev/null
+real_nft="$(command -v nft)"
+real_ip="$(command -v ip)"
+"$real_nft" add table inet nr_probe 2>/dev/null || skip "nf_tables недоступен"
+"$real_nft" add chain inet nr_probe c '{ type filter hook ingress device "lo" priority 10; }' \
+    2>/dev/null || { "$real_nft" delete table inet nr_probe; skip "ядро не принимает цепочку inet ingress"; }
+"$real_nft" delete table inet nr_probe
+
+tmp="$(mktemp -d)"
+pids=""
+cleanup() {
+    for p in $pids; do kill "$p" 2>/dev/null; done
+    [ -n "$tmp" ] && rm -rf "$tmp"
+}
+trap cleanup EXIT
+pass=0 fail=0
+check() {
+    if [ "$2" = "$3" ]; then pass=$((pass + 1)); echo "ok   $1"; else
+        fail=$((fail + 1))
+        printf 'FAIL %s\n  expected: %s\n  actual:   %s\n' "$1" "$2" "$3"
+    fi
+}
+wait_for() {
+    i=0
+    while [ $i -lt $(($2 * 10)) ]; do eval "$1" && return 0; sleep 0.1; i=$((i + 1)); done
+    return 1
+}
+now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
+
+# ---- сеть -------------------------------------------------------------------------------------
+unshare -n sleep 900 >/dev/null 2>&1 & C=$!
+unshare -n sleep 900 >/dev/null 2>&1 & T=$!
+unshare -n sleep 900 >/dev/null 2>&1 & W=$!
+pids="$C $T $W"
+sleep 0.3
+IC="nsenter -t $C -n"; IT="nsenter -t $T -n"; IW="nsenter -t $W -n"
+link() {   # link ЗДЕСЬ ТАМ PID АДРЕС_ЗДЕСЬ АДРЕС_ТАМ
+    "$real_ip" link add "$1" type veth peer name "$2"
+    "$real_ip" link set "$2" netns "$3"
+    [ -n "$4" ] && "$real_ip" addr add "$4" dev "$1"
+    "$real_ip" link set "$1" up
+    nsenter -t "$3" -n "$real_ip" link set lo up
+    nsenter -t "$3" -n "$real_ip" addr add "$5" dev "$2"
+    nsenter -t "$3" -n "$real_ip" link set "$2" up
+}
+link r0 c0 "$C" "" 10.77.1.2/24
+# Порт вне моста не пересылает: между `ip link del br0` и новым мостом пакет клиента приходил бы
+# на голый r0 и уходил бы по main мимо «кто» канала (устройство br0). На роутере это закрывает fw4:
+# у порта без моста нет зоны, и пересылку с него отвергает политика forward по умолчанию.
+sysctl -qw net.ipv4.conf.r0.forwarding=0 2>/dev/null
+link t0 t1 "$T" 10.9.0.1/30 10.9.0.2/30
+link t2 t3 "$T" 10.9.1.1/30 10.9.1.2/30
+link w0 w1 "$W" 10.77.0.1/30 10.77.0.2/30
+# Мост раздачи — как br-lan у netifd: пересоздаётся целиком (mkbr после `ip link del br0`).
+mkbr() {
+    "$real_ip" link add br0 type bridge
+    "$real_ip" link set r0 master br0
+    "$real_ip" addr add 10.77.1.1/24 dev br0
+    "$real_ip" link set br0 up
+}
+mkbr
+$IC "$real_ip" route add default via 10.77.1.1
+"$real_ip" route add default via 10.77.0.2 dev w0
+for ns in "$IT" "$IW"; do
+    $ns "$real_ip" link add dum0 type dummy
+    $ns "$real_ip" link set dum0 up
+    $ns "$real_ip" addr add 203.0.113.10/32 dev dum0
+done
+# Цели пробы сторожа — за туннелем (выход жив, пока их видно через t0 и t2).
+$IT "$real_ip" addr add 1.1.1.1/32 dev dum0
+$IT "$real_ip" addr add 8.8.8.8/32 dev dum0
+$IW "$real_ip" addr add 198.51.100.7/32 dev dum0
+$IW "$real_ip" addr add 198.51.100.8/32 dev dum0
+$IT "$real_nft" -f - <<'N'
+table inet cnt {
+    chain pre {
+        type filter hook prerouting priority -300; policy accept;
+        iifname "t1" ip daddr 203.0.113.10 counter comment "real1"
+        iifname "t3" ip daddr 203.0.113.10 counter comment "real3"
+    }
+}
+N
+$IW "$real_nft" -f - <<'N'
+table inet cnt {
+    chain pre {
+        type filter hook prerouting priority -300; policy accept;
+        ip daddr 203.0.113.10 counter comment "real"
+        ip daddr 198.18.0.0/15 counter comment "pool"
+        ip daddr 198.51.100.7 counter comment "direct"
+        ip daddr 198.51.100.8 counter comment "fo"
+    }
+}
+N
+$IT "$real_ip" route add 10.77.1.0/24 via 10.9.0.1
+$IW "$real_ip" route add 10.77.1.0/24 via 10.77.0.1
+cnt() {   # cnt ПРОСТРАНСТВО МЕТКА
+    $1 "$real_nft" list chain inet cnt pre | grep "comment \"$2\"" |
+        sed -n 's/.*counter packets \([0-9]*\).*/\1/p'
+}
+guard() {  # счётчик правила steer-guard:ВЫХОД
+    "$real_nft" list chain inet steer postrouting_guard 2>/dev/null | grep "steer-guard:$1\"" |
+        sed -n 's/.*counter packets \([0-9]*\).*/\1/p'
+}
+
+# ifdown/ifup netifd у стенда нет: сторож оживлял бы ими выход без устройства.
+mkdir -p "$tmp/bin"
+printf '#!/bin/sh\nexit 1\n' > "$tmp/bin/ifdown"
+printf '#!/bin/sh\nexit 1\n' > "$tmp/bin/ifup"
+chmod +x "$tmp/bin/ifdown" "$tmp/bin/ifup"
+PATH="$tmp/bin:$PATH"
+export PATH
+
+cat > "$tmp/send.py" <<'PY'
+import os, socket, sys, time
+dst, stop = sys.argv[1], sys.argv[2]
+n = 0
+while not os.path.exists(stop):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.sendto(b'x', (dst, 9999)); n += 1
+    except OSError:
+        pass
+    s.close()
+    time.sleep(0.005)
+print(n)
+PY
+SENDER=""
+send_start() { rm -f "$tmp/stop"; $IC python3 "$tmp/send.py" "$1" "$tmp/stop" > "$tmp/sent" & SENDER=$!; }
+send_stop() { : > "$tmp/stop"; wait "$SENDER" 2>/dev/null; sleep 0.2; cat "$tmp/sent"; }
+burst() { $IC python3 -c "
+import socket, time
+for i in range($2):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try: s.sendto(b'x', ('$1', 9999))
+    except OSError: pass
+    s.close(); time.sleep(0.005)
+"; sleep 0.2; }
+
+printf 's19.test\n' > "$tmp/d.lst"
+printf '198.51.100.7\n' > "$tmp/dir.lst"
+printf '198.51.100.8\n' > "$tmp/fo.lst"
+cat > "$tmp/spec.json" <<EOF
+{ "schema": 2, "lan_devices": ["br0"],
+  "outputs": { "wg": { "kind": "interface", "devices": ["t0", "t2"], "on_fail": "drop" },
+               "dx": { "kind": "interface", "device": "nodev0", "on_fail": "direct" },
+               "dr": { "kind": "direct" } },
+  "channels": [ { "name": "dir", "match": { "prefixes_files": ["$tmp/dir.lst"] }, "out": "dr" },
+                { "name": "fo", "match": { "prefixes_files": ["$tmp/fo.lst"] }, "out": "dx" },
+                { "name": "s", "match": { "domains_files": ["$tmp/d.lst"], "mode": "fakeip" },
+                  "out": "wg" } ] }
+EOF
+mkdir -p "$tmp/st"
+printf 's19.test\t198.18.0.1\t203.0.113.10\n' > "$tmp/st/fakeip.state"
+S="--spec $tmp/spec.json --state-dir $tmp/st"
+# Правило выхода wg — по метке из реестра: таблица в выводе ip бывает и именем из rt_tables.d.
+ours() { "$real_ip" rule show | grep -c "fwmark 0x$MW/"; }
+pref_of() { "$real_ip" rule show | grep "fwmark 0x$MW/" | head -n 1 | cut -d: -f1; }
+
+# ---- A1. без демона: снятое правило — отбрасывание, а не WAN ---------------------------------
+"$BIN" apply $S >"$tmp/apply.out" 2>&1
+check "A1: apply проходит" "0" "$?"
+MW="$(awk '$1 == "wg" { print $2 }' "$tmp/st/registry")"
+check "  цепочка postrouting_guard в ядре, правило выхода wg — по устройствам пула" "yes" \
+    "$("$real_nft" list chain inet steer postrouting_guard 2>/dev/null |
+       grep -q 'oifname != { "t0", "t2" } counter packets [0-9]* bytes [0-9]* drop comment "steer-guard:wg"' &&
+       echo yes || echo no)"
+W0="$(cnt "$IW" real)" T0="$(cnt "$IT" real1)"
+burst 198.18.0.1 20
+check "  с правилом: пакеты — в туннель, у провайдера ни одного" "yes 0" \
+    "$([ $(($(cnt "$IT" real1) - T0)) -ge 18 ] && echo yes || echo no) $(($(cnt "$IW" real) - W0))"
+"$real_ip" rule del fwmark "0x$MW/$("$real_ip" rule show | grep -o "fwmark 0x$MW/[^ ]*" | head -n 1 | cut -d/ -f2)"
+check "  правило fwmark выхода снято" "0" "$(ours)"
+W0="$(cnt "$IW" real)" G0="$(guard wg)"
+burst 198.18.0.1 20
+check "  без правила: у провайдера ни одного" "0" "$(($(cnt "$IW" real) - W0))"
+check "  отбросило правило steer-guard:wg" "yes" \
+    "$([ $(($(guard wg) - G0)) -ge 18 ] && echo yes || echo "no:$(($(guard wg) - G0))")"
+
+# ---- демон ------------------------------------------------------------------------------------
+"$BIN" down --state-dir "$tmp/st" >/dev/null 2>&1
+"$BIN" daemon --watch --watch-period 3 --apply --socket "$tmp/s.sock" $S >"$tmp/d.out" 2>"$tmp/d.err" &
+D=$!
+pids="$pids $D"
+wait_for 'grep -q "спека применена при старте" "$tmp/d.err"' 15
+wait_for 'grep -q "^wg t0 " "$tmp/st/active" 2>/dev/null' 15
+check "демон: спека применена, выход wg на t0" "1 yes" \
+    "$(grep -c 'спека применена при старте' "$tmp/d.err") $(grep -q '^wg t0 ' "$tmp/st/active" && echo yes || echo no)"
+STEER_SOCKET="$tmp/s.sock" "$BIN" subscribe $S > "$tmp/sub.out" 2>&1 &
+SUB=$!
+pids="$pids $SUB"
+wait_for 'grep -q "\"cmd\":\"subscribe\"" "$tmp/sub.out" 2>/dev/null' 5
+sleep 4   # первый проход и его следствия — до опыта
+
+# ---- A2. netifd снимает все правила под трафиком ----------------------------------------------
+P0="$(pref_of)"
+W0="$(cnt "$IW" real)" WP0="$(cnt "$IW" pool)" T0="$(cnt "$IT" real1)" G0="$(guard wg)"
+n0="$(grep -c 'сняты снаружи — возвращены' "$tmp/d.err")"
+send_start 198.18.0.1
+sleep 0.3
+t0="$(now_ms)"
+"$real_ip" rule flush
+"$real_ip" rule add priority 32766 table main
+"$real_ip" rule add priority 32767 table default
+wait_for '[ "$(ours)" = 1 ]' 5
+ms=$(( $(now_ms) - t0 ))
+sleep 0.5
+sent="$(send_stop)"
+check "A2: ip rule flush как netifd — у провайдера ни одного пакета (отправлено $sent)" "0 0" \
+    "$(($(cnt "$IW" real) - W0)) $(($(cnt "$IW" pool) - WP0))"
+echo "     (правило назад через $ms мс)"
+check "  правило назад быстрее секунды" "yes" "$([ "$(ours)" = 1 ] && [ $ms -lt 1000 ] && echo yes || echo "no:$ms ms")"
+check "  с прежним приоритетом" "$P0" "$(pref_of)"
+check "  туннель получал" "yes" \
+    "$([ $(($(cnt "$IT" real1) - T0)) -gt 50 ] && echo yes || echo "no:$(($(cnt "$IT" real1) - T0))")"
+check "  окно было, и его закрыл steer-guard (отброшено > 0)" "yes" \
+    "$([ $(($(guard wg) - G0)) -gt 0 ] && echo yes || echo no)"
+check "  в журнале — «возвращены: wg»" "yes" \
+    "$([ "$(grep -c 'сняты снаружи — возвращены: wg' "$tmp/d.err")" -gt "$n0" ] && echo yes || echo no)"
+wait_for 'grep -q "\"ev\":\"repaired\"" "$tmp/sub.out"' 3
+check "  подписчику repaired" '{"v":1,"ev":"repaired","outputs":["wg"],"masq":false}' \
+    "$(grep '"ev":"repaired"' "$tmp/sub.out" | tail -n 1)"
+sleep 6   # внеочередной проход сторожа после починки — до следующего опыта
+
+# ---- A3. мост пересоздан и правила сняты одновременно ------------------------------------------
+ing_on_br0() { "$real_nft" list chain inet steer ingress_mark 2>/dev/null | grep -q 'device "br0"' && echo yes || echo no; }
+check "A3: до опыта цепочка ingress_mark висит на br0" "yes" "$(ing_on_br0)"
+W0="$(cnt "$IW" real)" WP0="$(cnt "$IW" pool)" T0="$(cnt "$IT" real1)"
+n0="$(grep -c 'устройство раздачи появилось заново' "$tmp/d.err")"
+send_start 198.18.0.1
+sleep 0.3
+"$real_ip" link del br0
+check "  мост снят — цепочку ядро сняло вместе с ним" "no" "$(ing_on_br0)"
+t0="$(now_ms)"
+mkbr
+"$real_ip" rule flush
+"$real_ip" rule add priority 32766 table main
+"$real_ip" rule add priority 32767 table default
+wait_for '[ "$(ing_on_br0)" = yes ] && [ "$(ours)" = 1 ]' 10
+ms=$(( $(now_ms) - t0 ))
+sleep 0.5
+sent="$(send_stop)"
+echo "     (цепочка ingress и правило назад через $ms мс)"
+check "  у провайдера ни одного пакета (отправлено $sent)" "0 0" \
+    "$(($(cnt "$IW" real) - W0)) $(($(cnt "$IW" pool) - WP0))"
+check "  цепочка ingress_mark на новом br0 и правило на месте быстрее двух секунд" "yes" \
+    "$([ "$(ing_on_br0)" = yes ] && [ "$(ours)" = 1 ] && [ $ms -lt 2000 ] && echo yes || echo "no:$ms ms")"
+check "  в журнале — сверка по новому устройству раздачи" "yes" \
+    "$([ "$(grep -c 'устройство раздачи появилось заново' "$tmp/d.err")" -gt "$n0" ] && echo yes || echo no)"
+check "  туннель получал" "yes" \
+    "$([ $(($(cnt "$IT" real1) - T0)) -gt 20 ] && echo yes || echo "no:$(($(cnt "$IT" real1) - T0))")"
+sleep 6
+
+# ---- A4. законные пути в WAN ------------------------------------------------------------------
+D0="$(cnt "$IW" direct)" F0="$(cnt "$IW" fo)"
+burst 198.51.100.7 20
+check "A4: канал в direct — к провайдеру, как прежде" "yes" \
+    "$([ $(($(cnt "$IW" direct) - D0)) -ge 18 ] && echo yes || echo "no:$(($(cnt "$IW" direct) - D0))")"
+MX="$(awk '$1 == "dx" { print $2 }' "$tmp/st/registry")"
+check "  выход dx без устройства (on_fail=direct) отмечен «пущен напрямую»" "yes" \
+    "$("$real_nft" list set inet steer failopen 2>/dev/null | grep -q "0x0*$MX" && echo yes || echo no)"
+burst 198.51.100.8 20
+check "  его канал — к провайдеру, steer-guard не мешает" "yes" \
+    "$([ $(($(cnt "$IW" fo) - F0)) -ge 18 ] && echo yes || echo "no:$(($(cnt "$IW" fo) - F0))")"
+
+# ---- A5. группа переключилась ----------------------------------------------------------------
+"$real_ip" link set t0 down
+wait_for 'grep -q "^wg t2 " "$tmp/st/active" 2>/dev/null' 20
+check "A5: t0 упал — сторож увёл выход wg на t2" "yes" \
+    "$(grep -q '^wg t2 ' "$tmp/st/active" && echo yes || echo no)"
+sleep 1
+W0="$(cnt "$IW" real)" T3="$(cnt "$IT" real3)" G0="$(guard wg)"
+burst 198.18.0.1 20
+check "  трафик идёт в t2, не отбрасывается" "yes 0" \
+    "$([ $(($(cnt "$IT" real3) - T3)) -ge 18 ] && echo yes || echo "no:$(($(cnt "$IT" real3) - T3))") $(($(guard wg) - G0))"
+check "  у провайдера ни одного" "0" "$(($(cnt "$IW" real) - W0))"
+"$real_ip" link set t0 up
+
+# ---- A6. шторм: правило снимают снова и снова ------------------------------------------------
+del_ours() { "$real_ip" rule del fwmark "$("$real_ip" rule show | grep -o "fwmark 0x$MW/[^ ]*" | head -n 1 | cut -d' ' -f2)"; }
+ok6=0
+for k in 1 2 3 4 5 6; do
+    del_ours
+    wait_for '[ "$(ours)" = 1 ]' 4 && ok6=$((ok6 + 1))
+done
+check "A6: шесть снятий подряд — правило каждый раз назад (≤ 3 с)" "6" "$ok6"
+check "  в журнале — шторм, одной строкой" "1" "$(grep -c 'снимают снаружи снова и снова' "$tmp/d.err")"
+
+# NETRESTART_KEEP=ФАЙЛ — журнал демона сохранить (разбор упавшего опыта).
+[ -n "${NETRESTART_KEEP:-}" ] && cp "$tmp/d.err" "$NETRESTART_KEEP"
+kill "$D" 2>/dev/null
+wait "$D" 2>/dev/null
+"$BIN" down --state-dir "$tmp/st" >/dev/null 2>&1
+
+echo "netrestart: $pass ok, $fail fail"
+[ "$fail" = 0 ]

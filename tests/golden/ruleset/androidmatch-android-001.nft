@@ -19,10 +19,20 @@ table inet steer {
         iifname "rndis0" ip6 daddr @vpn_dom6 meta mark set mark and 0xf03fffff or 0x00400000 ct mark set mark counter return comment "steer:vpn_dom"
     }
 
+    set failopen {
+        type mark
+    }
+
     chain postrouting_down {
         type filter hook postrouting priority srcnat + 10; policy accept;
         oifname "rndis0" ip saddr @vpn_dom counter comment "steer-down:vpn_dom"
         oifname "rndis0" ip6 saddr @vpn_dom6 counter comment "steer-down:vpn_dom"
+    }
+    chain postrouting_guard {
+        type filter hook postrouting priority filter; policy accept;
+        meta mark and 0x0fc00000 == 0x00000000 return
+        meta mark and 0x0fc00000 @failopen return
+        meta mark and 0x0fc00000 == 0x00400000 oifname != "wg0" counter drop comment "steer-guard:vpn"
     }
     chain prerouting_dns {
         type nat hook prerouting priority dstnat; policy accept;

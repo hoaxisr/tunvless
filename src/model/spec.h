@@ -731,8 +731,22 @@ static inline int out_skips_zapret(const struct output *o) {
  * ставятся, лишь если в спеке есть такой выход с on_fail не drop, — остальным на каждый
  * пакет лишний поиск ни к чему. */
 #define FAILOPEN_SET "failopen"
+/* ВЫХОД, КОТОРЫЙ ВООБЩЕ БЫВАЕТ «ПУЩЕН НАПРЯМУЮ»: с устройством и с on_fail не drop. Отдельно от
+ * out_failopen_capable, потому что у набора FAILOPEN_SET после проверки на QEMU 04664a5
+ * (docs/architecture.md, раздел 5) два читателя, а не один:
+ *   - цепочка prerouting_failopen — снять бит «не для zapret»; ей нужен ещё и сам бит
+ *     (out_failopen_capable ниже), то есть на телефоне её нет;
+ *   - цепочка postrouting_guard (generate.c, «ПОМЕЧЕННЫЙ ПАКЕТ НЕ ТУДА — НИКУДА») — пропустить
+ *     мимо устройств выхода помеченный пакет выхода, который сторож законно отпустил напрямую.
+ *     Этой отметка нужна на любой платформе: на телефоне выход с on_fail=direct, упав, тоже уводит
+ *     свой трафик в сеть телефона, и без отметки цепочка сочла бы это утечкой и отбросила.
+ * Поэтому набор заводится по этому вопросу и отметку ставит и снимает failopen_mark по нему же, а
+ * цепочка снятия бита — по out_failopen_capable. */
+static inline int out_releasable(const struct output *o) {
+    return out_has_device(o) && o->on_fail != FAIL_DROP;
+}
 static inline int out_failopen_capable(const struct output *o) {
-    return out_has_device(o) && out_skips_zapret(o) && o->on_fail != FAIL_DROP;
+    return out_releasable(o) && out_skips_zapret(o);
 }
 
 /* Похожа ли строка списка на адресную запись: «10.0.0.1», «10.0.0.0/8» или диапазон
@@ -983,7 +997,7 @@ void conntrack_evict(unsigned mark);
  * NETLINK_NETFILTER или подсистемы conntrack в нём) — тогда conntrack_evict пробует внешний
  * инструмент. Живёт в lib/ctnl.c, рядом с другим разговором с conntrack. */
 int ctnl_evict_mark(uint32_t val, uint32_t mask);
-/* Отметить выход «пущен напрямую» (on=1) или снять отметку — см. out_failopen_capable. */
+/* Отметить выход «пущен напрямую» (on=1) или снять отметку — см. out_releasable. */
 void failopen_mark(const struct output *o, int on);
 void rule_drop(unsigned mark, int table);
 /* Правило выхода — ровно одной копией, НЕ СНИМАЯ стоящую: недостающее добавляется, лишние

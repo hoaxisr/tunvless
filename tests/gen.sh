@@ -93,6 +93,11 @@ table inet steer {
         ip daddr { 192.168.1.0/24 } ip saddr @direct_ip counter comment "steer-down:direct_ip"
         ip daddr { 192.168.1.0/24 } ip saddr @vpn_ip counter comment "steer-down:vpn_ip"
     }
+    chain postrouting_guard {
+        type filter hook postrouting priority filter; policy accept;
+        meta mark and 0x0ff00000 == 0x00000000 return
+        meta mark and 0x0ff00000 == 0x00100000 oifname != "wg0" counter drop comment "steer-guard:vpn"
+    }
     chain prerouting_dns {
         type nat hook prerouting priority dstnat; policy accept;
         ip saddr 192.168.1.0/24 udp dport 53 counter redirect to :5300

@@ -45,6 +45,11 @@ table inet steer {
         ip daddr { 192.168.1.0/24 } ip saddr @yt_ip counter comment "steer-down:yt_ip"
         ip daddr { 192.168.1.0/24 } ip saddr @tg_ip counter comment "steer-down:tg_ip"
     }
+    chain postrouting_guard {
+        type filter hook postrouting priority filter; policy accept;
+        meta mark and 0x0ff00000 == 0x00000000 return
+        meta mark and 0x0ff00000 == 0x00100000 oifname != "wg0" counter drop comment "steer-guard:vpn"
+    }
 
     chain zapret_queue {
         type filter hook postrouting priority srcnat + 2; policy accept;

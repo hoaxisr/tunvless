@@ -91,6 +91,15 @@ table inet steer {
         oifname { "br-lan", "tailscale0" } ip saddr @dpi_ip counter comment "steer-down:dpi_ip"
         oifname { "br-lan", "tailscale0" } ip saddr @tg_ip counter comment "steer-down:tg_ip"
     }
+    chain postrouting_guard {
+        type filter hook postrouting priority filter; policy accept;
+        meta mark and 0x0ff00000 == 0x00000000 return
+        meta mark and 0x0ff00000 == 0x00100000 oifname != "wg0" counter drop comment "steer-guard:wg0"
+        meta mark and 0x0ff00000 == 0x00200000 oifname != "wg1" counter drop comment "steer-guard:wg1"
+        meta mark and 0x0ff00000 == 0x00300000 oifname != { "wg0", "wg1" } counter drop comment "steer-guard:res"
+        meta mark and 0x0ff00000 == 0x00400000 oifname != { "wg0", "wg1" } counter drop comment "steer-guard:fast"
+        meta mark and 0x0ff00000 == 0x00500000 oifname != { "wg0", "wg1" } counter drop comment "steer-guard:bal"
+    }
 
     chain zapret_queue {
         type filter hook postrouting priority srcnat + 2; policy accept;
