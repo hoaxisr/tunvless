@@ -1828,7 +1828,7 @@ check "ingress: устройства раздачи нет — ingress не ст
 check "ingress: старое ядро (legacy-min) — ingress нет" "0" \
     "$(STEER_NFT_INGRESS=all STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run $IS 2>/dev/null | grep -c 'hook ingress')"
 sed 's/tolerance: 50 }/tolerance: 50, idle_timeout: 600 }/' "$tmp/ing.yaml" > "$tmp/ing-idle.yaml"
-check "ingress: группа latency с idle_timeout — пока на prerouting (сторож считает трафик там)" "0" \
+check "ingress: группа latency с idle_timeout — тоже на ingress (сторож считает трафик и в ingress_mark)" "1" \
     "$(STEER_NFT_INGRESS=all "$BIN" apply --dry-run --spec "$tmp/ing-idle.yaml" --state-dir "$tmp/st-ing" 2>/dev/null |
        grep -c 'hook ingress')"
 # Телефон (устройства раздачи по требованию) — androidmatch.sh: здесь платформа — у бинарника

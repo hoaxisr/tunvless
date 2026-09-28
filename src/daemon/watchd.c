@@ -532,8 +532,13 @@ static int watchd_traffic(void *arg, const struct spec *sp, const struct output 
         *pkts = 0;
         return 0;
     }
-    static const char *const chains[] = { "prerouting_mark", "output_mark" };
-    if (nfd_chain_rules(NFD_INET, nft_table(), chains, 2, wtraffic_rule, &t) != 0) return -1;
+    /* ingress_mark — разметка каналов раздачи на хуке ingress (compile/generate.c, «разметка на
+     * ingress»): там растут счётчики каналов раздачи, а запасные правила prerouting_mark их
+     * пакеты уже не проходят. Цепочки нет (ingress не ставился) — nfd_chain_rules её просто не
+     * находит. Пакет, который разметили оба хука (чужая перезапись метки между ними), здесь
+     * засчитывается дважды: вопрос «шёл ли трафик» от этого не меняется. */
+    static const char *const chains[] = { "ingress_mark", "prerouting_mark", "output_mark" };
+    if (nfd_chain_rules(NFD_INET, nft_table(), chains, 3, wtraffic_rule, &t) != 0) return -1;
     *pkts = t.pkts;
     return 0;
 }

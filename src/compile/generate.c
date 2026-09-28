@@ -803,8 +803,7 @@ static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const s
  * ГДЕ INGRESS НЕ СТАВИТСЯ (ingress_devs): старое ядро и ядро без inet ingress (NFTC_INGRESS,
  *   проба nft_ingress_ok), платформа, где устройства раздачи появляются по требованию
  *   (lan_devs_persist — телефон), поле метки без места под «разобран» (мини-сборка tgws), спека
- *   без правил для раздачи, ни одного существующего устройства раздачи и — временно — группа
- *   latency с idle_timeout (ingress_idle_group ниже). Каналы на сам телефон (from self, uid) —
+ *   без правил для раздачи, и ни одного существующего устройства раздачи. Каналы на сам телефон (from self, uid) —
  *   хук output, их это не касается вовсе.
  *
  * ЦЕНА. Выигрыша в работе на пакет нет: поиск по наборам тот же, только раньше, а к нему
@@ -814,27 +813,9 @@ static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const s
  *   (серия из семи кругов — 94,1, 98,9 и 139,9) — пересылка пакета на 2-5 % дороже, разбросы
  *   перекрываются; TCP на veth с GRO — в пределах разброса.
  *   Числа и доводы — docs/architecture.md, раздел 5, «inet ingress». */
-/* ВРЕМЕННОЕ ИСКЛЮЧЕНИЕ — группа latency с idle_timeout. Сторож решает «через группу идёт трафик
- * или нет» по счётчикам правил каналов (watchd_traffic в daemon/watchd.c), а читает он только
- * prerouting_mark и output_mark. С разметкой на ingress счётчики каналов раздачи растут в
- * ingress_mark, сторож видел бы группу простаивающей всегда и не мерил бы её никогда. Пока
- * сторож не читает и ingress_mark (одна строка в его перечне цепочек), такая спека остаётся на
- * prerouting целиком. Порог — тот же, что у fog_idle_limit (daemon/fogroup.c): явное значение
- * группы, иначе умолчание платформы. */
-static int ingress_idle_group(const struct spec *sp) {
-    for (size_t i = 0; i < sp->out_n; i++) {
-        const struct group_cfg *g = out_group(&sp->out[i]);
-        if (!g || g->pick != PICK_LATENCY) continue;
-        int lim = g->idle_timeout_s >= 0 ? g->idle_timeout_s : (plat()->netifd ? 0 : 1800);
-        if (lim > 0) return 1;
-    }
-    return 0;
-}
-
 static size_t ingress_devs(const struct spec *sp, const struct groups *gr, const char **devs) {
     if (!(g_nftc & NFTC_INGRESS) || (g_nftc & NFTC_LEGACY)) return 0;
     if (!plat()->lan_devs_persist || !steer_ingress_seen_ok()) return 0;
-    if (ingress_idle_group(sp)) return 0;
     int any = 0;
     for (size_t i = 0; i < gr->n && !any; i++) any = !group_is_local(&gr->g[i]);
     if (!any) return 0;
