@@ -27,6 +27,14 @@
 #     --supervise за 20 с тишины переключается не больше одного раза (ни таймера сторожа, ни
 #     снимка status, ни стража правил); reload после включения — проход сторожа сразу, дальше не
 #     чаще периода; выключили и reload — снова тишина и ни одной пробы.
+# 13. Сверка набора правил на проходе сторожа (recon.c, «СВЕРКА НА ПРОХОДЕ СТОРОЖА»; демон в своём
+#     пространстве PID, период 3 с): проходы по здоровому ядру — ни одного процесса; снятое снаружи
+#     правило канала возвращает проход сам, без apply, не позже периода (+ время починки), — в
+#     журнале почему, подписчику applied с by: watch, элементы, которые клал резолвер, на месте;
+#     таблица, заменённая мимо демона (`steerd apply` без сокета), — тоже возвращается; свои
+#     замены набора (apply новой спеки, пока идут проходы) расхождением не считаются. Элементы
+#     статических наборов проход не сверяет: снятую подсеть списка из доменного набора выхода
+#     возвращает apply той же спеки.
 #
 # Нужны root, unshare, nsenter, nft, ip и python3; без них сетевая часть пропускается.
 set -u
@@ -480,6 +488,86 @@ d = json.load(open(sys.argv[1]))
 v = {c["id"]: c["verdict"] for c in d["checks"]}
 print(v.get("dnsd"), v.get("table"))' "$tmp/diag4.d")"
 
+# ---- сверка набора правил на проходе сторожа ----
+# Перед каждым проходом демон сверяет номер и отпечаток своей таблицы с ядром — netlink в его
+# процессе. Проходы по здоровому ядру не запускают никого: PID в пространстве демона те же, а
+# эхо-пробы сторожа у ответчика показывают, что проходы за это время были.
+echos() { R awk '/^Icmp:/ { if (!h) { for (i = 1; i <= NF; i++) if ($i == "InEchos") c = i; h = 1 } else print $c }' /proc/net/snmp; }
+p0=$(nspid); e0=$(echos)
+sleep 7
+p1=$(nspid); e1=$(echos)
+check "сверка на проходе: за 7 с (период 3) проходы были, новых процессов нет" "yes 0" \
+    "$([ $((e1 - e0)) -ge 2 ] && echo yes || echo "no:$((e1 - e0))") $((p1 - p0 - 1))"
+check "  расхождений на здоровом ядре нет" "0" "$(grep -c 'разошёлся с поставленным' "$tmp/d4.err")"
+c4 subscribe > "$tmp/sub4.out" 2>&1 &
+SUB=$!
+wait_for 'grep -q "\"cmd\":\"subscribe\"" "$tmp/sub4.out" 2>/dev/null' 5
+# Правило канала по комментарию, в какой бы цепочке оно ни стояло: «цепочка номер» первого;
+# chan_n — сколько их (у канала их два: IPv4 и IPv6).
+chan_rule() { "$real_nft" -a list table inet steer 2>/dev/null |
+    awk '/^\tchain /{ c = $2 } /comment "steer:vpn_dom"/ { sub(/.*# handle /, ""); print c, $1; exit }'; }
+chan_n() { "$real_nft" list table inet steer 2>/dev/null | grep -c 'comment "steer:vpn_dom"'; }
+drift4() { grep -c "проход сторожа: набор правил в ядре разошёлся с поставленным ($1)" "$tmp/d4.err"; }
+fixed4() { grep -c 'набор правил сверен с ядром проходом сторожа — поставлен заново' "$tmp/d4.err"; }
+handle4() { "$real_nft" -a list table inet steer 2>/dev/null | sed -n '1s/.*# handle \([0-9]*\).*/\1/p'; }
+cn="$(chan_n)"
+cr="$(chan_rule)"
+"$real_nft" delete rule inet steer "${cr% *}" handle "${cr#* }"
+check "  правило канала снято снаружи" "$((cn - 1))" "$(chan_n)"
+t0=$(date +%s%N)
+wait_for '[ "$(chan_n)" = "$cn" ]' 10
+ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+# Не позже периода прохода (3 с) — плюс сама починка: план и nft -f ребёнком.
+check "снятое правило канала: проход сторожа вернул его сам, без apply, ≤ периода + 2 с" "yes" \
+    "$([ "$(chan_n)" = "$cn" ] && [ $ms -le 5000 ] && echo yes || echo "no:$ms ms")"
+wait_for '[ "$(fixed4)" = 1 ]' 3
+check "  в журнале — почему, одной строкой; и итог починки" "1 1" \
+    "$(drift4 'цепочки, правила или наборы не те, что ставил движок') $(fixed4)"
+wait_for 'grep -q "\"by\":\"watch\"" "$tmp/sub4.out"' 3
+check "  подписчику — applied с by: watch, набор правил поставлен" "1" \
+    "$(grep '"ev":"applied","by":"watch"' "$tmp/sub4.out" | grep -c '"ruleset":true')"
+# Таблицу заменили мимо демона — движком без сокета (как `steerd apply` из скрипта): номер другой.
+H0="$(handle4)"
+local4 apply >/dev/null 2>&1
+H1="$(handle4)"
+check "таблица заменена мимо демона: номер другой" "yes" \
+    "$([ -n "$H1" ] && [ "$H1" != "$H0" ] && echo yes || echo no)"
+wait_for '[ "$(fixed4)" = 2 ]' 10
+check "  проход ставит набор правил демона заново" "1 2 yes" \
+    "$(drift4 'таблицу движка заменили мимо демона') $(fixed4) \
+$([ "$(handle4)" != "$H1" ] && echo yes || echo no)"
+# Свои замены набора правил — не расхождение: apply новой спеки (канал прибавился и убавился)
+# шесть раз подряд, пока идут проходы по периоду 3 с.
+cp "$tmp/spec4.json" "$tmp/spec4.bak"
+python3 - "$tmp/spec4.json" "$tmp/p2.lst" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["channels"].append({"name": "q", "match": {"prefixes_files": [sys.argv[2]]}, "out": "vpn"})
+json.dump(d, open(sys.argv[1] + ".q", "w"))
+PY
+n0=$(grep -c 'разошёлся с поставленным' "$tmp/d4.err")
+i=0 ok=0
+while [ $i -lt 6 ]; do
+    if [ $((i % 2)) = 0 ]; then cp "$tmp/spec4.json.q" "$tmp/spec4.json"; else cp "$tmp/spec4.bak" "$tmp/spec4.json"; fi
+    c4 apply >/dev/null 2>&1 && ok=$((ok + 1))
+    sleep 1.3
+    i=$((i + 1))
+done
+sleep 4
+check "свои замены набора правил (6 apply, пока идут проходы): не расхождение" "6 $n0 2" \
+    "$ok $(grep -c 'разошёлся с поставленным' "$tmp/d4.err") $(fixed4)"
+# Элементы статических наборов проход не сверяет (дорого) — их сверяет apply. У выхода vpn и
+# адресный, и доменный канал: подсеть списка генератор кладёт в доменный набор vpn_dom, рядом с
+# элементами резолвера.
+in_dom() { "$real_nft" list set inet steer vpn_dom 2>/dev/null | grep -c '10\.1\.0\.0/16'; }
+"$real_nft" delete element inet steer vpn_dom "{ 10.1.0.0/16 }"
+sleep 4
+check "подсеть списка в доменном наборе снята: проход её не сверяет" "0 2" "$(in_dom) $(fixed4)"
+c4 apply >/dev/null 2>&1
+check "  apply той же спеки возвращает её, в журнале почему" "1 1" \
+    "$(in_dom) $(grep -c 'элементы статических наборов в ядре не те' "$tmp/d4.err")"
+kill $SUB 2>/dev/null; wait $SUB 2>/dev/null; SUB=""
+
 # Выход в отказе: устройство поднято (operstate up), но трафик не несёт — адреса у него нет, и
 # проба отвечает «нет» сразу (молчащий адресат стоил бы шесть секунд на каждый из десяти шагов
 # ожидания подъёма). Сторож ставит on_fail=drop. До правки status отдавал здесь `up: true`, и
@@ -509,7 +597,6 @@ ip link set sw1 up
 S3="--spec $tmp/spec3.json --state-dir $tmp/st3"
 echo 0 > "$tmp/enabled"
 csw() { awk '/^voluntary_ctxt_switches/{print $2}' "/proc/$D/status"; }
-echos() { R awk '/^Icmp:/ { if (!h) { for (i = 1; i <= NF; i++) if ($i == "InEchos") c = i; h = 1 } else print $c }' /proc/net/snmp; }
 c3() { "$BIN" ctl --socket "$tmp/s3.sock" "$@"; }
 STEER_CTL_ENABLED_FILE="$tmp/enabled" unshare -m sh -c "mount -t sysfs sysfs /sys && exec \"$BIN\" \
     daemon --watch --watch-period 3 --supervise --apply --socket \"$tmp/s3.sock\" $S3 \

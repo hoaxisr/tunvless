@@ -542,6 +542,9 @@ struct conn {
     int rcode;                /* код reload */
     int boot;                 /* применение при старте (--apply): соединения нет, итог — в журнал */
     int repair;               /* починка правил (rulewd.c): соединения нет, итог — в журнал */
+    /* Починка набора правил по сверке прохода сторожа (srv_resync): reload без соединения. */
+    int resync;
+    struct recon_kernel kern; /* ядро после nft -f apply-commit (строка recon-kernel) */
 };
 
 struct ctl_srv {
@@ -560,6 +563,10 @@ struct ctl_srv {
     struct loop_timer *snap_tm;   /* освежение снимка status (с --watch), см. srv_snap */
     struct rulewd *rules;     /* страж правил выходов (с --watch); NULL — без него */
     int on;                   /* движок включён — как сказали последние apply, reload, SIGHUP */
+    /* Когда ставились последние починки по сверке прохода (srv_resync), мс монотонных, по кругу;
+     * 0 — не было. Размер — RESYNC_BURST. */
+    long resync_at[3];
+    int resync_i;
 };
 
 static void mem_version(struct conn *c, struct cbuf *r);
@@ -1382,6 +1389,9 @@ static int plan_start(struct conn *c, const char *path, job_done_fn done) {
         av[n++] = "--nftc";
         av[n++] = nb;
     }
+    /* Сводка элементов статических наборов ядра — только когда есть с чем её сравнить
+     * (recon.c, «СВЕРКА ЭЛЕМЕНТОВ»): дамп больших списков стоит своих миллисекунд. */
+    if (s->rec.valid && s->rec.kel_ok) av[n++] = "--kernel-elems";
     av[n] = NULL;
     return job_start(c, av, 120, CTL_OUT_MAX, CTL_ERR_MAX, done);
 }
@@ -1428,6 +1438,9 @@ static void commit_output(struct conn *c, struct cbuf *out, struct cbuf *err) {
     memset(err, 0, sizeof(*err));
     out->max = CTL_OUT_MAX;
     err->max = CTL_ERR_MAX;
+    /* Ядро сразу после nft -f ребёнка (строка recon-kernel) — для recon_applied, не для ответа. */
+    memset(&c->kern, 0, sizeof(c->kern));
+    if (c->committed && j->out.p) recon_kernel_take(j->out.p, &j->out.n, &c->kern);
     if (c->committed && j->out.p) cb_put(out, j->out.p, j->out.n);
     if (!c->committed)
         cb_fmt(out, "steer: applied %zu channel(s), %zu output(s)\n", c->plan.ch_n, c->plan.out_n);
@@ -1534,7 +1547,7 @@ static void apply_committed(struct conn *c, int code) {
         conn_reply(c);
         return;
     }
-    recon_applied(&s->rec, &c->plan, &c->diff);
+    recon_applied(&s->rec, &c->plan, &c->diff, &c->kern);
     fprintf(stderr, LOG_I "спека применена%s\n", c->committed ? "" : " (в ядре менять нечего)");
     resp_run(&c->resp, 0, &out, &err);
     free(out.p);
@@ -1691,7 +1704,10 @@ static void reload_begin(struct conn *c) {
 }
 
 static void reload_done(struct conn *c) {
-    srv_spec_changed(c->srv, "reload", ctl_enabled(), &c->diff, c->watch, &c->resp);
+    /* Починка по сверке прохода сторожа — событие applied с by: watch (docs/ctl.md): интерфейс
+     * отличает её от reload, который позвал человек или init. */
+    srv_spec_changed(c->srv, c->resync ? "watch" : "reload", ctl_enabled(), &c->diff, c->watch,
+                     &c->resp);
     /* Стартовое применение кончилось — удачно или нет: теперь первый проход сторожа (см.
      * «ПЕРВЫЙ ПРОХОД — ПОСЛЕ СТАРТОВОГО APPLY» в watchd.c). */
     if (c->boot) watchd_release(c->srv->watch);
@@ -1708,6 +1724,15 @@ static void reload_head(struct conn *c, int enabled, struct cbuf *err) {
                     err && err->p ? err->p : "");
         else if (enabled)
             fprintf(stderr, LOG_I "спека применена при старте\n");
+    }
+    if (c->resync) {
+        if (c->rcode != 0)
+            fprintf(stderr, LOG_W "набор правил вернуть не удалось (код %d)%s%.*s", c->rcode,
+                    err && err->n ? ":\n" : "\n", err ? (int)err->n : 0,
+                    err && err->p ? err->p : "");
+        else if (enabled)
+            fprintf(stderr, LOG_I "набор правил сверен с ядром проходом сторожа%s\n",
+                    c->diff.ruleset ? " — поставлен заново" : " — менять уже нечего");
     }
     cb_fmt(&c->resp, ",\"code\":%d", c->rcode);
     if (c->rcode != 0) {
@@ -1731,7 +1756,7 @@ static void reload_committed(struct conn *c, int code) {
         memset(&c->diff, 0, sizeof(c->diff));
         fprintf(stderr, LOG_W "reload: применение не прошло (код %d)\n", code);
     } else {
-        recon_applied(&c->srv->rec, &c->plan, &c->diff);
+        recon_applied(&c->srv->rec, &c->plan, &c->diff, &c->kern);
     }
     free(out.p);
     reload_head(c, 1, &err);
@@ -2569,6 +2594,67 @@ static void srv_repair(void *arg) {
     conn_exec(c);
 }
 
+/* ---- сверка набора правил на проходе сторожа ---------------------------------------------------
+ *
+ * Решение владельца 2026-09-28 (устройство и доводы — в шапке recon.c, «СВЕРКА НА ПРОХОДЕ
+ * СТОРОЖА»): сторож в начале каждого прохода зовёт srv_kcheck, и тот сверяет номер и отпечаток
+ * наших таблиц в ядре с запомненными после последнего нашего nft -f — четыре обмена netlink, без
+ * процессов. Разошлось — строка в журнал и починка в очереди изменяющих команд: reload без
+ * соединения (как стартовое применение), то есть тот же путь, что apply той же спеки. Проход её
+ * не ждёт. */
+
+/* Починок — не больше RESYNC_BURST за RESYNC_WINDOW_MS: тот, кто правит нашу таблицу без
+ * остановки, не должен превращать каждый проход (а после событий сети они идут через 5 с) в
+ * компиляцию и nft -f. Не интервал между починками, а их число в окне: два независимых
+ * вмешательства подряд (снятое правило, потом чужая таблица) чинятся оба сразу, а бесконечная
+ * драка стоит трёх починок за пять минут. Пропущенное расхождение найдёт первый проход после
+ * того, как окно освободится. */
+#define RESYNC_BURST 3
+#define RESYNC_WINDOW_MS (5 * 60 * 1000L)
+
+static void srv_resync(struct ctl_srv *s) {
+    struct conn *c = calloc(1, sizeof(*c));
+    if (!c) return;
+    c->srv = s;
+    c->fd = -1;
+    c->hup = 1;          /* ответ отдавать некому: conn_reply освобождает соединение */
+    c->resync = 1;
+    c->job.po = c->job.pe = -1;
+    c->q.cmd = ctl_lookup("reload");
+    c->q.cf = &s->cf;
+    c->next = s->conns;
+    s->conns = c;
+    resp_begin(&c->resp, "reload");
+    s->resync_at[s->resync_i] = loop_now_ms();
+    s->resync_i = (s->resync_i + 1) % RESYNC_BURST;
+    if (s->lock_owner) {
+        c->st = C_WAIT;
+        struct conn **pp = &s->lockq;
+        while (*pp) pp = &(*pp)->qnext;
+        *pp = c;
+        return;
+    }
+    conn_exec(c);
+}
+
+static void srv_kcheck(void *arg) {
+    struct ctl_srv *s = arg;
+    /* Своя изменяющая команда идёт или ждёт очереди — её замена набора правил ещё не запомнена
+     * (или уже в полёте), и расхождение с ней не расхождение. Проход при этом и не начинается
+     * (srv_busy), но починка, поставленная прошлым проходом, может ждать в очереди. */
+    if (!s->on || !s->rec.valid || s->lock_owner || s->lockq) return;
+    for (struct conn *c = s->conns; c; c = c->next)
+        if (c->resync) return;
+    const char *why = "";
+    if (recon_kernel_drift(&s->rec, &why) != 1) return;
+    /* resync_at[resync_i] — самая старая из последних RESYNC_BURST починок (0 — их было меньше). */
+    long oldest = s->resync_at[s->resync_i];
+    if (oldest && loop_now_ms() - oldest < RESYNC_WINDOW_MS) return;
+    fprintf(stderr, LOG_W "проход сторожа: набор правил в ядре разошёлся с поставленным (%s) — "
+                          "сверка в очереди\n", why);
+    srv_resync(s);
+}
+
 static void ctl_bad_flag(const char *cmd, const char *msg, const char *arg) {
     fprintf(stderr, "steer: %s: %s%s%s\n", cmd, msg, arg ? ": " : "", arg ? arg : "");
     exit(2);
@@ -2730,7 +2816,7 @@ int ctl_serve_main(int argc, char **argv) {
     S.on = ctl_enabled();
     if (cf->watch) {
         struct watchd_conf wc = { cf->watch_period ? cf->watch_period : 60, ctl_enabled,
-                                  srv_busy, &S };
+                                  srv_busy, &S, srv_kcheck };
         /* С --apply первый проход — после стартового применения (watchd_release в reload_done). */
         S.watch = watchd_start(&S.d, &wc, S.on, cf->apply && S.d.have);
         if (!S.watch) { fprintf(stderr, LOG_W "сторож: нет памяти\n"); return 1; }
