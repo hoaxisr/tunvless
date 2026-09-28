@@ -751,16 +751,22 @@ int route6_bind(const struct output *o, const char *dev) {
 }
 
 /* Пущен ли выход напрямую — отметка в наборе FAILOPEN_SET нашей таблицы. Зачем она и почему
- * так, а не иначе, — у out_failopen_capable в spec.h: пока метка выхода в наборе, цепочка
- * prerouting_failopen снимает с его пакетов бит ZAPRET_SKIP_MARK, и трафик упавшего выхода
- * идёт как обычный трафик роутера — через общий обход, если тот запущен.
+ * так, а не иначе, — у out_failopen_capable и out_releasable в spec.h: пока метка выхода в
+ * наборе, цепочка prerouting_failopen снимает с его пакетов бит ZAPRET_SKIP_MARK, и трафик
+ * упавшего выхода идёт как обычный трафик роутера — через общий обход, если тот запущен, — а
+ * цепочка postrouting_guard пропускает его мимо устройств выхода (generate.c, «ПОМЕЧЕННЫЙ ПАКЕТ
+ * НЕ ТУДА — НИКУДА»).
+ *
+ * С проверки на QEMU 04664a5 — на любой платформе, а не только там, где есть бит zapret: второму
+ * читателю отметка нужна и на телефоне. Цена там — запуск nft на привязку выхода и на отказ, то
+ * есть на событие, а не на проход (bind_device зовут, только когда маршрут выхода меняется).
  *
  * Молча: `add` существующего элемента nft принимает, а отказ `delete` отсутствующего — обычное
  * дело (выход и не был отмечен). Набора нет, если в спеке нет ни одного выхода, которому он
  * нужен, — тогда отказывает любая из двух команд, и это тоже ничего не значит. */
 void failopen_mark(const struct output *o, int on) {
-    if (!o->mark || !out_has_device(o) || !out_skips_zapret(o)) return;
-    if (on && !out_failopen_capable(o)) on = 0;   /* on_fail=drop: напрямую не пускаем */
+    if (!o->mark || !out_has_device(o)) return;
+    if (on && !out_releasable(o)) on = 0;   /* on_fail=drop: напрямую не пускаем */
     char el[32];
     snprintf(el, sizeof(el), "{ 0x%08x }", o->mark);
     const char *cmd[] = { "nft", on ? "add" : "delete", "element", "inet", nft_table(),

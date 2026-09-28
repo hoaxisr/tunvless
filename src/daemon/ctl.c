@@ -160,6 +160,7 @@
 #include "recon.h"
 #include "rulewd.h"
 #include "fogroup.h"
+#include "nftcompat.h"
 #include "ctl.h"
 
 /* Путь сокета по умолчанию — путь платформы (ctl_sock, src/platform/platform.h). */
@@ -503,6 +504,10 @@ enum conn_state {
     C_SUB,        /* подписчик: соединение открыто, пишем события */
 };
 
+/* Чья сверка набора правил без соединения (conn.resync; ниже, «сверка набора правил на проходе
+ * сторожа»). */
+enum { RESYNC_PASS = 1, RESYNC_LAN = 2 };
+
 struct conn {
     struct conn *next;        /* все соединения демона */
     struct conn *qnext;       /* очередь изменяющих команд */
@@ -542,7 +547,9 @@ struct conn {
     int rcode;                /* код reload */
     int boot;                 /* применение при старте (--apply): соединения нет, итог — в журнал */
     int repair;               /* починка правил (rulewd.c): соединения нет, итог — в журнал */
-    /* Починка набора правил по сверке прохода сторожа (srv_resync): reload без соединения. */
+    /* Починка набора правил по сверке прохода сторожа (srv_resync): reload без соединения.
+     * RESYNC_PASS — расхождение нашёл проход, RESYNC_LAN — пересоздано устройство раздачи
+     * (srv_lan). */
     int resync;
     struct recon_kernel kern; /* ядро после nft -f apply-commit (строка recon-kernel) */
 };
@@ -567,6 +574,19 @@ struct ctl_srv {
      * 0 — не было. Размер — RESYNC_BURST. */
     long resync_at[3];
     int resync_i;
+    /* Устройство раздачи пересоздано (srv_lan): сверка набора правил через LAN_SETTLE_MS; ещё
+     * одна после идущей (lan_again) — та могла собрать план до нового устройства. Сверок по
+     * устройствам раздачи за окно — lan_n с начала окна lan_win. */
+    struct loop_timer *lan_tm;
+    int lan_again;
+    long lan_win;
+    int lan_n;
+    long lan_said;
+    /* Лимит сверок прохода (srv_kcheck): когда устройство раздачи последний раз пропадало или
+     * появлялось (lan_at) и когда начинался последний план (plan_at), мс монотонных. Расхождение
+     * после смены устройства раздачи, которую ещё не видел ни один план, — объяснимое и не в счёт
+     * RESYNC_BURST. resync_said — окно (самая старая починка в нём), о котором отказ уже сказан. */
+    long lan_at, plan_at, resync_said;
 };
 
 static void mem_version(struct conn *c, struct cbuf *r);
@@ -1379,6 +1399,7 @@ static int plan_start(struct conn *c, const char *path, job_done_fn done) {
     struct ctl_srv *s = c->srv;
     char *av[12], nb[16];
     size_t n = 0;
+    s->plan_at = loop_now_ms();     /* после него устройства раздачи план уже видел (srv_kcheck) */
     av[n++] = s->cf.exe;
     av[n++] = "apply-plan";
     av[n++] = "--spec";
@@ -1711,7 +1732,15 @@ static void reload_done(struct conn *c) {
     /* Стартовое применение кончилось — удачно или нет: теперь первый проход сторожа (см.
      * «ПЕРВЫЙ ПРОХОД — ПОСЛЕ СТАРТОВОГО APPLY» в watchd.c). */
     if (c->boot) watchd_release(c->srv->watch);
+    struct ctl_srv *s = c->srv;
+    int resync = c->resync;
     conn_reply(c);
+    /* Устройство раздачи пересоздали, пока шла эта сверка (её план мог собраться ещё без него), —
+     * ещё одна, сразу (srv_lan). */
+    if (resync && s->lan_again && s->lan_tm) {
+        s->lan_again = 0;
+        loop_timer_set(s->lan_tm, 0);
+    }
 }
 
 /* Голова ответа reload: код (не 0 — ядро не приняло набор или план не прошёл, причина в
@@ -1731,7 +1760,8 @@ static void reload_head(struct conn *c, int enabled, struct cbuf *err) {
                     err && err->n ? ":\n" : "\n", err ? (int)err->n : 0,
                     err && err->p ? err->p : "");
         else if (enabled)
-            fprintf(stderr, LOG_I "набор правил сверен с ядром проходом сторожа%s\n",
+            fprintf(stderr, LOG_I "набор правил сверен с ядром %s%s\n",
+                    c->resync == RESYNC_LAN ? "по новому устройству раздачи" : "проходом сторожа",
                     c->diff.ruleset ? " — поставлен заново" : " — менять уже нечего");
     }
     cb_fmt(&c->resp, ",\"code\":%d", c->rcode);
@@ -2510,6 +2540,28 @@ static int boot_apply(struct ctl_srv *s) {
  * пока починка ждала очереди, apply мог уже всё поставить. */
 static const struct ctl_cmd CTL_REPAIR = {"repair", NULL, NULL, st_repair, 0, 0, 0, {{0}}, 0, 0, 1};
 
+/* Правила возвращены (list — выходы через запятую): событие repaired подписчикам и внеочередной
+ * проход сторожа, который сверит остальную маршрутизацию выходов (и masquerade на телефоне:
+ * проход после события сверяет его сразу, watch_masq_due). masq — masquerade вернули уже здесь. */
+static void repaired_emit(struct ctl_srv *s, const char *list, int masq) {
+    struct cbuf f = {0};
+    cb_str(&f, ",\"outputs\":[");
+    int first = 1;
+    for (const char *p = list; *p; ) {
+        const char *e = strchr(p, ',');
+        size_t l = e ? (size_t)(e - p) : strlen(p);
+        if (!first) cb_str(&f, ",");
+        cb_json(&f, p, l);
+        first = 0;
+        if (!e) break;
+        p = e + 1;
+    }
+    cb_fmt(&f, "],\"masq\":%s", masq ? "true" : "false");
+    steerd_emit(&s->d, "repaired", f.p ? f.p : "");
+    free(f.p);
+    watchd_spec_changed(s->watch);
+}
+
 static void repair_done(struct conn *c, int code) {
     struct ctl_srv *s = c->srv;
     struct job *j = &c->job;
@@ -2522,25 +2574,18 @@ static void repair_done(struct conn *c, int code) {
         fprintf(stderr, LOG_I "правила выходов сняты снаружи — возвращены: %s%s\n", c->tmp,
                 masq ? " (и masquerade)" : "");
         if (j->err.n) fprintf(stderr, "%.*s", (int)j->err.n, j->err.p);
-        struct cbuf f = {0};
-        cb_str(&f, ",\"outputs\":[");
-        int first = 1;
-        for (char *p = c->tmp; *p; ) {
-            char *e = strchr(p, ',');
-            size_t l = e ? (size_t)(e - p) : strlen(p);
-            if (!first) cb_str(&f, ",");
-            cb_json(&f, p, l);
-            first = 0;
-            if (!e) break;
-            p = e + 1;
-        }
-        cb_fmt(&f, "],\"masq\":%s", masq ? "true" : "false");
-        steerd_emit(&s->d, "repaired", f.p ? f.p : "");
-        free(f.p);
-        /* Остальную маршрутизацию выходов сверит сторож — внеочередным проходом. */
-        watchd_spec_changed(s->watch);
+        repaired_emit(s, c->tmp, masq);
     }
     conn_reply(c);
+}
+
+/* Обратный вызов стража: правила он вернул сам, в процессе демона (rulewd.c, «СРАЗУ, А НЕ ЧЕРЕЗ
+ * СЕКУНДУ»). Очередь изменяющих команд не нужна: одно сообщение rtnetlink на правило, таблицы не
+ * тронуты. masquerade (телефон) вернёт проход сторожа, который repaired_emit зовёт. */
+static void srv_restored(void *arg, const char *list) {
+    struct ctl_srv *s = arg;
+    fprintf(stderr, LOG_I "правила выходов сняты снаружи — возвращены: %s\n", list);
+    repaired_emit(s, list, 0);
 }
 
 static void st_repair(struct conn *c) {
@@ -2612,21 +2657,25 @@ static void srv_repair(void *arg) {
 #define RESYNC_BURST 3
 #define RESYNC_WINDOW_MS (5 * 60 * 1000L)
 
-static void srv_resync(struct ctl_srv *s) {
+/* Сверка в очередь. kind — RESYNC_PASS (идёт в счёт RESYNC_BURST) или RESYNC_LAN (свой счёт,
+ * srv_lan). */
+static void srv_resync(struct ctl_srv *s, int kind) {
     struct conn *c = calloc(1, sizeof(*c));
     if (!c) return;
     c->srv = s;
     c->fd = -1;
     c->hup = 1;          /* ответ отдавать некому: conn_reply освобождает соединение */
-    c->resync = 1;
+    c->resync = kind;
     c->job.po = c->job.pe = -1;
     c->q.cmd = ctl_lookup("reload");
     c->q.cf = &s->cf;
     c->next = s->conns;
     s->conns = c;
     resp_begin(&c->resp, "reload");
-    s->resync_at[s->resync_i] = loop_now_ms();
-    s->resync_i = (s->resync_i + 1) % RESYNC_BURST;
+    if (kind == RESYNC_PASS) {
+        s->resync_at[s->resync_i] = loop_now_ms();
+        s->resync_i = (s->resync_i + 1) % RESYNC_BURST;
+    }
     if (s->lock_owner) {
         c->st = C_WAIT;
         struct conn **pp = &s->lockq;
@@ -2636,6 +2685,25 @@ static void srv_resync(struct ctl_srv *s) {
     }
     conn_exec(c);
 }
+
+/* ЛИМИТ МОЛЧАЛ (проверка на QEMU 04664a5, docs/architecture.md, раздел 5). После четвёртого и
+ * шестого `network restart` за пять минут цепочка ingress не вернулась: сработали «три починки за
+ * пять минут», и вернулась она через ~80 с, а в журнале — ни строки. Теперь:
+ *   - отказ по лимиту — строка в журнал, одна на окно (окно узнаётся по самой старой починке в нём:
+ *     следующая починка — новое окно, и о нём скажут снова), с тем, что разошлось, и через сколько
+ *     секунд проход починит;
+ *   - что лимит ограничивает. Он заведён против того, кто правит нашу таблицу без остановки, а не
+ *     против законных пересозданий устройств раздачи: цепочку ingress_mark ядро снимает вместе с
+ *     устройством, и такое расхождение не чья-то драка с нами, а следствие `network restart`.
+ *     Расхождение, найденное после того, как устройство раздачи пропало или появилось, а плана с
+ *     тех пор не было (lan_at не раньше plan_at), — объяснимое: починка идёт вне RESYNC_BURST, в
+ *     счёт предела сверок по устройствам раздачи (srv_lan_budget, 20 за пять минут). Отличить
+ *     «цепочку сняло ядро» от «цепочку снял кто-то в тот же миг» по отпечатку нельзя (он один на
+ *     таблицу), но и незачем: починка у обоих одна и та же — замена набора, — а шторм чужих правок
+ *     без пересозданий моста по-прежнему упирается в три за пять минут. Сверка по новому
+ *     устройству (srv_lan) обычно успевает раньше прохода, и сюда такое расхождение не доходит;
+ *     сюда — когда проход пришёл, пока устройства ещё нет, или событие потерялось. */
+static int srv_lan_budget(struct ctl_srv *s);
 
 static void srv_kcheck(void *arg) {
     struct ctl_srv *s = arg;
@@ -2647,12 +2715,100 @@ static void srv_kcheck(void *arg) {
         if (c->resync) return;
     const char *why = "";
     if (recon_kernel_drift(&s->rec, &why) != 1) return;
+    long now = loop_now_ms();
+    int lan = s->lan_at && s->lan_at >= s->plan_at;
+    if (lan && srv_lan_budget(s)) {
+        fprintf(stderr, LOG_W "проход сторожа: набор правил в ядре разошёлся с поставленным (%s) "
+                              "после пересоздания устройства раздачи — сверка в очереди\n", why);
+        srv_resync(s, RESYNC_LAN);
+        return;
+    }
     /* resync_at[resync_i] — самая старая из последних RESYNC_BURST починок (0 — их было меньше). */
     long oldest = s->resync_at[s->resync_i];
-    if (oldest && loop_now_ms() - oldest < RESYNC_WINDOW_MS) return;
+    if (oldest && now - oldest < RESYNC_WINDOW_MS) {
+        if (s->resync_said != oldest) {
+            s->resync_said = oldest;
+            fprintf(stderr, LOG_W "проход сторожа: набор правил в ядре разошёлся с поставленным (%s), "
+                    "но починок по сверке уже %d за %ld мин — следующая через %ld с\n", why,
+                    RESYNC_BURST, RESYNC_WINDOW_MS / 60000L,
+                    (oldest + RESYNC_WINDOW_MS - now + 999) / 1000);
+        }
+        return;
+    }
     fprintf(stderr, LOG_W "проход сторожа: набор правил в ядре разошёлся с поставленным (%s) — "
                           "сверка в очереди\n", why);
-    srv_resync(s);
+    srv_resync(s, RESYNC_PASS);
+}
+
+/* ---- устройство раздачи пересоздано: сверка сразу, а не проходом ---------------------------------
+ *
+ * Проверка на QEMU 04664a5 (docs/architecture.md, раздел 5): после `/etc/init.d/network restart`
+ * br-lan пересоздан, и цепочку ingress_mark ядро сняло вместе со старым устройством. Прежде её
+ * возвращала сверка на проходе сторожа — проход после события сети идёт через WATCH_SETTLE_S, и
+ * цепочка возвращалась через 3,6-8,6 с. Теперь сторож разбирает события сети сам (watchd.c,
+ * «УСТРОЙСТВА РАЗДАЧИ») и зовёт srv_lan на новый номер устройства раздачи; сверка — тот же reload
+ * без соединения, что у прохода (план увидит новое устройство или снятую ядром цепочку, и набор
+ * правил встанет одной транзакцией), через LAN_SETTLE_MS: netifd поднимает мосты пачкой (br-lan,
+ * гостевой), и на пачку хватает одной сверки. Сверка уже идёт — ещё одна после неё (lan_again):
+ * её план мог собраться до нового устройства.
+ *
+ * Только если раскладка вообще ставит ingress (NFTC_INGRESS без NFTC_LEGACY; раскладка ещё не
+ * известна — сверяем): иначе цепочки нет и возвращать нечего. Пропавшее устройство (up = 0) сверки
+ * не зовёт: вешать цепочку не на что, а пересчитать набор без него успеет сверка по появлению — или
+ * проход, если устройство ушло насовсем.
+ *
+ * СВОЙ СЧЁТ, НЕ RESYNC_BURST. Лимит сверок прохода — против того, кто правит нашу таблицу без
+ * остановки. Пересоздание моста — законное событие, и три `network restart` за пять минут не
+ * должны оставлять четвёртый без цепочки. От шторма (мост, который пересоздаётся по кругу, —
+ * сломанный драйвер или скрипт) — свой предел: LAN_RESYNC_BURST сверок за RESYNC_WINDOW_MS, одна
+ * строка в журнал на окно; дальше цепочку вернёт проход, как прежде, в пределах RESYNC_BURST. */
+#define LAN_SETTLE_MS 300
+#define LAN_RESYNC_BURST 20
+
+static int srv_resync_pending(const struct ctl_srv *s) {
+    for (const struct conn *c = s->conns; c; c = c->next)
+        if (c->resync) return 1;
+    return 0;
+}
+
+/* Ещё одна сверка по устройствам раздачи в окне: 1 — можно (и посчитана), 0 — предел, строка в
+ * журнал одна на окно. */
+static int srv_lan_budget(struct ctl_srv *s) {
+    long now = loop_now_ms();
+    if (!s->lan_win || now - s->lan_win >= RESYNC_WINDOW_MS) { s->lan_win = now; s->lan_n = 0; }
+    if (s->lan_n >= LAN_RESYNC_BURST) {
+        if (s->lan_said != s->lan_win) {
+            s->lan_said = s->lan_win;
+            fprintf(stderr, LOG_W "устройства раздачи пересоздают снова и снова (%d раз за %ld мин) — "
+                    "дальше цепочку ingress вернёт проход сторожа, не чаще трёх раз за %ld мин\n",
+                    LAN_RESYNC_BURST, RESYNC_WINDOW_MS / 60000L, RESYNC_WINDOW_MS / 60000L);
+        }
+        return 0;
+    }
+    s->lan_n++;
+    return 1;
+}
+
+static void srv_lan_timer(struct loop *l, struct loop_timer *t, void *arg) {
+    (void)l; (void)t;
+    struct ctl_srv *s = arg;
+    if (!s->on || !s->d.have || !s->rec.valid) return;
+    if (srv_resync_pending(s)) { s->lan_again = 1; return; }
+    if (!srv_lan_budget(s)) return;
+    fprintf(stderr, LOG_I "устройство раздачи появилось заново — набор правил сверяется с ядром\n");
+    srv_resync(s, RESYNC_LAN);
+}
+
+static void srv_lan(void *arg, const char *dev, int up) {
+    struct ctl_srv *s = arg;
+    (void)dev;
+    if (!s->on || !s->d.have || !s->lan_tm) return;
+    int nftc = s->rec.nftc;
+    if (nftc >= 0 && (!(nftc & NFTC_INGRESS) || (nftc & NFTC_LEGACY))) return;
+    /* И пропажа, и появление объясняют расхождение, которое найдёт проход (srv_kcheck). */
+    s->lan_at = loop_now_ms();
+    if (!up) return;
+    loop_timer_set(s->lan_tm, LAN_SETTLE_MS);
 }
 
 static void ctl_bad_flag(const char *cmd, const char *msg, const char *arg) {
@@ -2816,13 +2972,15 @@ int ctl_serve_main(int argc, char **argv) {
     S.on = ctl_enabled();
     if (cf->watch) {
         struct watchd_conf wc = { cf->watch_period ? cf->watch_period : 60, ctl_enabled,
-                                  srv_busy, &S, srv_kcheck };
+                                  srv_busy, &S, srv_kcheck, srv_lan };
+        S.lan_tm = loop_timer_new(S.l, srv_lan_timer, &S);
         /* С --apply первый проход — после стартового применения (watchd_release в reload_done). */
         S.watch = watchd_start(&S.d, &wc, S.on, cf->apply && S.d.have);
         if (!S.watch) { fprintf(stderr, LOG_W "сторож: нет памяти\n"); return 1; }
         S.snap_tm = loop_timer_new(S.l, srv_snap, &S);
         if (S.snap_tm && S.on) loop_timer_set(S.snap_tm, CTL_SNAP_MS);
-        struct rulewd_conf rc = { srv_busy, srv_repair, &S };
+        struct rulewd_conf rc = { .busy = srv_busy, .repair = srv_repair,
+                                  .restored = srv_restored, .arg = &S };
         S.rules = rulewd_start(&S.d, &rc, S.on);
         if (!S.rules) { fprintf(stderr, LOG_W "страж правил: нет памяти\n"); return 1; }
     }

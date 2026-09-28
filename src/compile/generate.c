@@ -786,7 +786,10 @@ static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const s
  *   входит в него целиком) расходится с применённым, и следующий apply или reload (apply-сверка,
  *   daemon/recon.c) ставит набор заново уже на новое устройство (стенд ingressns). SIGHUP от
  *   hotplug (files/etc/hotplug.d) набор не ставит: он перечитывает спеку и зовёт проход сторожа.
- *   До apply теряется только выигрыш ingress, а не маршрутизация.
+ *   Демон со сторожем ставит его сам и сразу: новое устройство раздачи он узнаёт по событию
+ *   rtnetlink (daemon/watchd.c, «УСТРОЙСТВА РАЗДАЧИ»; проверка на QEMU 04664a5 — после `network
+ *   restart` цепочка возвращалась только сверкой на проходе, через 3,6-8,6 с). До того теряется
+ *   только выигрыш ingress, а не маршрутизация.
  *
  * МОСТ. Цепочка висит на самом мосту (br-lan), а не на его портах: пакет с порта в стек
  *   маршрутизации мост отдаёт вверх через свой приёмник (br_pass_frame_up), и ingress моста его
@@ -921,13 +924,26 @@ static int build_mark(struct nft_table *t, const struct spec *sp, const struct g
  *
  * mangle + 2 — сразу после разметки (mangle + 1), то есть задолго до цепочек zapret на
  * postrouting. Счётчик — чтобы по дампу было видно, что правило действительно брало
- * пакеты, а не только стояло. */
+ * пакеты, а не только стояло.
+ *
+ * НАБОР — ШИРЕ ЦЕПОЧКИ. С проверки на QEMU 04664a5 его читает и postrouting_guard ниже, которой
+ * отметка нужна на любой платформе (out_releasable в spec.h): набор есть, когда в спеке есть
+ * выход с устройством и on_fail не drop, а цепочка снятия бита — только там, где этот бит вообще
+ * ставится (out_failopen_capable; на телефоне zapret нет, и цепочки нет). Где выход такой один и
+ * бит есть — текст прежний до байта. */
+static int has_releasable(const struct spec *sp) {
+    for (size_t i = 0; i < sp->out_n; i++)
+        if (sp->out[i].mark && out_releasable(&sp->out[i])) return 1;
+    return 0;
+}
+
 static void build_failopen(struct nft_table *t, const struct spec *sp) {
     int failopen = 0;
     for (size_t i = 0; i < sp->out_n; i++)
         if (out_failopen_capable(&sp->out[i])) failopen = 1;
-    if (!failopen) return;
+    if (!failopen && !has_releasable(sp)) return;
     ir_gap(ir_set_add(t, FAILOPEN_SET, "mark"));
+    if (!failopen) return;
     struct nft_rule *r = ir_rule(ir_base_chain_add(t, "prerouting_failopen", "filter",
                                                    "prerouting", "mangle", 2));
     char m[40];
@@ -1039,6 +1055,144 @@ static void build_forward_v6(struct nft_table *t, const struct spec *sp, const s
         ir_counter(r, 0, 0);
         ir_x(r, "reject with icmpx type admin-prohibited");
         ir_comment(r, "steer-v6drop:%s", names[k]);
+    }
+}
+
+/* ---- ПОМЕЧЕННЫЙ ПАКЕТ НЕ ТУДА — НИКУДА: postrouting_guard ------------------------------------
+ *
+ * ЧТО СЛУЧИЛОСЬ (проверка на QEMU 04664a5, OpenWrt 25.12.5, docs/architecture.md, раздел 5).
+ * `/etc/init.d/network restart`: netifd при старте снимает ВСЕ правила ip rule и ставит свои
+ * (local, main, default), и вместе с ними пропадает наше `fwmark <метка>/<маска> lookup <таблица>`.
+ * Разметка при этом цела — prerouting_mark метит, dnat fake-IP подменяет адрес, — а правила нет:
+ * помеченный пакет идёт по таблице main, masquerade — и он в WAN с адресом WAN, мимо выхода и мимо
+ * on_fail=drop. Страж правил (daemon/rulewd.c) возвращал правило через 2-2,5 с, и в 5 прогонах из
+ * 6 клиент успевал открыть в этом окне 2-4 соединения мимо туннеля. Правило ip rule живёт вне
+ * нашей таблицы и принадлежит всем, кто трогает маршрутизацию, — его снимут ещё не раз (netifd,
+ * netd, чужой `ip rule flush`), и никакой скоростью стража окно не закрыть до нуля.
+ *
+ * ПОЭТОМУ — ПРОВЕРКА ПО ФАКТУ, ГДЕ ПАКЕТ УЖЕ ЗНАЕТ, КУДА ИДЁТ. Пакет с меткой выхода с
+ * устройством обязан уйти в одно из устройств этого выхода. Решение маршрутизации уже принято
+ * (postrouting), oifname известен — и если это не устройство выхода, значит правило fwmark снято,
+ * таблица выхода пуста (устройство пересоздано, TUN помощника пропал) или маршрут переписал кто-то
+ * чужой; во всех трёх случаях пакет идёт не туда, куда его вели, и отбрасывается. Это та же
+ * страховка fail-closed, что `steer-fakeip-nomap` для подмены: не «успеть вернуть», а «пока не
+ * вернули — никуда». TCP клиента повторит SYN через секунду и найдёт правило на месте.
+ *
+ * КАКИЕ МЕТКИ. Только выходов с устройством и своей таблицей (out_has_device, метка и таблица):
+ *   - direct метки нет вовсе; kind=zapret и tgws метку имеют, но таблицы у них нет, и их трафик
+ *     законно идёт обычным маршрутом (zapret — в очередь на postrouting, tgws — в мост на самом
+ *     роутере, через input, сюда не доходит);
+ *   - «пущен напрямую» (набор FAILOPEN_SET: сторож при on_fail=direct/zapret снял правило нарочно)
+ *     — законно идёт по main: первым проверяется набор (out_releasable в spec.h — почему набор
+ *     теперь есть и на телефоне);
+ *   - «разобран на ingress» (STEER_INGRESS_SEEN) метки выхода не несёт и снимается ещё в
+ *     prerouting_mark; метка «сам движок» у телефона (STEER_SELF_MARK) — не метка выхода. Ни одно
+ *     правило ниже с ними не совпадёт;
+ *   - пустое поле — первым правилом, одним сравнением: так идёт почти весь трафик.
+ *
+ * КАКИЕ УСТРОЙСТВА. Все листья выхода по спеке: у выхода — его устройство (у vless и xsteer — их
+ * TUN, у awg — его интерфейс), у группы — устройства всех членов вглубь (out_members). Не «то, что
+ * сейчас выбрал сторож»: группа переключается между членами без замены набора правил, и правило,
+ * знающее только активного члена, отбросило бы трафик нового. Члены группы известны при apply, их
+ * смена — это смена спеки и новый набор. Устройство — ИМЕНЕМ (oifname), как «кто» по устройству
+ * (x_ifs): пересозданный wg0 или TUN с тем же именем узнаётся сам, а пока его нет, пакет и так идёт
+ * не туда — и отбрасывается, это и есть fail-closed. Балансирующая группа: пакет несёт метку члена
+ * (цепочка mark_…) — правило члена; метку самой группы (живых нет) — правило группы.
+ *
+ * ПОЧЕМУ НЕ «oif НЕ WAN». Устройства WAN движок не знает и знать не должен: их бывает несколько
+ * (mwan3, pppoe поверх eth, мобильный модем), на телефоне это любая сеть netd, и выход kind=
+ * interface сам может быть «второй WAN». Перечень устройств выхода движок знает точно — из спеки.
+ * Карта «метка → набор устройств», которую правил бы сторож элементами, не нужна по той же причине:
+ * перечень статичен между заменами набора, а менять его на каждом переключении — лишняя транзакция
+ * и лишнее окно.
+ *
+ * ГДЕ И ПОЧЕМУ ТАМ. postrouting, приоритет filter: видит и пересылаемое (раздача), и порождённое
+ * самим устройством (каналы на телефон — output_mark; сокет туннеля `over` несёт метку цели), до
+ * masquerade (srcnat) и до очереди zapret (srcnat + 2). Отброшенный здесь пакет ещё не
+ * подтверждён conntrack (подтверждение — на последнем приоритете postrouting), так что записи с
+ * подменой и masquerade не остаётся, и повтор SYN разбирается заново. Выгруженные потоки
+ * (flowtable) postrouting не проходят вовсе — у них маршрут уже запомнен, и снятие правила их не
+ * уводит. Оба семейства одним правилом: у выхода без IPv6 правила IPv6 для метки нет, и такой пакет
+ * (сокет туннеля поверх выхода без IPv6) раньше уходил в WAN — теперь отбрасывается, как обещает
+ * «лучше не работает заметно, чем работает не туда». Пересылаемый IPv6 такого выхода отвергает ещё
+ * forward_v6 выше, раньше и с ответом клиенту.
+ *
+ * Старая раскладка (legacy.c) цепочку не трогает: filter на postrouting в inet есть и на 4.9, и в
+ * ней нет ни nat, ни notrack. Счётчик на правиле — чтобы diag и человек видели, что пакеты
+ * отбрасывались. */
+static size_t guard_devs(const struct spec *sp, const struct output *o, const char **devs,
+                         size_t n, size_t max, int depth) {
+    if (depth > MAX_OUTPUTS) return n;
+    const struct output *m[MAX_MEMBERS];
+    if (out_group(o)) {
+        size_t mn = out_members(sp, o, m, MAX_MEMBERS);
+        for (size_t k = 0; k < mn; k++) n = guard_devs(sp, m[k], devs, n, max, depth + 1);
+        return n;
+    }
+    if (!o->device[0]) return n;
+    for (size_t k = 0; k < n; k++) if (!strcmp(devs[k], o->device)) return n;
+    if (n < max) devs[n++] = o->device;
+    return n;
+}
+
+/* Чьи метки вообще бывают на пакетах: выход правила, члены группы balance вглубь (их метку ставит
+ * цепочка mark_…, compile/balance.c) и цель подложки `over` (её метку несёт сокет туннеля, marks.h,
+ * out_underlay_mark). Правило guard — только им: у выхода, чью метку никто не ставит, правило ничего
+ * не ловило бы, а у спеки v2, переведённой из v1, лишние правила членов пула (у v1 они безымянны и
+ * без меток) разошлись бы с набором правил v1 (стенд v2match). Замер группы latency через члена
+ * (urltest, SO_MARK члена) сюда не входит по той же причине: у v1 он идёт SO_BINDTODEVICE. */
+static void guard_use(const struct spec *sp, const struct output *o, unsigned char *used,
+                      int depth) {
+    if (!o || depth > MAX_OUTPUTS) return;
+    size_t i = (size_t)(o - sp->out);
+    if (i >= sp->out_n || used[i]) return;
+    used[i] = 1;
+    if (!out_balanced(o)) return;
+    const struct output *m[MAX_MEMBERS];
+    size_t mn = out_members(sp, o, m, MAX_MEMBERS);
+    for (size_t k = 0; k < mn; k++) guard_use(sp, m[k], used, depth + 1);
+}
+
+static void build_guard(struct nft_table *t, const struct spec *sp, const struct groups *gr) {
+    unsigned char used[MAX_OUTPUTS + MAX_ANON];
+    if (sp->out_n > sizeof(used)) return;
+    memset(used, 0, sizeof(used));
+    for (size_t i = 0; i < gr->n; i++) guard_use(sp, out_by_name(sp, gr->g[i].out), used, 0);
+    for (size_t i = 0; i < sp->out_n; i++)
+        if (sp->out[i].over[0]) guard_use(sp, out_over(sp, &sp->out[i]), used, 0);
+    struct nft_chain *c = NULL;
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct output *o = &sp->out[i];
+        if (!used[i] || !out_has_device(o) || !o->mark || !o->table) continue;
+        const char *devs[MAX_OUTPUTS * MAX_MEMBERS];
+        size_t nd = guard_devs(sp, o, devs, 0, sizeof(devs) / sizeof(devs[0]), 0);
+        if (!nd) continue;
+        if (!c) {
+            c = ir_base_chain_add(t, "postrouting_guard", "filter", "postrouting", "filter", 0);
+            struct nft_rule *r = ir_rule(c);
+            ir_x(r, "meta mark and 0x%08x == 0x00000000", STEER_MARK_MASK);
+            ir_x(r, "return");
+            if (has_releasable(sp)) {
+                char m[40];
+                snprintf(m, sizeof(m), "meta mark and 0x%08x", STEER_MARK_MASK);
+                r = ir_rule(c);
+                ir_setref(r, m, FAILOPEN_SET);
+                ir_x(r, "return");
+            }
+        }
+        struct nft_rule *r = ir_rule(c);
+        ir_x(r, "meta mark and 0x%08x == 0x%08x", STEER_MARK_MASK, o->mark);
+        struct sbuf b = { .n = 0 };
+        if (nd == 1) sb_add(&b, "oifname != \"%s\"", devs[0]);
+        else {
+            sb_add(&b, "oifname != { ");
+            for (size_t k = 0; k < nd; k++) sb_add(&b, "%s\"%s\"", k ? ", " : "", devs[k]);
+            sb_add(&b, " }");
+        }
+        ir_x(r, "%s", b.s);
+        ir_counter(r, 0, 0);
+        ir_x(r, "drop");
+        ir_comment(r, "steer-guard:%s", o->name);
     }
 }
 
@@ -1534,6 +1688,7 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
     build_failopen(t, sp);
     build_postrouting_down(t, sp, gr);
     build_forward_v6(t, sp, gr);
+    build_guard(t, sp, gr);
     /* Построители видов (kind_ops.emit): по видам, в порядке реестра, поэтому все цепочки
      * zapret в тексте стоят раньше цепочки моста, в каком бы порядке выходы ни шли в спеке
      * (kind.c: kind_emit_all). */

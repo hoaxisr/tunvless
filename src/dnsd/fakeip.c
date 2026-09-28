@@ -89,6 +89,8 @@ static int fakeip_table_add(struct fakeip_table *t, const char *domain, uint32_t
     if (!t->entries[t->n].domain) return -1;
     t->entries[t->n].addr = addr;
     t->entries[t->n].real_host = 0;
+    t->entries[t->n].real_saved = 0;
+    t->entries[t->n].has_real6_saved = 0;
     t->entries[t->n].sets = 0;            /* unknown until the resolver routes it */
     t->entries[t->n].route_asserted = 0;
     t->entries[t->n].refreshed = 0;
@@ -175,12 +177,17 @@ void fakeip_state_load(const char *path) {
             char *tab3 = strchr(real_s, '\t');
             if (tab3) *tab3 = '\0';
             struct in_addr r;
+            /* И «в ядре» (real_host — до rehydrate, который подтвердит его или обнулит), и «знаем»
+             * (real_saved — до следующего ответа; неудачная запись в ядро его не трогает, см.
+             * struct fakeip_entry). */
             if (inet_aton(real_s, &r) != 0)
-                g_fakeip.entries[g_fakeip.n - 1].real_host = ntohl(r.s_addr);
+                g_fakeip.entries[g_fakeip.n - 1].real_host =
+                    g_fakeip.entries[g_fakeip.n - 1].real_saved = ntohl(r.s_addr);
             uint8_t r6[16];
             if (tab3 && inet_pton(AF_INET6, tab3 + 1, r6) == 1) {
                 memcpy(g_fakeip.entries[g_fakeip.n - 1].real6, r6, 16);
                 g_fakeip.entries[g_fakeip.n - 1].has_real6 = 1;
+                g_fakeip.entries[g_fakeip.n - 1].has_real6_saved = 1;
             }
         }
     }
@@ -217,13 +224,18 @@ void fakeip_state_rewrite(void) {
         struct in_addr fa; fa.s_addr = htonl(en->addr);
         char fstr[INET_ADDRSTRLEN];
         if (!inet_ntop(AF_INET, &fa, fstr, sizeof(fstr))) continue;
+        /* Пишется то, что ЗНАЕМ, а не только то, что стоит в ядре (struct fakeip_entry,
+         * real_saved): отказ ядра — не повод забыть адрес, по которому следующая замена набора
+         * правил засеет карту. */
         char rstr[INET_ADDRSTRLEN] = "";
-        if (en->real_host) {
-            struct in_addr ra; ra.s_addr = htonl(en->real_host);
+        uint32_t real = en->real_host ? en->real_host : en->real_saved;
+        if (real) {
+            struct in_addr ra; ra.s_addr = htonl(real);
             if (!inet_ntop(AF_INET, &ra, rstr, sizeof(rstr))) rstr[0] = '\0';
         }
         char r6str[INET6_ADDRSTRLEN] = "";
-        if (en->has_real6 && !inet_ntop(AF_INET6, en->real6, r6str, sizeof(r6str)))
+        if ((en->has_real6 || en->has_real6_saved) &&
+            !inet_ntop(AF_INET6, en->real6, r6str, sizeof(r6str)))
             r6str[0] = '\0';
         /* Строка без IPv6 — прежней формы до байта: файл, который пишет движок без IPv6 в
          * доменных правилах, не меняется. */
@@ -294,12 +306,23 @@ uint32_t fakeip_entry_get_real(const char *domain) {
     return at >= 0 ? g_fakeip.entries[at].real_host : 0;
 }
 
+uint32_t fakeip_entry_known_real(const char *domain) {
+    long at = fakeip_find(domain);
+    if (at < 0) return 0;
+    const struct fakeip_entry *e = &g_fakeip.entries[at];
+    return e->real_host ? e->real_host : e->real_saved;
+}
+
+/* Подмена встала (ack ядра): и «в ядре», и «знаем». Файл перезаписывается, только когда меняется
+ * то, что в нём лежит (fakeip_state_rewrite пишет «знаем»): подтверждение сохранённого адреса
+ * после отказа ядра — не новость для файла. */
 void fakeip_entry_set_real(const char *domain, uint32_t real_host) {
     long at = fakeip_find(domain);
     if (at < 0) return;
-    if (g_fakeip.entries[at].real_host == real_host) return;
-    g_fakeip.entries[at].real_host = real_host;
-    g_fakeip_dirty = 1;
+    struct fakeip_entry *e = &g_fakeip.entries[at];
+    uint32_t was = e->real_host ? e->real_host : e->real_saved;
+    e->real_host = e->real_saved = real_host;
+    if (was != real_host) g_fakeip_dirty = 1;
 }
 
 /* Половина IPv6: то же для карты fakeip6 — только после ack ядра (как real_host). */
@@ -308,14 +331,21 @@ const uint8_t *fakeip_entry_get_real6(const char *domain) {
     return at >= 0 && g_fakeip.entries[at].has_real6 ? g_fakeip.entries[at].real6 : NULL;
 }
 
+const uint8_t *fakeip_entry_known_real6(const char *domain) {
+    long at = fakeip_find(domain);
+    if (at < 0) return NULL;
+    const struct fakeip_entry *e = &g_fakeip.entries[at];
+    return e->has_real6 || e->has_real6_saved ? e->real6 : NULL;
+}
+
 void fakeip_entry_set_real6(const char *domain, const uint8_t real6[16]) {
     long at = fakeip_find(domain);
     if (at < 0) return;
     struct fakeip_entry *e = &g_fakeip.entries[at];
-    if (e->has_real6 && !memcmp(e->real6, real6, 16)) return;
+    int same = (e->has_real6 || e->has_real6_saved) && !memcmp(e->real6, real6, 16);
     memcpy(e->real6, real6, 16);
-    e->has_real6 = 1;
-    g_fakeip_dirty = 1;
+    e->has_real6 = e->has_real6_saved = 1;
+    if (!same) g_fakeip_dirty = 1;
 }
 
 /* Ensures DOMAIN's fake IP is a PERMANENT member of channel NEW_SET_IDX's nft set
@@ -576,7 +606,18 @@ static void route_reassert6(struct fakeip_entry *e, uint64_t want) {
  * поле в real_host безусловно, а неудача восстановления его не обнуляла — и при пустой
  * таблице ядра (netlink не открылся, таблица снесена) клиент получал fake-IP в чёрную дыру,
  * пока свежие домены честно шли наверх. Теперь несостоявшееся отображение обнуляет поле, и
- * такой домен идёт долгим путём — как обещает шапка файла про fail-open. */
+ * такой домен идёт долгим путём — как обещает шапка файла про fail-open.
+ *
+ * НО НАСТОЯЩИЙ АДРЕС ОТ ЭТОГО НЕ ЗАБЫВАЕТСЯ (проверка на QEMU 04664a5, docs/architecture.md,
+ * раздел 5). Обнулялся он раньше вместе с real_host — и резолвер, поднятый до набора правил
+ * (steer restart: таблицы ещё нет, ENOENT), забывал настоящие адреса всех имён; первая же
+ * перезапись файла (новое имя, новый ответ) писала их без адреса, и следующая замена набора
+ * правил засевала карту без них: клиент с поддельным адресом в кэше DNS упирался в «без подмены —
+ * никуда» (17 из 38 запросов на стенде QEMU). Теперь отказ ядра гасит только «стоит в ядре»
+ * (real_host, has_real6), а «знаем» (real_saved, has_real6_saved) остаётся: файл пишет его, а
+ * подмену ставит этот же проход, как только таблица появится, — его зовут и после каждой новой
+ * таблицы (reassert после загрузки набора правил демоном, SIGHUP без демона). Ставится именно
+ * «знаем»: в ядре после замены набора лежит засев из файла — то же значение, и ответ ядра EEXIST. */
 /* ПОРЯДОК В ЗАПИСИ — СНАЧАЛА НАБОРЫ КАНАЛОВ, ПОТОМ КАРТА. Подмена без метки — это утечка: пакет
  * клиента с поддельным адресом в кэше разворачивается картой в настоящий адрес и, не найдя себя в
  * наборе канала, уходит по таблице main в WAN (перепроверка на QEMU, 2026-09-28,
@@ -602,14 +643,20 @@ size_t fakeip_rehydrate(int nk_open, size_t *routed_out) {
             if (m || e->sets) route_reassert(e, m);
             if (m) routed++;
         }
-        if (e->real_host) {
+        uint32_t want = e->real_host ? e->real_host : e->real_saved;
+        if (want) {
             /* known_real = 0: after a restart the kernel map is empty as far as we know, so
-             * this is a plain add (and an EEXIST just means the map survived). */
-            if (nk_open == 0 && nft_map_set_element(g_fakeip_map, e->addr, e->real_host, 0) == 0)
+             * this is a plain add (and an EEXIST just means the map survived). Отказ гасит только
+             * «стоит в ядре»; real_saved остаётся (см. выше). */
+            if (nk_open == 0 && nft_map_set_element(g_fakeip_map, e->addr, want, 0) == 0) {
+                e->real_host = e->real_saved = want;
                 restored++;
-            else
+            } else {
+                e->real_saved = want;
                 e->real_host = 0;
+            }
         }
+        if (e->has_real6) e->has_real6_saved = 1;
         if (nk_open != 0) {
             e->has_real6 = 0;
             continue;
@@ -619,14 +666,16 @@ size_t fakeip_rehydrate(int nk_open, size_t *routed_out) {
          * прежние элементы IPv6 снимаются — на AAAA такого имени адресом больше не отвечают.
          * Настоящий IPv6 остаётся у записи, только если ядро приняло элемент карты fakeip6; иначе
          * быстрый путь AAAA закрыт до нового ответа, и элементы IPv6 снимаются тоже. */
-        uint64_t m6 = e->has_real6 && m && dch_all_v6(all) ? m : 0;
+        uint64_t m6 = e->has_real6_saved && m && dch_all_v6(all) ? m : 0;
         if (m6 || e->sets6) route_reassert6(e, m6);
-        if (e->has_real6) {
+        if (e->has_real6_saved) {
             uint8_t f6[16];
             fakeip6_of(e->addr, f6);
             if (nft_map_set_element6(g_fakeip6_map, f6, e->real6, NULL) != 0) {
-                e->has_real6 = 0;
+                e->has_real6 = 0;             /* «знаем» (has_real6_saved) остаётся */
                 if (e->sets6) route_reassert6(e, 0);
+            } else {
+                e->has_real6 = 1;
             }
         }
     }

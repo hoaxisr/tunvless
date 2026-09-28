@@ -360,6 +360,28 @@ int rtnl_rule_from(int add, struct in_addr src, int table, int prio) {
     return rtnl_talk(buf, msg_end(&b, nh), NULL, NULL);
 }
 
+int rtnl_rule_fwmark(int fam, uint32_t mark, uint32_t mask, int table, int prio) {
+    uint8_t buf[128];
+    struct nlbuf b;
+    struct fib_rule_hdr fr;
+    memset(&fr, 0, sizeof(fr));
+    fr.family = fam == 6 ? AF_INET6 : AF_INET;
+    fr.action = FR_ACT_TO_TBL;
+    fr.table = table < 256 ? (uint8_t)table : RT_TABLE_UNSPEC;
+    /* NLM_F_EXCL — как у `ip rule add`: ядро тогда отвечает EEXIST на точную копию, и вторая
+     * одинаковая не появляется. Без приоритета ядро выбирает его само — тем же правилом, что и
+     * для `ip rule add` без pref. */
+    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_NEWRULE,
+                                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                                    &fr, sizeof(fr));
+    nlbuf_put_u32(&b, FRA_FWMARK, mark);
+    nlbuf_put_u32(&b, FRA_FWMASK, mask);
+    nlbuf_put_u32(&b, FRA_TABLE, (uint32_t)table);
+    if (prio > 0) nlbuf_put_u32(&b, FRA_PRIORITY, (uint32_t)prio);
+    int rc = rtnl_talk(buf, msg_end(&b, nh), NULL, NULL);
+    return rc == EEXIST ? 0 : rc;
+}
+
 int rtnl_route_default_dev(int table, int ifindex) {
     uint8_t buf[128];
     struct nlbuf b;

@@ -51,7 +51,11 @@ check "метка пишется в биты 22-27, без бита zapret" "1" 
 check "  и у v6-двойника — та же" "1" \
     "$(printf '%s\n' "$out" | grep 'meta mark set mark and 0xf03fffff or 0x00400000' | grep -c 'ip6 daddr')"
 check "бита zapret 0x40000000 нет нигде" "0" "$(printf '%s\n' "$out" | grep -ci '0x4[0-9a-f]\{7\}')"
-check "набора и цепочки failopen нет" "0" "$(printf '%s\n' "$out" | grep -c 'failopen')"
+# Цепочки снятия бита zapret нет (бита нет); набор failopen есть — его читает postrouting_guard
+# (выход с on_fail=direct, упав, законно уходит в сеть телефона мимо своего устройства).
+check "цепочки prerouting_failopen нет" "0" "$(printf '%s\n' "$out" | grep -c 'prerouting_failopen')"
+check "  набор failopen есть, и guard его пропускает" "1 1" \
+    "$(printf '%s\n' "$out" | grep -c 'set failopen {') $(printf '%s\n' "$out" | grep -c 'meta mark and 0x0fc00000 @failopen return')"
 check "роутерного поля нет нигде" "0" "$(printf '%s\n' "$out" | grep -c '0x0ff00000\|0xf00fffff')"
 
 help="$("$BIN" help apply 2>&1)"
