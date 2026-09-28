@@ -170,3 +170,43 @@ int nft_concat_ok(void) {
              "}\n", nft_table());
     return cached = nft_check_text(text) == 1;
 }
+
+/* Цепочка inet ingress (разметка каналов, compile/generate.c, «разметка на ingress»): примет ли
+ * её ядро. Хук ingress в семействе inet — Linux 5.10 (и nftables 0.9.7, иначе отказ разбора), и
+ * нужен ещё CONFIG_NETFILTER_INGRESS; номер версии здесь, как и у notrack, не ответ — ответ даёт
+ * ядро. Проба — на lo: цепочка ingress ставится только на существующее устройство (иначе ядро
+ * отвергает всю транзакцию, «No such file or directory»), а lo есть в любом сетевом
+ * пространстве. Не смогли спросить (нет nft, нет прав) — «нет»: без ingress движок работает так,
+ * как работал до него, и это безопасный ответ на незнание.
+ *
+ * Старая раскладка — «нет» без пробы: 4.9 хука ingress в inet не знает. */
+static int ingress_env(void) {
+    const char *o = getenv("STEER_NFT_INGRESS");
+    if (!o) return -1;
+    if (!strcmp(o, "0")) return 0;
+    if (!strcmp(o, "1")) return 1;
+    if (!strcmp(o, "all")) return 2;
+    return -1;
+}
+
+int nft_ingress_all_devs(void) {
+    return ingress_env() == 2;
+}
+
+int nft_ingress_ok(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    int o = ingress_env();
+    if (o >= 0) return cached = o != 0;
+    if (nft_compat() & NFTC_LEGACY) return cached = 0;
+    const char *e = getenv("STEER_NFT_COMPAT");
+    if (e && !strcmp(e, "modern")) return cached = 1;
+    char text[512];
+    snprintf(text, sizeof(text),
+             "table inet %s_nprobe {\n"
+             "    chain c {\n"
+             "        type filter hook ingress device \"lo\" priority 10; policy accept;\n"
+             "    }\n"
+             "}\n", nft_table());
+    return cached = nft_check_text(text) == 1;
+}

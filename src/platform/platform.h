@@ -63,6 +63,13 @@ struct platform_ops {
     unsigned netifd : 1;              /* сторож оживляет интерфейс ifdown/ifup и procd */
     unsigned iptables_masq : 1;       /* masquerade выходов — правилом nat iptables движка */
     unsigned lan_bridge : 1;          /* раздача через мост Linux (diag про br_netfilter) */
+    /* Устройства раздачи (lan_devices) живут постоянно, а не появляются и исчезают по требованию.
+     * От этого зависит, вешать ли разметку каналов на хук ingress этих устройств (compile/
+     * generate.c, «разметка на ingress»): цепочка ingress привязана к устройству, исчезнувшее
+     * устройство ядро из неё вынимает, а с последним снимает и саму цепочку. Где устройства
+     * раздачи создаёт включение раздачи (телефон: rndis0, wlan1, ncm0), каждое включение и
+     * выключение меняло бы набор правил в ядре и звало бы его полную замену. */
+    unsigned lan_devs_persist : 1;
     unsigned warn_iptables_nat : 1;   /* старое ядро: предупреждать о живом nat iptables */
     unsigned dnsd_origdst : 1;        /* резолвер переспрашивает того, к кому шёл запрос (умолчание) */
     const char *ctl_allow_domain;     /* SELinux-домен клиента сокета; NULL — проверки нет */

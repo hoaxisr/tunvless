@@ -507,6 +507,13 @@ static void apply_prepare(const char *spec, struct spec *cfg, struct groups *gr,
      * dry-run'ом, и печатать ему надо то, что реально встанет на этом ядре. И до build_groups:
      * от неё зависит половина IPv6 доменных групп (fake-IP v6 — только где есть nat в ip6). */
     g_nftc = nftc >= 0 ? nftc : nft_compat();
+    /* Хук ingress (NFTC_INGRESS) — тем же разом, что раскладка, и ходит вместе с ней (--nftc):
+     * проба `nft -c` на каждый apply была бы процессом на каждое сохранение настройки. Где
+     * ingress не будет всё равно — телефон с устройствами раздачи по требованию, поле метки без
+     * места под «разобран на ingress» (мини-сборка tgws), — ядро не спрашивается вовсе. */
+    if (nftc < 0 && !(g_nftc & NFTC_LEGACY) && plat()->lan_devs_persist &&
+        steer_ingress_seen_ok() && nft_ingress_ok())
+        g_nftc |= NFTC_INGRESS;
     if (build_groups(cfg, gr, &e) < 0) err_die(&e);
     /* ДОМЕННЫЙ КАНАЛ В МИНИ-СБОРКЕ — ОТКАЗ, А НЕ ПРЕДУПРЕЖДЕНИЕ.
      *
