@@ -36,6 +36,11 @@
 # «без подмены» не отброшено ни одного пакета; по SIGHUP резолвер ставит подмену по сохранённым
 # адресам. Заодно: смена адреса у засеянного имени — одной транзакцией, а не EEXIST на засеве.
 #
+# C — лимит починок по сверке прохода (три за пять минут): три снятых правила канала — каждое
+# вернула сверка, четвёртое — отказ и одна строка в журнал на окно; мост пропал — расхождение
+# объяснимо и чинится мимо исчерпанного лимита; пять пересозданий моста подряд — цепочка ingress
+# каждый раз назад.
+#
 # Нужны root, unshare -nm, nsenter, ip, nft и python3. Чего-то нет — стенд пропускается вслух.
 set -u
 BIN="${STEER:-./build/steer}"
@@ -438,6 +443,60 @@ check "  SIGHUP (таблица появилась): резолвер стави
 kill "$DN" 2>/dev/null
 wait "$DN" 2>/dev/null
 "$BIN" down --state-dir "$tmp/bst" >/dev/null 2>&1
+
+# ---- C. лимит починок по сверке прохода ---------------------------------------------------------
+# На QEMU после четвёртого и шестого `network restart` за пять минут цепочка ingress не вернулась
+# (три починки за пять минут), и в журнале — ни строки. Проход — раз в 2 с.
+"$BIN" daemon --watch --watch-period 2 --apply --socket "$tmp/c.sock" $S >"$tmp/c.out" 2>"$tmp/c.err" &
+D=$!
+pids="$pids $D"
+wait_for 'grep -q "спека применена при старте" "$tmp/c.err"' 15
+wait_for 'grep -q "^wg t0 " "$tmp/st/active" 2>/dev/null' 15
+sleep 4
+chan_rules() { "$real_nft" list chain inet steer prerouting_mark 2>/dev/null | grep -c 'comment "steer:'; }
+del_chan() {
+    h="$("$real_nft" -a list chain inet steer prerouting_mark | grep 'comment "steer:' | head -n 1 |
+         sed -n 's/.*# handle \([0-9]*\).*/\1/p')"
+    "$real_nft" delete rule inet steer prerouting_mark handle "$h"
+}
+R0="$(chan_rules)"
+ok=0
+for k in 1 2 3; do
+    del_chan
+    wait_for '[ "$(chan_rules)" = "$R0" ]' 10 && ok=$((ok + 1))
+    sleep 1
+done
+check "C1: три снятых правила канала — каждое вернула сверка прохода" "3" "$ok"
+del_chan
+wait_for 'grep -q "починок по сверке уже 3" "$tmp/c.err"' 10
+check "  четвёртое — отказ по лимиту, строка в журнале" "1" "$(grep -c 'починок по сверке уже 3' "$tmp/c.err")"
+sleep 6
+check "  строка одна на окно, правило не вернулось" "1 $((R0 - 1))" \
+    "$(grep -c 'починок по сверке уже 3' "$tmp/c.err") $(chan_rules)"
+# Мост снят и не вернулся: расхождение (цепочку сняло ядро) находит проход — оно объяснимо
+# пропажей устройства раздачи и идёт мимо исчерпанного лимита.
+"$real_ip" link del br0
+wait_for 'grep -q "после пересоздания устройства раздачи" "$tmp/c.err"' 10
+check "C2: мост пропал — сверка прохода мимо лимита (расхождение объяснимо)" "yes" \
+    "$(grep -q 'после пересоздания устройства раздачи' "$tmp/c.err" && echo yes || echo no)"
+mkbr
+wait_for '[ "$(ing_on_br0)" = yes ]' 5
+check "  мост вернулся — цепочка ingress на месте" "yes" "$(ing_on_br0)"
+sleep 2
+n0="$(grep -c 'устройство раздачи появилось заново' "$tmp/c.err")"
+ok=0
+for k in 1 2 3 4 5; do
+    "$real_ip" link del br0
+    mkbr
+    wait_for '[ "$(ing_on_br0)" = yes ]' 5 && ok=$((ok + 1))
+    sleep 1
+done
+check "C3: пять пересозданий моста подряд при исчерпанном лимите — цепочка каждый раз назад" "5" "$ok"
+check "  сверок по новому устройству раздачи — пять" "5" \
+    "$(($(grep -c 'устройство раздачи появилось заново' "$tmp/c.err") - n0))"
+kill "$D" 2>/dev/null
+wait "$D" 2>/dev/null
+"$BIN" down --state-dir "$tmp/st" >/dev/null 2>&1
 
 echo "netrestart: $pass ok, $fail fail"
 [ "$fail" = 0 ]
