@@ -32,6 +32,7 @@
 #include "helpers.h"
 #include "failover_int.h"
 #include "fogroup.h"
+#include "recon.h"
 
 static void iptables_masq_drop_all(void);   /* ниже, у apply_routing */
 /* ---- apply ---------------------------------------------------------------- */
@@ -891,6 +892,8 @@ static int name_in_list(const char *list, const char *name) {
  * плану (recon.c).
  *   --ruleset  набор правил одной транзакцией, со счётчиками из ядра — тем же ruleset_load, что у
  *              подкоманды; отказ ядра — код 1, прежняя таблица стоит, остальное не трогается;
+ *              принят — строка `recon-kernel НОМЕР ОТПЕЧАТОК` в stdout (ожидаемое сверки демона
+ *              с ядром, снятое сразу после nft -f, — recon_kernel_print);
  *   --route    привязать таблицы и правила этих выходов (apply_routing_one);
  *   --drop     снять правило и таблицу меток, которых больше не несёт ни один выход (как
  *              cleanup_stale_routing);
@@ -914,6 +917,10 @@ int cmd_apply_commit(int argc, char **argv) {
     if (a.ruleset) {
         counters_load();
         if (ruleset_load(&cfg, &gr) != 0) return 1;
+        /* Ожидаемое для сверки демона с ядром — сразу после nft -f, до привязки выходов: правка
+         * таблицы снаружи за те секунды, что идёт остальное, иначе вошла бы в ожидаемое (шапка
+         * recon.c, «СВЕРКА С ЯДРОМ»). Строка — в stdout; демон вырезает её из ответа. */
+        recon_kernel_print(stdout);
     }
     /* Устройства kind=awg — до привязки таблиц, как у подкоманды. */
     if (a.awg) awg_apply_all(&cfg);
