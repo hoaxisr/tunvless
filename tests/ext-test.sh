@@ -211,12 +211,15 @@ echo "ext-test: собираю и прогоняю spokematch (ASan: ${ASAN:-н�
 # xslink.c в списке ОБЯЗАТЕЛЕН: командная строка клиента принимает и ссылку xs://, и файл
 # одним xs_conf_load_any, и живёт эта функция там. Без неё сборка стенда падает на компоновке,
 # то есть весь ext-test не доходит даже до первой проверки — а именно в нём и живёт ASan.
+# ctlcall.c — по той же причине: `steer xsteer-peers` под демоном отдаёт запрос в сокет
+# (cmd_xsteer_peers → ctlcall_forward), и с тех пор, как xsclient.c зовёт его, стенд без этого
+# файла не компоновался — ext-test падал здесь, не дойдя ни до одной проверки.
 $CC -O1 -g -w $STEER_INC $ASAN $MBED_INC "$PRIV" -o "$BUILD/spokematch" \
 	tests/spokematch.c \
 	src/proto/xsteer/xsconn.c src/proto/xsteer/xswire.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xsroute.c \
 	src/proto/xsteer/xsconf.c src/proto/xsteer/xslink.c src/proto/xsteer/xsstream.c src/proto/xsteer/xshake.c src/proto/tls/chello.c \
 	src/proto/tls/reality.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c src/tunnel/tun.c src/proto/obfs/obfs.c \
-	src/lib/jsonw.c src/lib/evline.c \
+	src/lib/jsonw.c src/lib/evline.c src/lib/ctlcall.c \
 	$MODEL_SRC $KINDS_SRC $MBED_LIB -lpthread
 "$BUILD/spokematch"
 
