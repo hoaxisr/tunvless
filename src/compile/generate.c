@@ -913,6 +913,7 @@ static void build_dns_redirect(struct nft_table *t, const struct spec *sp) {
  * (Tailscale, ZeroTier): 198.18.0.0/15 уходит в туннель, только если роутер
  * объявил этот диапазон маршрутом, и по умолчанию он его не объявляет. Из
  * локальной сети вопрос не встаёт вовсе — там роутер и есть шлюз. */
+static void fakeip_nomap_drop(struct nft_chain *c, int v6, const char *comment);
 static void build_fakeip(struct nft_table *t, int v6) {
     struct nft_set *m = ir_map_add(t, "fakeip", "ipv4_addr", "ipv4_addr");
     ir_gap(m);
@@ -934,12 +935,59 @@ static void build_fakeip(struct nft_table *t, int v6) {
     ir_x(r, "ip daddr 198.18.0.0/15");
     ir_counter(r, 0, 0);
     ir_dnat(r, "ip daddr", "fakeip");
+    if (v6) {
+        r = ir_rule(c);
+        ir_rule_fam(r, 6);
+        ir_x(r, "ip6 daddr " FAKEIP6_NET);
+        ir_counter(r, 0, 0);
+        ir_dnat(r, "ip6 daddr", "fakeip6");
+    }
+    fakeip_nomap_drop(c, v6, "steer-fakeip-nomap");
+}
+
+/* ПОДДЕЛЬНЫЙ АДРЕС БЕЗ ПОДМЕНЫ — НИКУДА. Правило за dnat в той же цепочке nat: dnat по карте, не
+ * нашедший в ней адреса, не срабатывает (поиск в карте не совпал — правило не совпало), и пакет
+ * идёт дальше — сюда.
+ *
+ * ЗАЧЕМ. Пул 198.18.0.0/15 (и fdfe:dcba:9876::/96) настоящим назначением не бывает (RFC 2544,
+ * ULA): пакет к нему без подмены никуда не доедет, но по пути уйдёт — по таблице main в WAN (без
+ * метки) или в туннель выхода (с меткой), унося наружу адрес, которого там никто не знает. А
+ * бывает такой пакет ровно в промежутках, которые и закрывались перепроверкой на QEMU
+ * (2026-09-28): подмены для адреса ещё нет — засев карты не собрался (apply.c, seed_begin), адрес
+ * выдан резолвером в миг замены таблицы и в новом тексте его нет, запись файла состояния без
+ * настоящего адреса, — и резолвер вернёт подмену вместе с меткой, когда к нему дойдёт таблица.
+ * До того соединение ждёт (повтор SYN через секунду находит уже и подмену, и метку), а не уходит
+ * мимо выхода. Это и есть страховка fail-closed для fake-IP: подмена в ядре появляется только
+ * вместе с решением о маршруте (засев карты и наборов — одним текстом, fpseed.c; резолвер ставит
+ * подмену и сразу набор), а всё, что подмены не нашло, отсюда не выходит.
+ *
+ * ПОЧЕМУ НЕ ПО МЕТКЕ. Проверка «адрес назначения был поддельным, а метки канала нет — не пускать в
+ * WAN» отрезала бы законные пути: канал fake-IP в выход без метки (direct), клиент вне «кто»
+ * канала (правило на телевизор, а поддельный адрес получил и ноутбук — резолвер отвечает по имени,
+ * не по клиенту), трафик вне сужения составного канала (канал — udp 50000-65535, а TCP 443 к тому
+ * же имени идёт напрямую), приложение телефона вне канала (nft_emit_output_dns). Все они — «подмена
+ * есть, метки нет» по замыслу, и напрямую они уходят законно. Отличить от них утечку по метке
+ * нельзя; утечку закрывает то, что подмена не появляется раньше решения о маршруте.
+ *
+ * ПОЧЕМУ ЗДЕСЬ. Цепочка nat видит только первый пакет соединения — правило ничего не стоит
+ * остальному трафику, — и стоит там же, где решается подмена, поэтому не зависит от того, где и
+ * когда ставится метка (цепочка разметки, хук ingress): метку оно не читает вовсе. В старой
+ * раскладке оно уезжает вместе с dnat в таблицы ip и ip6 (legacy.c, шаг 4) — ссылок на наборы
+ * inet у него нет. Счётчик — чтобы diag и человек видели, что такие пакеты были. */
+static void fakeip_nomap_drop(struct nft_chain *c, int v6, const char *comment) {
+    struct nft_rule *r = ir_rule(c);
+    ir_rule_fam(r, 4);
+    ir_x(r, "ip daddr 198.18.0.0/15");
+    ir_counter(r, 0, 0);
+    ir_x(r, "drop");
+    ir_comment(r, "%s", comment);
     if (!v6) return;
     r = ir_rule(c);
     ir_rule_fam(r, 6);
     ir_x(r, "ip6 daddr " FAKEIP6_NET);
     ir_counter(r, 0, 0);
-    ir_dnat(r, "ip6 daddr", "fakeip6");
+    ir_x(r, "drop");
+    ir_comment(r, "%s", comment);
 }
 
 /* Make traceroute show the REAL intermediate routers while the destination
@@ -1047,13 +1095,17 @@ void nft_emit_output_dns(struct nft_rs *rs, const struct spec *sp, const struct 
     ir_comment(r, "steer-fakeip-local");
     /* Поддельные IPv6 — тем же правилом по карте fakeip6 (только когда она есть; на старом ядре
      * без nat в ip6 её нет — dom6_ok). */
-    if (!has_fakeip6(gr)) return;
-    r = ir_rule(c);
-    ir_rule_fam(r, 6);
-    ir_x(r, "ip6 daddr " FAKEIP6_NET);
-    ir_counter(r, 0, 0);
-    ir_dnat(r, "ip6 daddr", "fakeip6");
-    ir_comment(r, "steer-fakeip-local");
+    int v6 = has_fakeip6(gr);
+    if (v6) {
+        r = ir_rule(c);
+        ir_rule_fam(r, 6);
+        ir_x(r, "ip6 daddr " FAKEIP6_NET);
+        ir_counter(r, 0, 0);
+        ir_dnat(r, "ip6 daddr", "fakeip6");
+        ir_comment(r, "steer-fakeip-local");
+    }
+    /* Поддельный адрес без подмены — и у приложений телефона никуда (fakeip_nomap_drop). */
+    fakeip_nomap_drop(c, v6, "steer-fakeip-local-nomap");
 }
 
 /* «Кто» у группы на сам телефон: владелец сокета. "self" — все приложения (UID от

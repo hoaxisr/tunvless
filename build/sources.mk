@@ -104,9 +104,13 @@ MODEL_SRC := $(PLATFORM_SRC) src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src
 # трогая DNSD_SRC вовсе.
 DNSD_TABLE_SRC := src/dnsd/table.c src/dnsd/tabfmt.c
 
+# dnsd/fpseed.c — засев наборов каналов fake-IP в тексте набора правил (src/dnsd/fpseed.h): код
+# резолвера, но зовёт его apply, а не резолвер, — поэтому он в любой сборке, где есть и apply, и
+# резолвер (то есть в DNSD_SRC, как и всё сопоставление имён).
 DNSD_SRC := src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c \
             src/dnsd/rules.c src/dnsd/wire.c src/dnsd/origdst.c src/dnsd/fakeip.c $(DNSD_TABLE_SRC) \
-            src/dnsd/dlog.c src/dnsd/realip.c src/dnsd/adopt.c src/dnsd/proxy.c src/dnsd/main.c
+            src/dnsd/dlog.c src/dnsd/realip.c src/dnsd/adopt.c src/dnsd/proxy.c src/dnsd/main.c \
+            src/dnsd/fpseed.c
 
 # Виды выхода (src/kinds, docs/architecture.md, раздел 2, правило 1): вид — это файл, и какие виды
 # есть в сборке, решает профиль. Реестр (kind.c) ссылается на записи видов слабо, поэтому вид,

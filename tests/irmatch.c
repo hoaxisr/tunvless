@@ -287,7 +287,11 @@ static void t_mixed_legacy(int nftc) {
     }
     check("dnat fakeip есть", 1, dnat_at >= 0);
     check("мост — после fakeip", 1, tg_at > dnat_at);
-    check("правил DNS в ip — только по подсети (2)", 2, i - 2);
+    /* Кроме DNS — dnat fakeip, правило «без подмены — drop» за ним (steer-fakeip-nomap,
+     * generate.c) и мост. */
+    check("правило без подмены — в той же цепочке", 1,
+          pn && ir_rule_find(pn, "steer-fakeip-nomap") != NULL);
+    check("правил DNS в ip — только по подсети (2)", 2, i - 3);
     struct nft_chain *pp = ir_chain_find(t4, "postrouting_nat");
     check("пустая postrouting_nat на srcnat + 1 = 101", 101, cprio(pp));
     check("и в ней ни одного правила", 0, (long)ir_rule_count(pp, NULL));
@@ -319,8 +323,9 @@ static void t_mixed_legacy(int nftc) {
         check("фрагмент IPv6 — frag frag-off >= 0", 1,
               nq && ir_rule_has(ir_rule_find(nq, NULL)->next, "frag frag-off >= 0"));
         struct nft_chain *p6 = ir_chain_find(t6, "prerouting_nat");
+        /* У карты fakeip6 в ip6 — два своих правила: dnat и «без подмены — drop». */
         check("в ip6 заворот DNS по устройству (udp, tcp)", 2,
-              (long)ir_rule_count(p6, NULL) - (ir_set_find(t6, "fakeip6") != NULL));
+              (long)ir_rule_count(p6, NULL) - 2 * (ir_set_find(t6, "fakeip6") != NULL));
         /* fake-IP v6: карта fakeip6 и её dnat переехали в ip6 вместе. */
         check("в ip6 — карта fakeip6", 1, ir_set_find(t6, "fakeip6") != NULL);
         check("и её нет в inet", 0, ir_set_find(in, "fakeip6") != NULL);
@@ -422,14 +427,17 @@ static void t_phone(int nftc) {
     if (!nftc) {
         struct nft_chain *od = ir_chain_find(in, "output_dns");
         check_str("заворот DNS приложений — nat output", "output", chook(od));
-        check("udp, tcp, fakeip и fakeip6", 4, (long)ir_rule_count(od, NULL));
+        /* И по правилу «без подмены — drop» на семейство (steer-fakeip-local-nomap, generate.c). */
+        check("udp, tcp, fakeip и fakeip6 (с правилами без подмены)", 6,
+              (long)ir_rule_count(od, NULL));
+        check("  правил без подмены — два", 2, (long)ir_rule_count(od, "steer-fakeip-local-nomap"));
         check("таблицы ip нет", 0, t4 != NULL);
     } else {
         struct nft_chain *rr = ir_chain_find(t4, "output_reroute");
         check_str("в ip — output_reroute типа route", "route", ctype(rr));
         check("на mangle + 2 = -148", -148, cprio(rr));
         struct nft_chain *on = ir_chain_find(t4, "output_nat");
-        check("output_nat в ip: udp, tcp и fakeip", 3, (long)ir_rule_count(on, NULL));
+        check("output_nat в ip: udp, tcp, fakeip и без подмены", 4, (long)ir_rule_count(on, NULL));
         check("output_dns в inet не осталось", 0, ir_chain_find(in, "output_dns") != NULL);
         /* ip6 — и без nat в ip6: IPv6 приложений метится (двойник), и бит перемаршрутизации на
          * нём снимает только цепочка route в ip6. nat там — только при NFTC_IP6NAT. */
@@ -437,8 +445,8 @@ static void t_phone(int nftc) {
         check("ip6 есть (перемаршрутизация IPv6)", 1, t6 != NULL);
         struct nft_chain *rr6 = ir_chain_find(t6, "output_reroute");
         check_str("в ip6 — output_reroute типа route", "route", ctype(rr6));
-        check("output_nat в ip6 — только при nat в ip6: udp, tcp и fakeip6",
-              nftc & NFTC_IP6NAT ? 3 : 0,
+        check("output_nat в ip6 — только при nat в ip6: udp, tcp, fakeip6 и без подмены",
+              nftc & NFTC_IP6NAT ? 4 : 0,
               (long)ir_rule_count(ir_chain_find(t6, "output_nat"), NULL));
         check("цепочек nat в ip6 без nat в ip6 нет", !!(nftc & NFTC_IP6NAT),
               ir_chain_find(t6, "prerouting_nat") != NULL);

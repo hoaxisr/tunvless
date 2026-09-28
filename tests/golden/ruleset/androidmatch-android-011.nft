@@ -58,6 +58,8 @@ table inet steer {
         type nat hook prerouting priority dstnat; policy accept;
         ip daddr 198.18.0.0/15 counter dnat ip to ip daddr map @fakeip
         ip6 daddr fdfe:dcba:9876::/96 counter dnat ip6 to ip6 daddr map @fakeip6
+        ip daddr 198.18.0.0/15 counter drop comment "steer-fakeip-nomap"
+        ip6 daddr fdfe:dcba:9876::/96 counter drop comment "steer-fakeip-nomap"
     }
     chain output_dns {
         type nat hook output priority dstnat; policy accept;
@@ -65,5 +67,7 @@ table inet steer {
         meta mark and 0x0fc00000 != 0x0fc00000 tcp dport 53 ct mark set mark counter redirect to :5300 comment "steer-dns-local-tcp"
         ip daddr 198.18.0.0/15 counter dnat ip to ip daddr map @fakeip comment "steer-fakeip-local"
         ip6 daddr fdfe:dcba:9876::/96 counter dnat ip6 to ip6 daddr map @fakeip6 comment "steer-fakeip-local"
+        ip daddr 198.18.0.0/15 counter drop comment "steer-fakeip-local-nomap"
+        ip6 daddr fdfe:dcba:9876::/96 counter drop comment "steer-fakeip-local-nomap"
     }
 }

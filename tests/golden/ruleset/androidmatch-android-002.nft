@@ -36,6 +36,7 @@ table ip steer {
         iifname "rndis0" udp dport 53 counter redirect to :5300
         iifname "rndis0" tcp dport 53 counter redirect to :5300
         ip daddr 198.18.0.0/15 counter dnat to ip daddr map @fakeip
+        ip daddr 198.18.0.0/15 counter drop comment "steer-fakeip-nomap"
     }
     chain postrouting_nat {
         type nat hook postrouting priority srcnat + 1; policy accept;
