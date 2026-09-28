@@ -15,6 +15,9 @@ SIM="${TGWSSIM:-./build/tgwssim}"
 pass=0 fail=0
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
+# Раскладка без ingress — явно, чтобы текст не зависел от машины (как в gen.sh); ingress — в
+# конце стенда.
+STEER_NFT_INGRESS=0; export STEER_NFT_INGRESS
 check() {
     if [ "$2" = "$3" ]; then
         pass=$((pass + 1))
@@ -97,6 +100,18 @@ old="$(STEER_NFT_TABLE=stgws STEER_MARK_ORDER=top \
 check "метка из чужого диапазона в реестре не берётся" "1" \
     "$(printf '%s\n' "$old" | grep -c 'or 0x50000000')"
 check "и в реестре заменяется своей" "tg 10000000 316" "$(grep '^tg ' "$tmp/st-old/registry")"
+
+# Разметка на ingress (compile/generate.c, «разметка на ingress») пишет в поле метки значение
+# «разобран, выхода нет». У мини-сборки поле — один бит, и места под него нет: оно совпало бы с
+# её единственной меткой (steer_ingress_seen_ok, marks.h). Её разметка остаётся на prerouting,
+# а полный движок рядом уходит на ingress.
+imini="$(STEER_NFT_INGRESS=all STEER_NFT_TABLE=stgws STEER_MARK_ORDER=top \
+         "$SIM" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-mini" 2>&1)"
+check "мини-сборка: разметка на ingress не ставится (в поле из бита нет места)" "0" \
+    "$(printf '%s\n' "$imini" | grep -c 'hook ingress')"
+check "  и текст — прежний" "$mini" "$imini"
+ifull="$(STEER_NFT_INGRESS=all "$STEER" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-full" 2>&1)"
+check "полный движок рядом — на ingress" "1" "$(printf '%s\n' "$ifull" | grep -c 'hook ingress device "br-lan"')"
 
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

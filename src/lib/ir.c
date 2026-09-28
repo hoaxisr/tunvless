@@ -200,6 +200,10 @@ struct nft_chain *ir_base_chain_add(struct nft_table *t, const char *name, const
     return c;
 }
 
+void ir_chain_devices(struct nft_chain *c, const char *text) {
+    if (c && c->o.table) c->devices = ir_strdup(c->o.table->rs, text);
+}
+
 void ir_gap(void *obj) {
     if (obj) ((struct nft_obj *)obj)->gap = 1;
 }

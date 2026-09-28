@@ -155,6 +155,9 @@ struct nft_chain {
     const char *hook;
     const char *prio_name;      /* «mangle», «dstnat»…; NULL — приоритет числом prio_off */
     int prio_off;
+    /* Устройства хука ingress — готовым текстом («device "br-lan"», «devices = { "a", "b" }»);
+     * NULL — хук без устройств (все, кроме ingress). */
+    const char *devices;
     const char *policy;
     struct nft_rule *rules, **rules_tail;
 };
@@ -197,6 +200,8 @@ void *ir_mem(struct nft_rs *rs, size_t n);
 struct nft_chain *ir_chain_add(struct nft_table *t, const char *name);
 struct nft_chain *ir_base_chain_add(struct nft_table *t, const char *name, const char *type,
                                     const char *hook, const char *prio_name, int prio_off);
+/* Устройства хука базовой цепочки (ingress) — текст копируется в арену. */
+void ir_chain_devices(struct nft_chain *c, const char *text);
 /* Пустая строка перед набором или цепочкой (obj — struct nft_set* или struct nft_chain*). */
 void ir_gap(void *obj);
 

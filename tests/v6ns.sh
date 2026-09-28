@@ -133,8 +133,18 @@ check "клиент: правило в выход без IPv6 — отвергн
     "$(ping6c 2001:db8:5::1)"
 check "  отказ — правилом forward_v6" "yes" \
     "$(nft list chain inet steer forward_v6 2>/dev/null | grep 'steer-v6drop:tg' | grep -q 'packets [1-9]' && echo yes || echo no)"
+# Правила каналов: на ядре с хуком inet ingress они стоят в ingress_mark на r0 (там и растут их
+# счётчики) и запасными — в prerouting_mark (compile/generate.c, «разметка на ingress»); без
+# него — только в prerouting_mark. Считаем по обеим цепочкам: объём канала — их сумма.
+marks() { nft list chain inet steer ingress_mark 2>/dev/null; nft list chain inet steer prerouting_mark; }
+ING=$(nft list chain inet steer ingress_mark >/dev/null 2>&1 && echo 1 || echo 0)
+echo "v6ns: разметка каналов — $([ "$ING" = 1 ] && echo 'на ingress' || echo 'в prerouting')"
 check "  счётчик правила IPv6 канала a растёт" "yes" \
-    "$(nft list chain inet steer prerouting_mark | grep 'ip6 daddr @wg_ip6' | grep -q 'packets [1-9]' && echo yes || echo no)"
+    "$(marks | grep 'ip6 daddr @wg_ip6' | grep -q 'packets [1-9]' && echo yes || echo no)"
+if [ "$ING" = 1 ]; then
+    check "  разметка — на ingress r0: запасные правила prerouting пакетов канала a не видели" "0" \
+        "$(nft list chain inet steer prerouting_mark | grep 'comment "steer:wg_ip"' | grep -c 'packets [1-9]')"
+fi
 
 check "клиент: адрес списка, известный только провайдеру, напрямую не ушёл" "нет" \
     "$(ping6c 2001:db8:1::77)"
@@ -142,7 +152,7 @@ check "клиент: адрес списка, известный только п
 # Счётчик канала — одно число: сумма правила IPv4 и его v6-двойника (одно имя в комментарии,
 # counters_load складывает), и через apply он переносится.
 pk_nft() {
-    nft list chain inet steer prerouting_mark | grep 'comment "steer:wg_ip"' |
+    marks | grep 'comment "steer:wg_ip"' |
         sed -n 's/.*counter packets \([0-9]*\).*/\1/p' | awk '{ s += $1 } END { print s + 0 }'
 }
 pk_status() {

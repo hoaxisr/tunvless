@@ -87,7 +87,10 @@ static const struct cli_cmd CMDS[] = {
  "либо весь набор каналов, либо ничего. Правила живут в своей таблице inet steer,\n"
  "поэтому перезагрузка fw4 их не трогает, а удаление сводится к удалению таблицы.\n"
  "На ядре без nat в inet (Linux до 5.2) nat уезжает в таблицы ip steer и ip6 steer —\n"
- "это решает проба ядра, а STEER_NFT_COMPAT=modern|legacy|legacy-min задаёт выбор явно.",
+ "это решает проба ядра, а STEER_NFT_COMPAT=modern|legacy|legacy-min задаёт выбор явно.\n"
+ "Каналы раздачи размечаются на хуке ingress её устройств (Linux 5.10 и новее; только на\n"
+ "устройствах, которые есть при apply), метка соединения — в prerouting; без ingress вся\n"
+ "разметка в prerouting. STEER_NFT_INGRESS=0 — разметка только в prerouting.",
  "--spec --state-dir --dry-run", 0, 0, 0, 0, 0},
 
 {"failover", "Маршрутизация", "",

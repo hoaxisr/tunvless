@@ -220,5 +220,12 @@ if [ -x "$ROUTER" ]; then
     check "роутерная сборка: каналы на себя — отказ" "2" "$?"
 fi
 
+# Разметка раздачи на ingress (compile/generate.c, «разметка на ingress») на телефоне не ставится:
+# устройства раздачи появляются с включением раздачи (lan_devs_persist = 0). Даже когда ядро
+# «принимает» inet ingress и устройство «есть» (STEER_NFT_INGRESS=all), текст — прежний.
+ing="$(STEER_NFT_INGRESS=all STEER_NFT_COMPAT=modern "$BIN" apply --dry-run $S 2>/dev/null)"
+check "раздача на телефоне — без ingress" "0" "$(printf '%s\n' "$ing" | grep -c 'hook ingress')"
+check "  и текст тот же, что без него" "$out" "$ing"
+
 printf '\nandroidmatch: %s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
