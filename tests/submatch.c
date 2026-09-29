@@ -188,9 +188,11 @@ int main(void) {
                                 "&flow=xtls-rprx-vision#x", &n));
         check("и имя у него пустое", "", n.sni);
 
-        check_n("транспорт ws: пропущен",
-                1, vless_parse_url("vless://u@h:443?security=none&type=ws#x", &n));
-        check("транспорт ws: причина названа", "транспорт ws не поддержан", n.skip_reason);
+        /* ws и httpupgrade поддержаны с шага 5 выпуска 1.10 (их случаи — ниже, «ws и
+         * httpupgrade»); неподдержанный транспорт теперь kcp. */
+        check_n("транспорт kcp: пропущен",
+                1, vless_parse_url("vless://u@h:443?security=none&type=kcp#x", &n));
+        check("транспорт kcp: причина названа", "транспорт kcp не поддержан", n.skip_reason);
 
         /* security опущен вовсе — это VLESS без TLS, он поддержан (см. sub.c). */
         check_n("security опущен: узел пригоден",
@@ -439,7 +441,7 @@ int main(void) {
             "vless://a@1.1.1.1:443?security=tls#Первый\n"
             "vless://b@2.2.2.2:443?security=tls#Второй\n"
             "vless://c@3.3.3.3:443?security=tls#Третий\n"
-            "vless://d@4.4.4.4:443?type=ws&security=none#Вебсокет\n"
+            "vless://d@4.4.4.4:443?type=kcp&security=none#Вебсокет\n"
             "vless://e@[2001:db8::1]:443?security=none#IPv6\n"
             "vless://f@6.6.6.6:443?security=reality&pbk=K&sni=x.com#Годный\n";
         size_t n = vless_parse_sub(sub, nodes, 16, &st);
@@ -459,9 +461,9 @@ int main(void) {
               st.reasons[0].reason);
         check_n("tls схлопнут в одну строку со счётчиком 3", 3, (long)st.reasons[0].count);
         check("tls: пример — имя первого узла", "Первый", st.reasons[0].example);
-        check("вторая причина: транспорт ws", "транспорт ws не поддержан",
+        check("вторая причина: транспорт kcp", "транспорт kcp не поддержан",
               st.reasons[1].reason);
-        check("ws: пример — имя своего узла", "Вебсокет", st.reasons[1].example);
+        check("kcp: пример — имя своего узла", "Вебсокет", st.reasons[1].example);
         /* IPv6-литерал разбор не осиливает и до проверки пригодности не доходит —
          * причину называет уже сам обход подписки, иначе ссылка снова стала бы
          * «пропущено на единицу больше» без объяснения. */
@@ -1055,6 +1057,71 @@ int main(void) {
             "\"users\":[{\"id\":\"u\"}]}]},\"streamSettings\":{\"network\":\"raw\"}}]}", nodes, 4, &st);
         check_n("network raw: узел пригоден", 1, (long)n);
         check("network raw читается как tcp", "tcp", n ? nodes[0].type : "");
+    }
+    /* ---- ws и httpupgrade (шаг 5 выпуска 1.10) --------------------------------- */
+    {
+        struct vless_node n;
+        check_n("ws по ссылке: пригоден", 0, vless_parse_url(
+            "vless://u@h:443?type=ws&security=tls&sni=s.example&path=%2Fws%3Fed%3D2048&host=cdn.example#w", &n));
+        check("ws: path раскодирован, ed оставлен (вырезает транспорт)", "/ws?ed=2048", n.path);
+        check("ws: host из ссылки", "cdn.example", n.http_host);
+        check_n("httpupgrade по ссылке: пригоден", 0,
+                vless_parse_url("vless://u@h:443?type=httpupgrade&path=/up#h", &n));
+        check("httpupgrade: тип", "httpupgrade", n.type);
+        /* Длинный путь целиком процентами: раскодируется ДО обрезки по полю. */
+        check_n("длинный путь процентами: пригоден", 0, vless_parse_url(
+            "vless://u@h:443?type=ws&path=%2F%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61"
+            "%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61#w", &n));
+        check("длинный путь процентами: раскодирован целиком",
+              "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", n.path);
+        check_n("ws с vision: пропущен", 1,
+                vless_parse_url("vless://u@h:443?type=ws&flow=xtls-rprx-vision#w", &n));
+        check("ws с vision: причина", "vision поверх ws не бывает", n.skip_reason);
+        check_n("ws с битым %XX в пути: пропущен", 1,
+                vless_parse_url("vless://u@h:443?type=ws&path=/a%25zz#w", &n));
+        check("ws с битым %XX: причина", "битый %XX в path", n.skip_reason);
+        check_n("httpupgrade с тем же путём: пригоден (Xray экранирует его целиком)", 0,
+                vless_parse_url("vless://u@h:443?type=httpupgrade&path=/a%25zz#w", &n));
+        check_n("host с пробелом: пропущен", 1,
+                vless_parse_url("vless://u@h:443?type=ws&host=a%20b#w", &n));
+        check("host с пробелом: причина", "негодный host у ws", n.skip_reason);
+        check_n("ws поверх reality: пригоден (security и транспорт независимы)", 0, vless_parse_url(
+            "vless://u@h:443?type=ws&security=reality&pbk=Zm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyMDA#w", &n));
+    }
+    {
+        struct vless_node nodes[4];
+        struct vless_sub_stats st;
+#define XO(stream) "{\"outbounds\":[{\"protocol\":\"vless\",\"settings\":{\"vnext\":[{\"address\":\"h\"," \
+                   "\"port\":443,\"users\":[{\"id\":\"u\"}]}]},\"streamSettings\":" stream "}]}"
+        size_t n = vless_parse_sub(XO("{\"wsSettings\":{\"path\":\"/w?ed=2048\",\"headers\":"
+            "{\"Host\":\"hdr.example\",\"X-A\":\"1\"}},\"xhttpSettings\":{\"path\":\"/x\"},\"network\":\"websocket\"}"),
+            nodes, 4, &st);
+        check_n("конфиг: network websocket — узел ws", 1, (long)n);
+        check("конфиг ws: тип", "ws", n ? nodes[0].type : "");
+        check("конфиг ws: путь из wsSettings, а не xhttpSettings", "/w?ed=2048", n ? nodes[0].path : "");
+        check("конфиг ws: Host из headers — в host (как Build у Xray)", "hdr.example", n ? nodes[0].http_host : "");
+        check("конфиг ws: прочие заголовки", "X-A: 1\n", n ? nodes[0].headers : "");
+        n = vless_parse_sub(XO("{\"network\":\"ws\",\"wsSettings\":{\"host\":\"h1\",\"headers\":{\"host\":\"h2\"}}}"),
+                            nodes, 4, &st);
+        check("конфиг ws: явный host главнее Host из headers", "h1", n ? nodes[0].http_host : "");
+        n = vless_parse_sub(XO("{\"network\":\"httpupgrade\",\"httpupgradeSettings\":{\"path\":\"/u\","
+                               "\"host\":\"c\",\"headers\":{\"x-b\":\"2\"}}}"), nodes, 4, &st);
+        check_n("конфиг httpupgrade: пригоден", 1, (long)n);
+        check("конфиг httpupgrade: путь", "/u", n ? nodes[0].path : "");
+        check("конфиг httpupgrade: заголовок — как написан", "x-b: 2\n", n ? nodes[0].headers : "");
+        n = vless_parse_sub(XO("{\"network\":\"httpupgrade\",\"httpupgradeSettings\":{\"headers\":{\"Host\":\"x\"}}}"),
+                            nodes, 4, &st);
+        check_n("конфиг httpupgrade с Host в headers: пропущен (Xray отвергает)", 0, (long)n);
+        check("его причина", "негодные headers у httpupgrade", st.reasons_n ? st.reasons[0].reason : "");
+        n = vless_parse_sub(XO("{\"network\":\"ws\",\"wsSettings\":{\"headers\":{\"Upgrade\":\"x\"}}}"),
+                            nodes, 4, &st);
+        check_n("конфиг ws с Upgrade в headers: пропущен", 0, (long)n);
+        n = vless_parse_sub(XO("{\"network\":\"ws\",\"wsSettings\":{\"headers\":{\"X\":1}}}"), nodes, 4, &st);
+        check_n("конфиг ws: заголовок не строкой — пропущен", 0, (long)n);
+        n = vless_parse_sub(XO("{\"network\":\"xhttp\",\"xhttpSettings\":{\"path\":\"/x\"},"
+                               "\"wsSettings\":{\"path\":\"/w\"}}"), nodes, 4, &st);
+        check("конфиг xhttp с чужим wsSettings: путь xhttp", "/x", n ? nodes[0].path : "");
+#undef XO
     }
     /* ---- ссылка: порт и границы имени --------------------------------------- */
     {

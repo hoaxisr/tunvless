@@ -170,15 +170,17 @@ XS_COMMON_SRC := src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/x
 # libsteer.so и бинарники модулей; пока все три входят в расширенный профиль целиком:
 #   STACK_SRC      стек TUN ↔ потоки TCP/UDP (tun.c — в XS_COMMON_SRC: на нём стоит и xsteer) —
 #                  в libsteer;
-#   TRANSPORT_SRC  транспорты до узла (сокет, security, tcp/grpc/xhttp) и корни проверки
-#                  сертификата — в libsteer, вместе с TLS;
+#   TRANSPORT_SRC  транспорты до узла (сокет, security, tcp/grpc/xhttp/ws/httpupgrade) и корни
+#                  проверки сертификата — в libsteer, вместе с TLS; trpath.c (путь запроса
+#                  Upgrade — чистые строки) зовёт и разбор подписки sub.c;
 #   VLESS_MOD_SRC  протокол: подкоманды vless*, дайлер, слежка за узлом, проверка узла,
 #                  заголовок и Vision — в бинарник модуля steer-vless.
 # sub.c (разбор подписки) — не в модуле: его зовёт и `steer-tools sub-fetch` (subfetch.c).
 STACK_SRC := src/tunnel/stack.c src/tunnel/rtx.c
 TRANSPORT_SRC := src/proto/transport/transport.c src/proto/transport/trdial.c \
                  src/proto/transport/trsec.c src/proto/transport/trgrpc.c \
-                 src/proto/transport/trxhttp.c src/proto/tls/roots.c
+                 src/proto/transport/trxhttp.c src/proto/transport/trupgrade.c \
+                 src/proto/transport/trws.c src/proto/transport/trpath.c src/proto/tls/roots.c
 VLESS_MOD_SRC := src/proto/vless/vlmain.c src/proto/vless/vldial.c src/proto/vless/vlwatch.c \
                  src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/vless/vision.c
 EXT_ROUTER_SRC := src/proto/vless/sub.c $(VLESS_MOD_SRC) $(STACK_SRC) $(TRANSPORT_SRC) \

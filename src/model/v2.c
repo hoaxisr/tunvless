@@ -764,8 +764,17 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         } else if (!strcmp(ks, "domain")) {
             if (str_of(x, v, w, &sv) || copy_to(x, v, w, sv, k.domain, sizeof(k.domain))) return -1;
         } else if (!strcmp(ks, "transport")) {
-            if (str_of(x, v, w, &sv)) return -1;
-            unsup(x, v, "%s — транспорты туннеля (ws, httpupgrade…), выпуск 1.10", w);
+            /* Какими транспортами узлов подписки ходить (фильтр, а не замена — довод у
+             * vless_cfg.transports в spec.h): одно имя или список. */
+            if (items_ok(x, v, w, TT_COUNT)) return -1;
+            if (!n_items(v)) return fail(x, v, "%s: пустой список — ни одного транспорта", w);
+            for (size_t i2 = 0; i2 < n_items(v); i2++) {
+                const struct ynode *it = item(v, i2);
+                unsigned b = tunnel_transport_bit(it->str);
+                if (!b) return fail(x, it, "%s: «%s» — нужен tcp, grpc, xhttp, ws или httpupgrade", w, it->str);
+                if (k.transports & b) return fail(x, it, "%s: %s указан дважды", w, it->str);
+                k.transports |= b;
+            }
         } else if (!strcmp(ks, "stream")) {
             if (bool_of(x, v, w, &k.stream)) return -1;
         } else if (!strcmp(ks, "stream_port")) {

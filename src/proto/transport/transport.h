@@ -4,8 +4,8 @@
  *
  *   сокет         TCP до узла по всем адресам имени, с меткой выхода-подложки (trdial.c);
  *   безопасность  поле security= ссылки узла: none, tls, reality (trsec.c, struct security_ops);
- *   транспорт     поле type= ссылки узла: tcp, grpc, xhttp — и на шаге 5 выпуска 1.10 ws и
- *                 httpupgrade (transport.c, trgrpc.c, trxhttp.c; struct transport_ops).
+ *   транспорт     поле type= ссылки узла: tcp, grpc, xhttp, ws, httpupgrade (transport.c,
+ *                 trgrpc.c, trxhttp.c, trws.c, trupgrade.c; struct transport_ops).
  *
  * ПОЧЕМУ ДВЕ ТАБЛИЦЫ, А НЕ ОДНА ЦЕПОЧКА «tcp → tls → grpc». В проекте раздела 2
  * docs/architecture.md все они перечислены одним списком transport_ops, но в ссылке узла это
@@ -45,19 +45,36 @@
  * «подключается и молчит». */
 #define TR_ENOH2     (-37)
 #define TR_EGRPC     (-38)   /* поток gRPC устроен не так, как мы умеем читать */
+/* ws и httpupgrade (trupgrade.c, trws.c). Отдельные коды, а не один «апгрейд не удался»: человеку
+ * здесь нужны РАЗНЫЕ действия. Ответ не 101 — это почти всегда не тот path или host (сервер Xray
+ * отвечает 404 на чужой путь), и код ответа называется в тексте; 101 без Upgrade или без верного
+ * Accept — ответил не сервер WebSocket, а посредник или кеш; не http/1.1 в ALPN — сервер за TLS
+ * выбрал другой протокол, а апгрейд идёт только по HTTP/1.1. */
+#define TR_ENOH1      (-39)  /* сервер согласовал в ALPN не http/1.1 */
+#define TR_EUPSTATUS  (-40)  /* на запрос Upgrade ответ не 101 (код — в тексте) */
+#define TR_ENOUPGRADE (-41)  /* 101 без Upgrade: websocket или Connection: upgrade */
+#define TR_EWSACCEPT  (-42)  /* 101 без верного Sec-WebSocket-Accept */
+#define TR_EUPTIMEOUT (-43)  /* ответа на запрос Upgrade нет за срок соединения */
+#define TR_EUPTOOBIG  (-44)  /* ответ на Upgrade не разобрался: длиннее предела или не HTTP */
+#define TR_EWSFRAME   (-45)  /* кадр WebSocket нарушает RFC 6455 */
 
 /* Узел глазами транспорта: только то, что касается связи. Указатели — в узел подписки
  * (struct vless_node), без копий: узел живёт дольше любого соединения к нему. */
 struct tr_node {
     const char *host;
     uint16_t port;
-    const char *type;          /* tcp | grpc | xhttp */
+    const char *type;          /* tcp | grpc | xhttp | ws | httpupgrade */
     const char *security;      /* none | tls | reality */
     const char *sni;           /* маскировочный домен — он же SNI в ClientHello */
     const char *fp;            /* отпечаток браузера */
     const char *pbk;           /* публичный ключ Reality, base64url */
     const char *sid;           /* short id Reality, hex */
-    const char *path;          /* xhttp */
+    const char *path;          /* xhttp, ws, httpupgrade; у ws/httpupgrade — с `?ed=` (trpath.h) */
+    /* ws и httpupgrade: заголовок Host (пусто — sni, затем адрес узла, как у Xray) и свои
+     * заголовки запроса строками «Имя: значение\n» (из конфига Xray в подписке, см. vless.h).
+     * NULL — то же, что пусто. */
+    const char *http_host;
+    const char *headers;
     const char *service;       /* grpc serviceName */
     const char *mode;          /* grpc: multi/gun; xhttp: auto/packet-up… */
     /* Длина набивки xhttp, объявленная узлом (см. vless_node.pad_from в vless.h). 0 в pad_to —
@@ -138,24 +155,65 @@ struct xh_state {
     uint16_t pad_from, pad_to;
 };
 
+/* Разбор кадров WebSocket от сервера (RFC 6455, раздел 5) — потоком, по кускам любой длины.
+ *
+ * Состояние, а не буфер, по той же причине, что у grpc_de: граница кадра не совпадает с границей
+ * записи TLS, и кадр в 64 КБ приезжает несколькими записями, а запись — несколькими кадрами.
+ * Полезная нагрузка кадров данных отдаётся сразу, по мере прихода; копится только заголовок
+ * кадра (до 14 байт) и тело служебного кадра (до 125 байт — предел RFC 6455, 5.5). */
+struct ws_rx {
+    unsigned char hdr[14];
+    uint8_t hdr_n;
+    uint8_t in_payload;        /* заголовок разобран, идёт тело кадра */
+    uint8_t op;                /* опкод текущего кадра */
+    uint8_t in_msg;            /* внутри сообщения, разрезанного на кадры (ждём продолжения) */
+    uint64_t left;             /* сколько байт тела текущего кадра ещё не пришло */
+    unsigned char ctl[125];    /* тело служебного кадра */
+    uint8_t ctl_n;
+    /* Пришёл ping — ответить pong с тем же телом. Ответ шлёт тот, кто читает (trws.c), после
+     * разбора куска: разбор чистый и в сеть не пишет, чтобы его можно было проверять в памяти.
+     * Два ping в одном куске дают один ответ на последний — это разрешает RFC 6455, 5.5.3. */
+    uint8_t pong_due;
+    uint8_t pong_n;
+    unsigned char pong[125];
+    uint8_t closed;            /* пришёл close: дальше данных не будет */
+    uint8_t close_sent;        /* ответный close уже отправлен */
+    uint16_t close_code;       /* код из close; 1005 — кода не было */
+};
+
+/* ws и httpupgrade: то, что остаётся после ответа 101.
+ *
+ * stash — байты, прочитанные вместе с ответом 101, но лежащие ЗА его заголовками: сервер вправе
+ * прислать данные сразу за ответом, и одна запись TLS (или одно чтение сокета) приносит их вместе.
+ * Выбросить их значило бы разъехаться с сервером на первые же байты потока — у httpupgrade это
+ * начало ответа VLESS, у ws — первый кадр. В куче и только когда они есть: это редкость, а
+ * буфер в каждом соединении стоил бы 16 КБ на каждое из сотен соединений пула. Кто прочитал, тот
+ * и освобождает (h1_stash_take); остаток до чтения освобождает transport_close. */
+struct h1_state {
+    unsigned char *stash;
+    uint32_t stash_n, stash_off;
+    struct ws_rx rx;           /* только ws */
+};
+
 struct transport;
 
 /* Транспорт — поле type= ссылки: как поток протокола уложен внутри защищённой связи.
  *
- * Шаг 5 (ws и httpupgrade) — это ещё две такие таблицы и два файла рядом с trgrpc.c: запрос
- * Upgrade по HTTP/1.1 в open, кадры WebSocket в write/read (у httpupgrade кадров нет — после
- * ответа 101 поток идёт как есть), ALPN "http/1.1". Ни стек туннеля, ни дайлер при этом не
- * меняются: они видят транспорт только через transport_write и transport_read. */
+ * ws и httpupgrade (шаг 5 выпуска 1.10) — ещё две такие таблицы и два файла рядом с trgrpc.c:
+ * запрос Upgrade по HTTP/1.1 в open (trupgrade.c), кадры WebSocket в write/read (trws.c; у
+ * httpupgrade кадров нет — после ответа 101 поток идёт как есть), ALPN "http/1.1". Ни стек
+ * туннеля, ни дайлер при этом не поменялись: они видят транспорт только через transport_write и
+ * transport_read. */
 struct transport_ops {
-    const char *name;          /* как в ссылке узла: tcp, grpc, xhttp */
+    const char *name;          /* как в ссылке узла: tcp, grpc, xhttp, ws, httpupgrade */
     /* Что просить в ALPN, или NULL — тогда расширения нет вовсе. Hello без ALPN проверен на
      * живых узлах, и состав Hello — это то, по чему Reality отличает нас от постороннего:
      * добавлять расширение туда, где оно не нужно, значит менять проверенное ради ничего.
      * Если сервер согласовал ДРУГОЕ, соединение отвергается кодом TR_ENOH2. */
     const char *alpn;
     /* Данные протокола лежат в записях TLS как есть: чтение вправе отдать указатель внутрь
-     * расшифрованной записи вместо копии (transport_read_zc). Правда только у tcp — у grpc и
-     * xhttp между TLS и данными лежит HTTP/2, и он всё равно перекладывает тело кадра. */
+     * расшифрованной записи вместо копии (transport_read_zc). Правда у tcp и httpupgrade — у grpc
+     * и xhttp между TLS и данными лежит HTTP/2, у ws — кадры, и тело всё равно перекладывается. */
     int zc;
     /* Открыть транспорт поверх уже защищённой связи: HTTP/2, запросы, вторая связь. NULL —
      * открывать нечего (tcp). На отказе закрывать ничего не нужно: закроет transport_open. */
@@ -166,8 +224,14 @@ struct transport_ops {
     /* Структура переехала в памяти (запасная сессия стека → таблица соединений): поправить
      * указатели на саму себя. NULL — таких указателей у транспорта нет. */
     void (*moved)(struct transport *t);
-    /* Освободить своё сверх основной связи (вторую связь xhttp). NULL — нечего. */
+    /* Освободить своё сверх основной связи (вторую связь xhttp, остаток после 101). NULL —
+     * нечего. */
     void (*close)(struct transport *t);
+    /* Лежит ли у транспорта своё непрочитанное, о котором ни ядро, ни связь не знают: остаток
+     * после ответа 101, отложенный конец потока ws. Без этого цикл туннеля ушёл бы ждать
+     * готовности сокета, а данные остались бы лежать до следующего пакета от сервера — которого
+     * может и не быть, если сервер уже всё сказал (см. transport_has_data). NULL — такого нет. */
+    int  (*pending)(const struct transport *t);
 };
 
 /* Безопасность — поле security= ссылки. Различаются только рукопожатием (см. шапку). */
@@ -185,6 +249,7 @@ struct transport {
     struct h2 h2;              /* только для grpc и xhttp */
     struct grpc_de de;         /* только для grpc */
     struct xh_state xh;        /* только для xhttp */
+    struct h1_state h1;        /* только для ws и httpupgrade */
 };
 
 /* Полное установление: TCP, рукопожатие безопасности, открытие транспорта. 0 — готово; иначе
@@ -237,8 +302,58 @@ void transport_set_sock_mark(uint32_t mark, int required);
 
 /* ---- для файлов этого каталога ------------------------------------------------------ */
 
-extern const struct transport_ops tr_tcp, tr_grpc, tr_xhttp;
+extern const struct transport_ops tr_tcp, tr_grpc, tr_xhttp, tr_ws, tr_httpupgrade;
 extern const struct security_ops tr_sec_none, tr_sec_tls, tr_sec_reality;
+
+/* ---- ws и httpupgrade: общий запрос Upgrade (trupgrade.c) и кадры (trws.c) ------------- */
+
+/* Запрос Upgrade и ответ 101 по HTTP/1.1 — синхронно, в пределах timeout_s (открытие идёт в
+ * потоке установщика, а не в цикле туннеля). ws — 1 для WebSocket (со Sec-WebSocket-Key и
+ * проверкой Accept), 0 для httpupgrade. Остаток за ответом кладётся в t->h1.stash. */
+int tr_h1_upgrade(struct transport *t, const struct tr_node *n, int ws, int timeout_s);
+
+/* Собрать запрос Upgrade в out — без сети, для открытия и для стенда (tests/wsmatch.c). key —
+ * Sec-WebSocket-Key у ws, NULL у httpupgrade. Длина запроса либо 0: не влез или путь негоден. */
+size_t tr_h1_request(const struct tr_node *n, int ws, const char *key, char *out, size_t cap);
+
+/* Ответ на запрос Upgrade — потоком, по кускам как угодно разрезанного входа. */
+struct h1_resp {
+    int done;                  /* заголовки ответа кончились */
+    int status;                /* код ответа, 0 — строки статуса ещё не было */
+    uint8_t up_ok, conn_ok, acc_ok;
+    uint8_t seen;              /* какие из трёх заголовков уже встречались */
+    uint8_t bad;               /* не HTTP вовсе или длиннее предела */
+    uint32_t total;            /* байт заголовков, для предела */
+    uint16_t line_n;
+    char line[256];            /* текущая строка; длиннее — обрезается (см. trupgrade.c) */
+};
+/* Скормить кусок; *used — сколько байт ушло на заголовки (остальное — уже поток за ними).
+ * accept — ожидаемый Sec-WebSocket-Accept у ws, NULL у httpupgrade. */
+void tr_h1_resp_feed(struct h1_resp *r, int ws, const char *accept,
+                     const unsigned char *in, size_t n, size_t *used);
+/* Итог разобранного ответа: 0 или код TR_* (TR_EUPSTATUS, TR_ENOUPGRADE, TR_EWSACCEPT). */
+int tr_h1_resp_verdict(const struct h1_resp *r, int ws);
+/* Код ответа последнего отказа TR_EUPSTATUS в этом потоке — для текста причины. */
+int tr_h1_last_status(void);
+/* Освободить остаток после 101 (t->h1.stash). */
+void tr_h1_free(struct transport *t);
+/* Случайные байты у ядра (ключ запроса ws, маска кадров). 0 или -1. */
+int tr_h1_random(unsigned char *out, size_t n);
+
+/* Sec-WebSocket-Accept для ключа (RFC 6455, 4.2.2): base64(SHA-1(ключ + GUID)), 28 знаков. */
+void tr_ws_accept(const char *key, char out[29]);
+
+/* Кадр клиента: заголовок, ключ маски и замаскированное тело (RFC 6455, 5.2–5.3). Клиент ОБЯЗАН
+ * маскировать каждый кадр, сервер обязан рвать соединение на незамаскированном. Длина кадра
+ * либо 0, если не влез в cap. */
+size_t tr_ws_frame(unsigned char *out, size_t cap, int opcode, int fin, const unsigned char key[4],
+                   const unsigned char *d, size_t n);
+
+/* Разобрать кусок кадров от сервера: тела кадров данных — в out (out вправе совпадать с in:
+ * разбор только сдвигает байты влево), служебные — в состояние (ping, close). Вход потребляется
+ * целиком. 0 или TR_EWSFRAME; H2_ETOOBIG — не влезло в out (вызывающий дал меньше входа). */
+int tr_ws_parse(struct ws_rx *r, const unsigned char *in, size_t n,
+                unsigned char *out, size_t cap, size_t *out_n);
 
 /* TCP до узла по всем адресам имени (trdial.c). Дескриптор либо отрицательный код TR_*. */
 int tr_dial(const char *host, uint16_t port, int timeout_s);

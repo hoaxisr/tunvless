@@ -79,7 +79,7 @@ $(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_DEFAULT_PLATFORM=android -o $@ $(CORE_SRC)
 
-test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool
+test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/snapshot.sh
@@ -122,6 +122,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@$(BUILD)/tgwsfailmatch
 	@$(BUILD)/h2match
 	@$(BUILD)/xhupmatch
+	@$(BUILD)/wsmatch
 	@$(BUILD)/submatch
 	@$(BUILD)/subfetchmatch
 	@$(BUILD)/fwmatch
@@ -394,12 +395,28 @@ $(BUILD)/h2match: tests/h2match.c src/proto/tls/h2.c src/proto/tls/h2.h src/prot
 # транспорта и h2.c настоящие и компонуются отдельно, TLS и Reality подменены — связь
 # выгрузки голая, на сокетной паре. Подробности — в шапке стенда.
 XHUPMATCH_SRC = src/proto/tls/h2.c src/proto/transport/transport.c src/proto/transport/trsec.c \
-                src/proto/transport/trdial.c src/proto/transport/trgrpc.c src/proto/tls/roots.c
+                src/proto/transport/trdial.c src/proto/transport/trgrpc.c src/proto/tls/roots.c \
+                src/proto/transport/trws.c src/proto/transport/trupgrade.c src/proto/transport/trpath.c
 $(BUILD)/xhupmatch: tests/xhupmatch.c src/proto/transport/trxhttp.c src/proto/transport/transport.h \
                     src/proto/tls/h2.h $(XHUPMATCH_SRC)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/xhupmatch.c \
 		$(XHUPMATCH_SRC) $(PLATFORM_SRC) -lpthread
+
+# Транспорты ws и httpupgrade (trws.c, trupgrade.c, trpath.c; шаг 5 выпуска 1.10): кадры WebSocket
+# в памяти, запрос Upgrade байт в байт против перехвата Xray, путь против net/url Go, ответ 101 и
+# отказы, остаток за ответом — на настоящем сокете с security=none и сервером-стендом в потоке.
+# Все ярусы транспорта компонуются настоящими, отдельными объектами (без #include .c), TLS и
+# Reality подменены заглушками в самом стенде. Поверх tls и reality с настоящей библиотекой —
+# vlessmatch в ext-test.
+WSMATCH_SRC = src/proto/transport/trws.c src/proto/transport/trupgrade.c src/proto/transport/trpath.c \
+              src/proto/transport/transport.c src/proto/transport/trsec.c src/proto/transport/trdial.c \
+              src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c src/proto/tls/h2.c \
+              src/proto/tls/roots.c
+$(BUILD)/wsmatch: tests/wsmatch.c src/proto/transport/transport.h src/proto/transport/trpath.h \
+                  src/proto/tls/h2.h $(WSMATCH_SRC)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/wsmatch.c $(WSMATCH_SRC) $(PLATFORM_SRC) -lpthread
 
 # Разбор подписки — единственное место, куда в движок попадает чужой текст из интернета.
 # Ни сети, ни криптобиблиотеки он не требует, поэтому стенд включает исходник напрямую и входит
@@ -416,10 +433,14 @@ $(BUILD)/visionmatch: tests/visionmatch.c src/proto/vless/vision.c src/proto/vle
 # Xray по длине строки). Без этой строки правка вывода UUID не пересобирала стенд, то есть
 # зелёный прогон ничего не значил бы. Библиотек файл не тянет — криптобиблиотеки здесь нет
 # по построению (см. ext-syntax).
+#
+# trpath.c — отдельным объектом: путь ws и httpupgrade подписка отбраковывает тем же правилом, по
+# которому транспорт собирает запрос (src/proto/transport/trpath.h), а сам файл — чистые строки.
 $(BUILD)/submatch: tests/submatch.c src/proto/vless/sub.c src/proto/vless/vless.h \
-                  src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h
+                  src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h \
+                  src/proto/transport/trpath.c src/proto/transport/trpath.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/submatch.c
+	$(CC) $(CFLAGS) -o $@ tests/submatch.c src/proto/transport/trpath.c
 
 # Скачивание и обработка подписки. Стенд включает исходник и подставляет две вещи: свой
 # run_quiet и поддельный curl в PATH (SHA-256 идентификатора устройства — свой, в hwid.c).
@@ -427,9 +448,10 @@ $(BUILD)/submatch: tests/submatch.c src/proto/vless/sub.c src/proto/vless/vless.
 # при том что до переноса вся эта работа жила в оболочке объекта rpcd и не проверялась ничем.
 $(BUILD)/subfetchmatch: tests/subfetchmatch.c src/proto/vless/subfetch.c src/proto/vless/subfetch.h \
                   src/tools/hwid.c src/tools/hwid.h src/lib/jsonw.c src/lib/jsonw.h \
-                  src/proto/vless/sub.c src/proto/vless/vless.h src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h
+                  src/proto/vless/sub.c src/proto/vless/vless.h src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h \
+                  src/proto/transport/trpath.c src/proto/transport/trpath.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/subfetchmatch.c src/lib/jsonw.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) -o $@ tests/subfetchmatch.c src/lib/jsonw.c src/proto/transport/trpath.c $(PLATFORM_SRC)
 
 # Арифметика провода xsteer: заголовок записи, вывод nonce, окно приёма, пределы
 # соединения. Всё, что она считает, ломается МОЛЧА — пакет отбрасывается стеком той
@@ -542,7 +564,7 @@ $(BUILD)/yamlmatch: tests/yamlmatch.c tests/unit.h $(YAML_SRC) src/lib/ynode.h s
 # только артефакты: то, что здесь же и собирается, плюс упаковка из build.sh.
 clean:
 	rm -rf $(BUILD)/steer $(BUILD)/steerd $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext \
-	       $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch \
+	       $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch \
 	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
 	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
 	       $(BUILD)/diagsim $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/yamlmatch $(BUILD)/wolfssl-host \

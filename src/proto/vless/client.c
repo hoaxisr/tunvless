@@ -42,6 +42,8 @@ static void tr_node_of(const struct vless_node *n, struct tr_node *t) {
     t->mode = n->mode;
     t->pad_from = n->pad_from;
     t->pad_to = n->pad_to;
+    t->http_host = n->http_host;
+    t->headers = n->headers;
 }
 
 /* Полное установление: TCP + безопасность + транспорт. Возвращает 0 и заполняет conn. */

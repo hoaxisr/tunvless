@@ -27,6 +27,12 @@
 int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
                         unsigned char *out, size_t out_n, size_t *out_len)
     { (void)cfg; (void)st; (void)out; (void)out_n; *out_len = 0; return -1; }
+/* С шага 5 выпуска 1.10 trsec.c зовёт и вариант с носителем — ради ALPN http/1.1 у ws и
+ * httpupgrade; до него здесь тоже не доходит. */
+int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_state *st,
+                              const struct reality_carrier *car,
+                              unsigned char *out, size_t out_n, size_t *out_len)
+    { (void)cfg; (void)st; (void)car; (void)out; (void)out_n; *out_len = 0; return -1; }
 int tls13_handshake_auth(struct tls13 *t, int fd, const unsigned char *ch, size_t n,
                          const unsigned char *ss, const struct tls13_auth *auth)
     { (void)t; (void)fd; (void)ch; (void)n; (void)ss; (void)auth; return -1; }

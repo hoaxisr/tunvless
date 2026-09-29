@@ -24,6 +24,7 @@ static int vless_parse(struct output *o, const struct out_keys *k, struct err *e
     snprintf(o->vless.sub_file, sizeof(o->vless.sub_file), "%s", k->sub_file);
     memcpy(o->vless.nodes, k->nodes, sizeof(o->vless.nodes));
     o->vless.nodes_n = k->nodes_n;
+    o->vless.transports = k->transports;
     if (!o->vless.sub_file[0]) {
         char msg[160];
         snprintf(msg, sizeof(msg), "outputs.%s: kind vless нужен %s с подпиской", o->name,
@@ -49,6 +50,7 @@ static void vless_keys_of(const struct output *o, struct out_keys *k) {
     snprintf(k->sub_file, sizeof(k->sub_file), "%s", o->vless.sub_file);
     memcpy(k->nodes, o->vless.nodes, sizeof(k->nodes));
     k->nodes_n = o->vless.nodes_n;
+    k->transports = o->vless.transports;
     char dev[32];
     snprintf(dev, sizeof(dev), "%.15s", o->name);
     k->device_derived = !strcmp(dev, o->device);
@@ -92,6 +94,9 @@ static int vless_helper(const struct spec *sp, const struct output *o, struct ki
     }
     for (size_t i = 0; i < o->vless.nodes_n; i++)
         kind_sig_mix(&h->sig, &o->vless.nodes[i], sizeof(o->vless.nodes[i]));
+    /* И выбор транспортов — по той же причине, что номера узлов: клиент читает его при старте. */
+    if (o->vless.transports)
+        kind_sig_mix(&h->sig, &o->vless.transports, sizeof(o->vless.transports));
     return 0;
 }
 

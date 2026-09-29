@@ -191,7 +191,43 @@ struct vless_cfg {
      * значение слова «номер узла» на весь проект (см. cmd_vless_nodes). */
     int nodes[MAX_NODE_SEL];
     size_t nodes_n;
+    /* Ключ `transport:` спеки v2 — какими транспортами узлов подписки туннелю ходить: биты
+     * TT_* ниже, 0 — любыми (ключа нет; v1 его не знает).
+     *
+     * ФИЛЬТР, А НЕ ЗАМЕНА. Транспорт — свойство входа на сервере (inbound у Xray): сервер
+     * слушает ws или tcp, и клиент, пришедший к tcp-входу с кадрами WebSocket, получит
+     * отказ. Узлы с транспортом приходят из подписки — ссылкой (`type=`) или конфигом
+     * (`network`), — поэтому `transport:` у выхода может только ВЫБРАТЬ среди них, а не
+     * переделать чужие. Нужен он тому, у кого панель отдаёт один сервер в нескольких видах
+     * («NL reality», «NL ws через CDN»): `transport: ws` держит туннель на узлах, идущих через
+     * CDN, и при обновлении подписки, когда номера узлов уехали, — без правки `nodes`.
+     *
+     * Вместе с `nodes` — пересечение: из выбранных номеров берутся узлы с этими транспортами;
+     * ни одного не осталось — туннель не поднимается и называет причину (vlmain.c), а не
+     * уходит на узел, которого человек не выбирал. Номера при этом не сдвигаются: они по-прежнему
+     * среди всех пригодных узлов, как печатает `steer vless-nodes`. */
+    unsigned transports;
 };
+
+/* Транспорты узла туннеля — имена как в ссылке узла (type=) и биты для vless_cfg.transports. */
+enum { TT_TCP = 1u << 0, TT_GRPC = 1u << 1, TT_XHTTP = 1u << 2, TT_WS = 1u << 3,
+       TT_HTTPUPGRADE = 1u << 4, TT_COUNT = 5 };
+static inline const char *tunnel_transport_name(unsigned i) {
+    switch (i) {
+    case 0: return "tcp";
+    case 1: return "grpc";
+    case 2: return "xhttp";
+    case 3: return "ws";
+    case 4: return "httpupgrade";
+    default: return "";
+    }
+}
+/* Бит транспорта по имени; 0 — такого нет. */
+static inline unsigned tunnel_transport_bit(const char *s) {
+    for (unsigned i = 0; i < TT_COUNT; i++)
+        if (!strcmp(s, tunnel_transport_name(i))) return 1u << i;
+    return 0;
+}
 
 struct xsteer_cfg {
     /* Путь к конфигурации в стиле wg. ПУТЬ, а не сами ключи, и
@@ -301,6 +337,7 @@ struct out_keys {
     size_t nodes_n;
     /* Какой из двух форм записан выбор узлов: `node` (сокращение) или `nodes` (список). */
     int node_one, node_many;
+    unsigned transports;        /* `transport:` спеки v2 (vless_cfg.transports) */
     /* `devices` спеки v1 — кандидаты в порядке предпочтения. В модели поля нет: пул устройств —
      * это группа (kind: group), её собирает перевод v1 (model/v1.c), а вид выхода только
      * решает, принимает ли он такой список вообще (KK_DEVICES — у interface). */

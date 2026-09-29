@@ -170,6 +170,13 @@ struct plan {
     int no_cv;            /* прислать Certificate и НЕ прислать CertificateVerify */
     int cv_bad_sig;       /* испортить байт подписи */
     int cv_bad_alg;       /* подписать кодом, которого мы не предлагали (rsa_pkcs1_sha256) */
+    /* Шаг 5 выпуска 1.10: ws и httpupgrade поверх tls и reality — на настоящей библиотеке.
+     * reality_ok — временный сертификат Reality с настоящей подписью HMAC-SHA512 на authkey
+     * (единственный путь к УДАВШЕМУСЯ Reality в этом стенде); upg — после рукопожатия сервер
+     * ведёт и данные: ключи трафика, запрос Upgrade, ответ 101 с первыми данными ТОЙ ЖЕ записью
+     * и приём ответа клиента (1 — ws, 2 — httpupgrade). */
+    int reality_ok;
+    int upg;
 };
 
 struct srv {
@@ -181,7 +188,17 @@ struct srv {
     uint64_t seq;
     struct sc_hash_ctx tr;             /* транскрипт рукопожатия */
     int rc;                            /* !=0 — половина сломалась сама, а не по замыслу */
+    /* Путь данных (plan.upg): секреты рукопожатия и то, что увидел сервер. */
+    unsigned char hs[HLEN], c_hs[HLEN];
+    int alpn_h11;                      /* в ClientHello ALPN — один http/1.1 */
+    char req[4096];                    /* запрос Upgrade, как пришёл */
+    int got_hello;                     /* ответ клиента после 101 дошёл и разобрался */
 };
+
+/* Постоянная пара сервера Reality для plan.reality_ok: pbk узла — её публичная половина. */
+static unsigned char g_rs_priv[32], g_rs_pub[32];
+/* Что сервер увидел в ALPN последнего ClientHello (для прогонов через run_case). */
+static volatile int g_seen_h11 = -1;
 
 /* HKDF-Expand-Label из RFC 8446 §7.1. Своя копия, а не вызов статической из tls13.c:
  * стенд обязан считать метку САМ, иначе ошибка в клиентской обёртке сошлась бы сама с
@@ -470,6 +487,136 @@ static int send_enc(struct srv *s, const unsigned char *msg, size_t n) {
     return wr_all(s->fd, out, 5 + total);
 }
 
+/* ---- путь данных после рукопожатия: ws и httpupgrade (plan.upg) ---------------------------
+ *
+ * Серверная половина здесь доводит соединение до данных — то, чего стенду прежде было не
+ * нужно: ключи трафика приложения (RFC 8446 §7.1, от master secret и транскрипта по серверный
+ * Finished), Finished клиента под ключом рукопожатия, запрос Upgrade, ответ 101 и за ним ТОЙ
+ * ЖЕ записью первые данные потока (кадр ws или сырые байты httpupgrade — остаток, который
+ * транспорт обязан не потерять), и приём того, что клиент пошлёт в ответ. Ключ и счётчик у
+ * каждого направления свои (struct dir). */
+struct dir { struct sc_aead g; unsigned char iv[12]; uint64_t seq; int ready; };
+
+static int dir_set(struct dir *d, const unsigned char secret[HLEN]) {
+    unsigned char key[16];
+    if (xlabel(secret, "key", NULL, 0, key, 16) || xlabel(secret, "iv", NULL, 0, d->iv, 12)) return -1;
+    if (d->ready) sc_aead_free(&d->g);
+    d->ready = 0;
+    if (sc_aead_setkey(&d->g, SC_AES128_GCM, key)) return -1;
+    d->ready = 1;
+    d->seq = 0;
+    return 0;
+}
+
+static void dir_nonce(const struct dir *d, unsigned char n[12]) {
+    memcpy(n, d->iv, 12);
+    for (int i = 0; i < 8; i++) n[11 - i] ^= (unsigned char)(d->seq >> (8 * i));
+}
+
+/* Следующая запись от клиента: ChangeCipherSpec пропускается, остальное расшифровывается. */
+static int rec_open(struct dir *d, int fd, unsigned char *out, size_t cap, size_t *n,
+                    unsigned char *inner) {
+    for (;;) {
+        unsigned char type;
+        size_t len;
+        if (rd_rec(fd, &type, out, cap, &len)) return -1;
+        if (type == 0x14) continue;
+        if (type != 0x17 || len < 17) return -1;
+        unsigned char hdr[5] = { 0x17, 0x03, 0x03, (unsigned char)(len >> 8), (unsigned char)len };
+        unsigned char nonce[12];
+        dir_nonce(d, nonce);
+        if (sc_aead_open(&d->g, nonce, hdr, 5, out, len - 16, out + len - 16)) return -1;
+        d->seq++;
+        size_t pt = len - 16;
+        while (pt && !out[pt - 1]) pt--;
+        if (!pt) return -1;
+        *inner = out[--pt];
+        *n = pt;
+        return 0;
+    }
+}
+
+static int rec_seal(struct dir *d, int fd, const unsigned char *msg, size_t n) {
+    static __thread unsigned char out[5 + 4096 + 17];
+    if (n + 17 > 4096 + 17) return -1;
+    size_t total = n + 1 + 16;
+    out[0] = 0x17; out[1] = 0x03; out[2] = 0x03;
+    out[3] = (unsigned char)(total >> 8); out[4] = (unsigned char)total;
+    memcpy(out + 5, msg, n);
+    out[5 + n] = 0x17;
+    unsigned char nonce[12];
+    dir_nonce(d, nonce);
+    if (sc_aead_seal(&d->g, nonce, out, 5, out + 5, n + 1, out + 5 + n + 1)) return -1;
+    d->seq++;
+    return wr_all(fd, out, 5 + total);
+}
+
+static int app_phase_dirs(struct srv *s, struct dir *cd, struct dir *sd) {
+    unsigned char zeros[HLEN] = {0}, empty[HLEN], derived[HLEN], master[HLEN], th[HLEN];
+    unsigned char c_ap[HLEN], s_ap[HLEN];
+    if (sc_hash(SC_SHA256, zeros, 0, empty) != 0) return -1;
+    if (xlabel(s->hs, "derived", empty, HLEN, derived, HLEN) != 0) return -1;
+    if (sc_hkdf_extract(SC_SHA256, derived, HLEN, zeros, HLEN, master) != 0) return -1;
+    tr_snapshot(&s->tr, th);
+    if (xlabel(master, "c ap traffic", th, HLEN, c_ap, HLEN) != 0) return -1;
+    if (xlabel(master, "s ap traffic", th, HLEN, s_ap, HLEN) != 0) return -1;
+
+    static __thread unsigned char buf[16384 + 256];
+    size_t n;
+    unsigned char inner;
+    if (dir_set(cd, s->c_hs) || rec_open(cd, s->fd, buf, sizeof(buf), &n, &inner) || inner != 0x16)
+        return -1;                                       /* Finished клиента */
+    if (dir_set(cd, c_ap) || dir_set(sd, s_ap)) return -1;
+
+    size_t rn = 0;
+    while (!strstr(s->req, "\r\n\r\n")) {
+        if (rec_open(cd, s->fd, buf, sizeof(buf), &n, &inner) || inner != 0x17) return -1;
+        if (rn + n >= sizeof(s->req)) return -1;
+        memcpy(s->req + rn, buf, n);
+        rn += n;
+        s->req[rn] = '\0';
+    }
+
+    char resp[512];
+    int k;
+    if (s->plan->upg == 1) {
+        char key[32] = "", acc[29];
+        const char *kp = strstr(s->req, "\r\nSec-WebSocket-Key: ");
+        if (!kp) return -1;
+        sscanf(kp + 21, "%31[^\r]", key);
+        tr_ws_accept(key, acc);
+        k = snprintf(resp, sizeof(resp), "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                     "Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", acc);
+        resp[k++] = (char)0x82; resp[k++] = 5;           /* кадр сервера: без маски */
+        memcpy(resp + k, "FIRST", 5); k += 5;
+    } else {
+        k = snprintf(resp, sizeof(resp), "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n"
+                     "Upgrade: websocket\r\n\r\nFIRST");
+    }
+    if (rec_seal(sd, s->fd, (const unsigned char *)resp, (size_t)k)) return -1;
+
+    if (rec_open(cd, s->fd, buf, sizeof(buf), &n, &inner) || inner != 0x17) return -1;
+    if (s->plan->upg == 1) {
+        /* 0x82, 0x80|5, маска, «hello» под маской. */
+        if (n != 11 || buf[0] != 0x82 || buf[1] != (0x80 | 5)) return -1;
+        for (int i = 0; i < 5; i++) buf[6 + i] ^= buf[2 + (i & 3)];
+        s->got_hello = !memcmp(buf + 6, "hello", 5);
+    } else {
+        s->got_hello = n == 5 && !memcmp(buf, "hello", 5);
+    }
+    return 0;
+}
+
+static int app_phase(struct srv *s) {
+    struct dir *cd = calloc(1, sizeof(*cd)), *sd = calloc(1, sizeof(*sd));
+    int rc = cd && sd ? app_phase_dirs(s, cd, sd) : -1;
+    if (cd && cd->ready) sc_aead_free(&cd->g);
+    if (sd && sd->ready) sc_aead_free(&sd->g);
+    free(cd);
+    free(sd);
+    return rc;
+}
+
 static void *server_half(void *arg) {
     struct srv *s = arg;
     const struct plan *pl = s->plan;
@@ -480,6 +627,10 @@ static void *server_half(void *arg) {
     s->rc = -1;
     if (rd_rec(s->fd, &type, ch, sizeof(ch), &ch_n) || type != 0x16) return NULL;
     if (pl->hangup) { s->rc = 0; close(s->fd); s->fd = -1; return NULL; }
+    /* ALPN ровно «http/1.1» — расширение 0x0010 длиной 11, список длиной 9 (у ws и httpupgrade;
+     * у прочих транспортов там пара «h2, http/1.1»). */
+    s->alpn_h11 = memmem(ch, ch_n, "\x00\x10\x00\x0b\x00\x09\x08http/1.1", 11) != NULL;
+    g_seen_h11 = s->alpn_h11;
 
     unsigned char cpub[32], sid[32];
     size_t sid_n = 0;
@@ -535,6 +686,8 @@ static void *server_half(void *arg) {
     if (sc_hkdf_extract(SC_SHA256, derived, HLEN, ecdhe, 32, hs) != 0) return NULL;
     tr_snapshot(&s->tr, th);
     if (xlabel(hs, "s hs traffic", th, HLEN, s->s_hs, HLEN) != 0) return NULL;
+    if (xlabel(hs, "c hs traffic", th, HLEN, s->c_hs, HLEN) != 0) return NULL;
+    memcpy(s->hs, hs, HLEN);
     if (xlabel(s->s_hs, "key", NULL, 0, s->key, sizeof(s->key)) != 0) return NULL;
     if (xlabel(s->s_hs, "iv", NULL, 0, s->iv, sizeof(s->iv)) != 0) return NULL;
 
@@ -592,6 +745,42 @@ static void *server_half(void *arg) {
         s->rc = send_enc(s, cc, 12) ? -1 : 0;
         return NULL;
     }
+    if (pl->reality_ok) {
+        /* Временный сертификат Reality: ключ Ed25519 (любые 32 байта — его никто не проверяет
+         * как ключ) и поле подписи = HMAC-SHA512(authkey, ключ), где authkey — HKDF-SHA256 от
+         * ECDH(постоянный ключ сервера, эфемерный клиента) с солью Random[0..20) и info
+         * «REALITY» (reality.go у Xray; клиентская половина — reality.c). DER — ровно столько,
+         * сколько читает cert_reality_check: SEQUENCE { tbs с SPKI Ed25519, algid, BIT STRING }. */
+        unsigned char shared[32], authkey[32], epub[32], sig[64];
+        if (x25519_shared_ext(g_rs_priv, cpub, shared) != 0) return NULL;
+        if (sc_hkdf(SC_SHA256, ch + 6, 20, shared, 32, "REALITY", 7, authkey, 32) != 0) return NULL;
+        for (int i = 0; i < 32; i++) epub[i] = (unsigned char)(0x40 + i);
+        if (sc_hmac(SC_SHA512, authkey, 32, epub, 32, sig) != 0) return NULL;
+        static const unsigned char spki[] = { 0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70,
+                                              0x03, 0x21, 0x00 };
+        unsigned char der[128];
+        size_t dn = 0;
+        der[dn++] = 0x30; der[dn++] = 0x78;                  /* Certificate, 120 байт */
+        der[dn++] = 0x30; der[dn++] = 0x2C;                  /* tbsCertificate: только SPKI */
+        memcpy(der + dn, spki, sizeof(spki)); dn += sizeof(spki);
+        memcpy(der + dn, epub, 32); dn += 32;
+        static const unsigned char alg[] = { 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70 };
+        memcpy(der + dn, alg, sizeof(alg)); dn += sizeof(alg);
+        der[dn++] = 0x03; der[dn++] = 0x41; der[dn++] = 0x00;
+        memcpy(der + dn, sig, 64); dn += 64;
+        unsigned char cm[256];
+        size_t cn = 0, body = 1 + 3 + 3 + dn + 2;
+        cm[cn++] = 0x0B;
+        cm[cn++] = 0; cm[cn++] = (unsigned char)(body >> 8); cm[cn++] = (unsigned char)body;
+        cm[cn++] = 0;                                        /* certificate_request_context */
+        size_t list = 3 + dn + 2;
+        cm[cn++] = 0; cm[cn++] = (unsigned char)(list >> 8); cm[cn++] = (unsigned char)list;
+        cm[cn++] = 0; cm[cn++] = (unsigned char)(dn >> 8); cm[cn++] = (unsigned char)dn;
+        memcpy(cm + cn, der, dn); cn += dn;
+        cm[cn++] = 0; cm[cn++] = 0;                          /* расширений записи нет */
+        if (send_enc(s, cm, cn)) return NULL;
+        sc_hash_update(&s->tr, cm, cn);
+    }
     if (pl->cert == 1) {
         /* Тело намеренно не разбирается ни в один сертификат: проверяется не разбор X.509,
          * а то, чем закрывается отказ проверки. */
@@ -617,6 +806,7 @@ finished:;
     if (send_enc(s, fin, sizeof(fin))) return NULL;
     sc_hash_update(&s->tr, fin, sizeof(fin));
 
+    if (pl->upg) { s->rc = app_phase(s); return NULL; }
     s->rc = 0;
     return NULL;
 }
@@ -713,6 +903,58 @@ static int run_case(const struct plan *pl, struct vless_node *n, char *reason, s
     /* Свой конец пары закрывает сам vless_connect (или vless_close на успехе). Не закрыл —
      * это и есть находка, и её видно проверкой по числу дескрипторов у вызывающего. */
     return rc;
+}
+
+/* Прогон ws или httpupgrade до данных: установление, первые данные за ответом 101 (они
+ * приехали ОДНОЙ записью TLS с ответом), ответ клиента. 0 — всё сошлось; *srv_out — что
+ * увидел сервер. */
+static int run_upg(const struct plan *pl, struct vless_node *n, struct srv *s) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -100;
+    memset(s, 0, sizeof(*s));
+    s->fd = sv[1];
+    s->plan = pl;
+    pthread_t th;
+    if (pthread_create(&th, NULL, server_half, s) != 0) { close(sv[0]); close(sv[1]); return -101; }
+
+    g_give_fd = sv[0];
+    g_tcp_dial = fake_dial;
+    struct transport c;
+    int rc = vless_connect(n, &c, 3);
+    g_tcp_dial = NULL;
+    if (rc == 0) {
+        static unsigned char buf[VLESS_MIN_RECV_CAP];
+        size_t got = 0;
+        for (int i = 0; i < 50 && !rc && !got; i++) {
+            if (!transport_has_data(&c)) {
+                struct pollfd p = { .fd = transport_fd(&c), .events = POLLIN, .revents = 0 };
+                if (poll(&p, 1, 3000) <= 0) break;
+            }
+            rc = transport_read(&c, buf, sizeof(buf), &got);
+        }
+        if (!rc && (got != 5 || memcmp(buf, "FIRST", 5))) rc = -102;
+        if (!rc) rc = transport_write(&c, (const unsigned char *)"hello", 5);
+        transport_close(&c);
+    }
+    pthread_join(th, NULL);
+    if (s->fd >= 0) close(s->fd);
+    return rc;
+}
+
+/* base64url без выравнивания — форма pbk в ссылке узла. */
+static void b64url(const unsigned char *in, size_t n, char *out) {
+    static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    size_t o = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        unsigned v = (unsigned)in[i] << 16;
+        if (i + 1 < n) v |= (unsigned)in[i + 1] << 8;
+        if (i + 2 < n) v |= in[i + 2];
+        out[o++] = T[(v >> 18) & 63];
+        out[o++] = T[(v >> 12) & 63];
+        if (i + 1 < n) out[o++] = T[(v >> 6) & 63];
+        if (i + 2 < n) out[o++] = T[v & 63];
+    }
+    out[o] = '\0';
 }
 
 /* Работает ли сама проверка кучи.
@@ -831,6 +1073,54 @@ int main(void) {
         check(what, 0, LEAK_CHECK());
     }
 
+    /* ---- удавшийся Reality и ws/httpupgrade поверх него (шаг 5 выпуска 1.10) ---------
+     *
+     * Сервер отвечает настоящим временным сертификатом Reality (подпись HMAC на authkey от
+     * своей постоянной пары, pbk узла — её публичная половина), то есть рукопожатие здесь
+     * УДАЁТСЯ, и дальше идут данные. У tcp проверяется только облик: ALPN прежний («h2,
+     * http/1.1» — Hello у tcp шагом не тронут). У ws и httpupgrade — всё до данных: ALPN один
+     * http/1.1, запрос Upgrade с путём без ed, ответ 101 и первые данные ОДНОЙ записью TLS (остаток
+     * не теряется), ответ клиента дошёл — у ws кадром с маской. */
+    if (xc_x25519_keypair(g_rs_priv, g_rs_pub) != 0) {
+        printf("%-64s %s\n", "пара сервера Reality", "ПРОВАЛ");
+        fails++;
+    } else {
+        static const char *rtype[] = { "tcp", "ws", "httpupgrade" };
+        for (int u = 0; u < 3; u++) {
+            struct plan up = { .name = "reality", .reality_ok = 1, .upg = u };
+            struct vless_node rn;
+            node_reality(&rn, rtype[u]);
+            b64url(g_rs_pub, 32, rn.pbk);
+            snprintf(rn.path, sizeof(rn.path), "%s", "/w?ed=2048");
+            snprintf(rn.http_host, sizeof(rn.http_host), "%s", "cdn.example");
+            char what[160];
+            int fd0 = fd_count();
+            static struct srv s;
+            int rc;
+            if (u == 0) {
+                g_seen_h11 = -1;
+                rc = run_case(&up, &rn, NULL, 0, NULL);
+                check("reality: временный сертификат признан — соединение установлено", 0, rc);
+                check("reality + tcp: ALPN прежний, не один http/1.1", 0, g_seen_h11);
+                check("reality + tcp: дескрипторы вернулись к исходному числу", fd0, fd_count());
+                continue;
+            }
+            rc = run_upg(&up, &rn, &s);
+            snprintf(what, sizeof(what), "reality + %s: соединение до данных", rtype[u]);
+            check(what, 0, rc);
+            snprintf(what, sizeof(what), "reality + %s: в ALPN только http/1.1", rtype[u]);
+            check(what, 1, s.alpn_h11);
+            snprintf(what, sizeof(what), "reality + %s: запрос Upgrade — путь без ed, Host из host", rtype[u]);
+            check(what, 1, !strncmp(s.req, "GET /w HTTP/1.1\r\nHost: cdn.example\r\n", 36));
+            snprintf(what, sizeof(what), "reality + %s: ответ клиента после 101 дошёл", rtype[u]);
+            check(what, 1, s.got_hello);
+            snprintf(what, sizeof(what), "reality + %s: дескрипторы вернулись к исходному числу", rtype[u]);
+            check(what, fd0, fd_count());
+            snprintf(what, sizeof(what), "reality + %s: в куче ничего не осталось", rtype[u]);
+            check(what, 0, LEAK_CHECK());
+        }
+    }
+
     /* ---- security=tls со своими корнями (R-118) ---------------------------------
      *
      * Здесь и только здесь проверка сервера может ПРОЙТИ, а значит только здесь достижимы
@@ -931,6 +1221,41 @@ int main(void) {
 
             snprintf(what, sizeof(what), "%s: в куче ничего не осталось", tls_plans[i].name);
             check(what, 0, LEAK_CHECK());
+        }
+        /* ws и httpupgrade поверх обычного TLS со своей цепочкой: то же, что у Reality выше,
+         * плюс настоящая проверка сертификата — путь, которым идут узлы за CDN. */
+        static const char *ttype[] = { "ws", "httpupgrade" };
+        for (int u = 1; u <= 2; u++) {
+            struct plan up = { .name = "tls", .chain = LEAF_OK, .upg = u };
+            struct vless_node tn;
+            node_tls(&tn, ttype[u - 1]);
+            snprintf(tn.path, sizeof(tn.path), "%s", "/w?ed=2048");
+            char what[160];
+            int fd0 = fd_count();
+            static struct srv s;
+            int rc = run_upg(&up, &tn, &s);
+            snprintf(what, sizeof(what), "tls + %s: соединение до данных", ttype[u - 1]);
+            check(what, 0, rc);
+            snprintf(what, sizeof(what), "tls + %s: в ALPN только http/1.1", ttype[u - 1]);
+            check(what, 1, s.alpn_h11);
+            snprintf(what, sizeof(what), "tls + %s: Host без host — sni", ttype[u - 1]);
+            check(what, 1, !strncmp(s.req, "GET /w HTTP/1.1\r\nHost: " TLS_SNI "\r\n",
+                                    strlen("GET /w HTTP/1.1\r\nHost: " TLS_SNI "\r\n")));
+            snprintf(what, sizeof(what), "tls + %s: ответ клиента после 101 дошёл", ttype[u - 1]);
+            check(what, 1, s.got_hello);
+            snprintf(what, sizeof(what), "tls + %s: дескрипторы вернулись к исходному числу", ttype[u - 1]);
+            check(what, fd0, fd_count());
+            snprintf(what, sizeof(what), "tls + %s: в куче ничего не осталось", ttype[u - 1]);
+            check(what, 0, LEAK_CHECK());
+        }
+        /* Сервер за TLS выбрал h2 — а апгрейд идёт по HTTP/1.1: свой код, не «не согласился на
+         * HTTP/2». */
+        {
+            struct plan up = { .name = "tls h2", .chain = LEAF_OK, .alpn = "h2" };
+            struct vless_node tn;
+            node_tls(&tn, "ws");
+            int rc = run_case(&up, &tn, NULL, 0, NULL);
+            check("tls + ws: сервер выбрал h2 — отказ TR_ENOH1", TR_ENOH1, rc);
         }
         g_cert_roots = NULL;
         chain_free();

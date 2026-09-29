@@ -20,16 +20,29 @@ struct vless_node {
     char host[128];
     uint16_t port;
     char uuid[64];
-    char type[16];         /* tcp | grpc | xhttp */
-    char security[16];     /* только reality имеет смысл */
+    char type[16];         /* tcp | grpc | xhttp | ws | httpupgrade */
+    char security[16];     /* none | tls | reality */
     char sni[128];         /* маскировочный домен — он же SNI в ClientHello */
     char fp[16];           /* отпечаток браузера: chrome, firefox, qq… */
     char pbk[64];          /* публичный ключ сервера, base64url */
     char sid[32];          /* short id, hex */
     char flow[32];         /* xtls-rprx-vision или пусто */
-    char path[128];        /* xhttp */
+    /* xhttp, ws, httpupgrade. У ws и httpupgrade — как в ссылке, вместе с `?ed=N`: ранние данные
+     * вырезаются из пути при запросе, ровно как у Xray (src/proto/transport/trpath.h). */
+    char path[128];
     char service[64];      /* grpc serviceName */
     char mode[16];         /* grpc: multi/gun; xhttp: auto/packet-up… */
+    /* ws и httpupgrade: заголовок Host — параметр `host` ссылки, `host` в wsSettings или
+     * httpupgradeSettings конфига Xray. Пусто — sni, затем адрес узла (правило Xray). */
+    char http_host[128];
+    /* ws и httpupgrade: свои заголовки запроса — `headers` конфига Xray, строками «Имя: значение\n».
+     * У ссылки vless:// такого поля нет вовсе (формат Xray его не знает), поэтому заголовки бывают
+     * только у подписки в виде конфига. Проверены при разборе: имя — знаки токена HTTP, в значении
+     * нет перевода строки (иначе один заголовок узла становился бы двумя строками запроса). */
+    char headers[192];
+    /* Заголовок из конфига не влез в headers или негоден — узел непригоден (skip_reason), а не
+     * уходит с молча выброшенным заголовком. */
+    uint8_t headers_bad;
 
     /* Длина набивки xhttp, в знаках: сколько сервер согласен принять в x_padding.
      *

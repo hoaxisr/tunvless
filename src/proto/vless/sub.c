@@ -17,6 +17,10 @@
  * транспорт и security, а правило, по которому он превращается в 16 байт, живёт в одном
  * месте — в vless_proto.c. Библиотек это не тянет. */
 #include "vless_proto.h"
+/* Ради tr_upgrade_target: путь ws и httpupgrade, на котором Xray споткнулся бы, отбраковывается
+ * здесь тем же правилом, по которому транспорт собирает запрос (src/proto/transport/trpath.c —
+ * чистые строки, без сети и библиотек). */
+#include "trpath.h"
 
 /* base64: только декодирование и только то, что встречается в подписках — с переводами
  * строк внутри и, возможно, без выравнивающих '='. URL-safe алфавит тоже принимается:
@@ -128,6 +132,17 @@ static void set_field(char *dst, size_t n, const char *src, size_t len) {
     if (len >= n) len = n - 1;
     memcpy(dst, src, len);
     dst[len] = '\0';
+}
+
+/* Поле ссылки в процентной форме: раскодировать, ПОТОМ обрезать по полю. Наоборот (как было у
+ * path) путь в 60 знаков, записанный процентами целиком (`%2Fstatic%2Fv1…` — так его кодируют
+ * многие панели), обрезался до раскодирования на трети и уезжал на сервер чужим путём: у xhttp и
+ * ws это 404 при исправном узле. */
+static void set_pct(char *dst, size_t n, const char *src, size_t len) {
+    char tmp[512];
+    set_field(tmp, sizeof(tmp), src, len);
+    pct_decode(tmp);
+    set_field(dst, n, tmp, strlen(tmp));
 }
 
 /* Снять с конца строки неполную последовательность UTF-8. Нужно там, где строку обрезал
@@ -295,9 +310,12 @@ int vless_parse_url(const char *url, struct vless_node *n) {
                 else if (klen == 3 && !strncmp(k, "pbk", 3)) set_field(n->pbk, sizeof(n->pbk), v, vlen);
                 else if (klen == 3 && !strncmp(k, "sid", 3)) set_field(n->sid, sizeof(n->sid), v, vlen);
                 else if (klen == 4 && !strncmp(k, "flow", 4)) set_field(n->flow, sizeof(n->flow), v, vlen);
-                else if (klen == 4 && !strncmp(k, "path", 4)) { set_field(n->path, sizeof(n->path), v, vlen); pct_decode(n->path); }
+                else if (klen == 4 && !strncmp(k, "path", 4)) set_pct(n->path, sizeof(n->path), v, vlen);
                 else if (klen == 11 && !strncmp(k, "serviceName", 11)) { set_field(n->service, sizeof(n->service), v, vlen); pct_decode(n->service); }
                 else if (klen == 4 && !strncmp(k, "mode", 4)) set_field(n->mode, sizeof(n->mode), v, vlen);
+                /* host — заголовок Host у ws и httpupgrade. У xhttp в ссылке он тоже бывает, но
+                 * xhttp его не читает: :authority там — sni, как было. */
+                else if (klen == 4 && !strncmp(k, "host", 4)) set_pct(n->http_host, sizeof(n->http_host), v, vlen);
                 /* extra — настройки транспорта в JSON. Читается ради длины набивки: сервер
                  * её ПРОВЕРЯЕТ и на чужую отвечает 400 (см. pad_range). */
                 else if (klen == 5 && !strncmp(k, "extra", 5)) {
@@ -325,6 +343,41 @@ int vless_parse_url(const char *url, struct vless_node *n) {
      * транспортами было бы ошибкой — причины у них разные. Пустое поле security означает
      * то же самое: в ссылке его просто опускают. */
     return node_usable(n);
+}
+
+/* Узел ws или httpupgrade: то, на чём Xray споткнулся бы сам, — заранее и с причиной. 1 —
+ * непригоден (причина в skip_reason).
+ *
+ *   - Vision (flow xtls-rprx-vision) поверх них не бывает: Xray требует для Vision голую связь
+ *     TLS или REALITY и отказывает («failed to use xtls-rprx-vision, maybe "security" is not
+ *     "tls"…»), а у нас прямое копирование Vision прочитало бы сокет мимо кадров;
+ *   - путь, который Xray не разобрал бы однозначно или у ws не открыл бы вовсе (trpath.h) — одно
+ *     правило с транспортом, чтобы «пригоден» здесь значило «откроется» там;
+ *   - host — имя для заголовка Host: без пробелов и управляющих знаков, иначе строка запроса
+ *     рвётся посередине;
+ *   - заголовки из конфига, которые не влезли или негодны (headers_bad, см. xray_headers). */
+static int upg_node_bad(struct vless_node *n, int ws) {
+    if (n->flow[0]) {
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "vision поверх %s не бывает", n->type);
+        return 1;
+    }
+    char tgt[1024];
+    const char *why = "";
+    if (tr_upgrade_target(n->path, ws, tgt, sizeof(tgt), &why) != 0) {
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "%s", why);
+        return 1;
+    }
+    for (const char *p = n->http_host; *p; p++) {
+        if ((unsigned char)*p <= 0x20 || *p == 0x7f) {
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "негодный host у %s", n->type);
+            return 1;
+        }
+    }
+    if (n->headers_bad) {
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "негодные headers у %s", n->type);
+        return 1;
+    }
+    return 0;
 }
 
 /* Пригоден ли РАЗОБРАННЫЙ узел. 0 — да, 1 — нет, причина в n->skip_reason.
@@ -403,11 +456,13 @@ static int node_usable(struct vless_node *n) {
         snprintf(n->skip_reason, sizeof(n->skip_reason), "reality без pbk");
         return 1;
     }
+    const int upg_ws = !strcmp(n->type, "ws"), upg = upg_ws || !strcmp(n->type, "httpupgrade");
     if (strcmp(n->type, "tcp") != 0 && strcmp(n->type, "grpc") != 0 &&
-        strcmp(n->type, "xhttp") != 0) {
+        strcmp(n->type, "xhttp") != 0 && !upg) {
         snprintf(n->skip_reason, sizeof(n->skip_reason), "транспорт %s не поддержан", n->type);
         return 1;
     }
+    if (upg && upg_node_bad(n, upg_ws)) return 1;
 
     /* Узел, который никуда не ведёт. Отдельная причина, а не «не подключился»: панели,
      * привязывающие подписку к устройствам, отвечают клиенту без идентификатора не отказом,
@@ -601,16 +656,109 @@ static int sj_arr_next(struct sj *j, int *first) {
     return 0;
 }
 
+/* Настройки ws или httpupgrade из конфига — до того, как станет известно, какой из двух у узла.
+ * Конфиг вправе нести оба объекта (и ещё xhttpSettings) сразу, а решает network — который может
+ * стоять и после них, поэтому разобранное складывается сюда и переносится в узел в конце
+ * (xray_stream). Иначе путь из wsSettings затирал бы путь xhttp у узла xhttp. */
+struct upg_cfg {
+    char path[sizeof(((struct vless_node *)0)->path)];
+    char host[sizeof(((struct vless_node *)0)->http_host)];
+    char headers[sizeof(((struct vless_node *)0)->headers)];
+    uint8_t bad;
+};
+
+static int ci_eq(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) {
+        char x = *a, y = *b;
+        if (x >= 'A' && x <= 'Z') x = (char)(x + 32);
+        if (y >= 'A' && y <= 'Z') y = (char)(y + 32);
+        if (x != y) return 0;
+    }
+    return *a == *b;
+}
+
+/* headers конфига Xray (map[string]string) — в строки «Имя: значение\n».
+ *
+ * Отбраковка (bad), а не молчаливый пропуск, потому что заголовок узла — часть облика, который
+ * продавец выбрал для своего сервера или CDN перед ним: узел, ушедший без него, может
+ * отвечать 403 и выглядеть мёртвым. Негодно:
+ *   - значение не строкой — Xray такой конфиг не загрузит вовсе;
+ *   - имя не из знаков токена HTTP или длиннее 40, значение с управляющим знаком (перевод строки
+ *     сделал бы из одного заголовка два) или длиннее 250 — запрос у нас собирается из строк;
+ *   - Upgrade, Connection и Sec-WebSocket-Key/Version/Extensions — их ставит сам транспорт; у ws
+ *     gorilla на них отказывает («duplicate header not allowed»), то есть и у Xray узел не
+ *     открылся бы;
+ *   - Host у httpupgrade — Xray отвергает конфиг («"headers" can't contain "host"»). У ws Host
+ *     из headers Xray переносит в host (если тот пуст) и из заголовков убирает — так и здесь.
+ *   - не влезло в буфер узла. */
+static void xray_headers(struct sj *j, struct upg_cfg *u, int hu) {
+    int f = 1;
+    char key[64], val[256];
+    size_t o = strlen(u->headers);
+    while (sj_obj_key(j, &f, key, sizeof(key)) == 0) {
+        sj_ws(j);
+        if (*j->p != '"') { sj_skip(j); u->bad = 1; continue; }
+        val[0] = '\0';
+        sj_str(j, val, sizeof(val));
+        size_t kn = strlen(key), vn = strlen(val);
+        if (ci_eq(key, "host")) {
+            if (hu) u->bad = 1;
+            else if (!u->host[0]) set_field(u->host, sizeof(u->host), val, vn);
+            continue;
+        }
+        int ok = kn > 0 && kn <= 40 && vn <= 250;
+        for (size_t i = 0; ok && i < kn; i++) {
+            unsigned char c = (unsigned char)key[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  (c && strchr("!#$%&'*+-.^_`|~", c))))
+                ok = 0;
+        }
+        for (size_t i = 0; ok && i < vn; i++) {
+            unsigned char c = (unsigned char)val[i];
+            if ((c < 0x20 && c != '\t') || c == 0x7f) ok = 0;
+        }
+        if (ci_eq(key, "upgrade") || ci_eq(key, "connection") || ci_eq(key, "sec-websocket-key") ||
+            ci_eq(key, "sec-websocket-version") || ci_eq(key, "sec-websocket-extensions"))
+            ok = 0;
+        if (!ok || o + kn + 2 + vn + 1 >= sizeof(u->headers)) { u->bad = 1; continue; }
+        o += (size_t)snprintf(u->headers + o, sizeof(u->headers) - o, "%s: %s\n", key, val);
+    }
+}
+
+/* wsSettings и httpupgradeSettings: path, host, headers. Пустой host не затирает Host из
+ * headers (у Xray пустой host — «не задан»). */
+static void xray_upg(struct sj *j, struct upg_cfg *u, int hu) {
+    int f = 1;
+    char k[64];
+    while (sj_obj_key(j, &f, k, sizeof(k)) == 0) {
+        sj_ws(j);
+        if (!strcmp(k, "path") && *j->p == '"') sj_str(j, u->path, sizeof(u->path));
+        else if (!strcmp(k, "host") && *j->p == '"') {
+            char h[sizeof(u->host)] = "";
+            sj_str(j, h, sizeof(h));
+            if (h[0]) snprintf(u->host, sizeof(u->host), "%s", h);
+        } else if (!strcmp(k, "headers") && *j->p == '{') xray_headers(j, u, hu);
+        else sj_skip(j);
+    }
+}
+
 /* streamSettings: транспорт, security и всё, что зависит от них. */
 static void xray_stream(struct sj *j, struct vless_node *n) {
     int first = 1;
     char k[64];
+    struct upg_cfg ws, hu;
+    memset(&ws, 0, sizeof(ws));
+    memset(&hu, 0, sizeof(hu));
     while (sj_obj_key(j, &first, k, sizeof(k)) == 0) {
         if (!strcmp(k, "network")) {
             sj_str(j, n->type, sizeof(n->type));
             /* raw — каноническое имя tcp у Xray с 24.9.30; панели пишут его всё чаще. */
             if (!strcmp(n->type, "raw")) snprintf(n->type, sizeof(n->type), "tcp");
+            /* websocket — второе имя ws у Xray (infra/conf: case "ws", "websocket"). */
+            if (!strcmp(n->type, "websocket")) snprintf(n->type, sizeof(n->type), "ws");
         }
+        else if (!strcmp(k, "wsSettings")) xray_upg(j, &ws, 0);
+        else if (!strcmp(k, "httpupgradeSettings")) xray_upg(j, &hu, 1);
         else if (!strcmp(k, "security")) sj_str(j, n->security, sizeof(n->security));
         else if (!strcmp(k, "realitySettings") || !strcmp(k, "tlsSettings")) {
             /* Оба объекта несут serverName и fingerprint; publicKey и shortId бывают только
@@ -649,6 +797,13 @@ static void xray_stream(struct sj *j, struct vless_node *n) {
                 else sj_skip(j);
             }
         } else sj_skip(j);
+    }
+    const struct upg_cfg *u = !strcmp(n->type, "ws") ? &ws : !strcmp(n->type, "httpupgrade") ? &hu : NULL;
+    if (u) {
+        snprintf(n->path, sizeof(n->path), "%s", u->path);
+        snprintf(n->http_host, sizeof(n->http_host), "%s", u->host);
+        snprintf(n->headers, sizeof(n->headers), "%s", u->headers);
+        n->headers_bad = u->bad;
     }
 }
 
