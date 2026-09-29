@@ -5,6 +5,7 @@
 
 #include <wolfssl/ssl.h>
 #include <wolfssl/quic.h>
+#include <wolfssl/wolfcrypt/sha256.h>
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <ngtcp2/ngtcp2_crypto_wolfssl.h>
@@ -94,6 +95,17 @@ void *qcssl_new(void *ctx, void *conn_ref, const char *sni, const char *alpn, in
 fail:
     wolfSSL_free(ssl);
     return NULL;
+}
+
+int qcssl_peer_sha256(void *ssl, uint8_t out[32]) {
+    WOLFSSL_X509 *x = wolfSSL_get_peer_certificate(ssl);
+    if (!x) return -1;
+    int len = 0;
+    const unsigned char *der = wolfSSL_X509_get_der(x, &len);
+    int rc = -1;
+    if (der && len > 0 && wc_Sha256Hash(der, (word32)len, out) == 0) rc = 0;
+    wolfSSL_X509_free(x);
+    return rc;
 }
 
 void qcssl_free(void *ssl) {

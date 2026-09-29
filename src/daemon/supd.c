@@ -1016,8 +1016,9 @@ static int start_one(struct helper *h, void *arg) {
                 h->st.known = 1;
                 h->st.said_down = 1;
                 if (!h->nomod_logged) {
-                    fprintf(stderr, LOG_SW "%s %s — модуля нет: нужен пакет %s (входит в "
-                                    "steer-extended)\n", h->cmd, h->name, h->prog);
+                    /* steer-extended ставит остальные модули, но не hysteria2: у него отдельный пакет. */
+                    fprintf(stderr, LOG_SW "%s %s — модуля нет: нужен пакет %s%s\n", h->cmd, h->name,
+                            h->prog, strcmp(h->prog, "steer-hysteria2") ? " (входит в steer-extended)" : "");
                     h->nomod_logged = 1;
                 }
                 return -1;
@@ -1295,6 +1296,12 @@ int supd_restart(struct supd *s, const char *out, const char *cmd) {
 
 /* ---- ход перебора узлов vless из памяти (probe.h) ---------------------------------------- */
 
+/* Помощник перебирает узлы подписки и рассказывает о переборе событиями node/nonode/down: vless и
+ * hysteria2 говорят одним языком, и память демона отвечает про обоих одинаково. */
+static int cmd_picks_nodes(const char *cmd) {
+    return !strcmp(cmd, "vless") || !strcmp(cmd, "hysteria2");
+}
+
 /* То же, что записал бы клиент (probe_report в src/proto/vless/vlmain.c), — по его событиям:
  * nonode — номер вне подписки (живёт до следующего запуска, как запись — пока свежа); node без
  * up и down у живого процесса — перебор идёт; down самого клиента — ни один узел не ответил (total
@@ -1318,7 +1325,7 @@ static int probe_mem(const char *out, struct probe_status *ps) {
     if (!s || !out) return -1;
     for (size_t i = 0; i < s->set.n; i++) {
         const struct helper *h = &s->set.h[i];
-        if (h->table || h->gone || strcmp(h->name, out) || strcmp(h->cmd, "vless")) continue;
+        if (h->table || h->gone || strcmp(h->name, out) || !cmd_picks_nodes(h->cmd)) continue;
         ps->state = probe_of(h, &ps->node, &ps->total);
         ps->since = 0;
         ps->why[0] = '\0';
@@ -1392,7 +1399,7 @@ int supd_helper_json(const struct supd *s, const char *name, FILE *out) {
             }
             if (h->rejected) fputs(",\"rejected\":true", out);
         }
-        if (!strcmp(h->cmd, "vless") && (st->node || st->nonode))
+        if (cmd_picks_nodes(h->cmd) && (st->node || st->nonode))
             fprintf(out, ",\"node\":%ld,\"total\":%ld", st->nonode ? st->nonode : st->node,
                     st->total);
         if (!strcmp(h->cmd, "tgws") || st->health_n) {
@@ -1412,7 +1419,7 @@ void supd_probe_env(const struct supd *s, char *buf, size_t n) {
     size_t w = (size_t)snprintf(buf, n, "STEER_PROBE_MEM=");
     for (size_t i = 0; i < s->set.n && w < n; i++) {
         const struct helper *h = &s->set.h[i];
-        if (h->table || h->gone || strcmp(h->cmd, "vless")) continue;
+        if (h->table || h->gone || !cmd_picks_nodes(h->cmd)) continue;
         int node, total;
         enum probe_state ps = probe_of(h, &node, &total);
         const char *word = ps == PROBE_RUNNING ? "probing" : ps == PROBE_FAILED ? "failed"

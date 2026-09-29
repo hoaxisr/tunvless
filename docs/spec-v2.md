@@ -172,7 +172,7 @@ rules:
 |---|---|---|
 | `direct` | — | не маршрутизировать: трафик идёт обычным путём |
 | `interface` | `device`, `obfs: { mode, server, listen }` | устройство системы (wireguard, pppoe…); `obfs` — WireGuard поверх поддельного TCP: `server` и `listen` — `адрес:порт` литералами, `mode` — `wg-over-tcp` (умолчание) |
-| `tunnel` | `protocol: vless`, `subscription`, `nodes`, `device`, `transport` | туннель по подписке; `subscription` — файл подписки (v1: `sub_file`), `nodes` — номера пригодных узлов по предпочтению (пусто — первый рабочий); `transport` — какими транспортами узлов ходить (ниже) |
+| `tunnel` | `protocol: vless` или `hysteria2`, `subscription`, `nodes`, `device`, `transport` | туннель по подписке; `subscription` — файл подписки (v1: `sub_file`), `nodes` — номера пригодных узлов по предпочтению (пусто — первый рабочий); `transport` — какими транспортами узлов ходить (ниже; только у vless) |
 | `xsteer` | `conf`, `stream`, `stream_port`, `device` | xsteer; `conf` — файл в стиле wg (умолчание `{etc}/xsteer/<имя>.conf`) |
 | `awg` | `conf`, `device` | AmneziaWG, устройство заводит движок; `conf` — умолчание `{etc}/awg/<имя>.conf` |
 | `zapret` | `strategy` | обход DPI через nfqws; `strategy` — файл ключей nfqws (v1: `opts_file`, умолчание `{etc}/zapret/<имя>.opts`); не на телефоне |
@@ -183,6 +183,12 @@ rules:
 общий стек, а протокол — его дайлер (docs/architecture.md, «Туннели: стек, дайлер, транспорт»).
 `kind: vless` в v2 — отказ с подсказкой. xsteer туннелем в этом смысле не является (везёт пакеты,
 а не потоки) и остаётся своим видом.
+
+`protocol: hysteria2` — клиент hysteria2 (QUIC), только с пакетом `steer-hysteria2` (в `steer-extended`
+он не входит; без него спека отвергается словами «kind hysteria2 требует пакет steer-hysteria2»).
+Ключи те же, что у vless, кроме `transport`: у hysteria2 транспорта нет, и ключ — ошибка разбора.
+Узлы подписки — ссылки `hysteria2://` / `hy2://` либо конфиг Xray-core
+([docs/hysteria2.md](hysteria2.md)). В v1 тот же выход пишется `kind: hysteria2`.
 
 **`transport` туннеля** — `tcp`, `grpc`, `xhttp`, `ws`, `httpupgrade`, одно имя или список
 (`transport: ws`, `transport: [ws, httpupgrade]`); ключа нет — любые. Это **фильтр** узлов

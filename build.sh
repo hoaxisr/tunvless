@@ -231,7 +231,7 @@ pkg_deps() {  # ФАЙЛ_БИНАРНИКА ВИД (core|mod|tun) -> "nftables i
 # обновить один, оставив другой (apk — `имя=версия`, opkg — `имя (= версия)`). Чужие пакеты
 # (nftables, kmod-…) остаются без версии. Демон дополнительно проверяет версию при запуске модуля
 # (hello, docs/ctl.md) — на случай установки файлами мимо менеджера.
-OURS=" steer libsteer libsteer-wolfssl steer-vless steer-xsteer steer-obfs steer-tgws steer-extended "
+OURS=" steer libsteer libsteer-wolfssl steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steer-extended "
 dep_apk() {  # ИМЕНА через пробел -> "имя=версия ..." для наших
     for _d in $1; do
         case "$OURS" in *" $_d "*) printf '%s=%s-r1 ' "$_d" "$VERSION" ;; *) printf '%s ' "$_d" ;; esac
@@ -501,7 +501,9 @@ for spec in $ISAS; do
     # Модули: по одному бинарнику в usr/sbin рядом со steerd, где их находит движок (src/lib/
     # module.c). Зависимость от steer — точной версии: ядро и модуль общаются линией событий, формат
     # которой между выпусками не обещан (hello в docs/ctl.md).
-    for m in vless xsteer obfs tgws; do
+    # steer-hysteria2 — тоже модуль, но в steer-extended он НЕ входит: отдельный пакет, который
+    # ставят сознательно (см. мета-пакет ниже).
+    for m in vless xsteer obfs tgws hysteria2; do
         mroot="build/pkg/$arch-$m"
         rm -rf "$mroot"
         mkdir -p "$mroot/usr/sbin"
@@ -512,6 +514,7 @@ for spec in $ISAS; do
             xsteer) md="steer-xsteer: клиент звезды xsteer для steer (модуль)"; mk=tun ;;
             obfs)   md="steer-obfs: обфускатор WireGuard для steer (модуль)"; mk=mod ;;
             tgws)   md="steer-tgws: мост Telegram для steer (модуль)"; mk=mod ;;
+            hysteria2) md="steer-hysteria2: клиент hysteria2 (QUIC, Brutal) для steer (модуль)"; mk=tun ;;
         esac
         mdeps="steer $(pkg_deps "$mroot/usr/sbin/steer-$m" "$mk")"
         pack "steer-$m" "$mroot" "$mdeps" "$md" mod

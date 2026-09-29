@@ -73,7 +73,7 @@ if command -v nm >/dev/null 2>&1; then
     wwant="$(sed -n 's/^ *\([A-Za-z_0-9]*\);$/\1/p' build/wolfssl/libsteer-wolfssl.map | sort)"
     whave="$(nm -D --defined-only "$WSO" | awk '$2 ~ /^[TDBRVW]$/ {sub(/@.*/, "", $3); print $3}' | sort)"
     check "в .dynsym libsteer-wolfssl — ровно список её карты" "$wwant" "$whave"
-    for m in steer-vless steer-xsteer steer-obfs steer-tgws; do
+    for m in steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2; do
         check "$m: в модуле нет failover.c (маршрут ставит демон)" "0" \
             "$(nm "$L/$m" 2>/dev/null | grep -c ' bind_device$\| table_bind$')"
         check "$m: в модуле нет разбора спеки (модель — в libsteer)" "0" \
@@ -89,7 +89,7 @@ if command -v readelf >/dev/null 2>&1; then
         "$(readelf -d "$WSO" | sed -n 's/.*Library soname: \[\(.*\)\]/\1/p')"
     check "libsteer зависит от libsteer-wolfssl" "libsteer-wolfssl.so.$WVER" \
         "$(readelf -d "$SO" | sed -n 's/.*Shared library: \[\(libsteer[^]]*\)\]/\1/p')"
-    for m in steer-vless steer-xsteer steer-obfs steer-tgws steerd; do
+    for m in steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steerd; do
         check "$m: из нашего только libsteer.so.$VER" "libsteer.so.$VER" \
             "$(readelf -d "$L/$m" | sed -n 's/.*Shared library: \[\(libsteer[^]]*\)\]/\1/p')"
     done
@@ -108,6 +108,25 @@ for c in "vless-nodes v" "sub-fetch http://x --out /dev/null" "tls-probe x" "xst
     check "без модуля: steerd $c — код 2 и «нужен пакет»" "2 1" \
         "$r $(printf '%s' "$o" | grep -c 'нужен пакет steer-')"
 done
+# steer-hysteria2 — отдельный пакет, не часть steer-extended: отказ называет его одного, и прежней
+# отсылки к мета-пакету в нём нет; вид выхода без модуля отвечает так же (kind.c).
+out="$(STEER_MODULE_DIR="$empty" "$L/steerd" hysteria2 x 2>&1)"; rc=$?
+check "без модуля: steerd hysteria2 — код 2 и «нужен пакет steer-hysteria2»" "2 1 0" \
+    "$rc $(printf '%s' "$out" | grep -c 'нужен пакет steer-hysteria2') $(printf '%s' "$out" | grep -c 'steer-extended')"
+mkdir -p "$L/hy2spec"
+printf 'hysteria2://p@h.example:443/?sni=h.example#n\n' > "$L/hy2spec/sub.txt"
+cat > "$L/hy2spec/spec.yaml" <<SPEC
+version: 2
+outputs:
+  hy: { kind: tunnel, protocol: hysteria2, subscription: $L/hy2spec/sub.txt }
+SPEC
+out="$(STEER_MODULE_DIR="$empty" "$L/steerd" apply --dry-run --spec "$L/hy2spec/spec.yaml" --state-dir "$L/hy2spec/st" 2>&1)"
+check "спека с protocol: hysteria2 без модуля: отказ «требует пакет steer-hysteria2»" "1" \
+    "$(printf '%s' "$out" | grep -c 'kind hysteria2 требует пакет steer-hysteria2')"
+cp "$L/steer-hysteria2" "$empty/steer-hysteria2"
+out="$(STEER_MODULE_DIR="$empty" "$L/steerd" apply --dry-run --spec "$L/hy2spec/spec.yaml" --state-dir "$L/hy2spec/st" 2>&1)"
+check "  с модулем та же спека принимается" "0" "$(printf '%s' "$out" | grep -c 'требует пакет')"
+rm -f "$empty/steer-hysteria2"
 # С модулем: steerd передаёт командную строку модулю, ответ тот же байт в байт.
 cp "$L/steer-vless" "$empty/steer-vless"
 a="$(STEER_MODULE_DIR="$empty" "$L/steerd" vless-nodes nosuch --spec /nonexistent 2>&1; echo "rc=$?")"
@@ -121,6 +140,8 @@ check "первое сообщение модуля — hello с версией 
     "{\"ev\":\"hello\",\"ver\":\"$VER\",\"mod\":\"vless\"}" "$h"
 h="$(STEER_EVENT_FD=3 "$L/steer-obfs" obfs x --spec /nonexistent 3>&1 >/dev/null 2>&1 | head -1)"
 check "  и у steer-obfs" "{\"ev\":\"hello\",\"ver\":\"$VER\",\"mod\":\"obfs\"}" "$h"
+h="$(STEER_EVENT_FD=3 "$L/steer-hysteria2" hysteria2 x --spec /nonexistent 3>&1 >/dev/null 2>&1 | head -1)"
+check "  и у steer-hysteria2" "{\"ev\":\"hello\",\"ver\":\"$VER\",\"mod\":\"hysteria2\"}" "$h"
 out="$("$L/steer-obfs" vless x 2>&1)"
 check "модуль чужой команды не берёт" "steer-obfs: команда vless — не этого модуля" "$out"
 
@@ -189,6 +210,16 @@ if [ -x "$BUILD/steer" ] && [ -x "$BUILD/steer-android" ] && [ -x "$BUILD/tgwssi
 else
     echo "libs-test: нет build/steer, steer-android или tgwssim — снимок динамическим steerd пропущен (make)"
 fi
+
+# ---- hysteria2 против настоящего сервера (apernet/hysteria) ----------------------------------------
+# Сетевые пространства, TUN и docker-образ tobyxdd/hysteria:v2 (или HY2_SERVER): нет чего-то из этого —
+# стенд сам говорит «ПРОПУСК» и выходит с нулём, это не падение.
+o="$(LIBS="$L" sh tests/run-hy2.sh 2>&1 | tail -1)"
+case "$o" in
+    *ПРОПУСК*) echo "libs-test: $o" ;;
+    *) check "hysteria2 против настоящего сервера: стенд tests/run-hy2.sh" "0" "$(printf '%s' "$o" | grep -c 'провалено [1-9]')"
+       check "  и он дошёл до итога" "1" "$(printf '%s' "$o" | grep -c 'проверок пройдено')" ;;
+esac
 
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi

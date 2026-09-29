@@ -45,6 +45,7 @@
     wc_Sha256Copy;
     wc_Sha256Final;
     wc_Sha256Free;
+    wc_Sha256Hash;
     wc_Sha256Update;
     wc_Sha384Copy;
     wc_Sha384Final;
@@ -81,6 +82,7 @@
     wolfSSL_free;
     wolfSSL_get_app_data;
     wolfSSL_get_error;
+    wolfSSL_get_peer_certificate;
     wolfSSL_get_peer_quic_transport_params;
     wolfSSL_Init;
     wolfSSL_new;
@@ -111,6 +113,7 @@
     wolfSSL_UseSNI;
     wolfSSL_X509_d2i;
     wolfSSL_X509_free;
+    wolfSSL_X509_get_der;
     wolfSSL_X509_STORE_CTX_free;
     wolfSSL_X509_STORE_CTX_get0_param;
     wolfSSL_X509_STORE_CTX_init;

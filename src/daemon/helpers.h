@@ -68,7 +68,7 @@ struct helper_state {
 
 struct helper {
     /* Состав — из вида выхода (kind_ops.helper). */
-    char cmd[8];
+    char cmd[16];               /* «hysteria2» — девять знаков: восьми уже не хватало */
     char name[32];
     char prog[16];
     char arg[2][256];

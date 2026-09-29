@@ -209,6 +209,16 @@ struct vless_cfg {
     unsigned transports;
 };
 
+/* hysteria2 (kind: tunnel, protocol: hysteria2). Узлы берутся из подписки так же, как у vless, —
+ * файл и выбор кандидатов с тем же смыслом (см. vless_cfg), — а вот транспорта нет: hysteria2 это
+ * QUIC целиком, и выбирать между tcp и ws ему нечем. Ключ `transport` у такого выхода — ошибка
+ * разбора, а не молча проглоченное слово. */
+struct hy2_cfg {
+    char sub_file[256];
+    int nodes[MAX_NODE_SEL];
+    size_t nodes_n;
+};
+
 /* Транспорты узла туннеля — имена как в ссылке узла (type=) и биты для vless_cfg.transports. */
 enum { TT_TCP = 1u << 0, TT_GRPC = 1u << 1, TT_XHTTP = 1u << 2, TT_WS = 1u << 3,
        TT_HTTPUPGRADE = 1u << 4, TT_COUNT = 5 };
@@ -421,6 +431,7 @@ struct output {
     union {
         struct iface_cfg iface;
         struct vless_cfg vless;
+        struct hy2_cfg hy2;
         struct xsteer_cfg xs;
         struct awg_cfg awg;
         struct zapret_cfg zp;

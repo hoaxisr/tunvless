@@ -198,6 +198,7 @@ link_app steer-vless "-O2 $APPF" PROFILE_mod_vless
 link_app steer-xsteer "-O2 $APPF" PROFILE_mod_xsteer
 link_app steer-obfs "-O2 $APPF" PROFILE_mod_obfs
 link_app steer-tgws "-O2 $APPF" PROFILE_mod_tgws
+link_app steer-hysteria2 "-O2 $APPF" PROFILE_mod_hysteria2
 
 # Клиент сокета `steer` — по-прежнему статический, один на все раскладки (build.sh собирает его сам).
-echo "libs: готово в $OUT (libsteer.so.$VERSION, libsteer-wolfssl.so.$WVER, steerd, steer-vless, steer-xsteer, steer-obfs, steer-tgws)"
+echo "libs: готово в $OUT (libsteer.so.$VERSION, libsteer-wolfssl.so.$WVER, steerd, steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2)"

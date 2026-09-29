@@ -1,0 +1,342 @@
+#!/bin/sh
+# Сквозной стенд hysteria2: клиент steer-hysteria2 против НАСТОЯЩЕГО сервера apernet/hysteria
+# (образ tobyxdd/hysteria:v2, бинарник берётся из него) — то есть независимой реализации
+# протокола на quic-go. Этот же прогон — сверка нашей обёртки QUIC (ngtcp2 + wolfSSL + Brutal)
+# с quic-go: рукопожатие, ALPN h3, датаграммы RFC 9221, потоки, окна, Brutal, Salamander.
+#
+# Что проверяется:
+#   1. авторизация (233) и проба узла; неверный пароль — отказ С ПРИЧИНОЙ (HTTP 404 маскировки);
+#   2. TCP через туннель (curl в сетевом пространстве клиента → цель за сервером): хеш файла
+#      8 МиБ, загрузка на сервер (PUT), несколько соединений разом;
+#   3. UDP: ответ DNS через туннель, эхо на 1 байт, 1200 и 3000 байт (фрагментация);
+#   4. Salamander: совпавший пароль работает, несовпавший и «одна сторона без obfs» — нет;
+#   5. pinSHA256: верный отпечаток проходит, неверный — отказ с причиной; без insecure и без
+#      отпечатка самоподписанный сертификат отвергается;
+#   6. прыжки по портам: сервер слушает один порт, диапазон заворачивает nft в его сетевом
+#      пространстве; проверяется, что клиент ходит на несколько портов диапазона и трафик не рвётся;
+#   7. режим перегрузки: ответ сервера «auto» (ignoreClientBandwidth) и предел сервера.
+# С параметром `bench` — ещё замер скорости на netem с потерями: BBR против Brutal.
+#
+# Всё в сетевых пространствах (клиент hy2c, сервер и цели hy2s, связаны veth): правил и маршрутов
+# хоста стенд не трогает. Нужны: root, ip netns, /dev/net/tun, openssl, python3, curl и бинарник
+# сервера (HY2_SERVER, иначе извлекается из образа tobyxdd/hysteria:v2 через docker create/cp).
+# Клиент — раскладка libs (LIBS, по умолчанию build/libs-host; её собирает tests/libs-test.sh).
+#
+# Использование: tests/run-hy2.sh [bench]
+set -u
+cd "$(dirname "$0")/.."
+
+LIBS="${LIBS:-build/libs-host}"
+MOD="$LIBS/steer-hysteria2"
+[ -x "$MOD" ] || { echo "run-hy2: нет $MOD (сначала tests/libs-test.sh) — ПРОПУСК"; exit 0; }
+WORK="$(mktemp -d)"
+NSC=hy2c
+NSS=hy2s
+SIP=10.66.0.1
+CIP=10.66.0.2
+TARGET=203.0.113.7
+pass=0; fail=0
+SRV_PID=""; CLI_PID=""; TGT_PID=""
+
+check() {
+    if [ "$2" = "$3" ]; then pass=$((pass + 1)); echo "  ok   $1"; else
+        fail=$((fail + 1)); printf '  FAIL %s\n    ожидалось: %s\n    получено:  %s\n' "$1" "$2" "$3"
+    fi
+}
+contains() {   # ИМЯ ТЕКСТ ОБРАЗЕЦ
+    case "$2" in *"$3"*) pass=$((pass + 1)); echo "  ok   $1" ;; *)
+        fail=$((fail + 1)); printf '  FAIL %s\n    в выводе нет «%s»:\n%s\n' "$1" "$3" "$(printf '%s' "$2" | sed 's/^/      /' | head -12)" ;; esac
+}
+
+cleanup() {
+    stop_client
+    stop_server
+    [ -n "$TGT_PID" ] && kill "$TGT_PID" 2>/dev/null
+    ip netns pids "$NSC" 2>/dev/null | xargs -r kill 2>/dev/null
+    ip netns pids "$NSS" 2>/dev/null | xargs -r kill 2>/dev/null
+    ip netns delete "$NSC" 2>/dev/null
+    ip netns delete "$NSS" 2>/dev/null
+    rm -rf "$WORK"
+}
+trap cleanup EXIT INT TERM
+
+# ---- бинарник сервера ------------------------------------------------------------------------
+HY2="${HY2_SERVER:-}"
+if [ -z "$HY2" ]; then
+    HY2="$WORK/hysteria"
+    if command -v docker >/dev/null 2>&1 && docker image inspect tobyxdd/hysteria:v2 >/dev/null 2>&1; then
+        c="hy2-extract-$$"
+        docker create --name "$c" tobyxdd/hysteria:v2 >/dev/null 2>&1 &&
+            docker cp "$c:/usr/local/bin/hysteria" "$HY2" >/dev/null 2>&1
+        docker rm "$c" >/dev/null 2>&1
+    fi
+fi
+[ -x "$HY2" ] || { echo "run-hy2: нет бинарника сервера hysteria (HY2_SERVER или образ tobyxdd/hysteria:v2) — ПРОПУСК"; exit 0; }
+
+# ---- сеть ------------------------------------------------------------------------------------
+ip netns delete "$NSC" 2>/dev/null; ip netns delete "$NSS" 2>/dev/null
+ip netns add "$NSC" && ip netns add "$NSS" || { echo "run-hy2: нет прав на ip netns — ПРОПУСК"; exit 0; }
+ip netns exec "$NSC" ip link set lo up
+ip netns exec "$NSS" ip link set lo up
+ip link add hy2-c type veth peer name hy2-s
+ip link set hy2-c netns "$NSC"; ip link set hy2-s netns "$NSS"
+ip netns exec "$NSC" ip addr add "$CIP/24" dev hy2-c; ip netns exec "$NSC" ip link set hy2-c up
+ip netns exec "$NSS" ip addr add "$SIP/24" dev hy2-s; ip netns exec "$NSS" ip link set hy2-s up
+# Цель — адрес на lo сервера: у клиента маршрута к нему нет, кроме устройства туннеля.
+ip netns exec "$NSS" ip addr add "$TARGET/32" dev lo
+
+nsc() { ip netns exec "$NSC" "$@"; }
+nss() { ip netns exec "$NSS" "$@"; }
+
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 \
+    -keyout "$WORK/key.pem" -out "$WORK/cert.pem" -subj "/CN=hy2.test" \
+    -addext "subjectAltName=DNS:hy2.test,IP:$SIP" >/dev/null 2>&1
+PIN="$(openssl x509 -in "$WORK/cert.pem" -outform der | sha256sum | cut -d' ' -f1)"
+
+mkdir -p "$WORK/www"
+# Фоновые процессы — прямым `ip netns exec`, а не через функцию nss/nsc: функция в фоне порождает
+# подоболочку, $! называет её, а не процесс, и kill убивал бы оболочку, оставляя сервер жить.
+ip netns exec "$NSS" python3 tests/hy2-targets.py --ip "$TARGET" --dir "$WORK/www" --mb 8 > "$WORK/targets.log" 2>&1 &
+TGT_PID=$!
+for _ in $(seq 50); do grep -q ready "$WORK/targets.log" 2>/dev/null && break; sleep 0.2; done
+WANT_SHA="$(cat "$WORK/www/big.sha256" 2>/dev/null)"
+
+# ---- сервер ----------------------------------------------------------------------------------
+# start_server ИМЯ [дополнительные строки yaml]: пароль hunter2.
+start_server() {
+    stop_server
+    {
+        echo "listen: $SIP:4433"
+        echo "tls: { cert: $WORK/cert.pem, key: $WORK/key.pem }"
+        echo "auth: { type: password, password: hunter2 }"
+        [ -n "${1:-}" ] && printf '%s\n' "$1"
+    } > "$WORK/server.yaml"
+    ip netns exec "$NSS" "$HY2" server -c "$WORK/server.yaml" > "$WORK/server.log" 2>&1 &
+    SRV_PID=$!
+    for _ in $(seq 50); do
+        nss ss -ulnH 2>/dev/null | grep -q ":4433 " && return 0
+        sleep 0.1
+    done
+    echo "  сервер не поднялся:"; sed 's/^/    /' "$WORK/server.log" | head -5
+    return 1
+}
+stop_server() {
+    [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null && wait "$SRV_PID" 2>/dev/null
+    SRV_PID=""
+}
+
+# ---- клиент ----------------------------------------------------------------------------------
+# write_sub ССЫЛКА: подписка и спека v1 с выходом hy (kind hysteria2).
+write_sub() {
+    printf '%s\n' "$1" > "$WORK/sub.txt"
+    cat > "$WORK/spec.json" <<SPEC
+{"schema":1,
+ "outputs":{"hy":{"name":"hy","kind":"hysteria2","sub_file":"$WORK/sub.txt","node":0}},
+ "channels":[]}
+SPEC
+}
+mod() { nsc env LD_LIBRARY_PATH="$LIBS" "$MOD" "$@"; }
+start_client() {
+    stop_client
+    rm -rf "$WORK/state"
+    ip netns exec "$NSC" env LD_LIBRARY_PATH="$LIBS" STEER_TUN_STATS=1 "$MOD" hysteria2 hy --spec "$WORK/spec.json" \
+        --state-dir "$WORK/state" > "$WORK/client.log" 2>&1 &
+    CLI_PID=$!
+    for _ in $(seq 60); do
+        nsc ip link show hy >/dev/null 2>&1 && break
+        kill -0 "$CLI_PID" 2>/dev/null || break
+        sleep 0.2
+    done
+    nsc ip link show hy >/dev/null 2>&1 || return 1
+    nsc ip route replace "$TARGET/32" dev hy
+    # Соединение с сервером поднимается сразу, но не мгновенно: ждём принятую авторизацию.
+    for _ in $(seq 40); do grep -q "принял авторизацию" "$WORK/client.log" && return 0; sleep 0.1; done
+    return 0
+}
+stop_client() {
+    [ -n "$CLI_PID" ] && kill "$CLI_PID" 2>/dev/null && wait "$CLI_PID" 2>/dev/null
+    CLI_PID=""
+    nsc ip link del hy 2>/dev/null
+}
+
+URI="hysteria2://hunter2@$SIP:4433/?insecure=1"
+echo "run-hy2: сервер $("$HY2" version 2>/dev/null | grep -i '^version' | head -1)"
+
+# ---- 1. проба и авторизация -------------------------------------------------------------------
+echo "1. авторизация"
+start_server "" || exit 1
+write_sub "$URI#ok"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+contains "проба: узел принял" "$out" '"ok":true'
+contains "  и назвал задержку" "$out" '"handshake_ms":'
+write_sub "hysteria2://wrong@$SIP:4433/?insecure=1#bad"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+contains "неверный пароль: отказ" "$out" '"ok":false'
+contains "  с причиной (HTTP-ответ маскировки)" "$out" 'отказал в авторизации (HTTP 404)'
+
+# ---- 2. TCP и UDP -----------------------------------------------------------------------------
+echo "2. TCP и UDP"
+write_sub "$URI#ok"
+start_client || { echo "  клиент не поднялся:"; sed 's/^/    /' "$WORK/client.log" | head; }
+got="$(nsc curl -s -m 60 "http://$TARGET/big.bin" | sha256sum | cut -d' ' -f1)"
+check "TCP: файл 8 МиБ прошёл целиком (хеш)" "$WANT_SHA" "$got"
+head -c 3000000 /dev/zero > "$WORK/up.bin"
+check "TCP: загрузка на сервер (PUT) 3000000 байт" "3000000" "$(nsc curl -s -m 60 -T "$WORK/up.bin" "http://$TARGET/up")"
+nsc sh -c "for i in 1 2 3 4 5 6; do curl -s -m 60 http://$TARGET/big.bin | sha256sum & done; wait" > "$WORK/par.txt"
+check "TCP: шесть соединений разом, все хеши верны" "6" "$(grep -c "^$WANT_SHA" "$WORK/par.txt")"
+dns="$(nsc dig +short +time=3 +tries=1 @"$TARGET" -p 53 x.test A 2>&1)"
+check "UDP: DNS через туннель" "192.0.2.53" "$dns"
+udp_echo() {  # размер
+    nsc python3 - "$TARGET" "$1" <<'PY'
+import socket, sys, os
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(5)
+d = os.urandom(int(sys.argv[2]))
+s.sendto(d, (sys.argv[1], 7))
+try:
+    r, _ = s.recvfrom(65535)
+    print("same" if r == d else "differ")
+except Exception as e:
+    print("none")
+PY
+}
+check "UDP: эхо 1 байт" "same" "$(udp_echo 1)"
+check "UDP: эхо 1200 байт" "same" "$(udp_echo 1200)"
+check "UDP: эхо 3000 байт (фрагментация в обе стороны)" "same" "$(udp_echo 3000)"
+st="$(cat "$WORK/state/../state/hy2-hy" 2>/dev/null || true)"
+sleep 3.5
+st="$(cat "$WORK/state/hy2-hy" 2>/dev/null)"
+contains "файл состояния: соединение поднято" "$st" '"up":true'
+contains "  режим перегрузки BBR (up в ссылке не задан)" "$st" '"cc":"bbr"'
+contains "  UDP разрешён сервером" "$st" '"udp":true'
+stop_client
+
+# ---- 3. Salamander ----------------------------------------------------------------------------
+echo "3. Salamander"
+start_server "obfs: { type: salamander, salamander: { password: obfspass1 } }" || exit 1
+write_sub "$URI&obfs=salamander&obfs-password=obfspass1#s"
+start_client
+got="$(nsc curl -s -m 30 "http://$TARGET/big.bin" | sha256sum | cut -d' ' -f1)"
+check "salamander: файл прошёл" "$WANT_SHA" "$got"
+contains "  и журнал называет обфускацию" "$(cat "$WORK/client.log")" "Salamander"
+stop_client
+write_sub "$URI&obfs=salamander&obfs-password=wrongpass#s"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --timeout 4 --state-dir "$WORK/state" 2>&1)"
+contains "salamander: чужой пароль — отказ" "$out" '"ok":false'
+write_sub "$URI#plain"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --timeout 4 --state-dir "$WORK/state" 2>&1)"
+contains "salamander: сервер с obfs, клиент без — отказ" "$out" '"ok":false'
+start_server "" || exit 1
+write_sub "$URI&obfs=salamander&obfs-password=obfspass1#s"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --timeout 4 --state-dir "$WORK/state" 2>&1)"
+contains "salamander: клиент с obfs, сервер без — отказ" "$out" '"ok":false'
+
+# Gecko — Salamander плюс нарезка пакетов рукопожатия (extras/obfs эталона): рукопожатие, TCP и UDP
+# через него; неверный пароль — отказ; Salamander против Gecko-сервера не срабатывает.
+echo "3б. Gecko"
+start_server "obfs: { type: gecko, gecko: { password: geckopass1 } }" || exit 1
+write_sub "$URI&obfs=gecko&obfs-password=geckopass1#g"
+start_client
+got="$(nsc curl -s -m 30 "http://$TARGET/big.bin" | sha256sum | cut -d' ' -f1)"
+check "gecko: файл прошёл" "$WANT_SHA" "$got"
+check "  и UDP (эхо 3000 байт)" "same" "$(udp_echo 3000)"
+contains "  журнал называет Gecko" "$(cat "$WORK/client.log")" "Gecko"
+stop_client
+write_sub "$URI&obfs=gecko&obfs-password=wrongpass#g"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --timeout 4 --state-dir "$WORK/state" 2>&1)"
+contains "gecko: чужой пароль — отказ" "$out" '"ok":false'
+write_sub "$URI&obfs=salamander&obfs-password=geckopass1#s"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --timeout 4 --state-dir "$WORK/state" 2>&1)"
+contains "gecko-сервер, клиент с salamander — отказ" "$out" '"ok":false'
+start_server "" || exit 1
+
+# ---- 4. pinSHA256 и проверка сертификата ---------------------------------------------------------
+echo "4. сертификат"
+write_sub "hysteria2://hunter2@$SIP:4433/?pinSHA256=$PIN&sni=hy2.test#pin"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+contains "pinSHA256 верный: узел принят" "$out" '"ok":true'
+write_sub "hysteria2://hunter2@$SIP:4433/?pinSHA256=$(printf '%064d' 0)&sni=hy2.test#pin"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+contains "pinSHA256 чужой: отказ" "$out" '"ok":false'
+contains "  с причиной" "$out" 'не совпал с pinSHA256'
+write_sub "hysteria2://hunter2@$SIP:4433/?sni=hy2.test#nocheck"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+contains "самоподписанный без insecure и без отпечатка: отказ" "$out" '"ok":false'
+
+# ---- 5. режим перегрузки ------------------------------------------------------------------------
+echo "5. режим перегрузки"
+start_server "ignoreClientBandwidth: true" || exit 1
+write_sub "$URI&up=100&down=100#brutal"
+start_client
+sleep 3.5
+st="$(cat "$WORK/state/hy2-hy" 2>/dev/null)"
+contains "сервер ответил auto (ignoreClientBandwidth): клиент перешёл с Brutal на BBR" "$st" '"cc":"bbr"'
+got="$(nsc curl -s -m 30 "http://$TARGET/big.bin" | sha256sum | cut -d' ' -f1)"
+check "  файл прошёл" "$WANT_SHA" "$got"
+stop_client
+start_server "bandwidth: { up: 50 mbps, down: 50 mbps }" || exit 1
+start_client
+sleep 3.5
+st="$(cat "$WORK/state/hy2-hy" 2>/dev/null)"
+contains "предел сервера 50 Мбит/с, up клиента 100: Brutal на 50 (6250000 байт/с)" "$st" '"brutal_bps":6250000'
+got="$(nsc curl -s -m 30 "http://$TARGET/big.bin" | sha256sum | cut -d' ' -f1)"
+check "  файл прошёл" "$WANT_SHA" "$got"
+stop_client
+start_server "" || exit 1
+start_client
+sleep 3.5
+st="$(cat "$WORK/state/hy2-hy" 2>/dev/null)"
+contains "сервер без предела (0): Brutal на своём up (12500000 байт/с)" "$st" '"brutal_bps":12500000'
+stop_client
+
+# ---- 6. прыжки по портам --------------------------------------------------------------------------
+echo "6. прыжки по портам"
+start_server "" || exit 1
+nss nft add table ip hop
+nss nft add chain ip hop pre '{ type nat hook prerouting priority dstnat; }'
+nss nft add rule ip hop pre iifname hy2-s udp dport 20000-20099 counter redirect to :4433
+write_sub "hysteria2://hunter2@$SIP:20000/?insecure=1&mport=20000-20099&hop-interval=5#hop"
+start_client
+# Порты, на которые ходил клиент, — из conntrack нельзя (нет утилиты), поэтому считаем сегменты
+# диапазона счётчиками nft: по одному правилу на каждые десять портов.
+nss nft add chain ip hop pre2 '{ type filter hook prerouting priority -300; }'
+for b in 0 1 2 3 4 5 6 7 8 9; do
+    nss nft add rule ip hop pre2 iifname hy2-s udp dport "200${b}0-200${b}9" counter
+done
+# Период прыжка 5 с, порт выбирается из ста, участков десять: за полминуты смен набирается около
+# пяти, и вероятность, что все они упали в один участок, — порядка 10^-4 (в четыре загрузки за 15 с
+# стенд был флаковым).
+nsc sh -c "for i in 1 2 3 4 5 6 7; do curl -s -m 40 http://$TARGET/big.bin | sha256sum; sleep 4; done" > "$WORK/hop.txt"
+check "прыжки: 7 загрузок за ~30 с, все хеши верны" "7" "$(grep -c "^$WANT_SHA" "$WORK/hop.txt")"
+seg="$(nss nft list chain ip hop pre2 | grep -c 'packets [1-9]')"
+[ "$seg" -ge 2 ] && seg=">=2" || seg="$seg"
+check "  клиент ходил на несколько участков диапазона" ">=2" "$seg"
+stop_client
+
+# ---- замер на потерях -------------------------------------------------------------------------
+if [ "${1:-}" = bench ]; then
+    echo "7. замер: 5% потерь, задержка 20 мс в каждую сторону"
+    start_server "" || exit 1
+    for ns in "$NSC" "$NSS"; do
+        d=hy2-c; [ "$ns" = "$NSS" ] && d=hy2-s
+        ip netns exec "$ns" tc qdisc replace dev "$d" root netem delay 20ms loss 5%
+    done
+    bench() {  # ИМЯ ССЫЛКА
+        write_sub "$2"
+        start_client
+        d="$(nsc curl -s -m 120 -o /dev/null -w '%{speed_download}' "http://$TARGET/big.bin")"
+        u="$(nsc curl -s -m 120 -o /dev/null -w '%{speed_upload}' -T "$WORK/up.bin" "http://$TARGET/up")"
+        awk -v n="$1" -v d="$d" -v u="$u" 'BEGIN{printf "  %-34s загрузка %7.2f Мбит/с   выгрузка %7.2f Мбит/с\n", n, d*8/1e6, u*8/1e6}'
+        stop_client
+    }
+    bench "BBR (up не задан)" "$URI#bbr"
+    bench "Brutal up=down=100 Мбит/с" "$URI&up=100&down=100#br100"
+    bench "Brutal up=down=20 Мбит/с" "$URI&up=20&down=20#br20"
+    for ns in "$NSC" "$NSS"; do
+        d=hy2-c; [ "$ns" = "$NSS" ] && d=hy2-s
+        ip netns exec "$ns" tc qdisc del dev "$d" root 2>/dev/null
+    done
+fi
+
+echo
+echo "run-hy2: $pass проверок пройдено, провалено $fail"
+[ "$fail" = 0 ]
