@@ -105,8 +105,13 @@
  * Сверка — два дампа rtnetlink в процессе (rtnl_rules_text, rtnl_routes_text) и разбор тем же
  * route_facts_of, которым сверяет маршрутизацию сторож, — без единого процесса. Пока идёт своя
  * команда, которая сама снимает правила (посреди apply-commit с --drop или --route правило бывает
- * уже снято, а таблица ещё не сброшена), проверка ждёт её конца (rulewd_kick). План и применение
- * одного набора правил проверку не держат: прежде ждала любая изменяющая команда, и на `network
+ * уже снято, а таблица ещё не сброшена), проверка не трогает только выходы, которых команда держит
+ * (rulewd_conf.held), а остальные возвращает сразу: раньше она ждала конца всей команды, и на
+ * `network restart` команда с --route (привязка ~0,4 с на выход) держала правила снятыми
+ * 0,5–1,65 с (проверка на QEMU). Проверка по выходам, которых держат, и по командам, которых ждут
+ * целиком (busy), не теряется: пока команда идёт, она повторяется каждые RULEWD_BUSY_MS
+ * (rulewd_defer) и сразу после неё (rulewd_kick). План и применение одного набора правил проверку
+ * не держат: прежде ждала любая изменяющая команда, и на `network
  * restart` сверка по новому мосту, державшая очередь, успевала сама перепривязать выходы ребёнком
  * по одному — ~0,4 с на выход, и цепочка ingress_mark ждала их (проверка на QEMU 4192267, доводы
  * — у srv_rules_busy в ctl.c). Перед решением сверки проверка идёт сразу (rulewd_settle). Таблицы движка в ядре нет — движок снят целиком (`steer
@@ -148,6 +153,8 @@
  * не позже RULEWD_FAST_MAX_MS после первого (см. шапку, «СРАЗУ, А НЕ ЧЕРЕЗ СЕКУНДУ»). */
 #define RULEWD_FAST_MS      100
 #define RULEWD_FAST_MAX_MS  300
+/* Опрос при занятости — как часто. */
+#define RULEWD_BUSY_MS      50
 /* Шторм: тишина после последнего события пачки и предел от первого — прежние числа. */
 #define RULEWD_QUIET_MS 1000
 #define RULEWD_MAX_MS   2000
@@ -220,9 +227,19 @@ static int rules_read(char *rules, size_t rn, char *rules6, size_t r6n) {
     return 0;
 }
 
-int rulewd_missing(const struct spec *sp, char *list, size_t n) {
+/* Держит ли выход идущая команда демона (rulewd_conf.held): его правила проверка не трогает. */
+static int out_held(const struct rulewd *r, const struct output *o) {
+    return r && r->cf.held && r->cf.held(r->cf.arg, o);
+}
+
+/* rulewd_missing с учётом held: выходы, чьи правила держит идущая команда, не считаются, а
+ * *heldmiss (если он есть) отмечает, что среди них есть и такие, у которых чего-то не хватает, —
+ * их проверять после конца команды (rulewd_defer). r == NULL — held не спрашивается. */
+static int missing_x(const struct rulewd *r, const struct spec *sp, char *list, size_t n,
+                     int *heldmiss) {
     static char rules[16384], rules6[16384];
     if (n) list[0] = '\0';
+    if (heldmiss) *heldmiss = 0;
     if (!sp) return 0;
     if (rules_read(rules, sizeof(rules), rules6, sizeof(rules6)) != 0) return -1;
     int cnt = 0;
@@ -233,10 +250,18 @@ int rulewd_missing(const struct spec *sp, char *list, size_t n) {
         int m = out_missing(rules, rules6, o);
         if (m < 0) return -1;
         if (!m) continue;
+        if (out_held(r, o)) {
+            if (heldmiss) *heldmiss = 1;
+            continue;
+        }
         list_add(list, n, &k, cnt, o->name);
         cnt++;
     }
     return cnt;
+}
+
+int rulewd_missing(const struct spec *sp, char *list, size_t n) {
+    return missing_x(NULL, sp, list, n, NULL);
 }
 
 /* Приоритет, с которым вернуть правило семейства fam с меткой mark: свой у платформы, иначе тот,
@@ -276,7 +301,7 @@ static int rulewd_restore(struct rulewd *r, const struct spec *sp, char *all, ch
         if (!out_has_device(o) || !o->mark || !o->table) continue;
         int m = out_missing(rules, rules6, o);
         if (m < 0) return -1;
-        if (!m) continue;
+        if (!m || out_held(r, o)) continue;
         if ((m & MISS_R4) && rtnl_rule_fwmark(4, o->mark, STEER_MARK_MASK, o->table,
                                               (int)pref_of(r, 4, o->mark)) != 0) bad = 1;
         /* Запрет — раньше правила IPv6: вернувшееся правило должно найти в таблице запрет, а не
@@ -298,6 +323,17 @@ static int rulewd_storm(const struct rulewd *r, long now) {
     return oldest && now - oldest < RULEWD_STORM_WIN_MS;
 }
 
+/* Проверку — повторить через RULEWD_BUSY_MS: идёт команда, которая держит правила выхода, или
+ * своя операция целиком (rulewd_conf.busy, held). Одного rulewd_kick из конца операции мало: он
+ * зовётся, только когда очередь изменяющих команд опустела, а за одной командой обычно стоит
+ * следующая (сверка по проходу сторожа, потом сверка по новому мосту), и проверка, отложенная до
+ * «тишины», ждала бы их всех. Опрос раз в 50 мс идёт только пока команда работает и есть что
+ * проверять — два дампа rtnetlink, без единого процесса. */
+static void rulewd_defer(struct rulewd *r) {
+    r->pending = 1;
+    loop_timer_set(r->tm, RULEWD_BUSY_MS);
+}
+
 static void rulewd_check(struct rulewd *r) {
     struct steerd *d = r->d;
     r->pending = 0;
@@ -307,7 +343,12 @@ static void rulewd_check(struct rulewd *r) {
     uint64_t h;
     if (recon_table_handle(nft_table(), &h) == 1) return;
     char list[512];
-    if (rulewd_missing(d->sp, list, sizeof(list)) <= 0) return;
+    int hm = 0;
+    int cnt = missing_x(r, d->sp, list, sizeof(list), &hm);
+    /* Чего-то не хватает у выхода, которого держит идущая команда, — вернуться к нему, когда она
+     * кончится (rulewd_defer): событие снятия не повторится. */
+    if (hm) rulewd_defer(r);
+    if (cnt <= 0) return;
     if (!r->cf.restored) { r->cf.repair(r->cf.arg); return; }
     char rl[512], bs[512];
     int rc = rulewd_restore(r, d->sp, list, rl, bs, sizeof(list));
@@ -320,7 +361,7 @@ static void rulewd_check(struct rulewd *r) {
         r->back_i = (r->back_i + 1) % (RULEWD_STORM_N + 1);
     }
     char left[512];
-    if (rc > 0 && rulewd_missing(d->sp, left, sizeof(left)) == 0) {
+    if (rc > 0 && missing_x(r, d->sp, left, sizeof(left), NULL) == 0) {
         r->cf.restored(r->cf.arg, list, rl, bs);
         return;
     }
@@ -332,8 +373,9 @@ static void rulewd_timer(struct loop *l, struct loop_timer *t, void *arg) {
     (void)l; (void)t;
     struct rulewd *r = arg;
     if (!r->pending) return;
-    /* Своя операция идёт — проверка после неё (rulewd_kick из конца операции). */
-    if (r->cf.busy && r->cf.busy(r->cf.arg)) return;
+    /* Своя операция идёт — проверка после неё: опрос (rulewd_defer) и rulewd_kick из конца
+     * операции. Событие, пришедшее в занятости, не теряется. */
+    if (r->cf.busy && r->cf.busy(r->cf.arg)) { rulewd_defer(r); return; }
     rulewd_check(r);
 }
 

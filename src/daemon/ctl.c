@@ -1437,6 +1437,7 @@ static void commit_start(struct conn *c, job_done_fn done) {
      * только потом решение (srv_rules_busy — доводы): иначе решение, увидев «правила нет»,
      * перепривязало бы выходы ребёнком по одному, а набор правил встал бы только после них. План
      * уже кончился, ребёнок применения ещё не запущен — в ядро наши сейчас не пишут. */
+    c->committed = 0;       /* на время проверки стража команда ещё ничего не держит (srv_rules_held) */
     rulewd_settle(s->rules);
     /* Спека в памяти — последняя применённая: по ней сверка знает, как должна стоять
      * маршрутизация выходов, чья подпись не изменилась; память сторожа — какие из них в отказе. */
@@ -2479,20 +2480,53 @@ static int srv_busy(void *arg) {
  *   - применение без --drop и --route (сверка по новому мосту: только набор правил) правил не
  *     снимает — тоже сразу. Сообщение rtnetlink стража с nft -f ребёнка не спорит: набор правил
  *     правил маршрутизации не касается;
- *   - применение с --drop или --route — ждать, как прежде. Гонки двух привязок одного правила
- *     здесь нет и поэтому: с NLM_F_EXCL на том же приоритете ядро ответило бы EEXIST
- *     (rtnl_rule_fwmark считает это успехом), но rule_ensure ставит правило `ip rule add` без
- *     приоритета, и после своего дампа — копия на другом приоритете вреда не несла бы (та же
- *     таблица), но и держать её незачем;
+ *   - применение с --drop или --route — не ждать целиком: ждёт только правило того выхода, который
+ *     команда сама может снять (srv_rules_held ниже). Прежде страж молчал до конца команды, а
+ *     команда с --route на `network restart` шла секунду с лишним (проверка на QEMU, 1,3–1,65 с;
+ *     ~0,4 с на выход, и набор правил с ingress_mark после привязок), — всё это время правило,
+ *     снятое netifd посреди неё, не стояло, и возвращал его сам reload («привязываю заново»),
+ *     когда доходил до выхода;
  *   - прочие изменяющие команды (починка ребёнком, выключатель, restart…) — ждать, как прежде.
  * Чтобы само решение сверки не увидело снятое правило раньше стража (событие ещё в очереди
- * цикла или в пачке на 100 мс), commit_start перед recon_decide зовёт rulewd_settle. */
+ * цикла или в пачке на 100 мс), commit_start перед recon_decide зовёт rulewd_settle.
+ *
+ * Возвращать при идущем --route безопасно, и вот почему. Возврат — одно сообщение rtnetlink,
+ * идемпотентное: rtnl_rule_fwmark с NLM_F_EXCL на точную копию получает EEXIST и считает это
+ * успехом. Приоритет страж ставит тот же, что был у снятого правила (событие его несёт; на
+ * телефоне он свой), а rule_ensure ребёнка сначала читает дамп: увидев верную копию (метка, наша
+ * маска, таблица), он ничего не добавляет, а лишние снимает — так что приоритет чужого возврата
+ * значения не имеет. Остаётся окно между дампом ребёнка и его `ip rule add`: если страж вернул
+ * правило именно там, копий станет две — обе ведут в ту же таблицу, трафик идёт верно, лишнюю
+ * снимет следующий rule_ensure (следующая привязка) — вред только косметический, а не утечка.
+ * Ждать ради этого окна значило бы держать выход без правила на всё время команды: помеченный
+ * трафик выхода идёт тогда через postrouting_guard в отбрасывание, то есть «не работает». */
 static int srv_rules_busy(void *arg) {
     const struct conn *c = ((struct ctl_srv *)arg)->lock_owner;
     if (!c) return 0;
     const char *name = c->q.cmd ? c->q.cmd->name : "";
-    if (strcmp(name, "apply") != 0 && strcmp(name, "reload") != 0) return 1;
-    return c->committed && (c->diff.drop_n || c->diff.route_n);
+    return strcmp(name, "apply") != 0 && strcmp(name, "reload") != 0;
+}
+
+/* Страж правил (rulewd_conf.held): выход o, чьи правила идущий apply или reload сам снимает или
+ * может снять, — пока команда идёт, страж их не возвращает (потом проверит, rulewd_defer):
+ *   - метка из --drop: rule_drop снимет и вернутую копию, но правило и таблицу он снимает двумя
+ *     шагами, и вернуть правило между ними значило бы оставить его без таблицы;
+ *   - выход из --route, у которого изменилась подпись маршрутизации (или полный apply): спека
+ *     могла отнять у него IPv6 (apply_routing_one снимет правило и таблицу IPv6), а страж судит
+ *     по спеке в памяти — прежней, пока команда не кончится;
+ *   - выход из --route только из-за расхождения с ядром (recon_diff.route_kern) — не держится:
+ *     привязка ничего не снимает нарочно, правило она лишь оставляет или ставит. Это и есть путь
+ *     `network restart`, когда правила снял netifd. */
+static int srv_rules_held(void *arg, const struct output *o) {
+    const struct conn *c = ((struct ctl_srv *)arg)->lock_owner;
+    if (!c || !c->committed) return 0;
+    const char *name = c->q.cmd ? c->q.cmd->name : "";
+    if (strcmp(name, "apply") != 0 && strcmp(name, "reload") != 0) return 0;
+    for (size_t i = 0; i < c->diff.drop_n; i++)
+        if (c->diff.drop[i].mark == o->mark) return 1;
+    for (size_t i = 0; i < c->diff.route_n; i++)
+        if (!strcmp(c->diff.route[i], o->name)) return !c->diff.route_kern[i];
+    return 0;
 }
 
 /* Дети команд, которые ещё идут (apply, diag, vless-probe…): их группам процессов — SIGTERM,
@@ -3026,7 +3060,7 @@ int ctl_serve_main(int argc, char **argv) {
         if (!S.watch) { fprintf(stderr, LOG_W "сторож: нет памяти\n"); return 1; }
         S.snap_tm = loop_timer_new(S.l, srv_snap, &S);
         if (S.snap_tm && S.on) loop_timer_set(S.snap_tm, CTL_SNAP_MS);
-        struct rulewd_conf rc = { .busy = srv_rules_busy, .repair = srv_repair,
+        struct rulewd_conf rc = { .busy = srv_rules_busy, .held = srv_rules_held, .repair = srv_repair,
                                   .restored = srv_restored, .arg = &S };
         S.rules = rulewd_start(&S.d, &rc, S.on);
         if (!S.rules) { fprintf(stderr, LOG_W "страж правил: нет памяти\n"); return 1; }

@@ -397,6 +397,7 @@ void recon_decide(const struct recon_state *st, const struct recon_plan *p, cons
         const struct recon_out *o = &p->out[i];
         if (!o->routed) continue;
         const struct recon_out *was = full ? NULL : out_find(st->out, st->n, o->name);
+        int kern = 0;      /* привязка только из-за расхождения с ядром (recon_diff.route_kern) */
         if (was && was->routed && was->rsig == o->rsig) {
             /* Подпись та же — сверить с ядром. Выход берётся из спеки в памяти: при той же
              * подписи вид, метка, таблица, on_fail, устройства и IPv6 у неё те же, что в плане
@@ -418,7 +419,9 @@ void recon_decide(const struct recon_state *st, const struct recon_plan *p, cons
             fprintf(stderr, LOG_W "выход %s: %s — %s\n", o->name, why,
                     kr == KR_REBIND ? "привязываю заново" : "сторожу внеочередной проход");
             if (kr == KR_WATCH) continue;
+            kern = 1;
         }
+        d->route_kern[d->route_n] = (unsigned char)kern;
         snprintf(d->route[d->route_n++], sizeof(d->route[0]), "%s", o->name);
         if (o->awg) d->awg = 1;
     }

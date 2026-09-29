@@ -527,6 +527,53 @@ sleep 0.5
 sent="$(send_stop)"
 check "  у провайдера ни одного пакета (отправлено $sent)" "0 0" \
     "$(($(cnt "$IW" real) - W0)) $(($(cnt "$IW" real6) - W6))"
+
+# ---- A9. сверка по проходу сторожа (reload с --route) идёт, правила снимаются в её середине -------
+# Проверка на QEMU (a2, a4; network restart при vless и ipv6: nat): ifdown wg0 запускает проход
+# сторожа, тот находит расхождение набора правил и ставит reload; пока он идёт с --route, netifd
+# снимает правила fwmark. Страж ждал конца всей команды (srv_rules_busy: apply/reload с --route
+# или --drop), и правила возвращал сам reload, дойдя до выхода («привязываю заново»), — через
+# 1,3–1,65 с вместо ~300 мс. Здесь расхождение — снятое правило канала в наборе правил (сверка
+# ставит набор заново) и пустая таблица выхода wg (привязка заново, --route); nft у детей движка
+# медленный (0,6 с), так что набор правил грузится долго — уже после привязки, и сама привязка
+# снятые посреди набора правила не вернёт. Правила обоих семейств снимаются, когда таблица выхода
+# привязана, а apply-commit ещё идёт: назад стражем быстрее 300 мс, без второго «привязываю
+# заново», у провайдера ни одного пакета.
+sleep 6
+printf '#!/bin/sh\nsleep 0.6\nexec %s "$@"\n' "$real_nft" > "$tmp/bin/nft"
+chmod +x "$tmp/bin/nft"
+TW="$("$real_ip" rule show | grep "fwmark 0x$MW/" | head -n 1 | sed -n 's/.*lookup \([^ ]*\).*/\1/p')"
+W0="$(cnt "$IW" real)" W6="$(cnt "$IW" real6)"
+nb0="$(grep -c 'привязываю заново' "$tmp/d7.err")"
+nr0="$(grep -c 'сняты снаружи — возвращены: wg' "$tmp/d7.err")"
+send_start 198.18.0.1
+sleep 0.3
+h="$("$real_nft" -a list chain inet steer prerouting_mark | grep 'comment "steer:' | head -n 1 | sed -n 's/.*# handle \([0-9]*\).*/\1/p')"
+"$real_nft" delete rule inet steer prerouting_mark handle "$h"
+"$real_ip" route flush table "$TW"
+wait_for '[ "$(grep -c "привязываю заново" "$tmp/d7.err")" -gt "$nb0" ]' 12
+wait_for '"$real_ip" route show table "$TW" | grep -q default' 10
+sleep 0.15
+busy=no
+pgrep -f apply-commit >/dev/null 2>&1 && busy=yes
+t0="$(now_ms)"
+"$real_ip" rule flush
+"$real_ip" rule add priority 32766 table main
+"$real_ip" rule add priority 32767 table default
+"$real_ip" -6 rule flush
+"$real_ip" -6 rule add priority 32766 table main
+wait_for '[ "$(ours)" = 1 ] && [ "$(ours6)" = 1 ]' 10
+msr=$(( $(now_ms) - t0 ))
+echo "     (правила назад через $msr мс после снятия посреди сверки)"
+check "A9: правила сняты, пока apply-commit сверки ещё идёт" "yes" "$busy"
+check "  правила обоих семейств назад быстрее 300 мс — стражем, а не сверкой" "yes yes" \
+    "$([ "$(ours)" = 1 ] && [ "$(ours6)" = 1 ] && [ $msr -lt 300 ] && echo yes || echo "no:$msr ms") $([ "$(grep -c 'сняты снаружи — возвращены: wg' "$tmp/d7.err")" -gt "$nr0" ] && echo yes || echo no)"
+sleep 1.5
+check "  выход перепривязывался один раз — до снятия, не после" "1" \
+    "$(($(grep -c 'привязываю заново' "$tmp/d7.err") - nb0))"
+sent="$(send_stop)"
+check "  у провайдера ни одного пакета (отправлено $sent)" "0 0" \
+    "$(($(cnt "$IW" real) - W0)) $(($(cnt "$IW" real6) - W6))"
 rm -f "$tmp/bin/ip" "$tmp/bin/nft"
 [ -n "${NETRESTART_KEEP:-}" ] && cp "$tmp/d7.err" "$NETRESTART_KEEP.a7"
 kill "$D" 2>/dev/null
