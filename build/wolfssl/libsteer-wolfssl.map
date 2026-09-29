@@ -1,0 +1,75 @@
+/* Экспорт libsteer-wolfssl.so — ЭТОТ ФАЙЛ ПОРОЖДАЕТ build/libs-exports.sh (gen), руками не правится.
+ * Символы wolfSSL, которые зовёт слой src/lib/scrypto.c, и отпечаток сборки steer_wolfssl_abi
+ * (build/wolfssl/abi.c). Остальное скрыто: наружу торчит не библиотека, а нужное. Когда
+ * появится потребитель QUIC (ngtcp2, шаг 7), его символы добавятся тем же способом. */
+{
+  global:
+    steer_wolfssl_abi;
+    wc_AesCtrEncrypt;
+    wc_AesCtrSetKey;
+    wc_AesFree;
+    wc_AesGcmDecrypt;
+    wc_AesGcmEncrypt;
+    wc_AesGcmSetKey;
+    wc_AesInit;
+    wc_ChaCha20Poly1305_Decrypt_ex;
+    wc_ChaCha20Poly1305_Encrypt_ex;
+    wc_Chacha_SetKey;
+    wc_curve25519_generic;
+    wc_curve25519_make_pub;
+    wc_ecc_free;
+    wc_ecc_init;
+    wc_EccPublicKeyDecode;
+    wc_ecc_verify_hash;
+    wc_EncodeSignature;
+    wc_ForceZero;
+    wc_FreeRsaKey;
+    wc_GetSubjectPubKeyInfoDerFromCert;
+    wc_HashGetOID;
+    wc_HKDF_Expand;
+    wc_HKDF_Extract;
+    wc_HmacFinal;
+    wc_HmacFree;
+    wc_HmacInit;
+    wc_HmacSetKey;
+    wc_HmacUpdate;
+    wc_InitRsaKey;
+    wc_InitSha256_ex;
+    wc_InitSha384_ex;
+    wc_InitSha512_ex;
+    wc_RsaEncryptSize;
+    wc_RsaPSS_CheckPadding_ex2;
+    wc_RsaPSS_Verify_ex;
+    wc_RsaPublicKeyDecode;
+    wc_RsaSSL_Verify;
+    wc_Sha256Copy;
+    wc_Sha256Final;
+    wc_Sha256Free;
+    wc_Sha256Update;
+    wc_Sha384Copy;
+    wc_Sha384Final;
+    wc_Sha384Free;
+    wc_Sha384Update;
+    wc_Sha512Copy;
+    wc_Sha512Final;
+    wc_Sha512Free;
+    wc_Sha512Update;
+    wolfSSL_CertManagerLoadCABuffer_ex;
+    wolfSSL_Init;
+    wolfSSL_sk_X509_new_null;
+    wolfSSL_sk_X509_pop_free;
+    wolfSSL_sk_X509_push;
+    wolfSSL_X509_d2i;
+    wolfSSL_X509_free;
+    wolfSSL_X509_STORE_CTX_free;
+    wolfSSL_X509_STORE_CTX_get0_param;
+    wolfSSL_X509_STORE_CTX_init;
+    wolfSSL_X509_STORE_CTX_new;
+    wolfSSL_X509_STORE_free;
+    wolfSSL_X509_STORE_new;
+    wolfSSL_X509_verify_cert;
+    wolfSSL_X509_VERIFY_PARAM_set1_host;
+    wolfSSL_X509_VERIFY_PARAM_set1_ip_asc;
+  local:
+    *;
+};

@@ -33,34 +33,67 @@ extern const struct kind_ops kind_zapret __attribute__((weak));
 extern const struct kind_ops kind_tgws __attribute__((weak));
 extern const struct kind_ops kind_awg __attribute__((weak));
 
-/* Тексты — ровно те, что печатал разбор, пока отказ стоял в нём под #ifndef STEER_EXTENDED:
- * их сверяет снимок (tests/snapshot.sh), а подстроку «steer-extended» читает splify2 — по ней
- * он предлагает поставить полный пакет. Менять её нельзя. */
+/* ТЕКСТ ОТКАЗА «НУЖЕН ПАКЕТ» — из одного места: здесь. С выпуска 1.10 у каждого модуля свой пакет
+ * (steer-vless, steer-xsteer), а прежнее имя steer-extended осталось пакетом, который ставит их
+ * все. Подстроку «steer-extended» читает splify2 — по ней он предлагает поставить полный пакет
+ * (tests/climatch.sh, splify2 FirstRun.tsx), и пока он не научится читать имена модулей, она
+ * обязана остаться в тексте рядом с новым именем. Прежней фразы «требует пакет steer-extended»
+ * снимок генератора не хранит (в tests/golden её нет), так что дописать имя модуля можно. */
 static const struct kind_ops no_interface = { .name = "interface", .absent = "kind interface в этой сборке нет" };
-static const struct kind_ops no_vless     = { .name = "vless",  .absent = "kind vless требует пакет steer-extended" };
-static const struct kind_ops no_xsteer    = { .name = "xsteer", .absent = "kind xsteer требует пакет steer-extended" };
+static const struct kind_ops no_vless     = { .name = "vless",  .absent = "kind vless требует пакет steer-vless (входит в steer-extended)" };
+static const struct kind_ops no_xsteer    = { .name = "xsteer", .absent = "kind xsteer требует пакет steer-xsteer (входит в steer-extended)" };
 static const struct kind_ops no_zapret    = { .name = "zapret", .absent = "kind zapret в этой сборке нет" };
 static const struct kind_ops no_tgws      = { .name = "tgws",   .absent = "kind tgws в этой сборке нет" };
 static const struct kind_ops no_awg       = { .name = "awg",    .absent = "kind awg в этой сборке нет" };
 
 /* Порядок — прежний порядок видов (им же печатается справка о видах и идут проверки diag по
  * видам, см. cmd_diag). */
-static const struct { const struct kind_ops *have, *none; } REG[] = {
-    { &kind_direct,    NULL },
-    { &kind_interface, &no_interface },
-    { &kind_vless,     &no_vless },
-    { &kind_xsteer,    &no_xsteer },
-    { &kind_zapret,    &no_zapret },
-    { &kind_tgws,      &no_tgws },
-    { &kind_awg,       &no_awg },
+static const struct { const struct kind_ops *have, *none; const char *module; } REG[] = {
+    { &kind_direct,    NULL,          NULL },
+    { &kind_interface, &no_interface, NULL },
+    { &kind_vless,     &no_vless,     "steer-vless" },
+    { &kind_xsteer,    &no_xsteer,    "steer-xsteer" },
+    { &kind_zapret,    &no_zapret,    NULL },
+    { &kind_tgws,      &no_tgws,      NULL },
+    { &kind_awg,       &no_awg,       NULL },
 };
 #define REG_N (sizeof(REG) / sizeof(REG[0]))
 
 size_t kind_count(void) { return REG_N; }
 
+#ifdef STEER_LIBSTEER
+#include <time.h>
+#include "module.h"
+
+/* В libsteer (ею пользуются steerd и модули) записи видов vless и xsteer есть всегда — сами
+ * kinds/vless.c и xsteer.c разбирают ключи и пишут состояние, — а вот доступен ли ВИД, решает
+ * модуль: установлен steer-vless — вид есть, нет — запись отказа, как у базовой сборки прежних
+ * выпусков. Отказываем СРАЗУ, при разборе спеки (kinds/vless.c, шапка): иначе спека применялась
+ * бы, правила вставали, и выход молча никуда не вёл.
+ *
+ * Установлен ли модуль — файл рядом с движком (lib/module.c). Ответ помнится секунду: реестр
+ * спрашивают на каждый выход и каждый проход, а установка пакета не происходит чаще. Секунда, а
+ * не навсегда: пакет ставят при работающем демоне, и его следующий проход обязан увидеть модуль. */
+static int module_ok(size_t i) {
+    static int val[REG_N];
+    static time_t at[REG_N];
+    time_t now = time(NULL);
+    if (!at[i] || at[i] != now) {
+        val[i] = steer_module_present(REG[i].module);
+        at[i] = now;
+    }
+    return val[i];
+}
+#else
+/* Статические сборки (телефон, стенды, микропакеты) несут модули в себе, и вид есть, если есть
+ * его файл: профиль в build/sources.mk и решает. */
+static int module_ok(size_t i) { (void)i; return 1; }
+#endif
+
 const struct kind_ops *kind_at(size_t i) {
     if (i >= REG_N) return NULL;
-    return REG[i].have ? REG[i].have : REG[i].none;
+    if (REG[i].have && (!REG[i].module || module_ok(i))) return REG[i].have;
+    return REG[i].none;
 }
 
 const struct kind_ops *kind_by_name(const char *name) {

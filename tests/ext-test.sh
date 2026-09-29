@@ -255,4 +255,9 @@ $CC -O1 -w $STEER_INC -o "$BUILD/steer-hub-native" $SERVER_SRC $CRYPTO -lpthread
 echo "ext-test: прогоняю probe (зондирование порта хаба)..."
 BUILD="$BUILD" sh tests/probe.sh
 
+# Разделяемая раскладка роутера (шаг 4 выпуска 1.10): те же исходники wolfSSL, тот же рецепт, что у
+# пакетов, — libsteer, libsteer-wolfssl, steerd и модули собираются и проверяются как целое.
+echo "ext-test: раскладка libsteer и модулей (tests/libs-test.sh)..."
+STEER_WOLFSSL="$WSRC" BUILD="$BUILD" CC="$CC" sh tests/libs-test.sh
+
 echo "ext-test: все стенды прошли на wolfSSL $WVER"

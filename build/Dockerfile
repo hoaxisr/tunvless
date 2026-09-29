@@ -48,6 +48,25 @@ COPY wolfssl/fetch.sh /opt/steer-wolfssl-fetch.sh
 RUN sh /opt/steer-wolfssl-fetch.sh /opt/wolfssl \
  && ls /opt/wolfssl/wolfssl/wolfcrypt/settings.h
 
+# ЗАПЛАТКА ЗАГЛУШКИ libc.so ДЛЯ 32-БИТНЫХ ЦЕЛЕЙ (шаг 4 выпуска 1.10, разделяемая раскладка).
+#
+# Статический бинарник zig собирает с настоящим musl (libc.a из исходников), и там всё на месте. Но
+# бинарник, слинкованный с разделяемой libsteer.so, — динамический, и вместо libc.a zig подставляет
+# заглушку libc.so, собранную из перечня символов musl/libc.S. Заголовки musl на 32-битных
+# архитектурах подменяют time(), clock_gettime(), gmtime(), stat() и десяток соседей их
+# 64-битными вариантами (__time64, __clock_gettime64, __gmtime64, __fstat_time64…), а перечень
+# в libc.S отдаёт эти символы только под `#ifdef PTR32` — и на mips/mipsel макрос не выставляется,
+# так что заглушка их не содержит, и компоновщик отвечает «undefined symbol: __clock_gettime64» на
+# любой вызов времени. Настоящий libc.so роутера эти символы экспортирует (проверено по
+# libc_1.2.5-r4_mipsel_24kc.ipk из OpenWrt 24.10: __clock_gettime64, __time64, __gmtime64,
+# __localtime64_r, __fstat_time64, __stat_time64, __nanosleep_time64, __sigtimedwait_time64,
+# __timerfd_settime64), поэтому заплатка касается только заглушки: она добавляет эти имена ко всем
+# целям (лишнее для 64-битных ничему не мешает — на них никто не ссылается). Заглушка нужна
+# компоновщику и в бинарник не попадает: во время работы символы разрешает настоящий musl.
+RUN f="/opt/zig-linux-x86_64-${ZIG_VERSION}/lib/libc/musl/libc.S" \
+ && sed -i 's/^#ifdef PTR32$/#if 1/' "$f" \
+ && test "$(grep -c '^#ifdef PTR32$' "$f")" = 0
+
 ENV WOLFSSL_DIR=/opt/wolfssl
 WORKDIR /src
 ENTRYPOINT ["/usr/local/bin/zig"]

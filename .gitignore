@@ -7,6 +7,13 @@ build/steer-*
 build/steerd
 build/steerd-*
 build/libmbed-*.a
+# Разделяемая раскладка (шаг 4 выпуска 1.10): выход build/build-libs.sh по архитектурам, временные
+# объекты списков экспорта и хостовая сборка стенда tests/libs-test.sh.
+build/libs/
+build/libs-exports/
+build/libs-host/
+build/libs-host.*
+build/*-libs.log
 build/*.err
 build/pkg/
 build/scripts/

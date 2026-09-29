@@ -106,13 +106,15 @@ jobs:
           fi
           # Ожидаемое число считается из самого build.sh, а не вписано сюда числом:
           # список архитектур меняется, и константа разошлась бы с ним молча. На каждую
-          # архитектуру два пакета — базовый и extended — и это в КАЖДОМ из двух форматов.
+          # архитектуру восемь пакетов (с 1.10, шаг 4): libsteer-wolfssl, libsteer, steer, модули
+          # steer-vless, steer-xsteer, steer-obfs, steer-tgws и мета-пакет steer-extended — и это
+          # в КАЖДОМ из двух форматов.
           arch_n=$(sed -n '/^ISAS="/,/^"$/p' build.sh | grep -c '^[a-z0-9_.-]*:')
-          want=$((arch_n * 2))
+          want=$((arch_n * 8))
           for ext in apk ipk; do
             n=$(ls out/*."$ext" 2>/dev/null | wc -l)
             [ "$n" -eq "$want" ] || {
-              echo "::error::пакетов .$ext — $n, а ожидалось $want (архитектур $arch_n × 2)"
+              echo "::error::пакетов .$ext — $n, а ожидалось $want (архитектур $arch_n × 8)"
               ls -la out/ 2>/dev/null
               exit 1; }
             echo "собрано .$ext: $n из $want ожидаемых"
@@ -266,24 +268,26 @@ jobs:
             **Какой пакет брать.** Имя файла содержит архитектуру — ту же, что показывает
             `apk --print-arch` на роутере.
 
-            * `steer-*` — движок. Каналы, наборы адресов, доменные списки с fake-IP,
-              failover между устройствами.
-            * `steer-extended-*` — то же плюс собственный клиент VLESS/Reality с Vision,
-              транспортами tcp/grpc/xhttp и своим TUN. Нужен, только если туннель поднимает
-              сам движок; для готового wireguard или amneziawg достаточно базового.
+            * `steer-*` — ядро: каналы, наборы адресов, доменные списки с fake-IP, failover
+              между устройствами. Ему нужны `libsteer` и `libsteer-wolfssl` (общие библиотеки).
+            * `steer-vless-*`, `steer-xsteer-*` — клиенты туннелей (VLESS/Reality с Vision,
+              транспортами tcp/grpc/xhttp/ws/httpupgrade; звезда xsteer) — отдельные модули.
+              Нужны, только если туннель поднимает сам движок; для готового wireguard или
+              amneziawg достаточно ядра.
+            * `steer-obfs-*` (обфускатор WireGuard) и `steer-tgws-*` (мост Telegram) — модули.
+            * `steer-extended-*` — мета-пакет: ядро и все четыре модуля разом.
 
-            Пакеты взаимозаменяемы и конфликтуют между собой: `steer-extended` объявляет
-            `provides: steer`, поэтому ставится поверх без удаления настроек.
+            Модуль должен быть той же версии, что ядро (менеджер пакетов следит сам).
 
             **Два формата.** `.apk` — для OpenWrt 24.10 и новее, `.ipk` — для 23.05, 22.03
             и всего, что осталось на opkg. Содержимое одинаковое, отличаются только
             метаданные пакета.
 
             ```sh
-            # OpenWrt 24.10+
-            apk add --allow-untrusted ./steer-extended-${{ env.VERSION }}-1_<arch>.apk
+            # OpenWrt 24.10+ (все пакеты нужной архитектуры разом)
+            apk add --allow-untrusted ./*-${{ env.VERSION }}-1_<arch>.apk
             # OpenWrt 23.05 и старше
-            opkg install ./steer-extended-${{ env.VERSION }}-1_<arch>.ipk
+            opkg install ./*-${{ env.VERSION }}-1_<arch>.ipk
             ```
 
             **`steer-obfs-*.tar.gz` — серверная половина обфускации, для VPS.** Нужна

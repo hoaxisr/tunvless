@@ -35,6 +35,12 @@ cc_defaults {
         "src/lib/run.c",
         "src/lib/jsonw.c",
         "src/lib/evline.c",
+        // Step 4 of 1.10 (module split): which command belongs to which module and whether the
+        // module is installed, the module commands themselves (the phone keeps them all in
+        // steerd, so the stubs never fire) and the obfuscator entry point.
+        "src/lib/module.c",
+        "src/cli/modcmd.c",
+        "src/proto/obfs/obfsmain.c",
         "src/lib/err.c",
         "src/compile/groups.c",
         "src/compile/generate.c",
@@ -140,6 +146,7 @@ cc_defaults {
         "src/proto/vless",
         "src/proto/xsteer",
         "src/proto/tgws",
+        "src/modules",
         "src/client",
         "src/third_party/libyaml",
     ],

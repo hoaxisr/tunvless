@@ -110,6 +110,26 @@ fi
 
 mkdir -p "$OUT" build/pkg
 
+# ---- загрузчик musl для динамических бинарников (steerd, модули) -----------------------------
+#
+# Статическому бинарнику загрузчик не нужен, динамическому он вшит в файл ПУТЁМ, и путь обязан
+# совпасть с тем, что лежит на роутере: musl называет загрузчик по архитектуре и по ABI —
+# ld-musl-<арх>[hf|-sf].so.1. Умолчание zig этого не различает (мягкая плавающая точка MIPS и
+# hard-float ARM получили бы имя без суффикса), поэтому задаём явно по тройке цели; тот же
+# суффикс определяет, какая из трёх сборок Cortex-A9 у нас (musleabi против musleabihf, см. выше).
+# RPATH не нужен: библиотеки лежат в /usr/lib, где musl ищет сам.
+interp_of() {  # ТРОЙКА MCPU
+    case "$1" in
+        mipsel-linux-musl*)     echo /lib/ld-musl-mipsel-sf.so.1 ;;
+        mips-linux-musl*)       echo /lib/ld-musl-mips-sf.so.1 ;;
+        aarch64-linux-musl*)    echo /lib/ld-musl-aarch64.so.1 ;;
+        arm-linux-musleabihf*)  echo /lib/ld-musl-armhf.so.1 ;;
+        arm-linux-musleabi*)    echo /lib/ld-musl-arm.so.1 ;;
+        x86_64-linux-musl*)     echo /lib/ld-musl-x86_64.so.1 ;;
+        *) echo "interp_of: неизвестная цель $1 ($2)" >&2; echo /lib/ld-musl-unknown.so.1 ;;
+    esac
+}
+
 # ---- две упаковки одного пакета: apk и opkg ----------------------------------
 #
 # OpenWrt перешёл на apk в 24.10, но 23.05 и 22.03 живут на роутерах и будут жить: на
@@ -177,51 +197,80 @@ fi
 #                        больше не пересматривает — и запрет on_fail=drop до него не
 #                        доходит (H-110, R-096). Предупреждение в журнале читают редко,
 #                        а зависимость проверяет менеджер пакетов при установке.
-#   libsteer-wolfssl   — ТОЛЬКО когда бинарник связан с разделяемой wolfSSL своего пакета
-#                        (шаг 4 выпуска 1.10). Нынешние сборки несут
-#                        wolfSSL статикой и от пакета библиотеки не зависят вовсе.
+#   libsteer           — ТОЛЬКО когда бинарник связан с разделяемой libsteer.so (шаг 4 выпуска
+#                        1.10); libsteer-wolfssl подтягивает уже она сама, своей зависимостью.
+#   kmod-tun           — модулям, которые сами создают TUN (steer-vless, steer-xsteer).
 #
-# Про библиотеку важно, что зависимость выводится ИЗ БИНАРНИКА, а не приписывается расширенному
-# пакету списком: статический файл без пакета работает, связанный с .so — не запустится ни одной
-# командой, и список «расширенный зависит от библиотеки» был бы ложью в первом случае и правдой во
+# Про библиотеки важно, что зависимость выводится ИЗ БИНАРНИКА, а не приписывается пакету
+# списком: статический файл без пакета работает, связанный с .so — не запустится ни одной
+# командой, и список «пакет зависит от библиотеки» был бы ложью в первом случае и правдой во
 # втором. Проверка самого файла верна в обоих и не требует помнить, каким рецептом он собран.
-# (Прежде так же выводилась зависимость libmbedtls у нативной сборки на mbedtls роутера —
-# build/build-ext-native.sh; вместе с mbedtls снята и она.)
 #
-# Ищется SONAME в самом файле: у статического бинарника строки «libsteer-wolfssl.so» нет — она
+# Ищется SONAME в самом файле: у статического бинарника строки «libsteer.so.» нет — она
 # появляется только записью DT_NEEDED, которую пишет линковщик. readelf для этого не нужен (его нет
 # ни в alpine по умолчанию, ни на машине сборщика гарантированно), а grep -a по бинарнику есть
 # везде. Системный libwolfssl OpenWrt сюда не подходит нарочно: его SONAME несёт хеш опций и
 # меняется с каждым обновлением, а QUIC в нём нет.
-pkg_deps() {  # ФАЙЛ_БИНАРНИКА -> "nftables ip-full ..." через пробел
-    _pd="nftables ip-full conntrack kmod-nft-queue"
-    case "$2" in ext) _pd="$_pd kmod-tun" ;; esac
-    if grep -aq 'libsteer-wolfssl\.so' "$1" 2>/dev/null; then
-        _pd="$_pd libsteer-wolfssl"
+pkg_deps() {  # ФАЙЛ_БИНАРНИКА ВИД (core|mod|tun) -> "nftables ip-full ..." через пробел
+    case "$2" in
+        core) _pd="nftables ip-full conntrack kmod-nft-queue" ;;
+        tun)  _pd="kmod-tun" ;;
+        *)    _pd="" ;;
+    esac
+    if grep -aq 'libsteer\.so\.' "$1" 2>/dev/null; then
+        _pd="$_pd libsteer"
     fi
     printf '%s' "$_pd"
 }
 
-# mk_ipk КОРЕНЬ ИМЯ АРХ ЗАВИСИМОСТИ ОПИСАНИЕ [ДОПОЛНИТЕЛЬНЫЕ ПОЛЯ CONTROL]
+# ---- зависимости между НАШИМИ пакетами: точная версия --------------------------------
 #
+# Формат событий между движком и модулями, ABI libsteer и раскладка libsteer-wolfssl между
+# выпусками не обещаются (шаг 4 выпуска 1.10), поэтому модуль той же версии, что движок, — не
+# пожелание, а условие: `steer-vless (= версия)`, `libsteer (= версия)`. Менеджер пакетов не даст
+# обновить один, оставив другой (apk — `имя=версия`, opkg — `имя (= версия)`). Чужие пакеты
+# (nftables, kmod-…) остаются без версии. Демон дополнительно проверяет версию при запуске модуля
+# (hello, docs/ctl.md) — на случай установки файлами мимо менеджера.
+OURS=" steer libsteer libsteer-wolfssl steer-vless steer-xsteer steer-obfs steer-tgws steer-extended "
+dep_apk() {  # ИМЕНА через пробел -> "имя=версия ..." для наших
+    for _d in $1; do
+        case "$OURS" in *" $_d "*) printf '%s=%s-r1 ' "$_d" "$VERSION" ;; *) printf '%s ' "$_d" ;; esac
+    done
+}
+dep_ipk() {  # ИМЕНА через пробел -> "имя (= версия), ..." для наших
+    _sep=""
+    for _d in $1; do
+        case "$OURS" in
+            *" $_d "*) printf '%s%s (= %s-1)' "$_sep" "$_d" "$VERSION" ;;
+            *)         printf '%s%s' "$_sep" "$_d" ;;
+        esac
+        _sep=", "
+    done
+}
+
+# mk_ipk КОРЕНЬ ИМЯ АРХ ЗАВИСИМОСТИ ОПИСАНИЕ [ДОПОЛНИТЕЛЬНЫЕ ПОЛЯ CONTROL] [СКРИПТЫ]
+#
+# СКРИПТЫ — префикс файлов build/scripts (умолчание «steer»: steer.postinst, steer.prerm).
 # Каталог CONTROL создаётся ВНУТРИ дерева пакета, поэтому зовётся строго ПОСЛЕ apk mkpkg
 # по тому же дереву: иначе служебные файлы уехали бы в полезную нагрузку apk.
 mk_ipk() {
     ipk_root="$1"; ipk_name="$2"; ipk_arch="$3"; ipk_dep="$4"; ipk_desc="$5"; ipk_extra="${6:-}"
+    ipk_scr="${7:-steer}"
     mkdir -p "$ipk_root/CONTROL"
     {
         echo "Package: $ipk_name"
         echo "Version: $VERSION-1"
-        echo "Depends: $ipk_dep"
+        [ -n "$ipk_dep" ] && echo "Depends: $ipk_dep"
         echo "Architecture: $ipk_arch"
         echo "Maintainer: xyzmean"
         echo "Section: net"
         [ -n "$ipk_extra" ] && printf '%s\n' "$ipk_extra"
         echo "Description: $ipk_desc"
     } > "$ipk_root/CONTROL/control"
-    cp build/scripts/post-install "$ipk_root/CONTROL/postinst"
-    cp build/scripts/pre-deinstall "$ipk_root/CONTROL/prerm"
-    chmod 0755 "$ipk_root/CONTROL/postinst" "$ipk_root/CONTROL/prerm"
+    cp "build/scripts/$ipk_scr.postinst" "$ipk_root/CONTROL/postinst"
+    cp "build/scripts/$ipk_scr.prerm" "$ipk_root/CONTROL/prerm"
+    cp "build/scripts/$ipk_scr.postrm" "$ipk_root/CONTROL/postrm"
+    chmod 0755 "$ipk_root/CONTROL/postinst" "$ipk_root/CONTROL/prerm" "$ipk_root/CONTROL/postrm"
     # Без -o/-g: нынешний ipkg-build их не понимает (они были в старых версиях), а
     # молчаливый отказ здесь означал бы релиз без половины пакетов.
     if "$PWD/$IPKG" "$ipk_root" "$PWD/$OUT" >/dev/null 2>&1; then
@@ -301,32 +350,64 @@ for spec in $ISAS; do
         echo "FAILED — $(grep -m1 error "build/$arch-tgws.err" || head -1 "build/$arch-tgws.err")"
     fi
 
-    # Расширенный вариант: те же исходники плюс VLESS и wolfSSL. Логика в отдельном
-    # скрипте — см. build/build-ext.sh, там объяснено почему.
-    printf '  %-26s ' "$arch (extended)"
-    if docker run --rm -v "$PWD:/src" -w /src --entrypoint sh "$IMAGE" \
-            /src/build/build-ext.sh "$target" "$mcpu" "/src/build/steer-ext-$arch" \
-            "$VERSION" router "$REV" \
-            2>"build/$arch-ext.err"; then
-        echo "$(stat -c %s "build/steer-ext-$arch") bytes"
+    # Разделяемая раскладка роутера (шаг 4 выпуска 1.10): libsteer-wolfssl.so, libsteer.so, steerd и
+    # модули steer-vless, steer-xsteer, steer-obfs, steer-tgws. Логика — build/build-libs.sh (одна
+    # для этого цикла и для tests/libs-test.sh), списки файлов — build/sources.mk. Статического
+    # расширенного бинарника роутера больше нет: его место — steerd + модули на общих библиотеках
+    # (статическая сборка расширенной части остаётся у телефона, шаг 6, и у стендов).
+    #
+    # Загрузчик задаётся на каждую архитектуру (interp_of): у динамического бинарника он вшит по
+    # абсолютному пути и обязан совпасть с файлом musl на роутере.
+    printf '  %-26s ' "$arch (libs)"
+    libs="build/libs/$arch"
+    rm -rf "$libs"
+    if docker run --rm -v "$PWD:/src" -w /src --entrypoint sh \
+            -e CC="zig cc -target $target -mcpu=$mcpu" -e AR="zig ar" -e ZIG=1 \
+            -e INTERP="$(interp_of "$target" "$mcpu")" "$IMAGE" \
+            /src/build/build-libs.sh "/src/$libs" "$VERSION" "$REV" \
+            >"build/$arch-libs.log" 2>"build/$arch-libs.err"; then
+        echo "libsteer $(stat -c %s "$libs"/libsteer.so.*) + wolfssl $(stat -c %s "$libs"/libsteer-wolfssl.so.*)" \
+             "+ steerd $(stat -c %s "$libs/steerd") bytes"
+        rm -rf "$libs/obj"
     else
-        rm -f "build/steer-ext-$arch"
-        echo "FAILED — $(grep -m1 error "build/$arch-ext.err" || head -1 "build/$arch-ext.err")"
+        rm -rf "$libs"
+        echo "FAILED — $(grep -m1 error "build/$arch-libs.err" || head -1 "build/$arch-libs.err")"
+        continue
     fi
 
+    # ---- пакеты ---------------------------------------------------------------------------
+    #
+    # Шесть пакетов и один мета-пакет на архитектуру (шаг 4 выпуска 1.10, docs/architecture.md,
+    # «Сборки»):
+    #
+    #   libsteer-wolfssl   наша wolfSSL (QUIC включён заранее, см. build/wolfssl) как .so;
+    #   libsteer           libsteer.so.<версия>: модель, виды, TLS, транспорты, стек, слой
+    #                      криптографии; зависит от libsteer-wolfssl;
+    #   steer              ядро: steerd на общих библиотеках, клиент steer, init-скрипт, обработчик
+    #                      обхода; зависит от libsteer (и через неё от libsteer-wolfssl);
+    #   steer-vless, steer-xsteer, steer-obfs, steer-tgws
+    #                      по бинарнику модуля; зависят от steer и libsteer ТОЧНОЙ версии;
+    #   steer-extended     мета-пакет из прежних времён: ставит ядро и все четыре модуля. Имя
+    #                      сохранено, потому что его ставит splify2 (`steer_install`) и читает
+    #                      определение вида пакета; замена базового пакета (provides/replaces)
+    #                      ему больше не нужна — у файлов ядра один владелец, пакет steer.
+    #
+    # Ядро зависит от libsteer и libsteer-wolfssl, а не только от libsteer: steerd сам ходит по
+    # HTTPS (замер групп, urltls; в 1.11 к DoH и DoT добавится dnsd), то есть ему нужен TLS и
+    # слой криптографии — и без модулей. Отдельного пакета «ядро без TLS» нет: цена — 0,6 МБ
+    # библиотеки на флеше и в памяти, выигрыш — один набор файлов и ни одной веточки «есть ли TLS».
     root="build/pkg/$arch"
     rm -rf "$root"
     mkdir -p "$root/usr/sbin" "$root/etc/init.d" "$root/etc/steer/lists" \
              "$root/lib/upgrade/keep.d" "$root/etc/hotplug.d/iface"
     # Три имени (docs/architecture.md, раздел 4а): steerd — движок целиком, steer — клиент сокета,
     # steer-tools — ссылка на steerd, под этим именем движок отвечает только на инструменты.
-    cp "build/steerd-$arch" "$root/usr/sbin/steerd"
+    cp "$libs/steerd" "$root/usr/sbin/steerd"
     cp "build/steer-client-$arch" "$root/usr/sbin/steer"
     ln -sf steerd "$root/usr/sbin/steer-tools"
-    # Обёртка обработчика обхода DPI: её запускает procd для каждого выхода kind=zapret, и
-    # читает она файл стратегии при КАЖДОМ запуске (см. её шапку). Едет в оба корня — как
-    # init-скрипт: расширенный пакет ставится вместо базового, и без своей копии замена
-    # пакета молча оставила бы выходы kind=zapret без обработчиков.
+    # Обработчик обхода DPI: его запускает procd для каждого выхода kind=zapret, и читает он
+    # файл стратегии при КАЖДОМ запуске (см. его шапку). Обработчик — часть ядра, а не модуль:
+    # правила очереди пишет ядро, а kind=zapret входит в каждый профиль.
     cp files/usr/sbin/steer-nfqws "$root/usr/sbin/steer-nfqws"
     cp files/etc/init.d/steer "$root/etc/init.d/steer"
     # Реакция на события сети: подъём и падение интерфейса доходят до сторожа сразу, а не
@@ -349,81 +430,102 @@ for spec in $ISAS; do
     # collides with every other package doing the same — apk refused the install of a
     # second package with "trying to overwrite .post-install owned by steer". The
     # script belongs to --script, not to the payload.
+    #
+    # Скрипты пакетов — три вида (файлы build/scripts/<вид>.<хук>, apk и opkg берут их же):
+    #   steer  ядро: включить и перезапустить службу при установке, остановить и выключить при
+    #          удалении;
+    #   mod    модуль: перезапустить службу при установке и после удаления — реестр видов и
+    #          состав помощников зависят от того, какие модули лежат рядом с движком, и демон
+    #          видит их, только стартуя заново; службу не включает и не выключает — это дело ядра;
+    #   noop   библиотеки и мета-пакет: делать нечего.
     mkdir -p build/scripts
-    cat > build/scripts/post-install <<'EOF'
-#!/bin/sh
-[ -n "${IPKG_INSTROOT}" ] && exit 0
-/etc/init.d/steer enable 2>/dev/null
-/etc/init.d/steer restart 2>/dev/null
-exit 0
-EOF
-    cat > build/scripts/pre-deinstall <<'EOF'
-#!/bin/sh
-[ -n "${IPKG_INSTROOT}" ] && exit 0
-/etc/init.d/steer stop 2>/dev/null
-/etc/init.d/steer disable 2>/dev/null
-exit 0
-EOF
-    chmod +x build/scripts/post-install build/scripts/pre-deinstall
+    {
+        printf '#!/bin/sh\n[ -n "${IPKG_INSTROOT}" ] && exit 0\n'
+        printf '/etc/init.d/steer enable 2>/dev/null\n/etc/init.d/steer restart 2>/dev/null\nexit 0\n'
+    } > build/scripts/steer.postinst
+    {
+        printf '#!/bin/sh\n[ -n "${IPKG_INSTROOT}" ] && exit 0\n'
+        printf '/etc/init.d/steer stop 2>/dev/null\n/etc/init.d/steer disable 2>/dev/null\nexit 0\n'
+    } > build/scripts/steer.prerm
+    {
+        printf '#!/bin/sh\n[ -n "${IPKG_INSTROOT}" ] && exit 0\n'
+        printf '[ -x /etc/init.d/steer ] && /etc/init.d/steer restart 2>/dev/null\nexit 0\n'
+    } > build/scripts/mod.postinst
+    cp build/scripts/mod.postinst build/scripts/mod.postrm
+    printf '#!/bin/sh\nexit 0\n' > build/scripts/mod.prerm
+    printf '#!/bin/sh\nexit 0\n' > build/scripts/noop.postinst
+    cp build/scripts/noop.postinst build/scripts/noop.prerm
+    cp build/scripts/noop.postinst build/scripts/noop.postrm
+    printf '#!/bin/sh\nexit 0\n' > build/scripts/steer.postrm
+    chmod +x build/scripts/*
 
-    # Расширенный пакет: то же имя команды, поэтому объявляется заменой базового —
-    # установленные вместе они спорили бы за /usr/sbin/steer, и какой победит зависело бы
-    # от порядка установки. В apk это provides + replaces (третьего поля там нет), в opkg
-    # к ним добавляется Conflicts — см. mk_ipk.
-    if [ -f "build/steer-ext-$arch" ]; then
-        eroot="build/pkg/$arch-ext"
-        rm -rf "$eroot"
-        mkdir -p "$eroot/usr/sbin" "$eroot/etc/init.d" "$eroot/etc/steer/lists" \
-                 "$eroot/lib/upgrade/keep.d" "$eroot/etc/hotplug.d/iface"
-        cp "build/steer-ext-$arch" "$eroot/usr/sbin/steerd"
-        cp "build/steer-client-$arch" "$eroot/usr/sbin/steer"
-        ln -sf steerd "$eroot/usr/sbin/steer-tools"
-        cp files/usr/sbin/steer-nfqws "$eroot/usr/sbin/steer-nfqws"
-        cp files/etc/init.d/steer "$eroot/etc/init.d/steer"
-        cp files/etc/hotplug.d/iface/95-steer "$eroot/etc/hotplug.d/iface/95-steer"
-        # Тот же файл, что и в базовом пакете: расширенный ставится ВМЕСТО базового
-        # (provides/replaces), и без своей копии keep.d замена пакета молча снимала бы
-        # объявление настроек — то есть возвращала бы I-037 на ровно том пакете, который
-        # ставит большинство.
-        cp files/lib/upgrade/keep.d/steer "$eroot/lib/upgrade/keep.d/steer"
-        chmod 0755 "$eroot/usr/sbin/steerd" "$eroot/usr/sbin/steer" "$eroot/usr/sbin/steer-nfqws" \
-                   "$eroot/etc/init.d/steer" "$eroot/etc/hotplug.d/iface/95-steer"
-        chmod 0644 "$eroot/lib/upgrade/keep.d/steer"
-        # Зависимости считаются по СОБРАННОМУ файлу — см. pkg_deps выше.
-        edeps="$(pkg_deps "$eroot/usr/sbin/steerd" ext)"
+    # pack ИМЯ КОРЕНЬ ЗАВИСИМОСТИ ОПИСАНИЕ ВИД-СКРИПТОВ — оба формата из одного дерева. Зависимости
+    # пишутся один раз (имена через пробел), версии нашим пакетам ставят dep_apk и dep_ipk.
+    pack() {
+        _n="$1"; _r="$2"; _dp="$3"; _ds="$4"; _sk="$5"
+        _dinfo=""
+        [ -n "$_dp" ] && _dinfo="--info depends:'$(dep_apk "$_dp")'"
+        # apk: скрипты — три хука. post-deinstall нужен модулям (перезапуск после удаления).
         docker run --rm -v "$PWD":/w -w /w alpine:latest sh -c \
             "apk add --no-cache apk-tools >/dev/null 2>&1; apk mkpkg \
-               --info name:steer-extended --info version:$VERSION-r1 \
-               --info description:'steer + клиент VLESS/Reality (как dnsmasq-full)' \
-               --info arch:$arch --info depends:'$edeps' \
-               --info provides:steer --info replaces:steer \
-               --script post-install:build/scripts/post-install \
-               --script pre-deinstall:build/scripts/pre-deinstall \
-               -F $eroot -o $OUT/steer-extended-$VERSION-1_$arch.apk" >/dev/null 2>&1 \
-            || echo "    (упаковка extended для $arch не удалась)"
-        # Тот же пакет в формате opkg. Три поля сразу: в opkg это ровно тот набор,
-        # которым выражается «ставится ВМЕСТО», и без Conflicts два пакета уживались бы
-        # в базе, споря за /usr/sbin/steer. Отдельной переменной, а не строкой в вызове:
-        # многострочный литерал посреди аргументов читается плохо и его проверяет стенд.
-        EXT_FIELDS='Provides: steer
-Replaces: steer
-Conflicts: steer'
-        mk_ipk "$eroot" steer-extended "$arch" "$(echo "$edeps" | tr ' ' ',' | sed 's/,/, /g')" \
-            "steer + клиент VLESS/Reality (как dnsmasq-full)" "$EXT_FIELDS"
-    fi
+               --info name:$_n --info version:$VERSION-r1 \
+               --info description:'$_ds' \
+               --info arch:$arch $_dinfo \
+               --script post-install:build/scripts/$_sk.postinst \
+               --script pre-deinstall:build/scripts/$_sk.prerm \
+               --script post-deinstall:build/scripts/$_sk.postrm \
+               -F $_r -o $OUT/$_n-$VERSION-1_$arch.apk" >/dev/null 2>&1 \
+            || echo "    (apk packaging failed for $_n $arch)"
+        mk_ipk "$_r" "$_n" "$arch" "$(dep_ipk "$_dp")" "$_ds" "" "$_sk"
+    }
 
-    deps="$(pkg_deps "$root/usr/sbin/steerd" base)"
-    docker run --rm -v "$PWD":/w -w /w alpine:latest sh -c \
-        "apk add --no-cache apk-tools >/dev/null 2>&1; apk mkpkg \
-           --info name:steer --info version:$VERSION-r1 \
-           --info description:'policy routing engine: channels in, nftables out' \
-           --info arch:$arch --info depends:'$deps' \
-           --script post-install:build/scripts/post-install \
-           --script pre-deinstall:build/scripts/pre-deinstall \
-           -F $root -o $OUT/steer-$VERSION-1_$arch.apk" >/dev/null 2>&1 \
-        || echo "    (apk packaging failed for $arch)"
-    mk_ipk "$root" steer "$arch" "$(echo "$deps" | tr ' ' ',' | sed 's/,/, /g')" \
-        "policy routing engine: channels in, nftables out"
+    # Библиотеки. Зависимости считаются по СОБРАННОМУ файлу — см. pkg_deps выше; libsteer-wolfssl
+    # не зависит ни от чего нашего, libsteer — от неё (pkg_deps по DT_NEEDED самой libsteer).
+    lroot="build/pkg/$arch-libsteer-wolfssl"
+    rm -rf "$lroot"
+    mkdir -p "$lroot/usr/lib"
+    cp "$libs"/libsteer-wolfssl.so.* "$lroot/usr/lib/"
+    pack libsteer-wolfssl "$lroot" "" "wolfSSL со своими опциями для steer (TLS 1.3, QUIC): общая библиотека" noop
+    lroot="build/pkg/$arch-libsteer"
+    rm -rf "$lroot"
+    mkdir -p "$lroot/usr/lib"
+    cp "$libs"/libsteer.so.* "$lroot/usr/lib/"
+    ldeps=""
+    grep -aq 'libsteer-wolfssl\.so\.' "$lroot"/usr/lib/libsteer.so.* && ldeps="libsteer-wolfssl"
+    pack libsteer "$lroot" "$ldeps" "libsteer: модель, TLS и транспорты, стек TUN — общее для steerd и модулей" noop
+
+    # Ядро. Зависит от libsteer (по DT_NEEDED steerd), а через неё — от libsteer-wolfssl.
+    deps="$(pkg_deps "$root/usr/sbin/steerd" core)"
+    pack steer "$root" "$deps" "policy routing engine: channels in, nftables out" steer
+
+    # Модули: по одному бинарнику в usr/sbin рядом со steerd, где их находит движок (src/lib/
+    # module.c). Зависимость от steer — точной версии: ядро и модуль общаются линией событий, формат
+    # которой между выпусками не обещан (hello в docs/ctl.md).
+    for m in vless xsteer obfs tgws; do
+        mroot="build/pkg/$arch-$m"
+        rm -rf "$mroot"
+        mkdir -p "$mroot/usr/sbin"
+        cp "$libs/steer-$m" "$mroot/usr/sbin/steer-$m"
+        chmod 0755 "$mroot/usr/sbin/steer-$m"
+        case "$m" in
+            vless)  md="steer-vless: клиент VLESS/Reality для steer (модуль)"; mk=tun ;;
+            xsteer) md="steer-xsteer: клиент звезды xsteer для steer (модуль)"; mk=tun ;;
+            obfs)   md="steer-obfs: обфускатор WireGuard для steer (модуль)"; mk=mod ;;
+            tgws)   md="steer-tgws: мост Telegram для steer (модуль)"; mk=mod ;;
+        esac
+        mdeps="steer $(pkg_deps "$mroot/usr/sbin/steer-$m" "$mk")"
+        pack "steer-$m" "$mroot" "$mdeps" "$md" mod
+    done
+
+    # Мета-пакет steer-extended: ядро и все четыре модуля. Пустой пакет менеджеры не любят, поэтому
+    # в нём один маленький файл-метка. Имя сохранено ради splify2, который ставит его по имени.
+    xroot="build/pkg/$arch-extended"
+    rm -rf "$xroot"
+    mkdir -p "$xroot/usr/lib/steer"
+    printf 'steer-extended %s: мета-пакет — steer, steer-vless, steer-xsteer, steer-obfs, steer-tgws\n' \
+        "$VERSION" > "$xroot/usr/lib/steer/extended"
+    pack steer-extended "$xroot" "steer steer-vless steer-xsteer steer-obfs steer-tgws" \
+        "steer со всеми модулями: VLESS/Reality, xsteer, обфускатор, мост Telegram (как dnsmasq-full)" noop
 done
 
 # ---- серверная половина обфускации: архив для VPS -----------------------------
@@ -435,9 +537,10 @@ done
 # компилятора нет и ставить его нельзя.
 #
 # Архив содержит ровно то, что нужно на той стороне: статический бинарник, установщик и
-# краткую справку. Бинарник тот же самый, что уезжает в пакет для роутера той же
-# архитектуры, — отдельной сборки для сервера нет и быть не должно: два бинарника из
-# разных сборок означали бы две обфускации, расходящиеся в мелочах на проводе.
+# краткую справку. Код тот же, что у модуля steer-obfs в пакете для роутера (obfs.c и obfsmain.c
+# входят в статическую базовую сборку, а в пакете — в libsteer и модуль), — отдельной обфускации
+# для сервера нет и быть не должно: две реализации означали бы две обфускации, расходящиеся в
+# мелочах на проводе. Сборка здесь статическая, без библиотек: на VPS нет пакетов OpenWrt.
 #
 # Архитектуры только те, на которых VPS реально бывают. Собирать архив под mips значило
 # бы предлагать людям то, чего не существует.
