@@ -480,3 +480,45 @@ int rtnl_route_dev(struct in_addr dst, char *dev, size_t n) {
     if (rc == 0 && !dev[0]) rc = ENOENT;
     return rc;
 }
+
+/* ---- маршруты main IPv6 для префикса донора (rtnl.h) ---------------------------------------- */
+
+struct main6_ctx { struct rtnl_route6 *v; size_t n, max; };
+
+static void main6_cb(const struct nlmsghdr *h, void *ctx) {
+    struct main6_ctx *c = ctx;
+    if (h->nlmsg_type != RTM_NEWROUTE) return;
+    const struct rtmsg *rt = NLMSG_DATA(h);
+    size_t hl = NLMSG_ALIGN(sizeof(*rt));
+    if (h->nlmsg_len < NLMSG_HDRLEN + hl || rt->rtm_family != AF_INET6) return;
+    if (rt->rtm_flags & RTM_F_CLONED) return;
+    const struct rtattr *tb[RTA_MAX + 1];
+    attrs_parse((const uint8_t *)rt + hl, h->nlmsg_len - NLMSG_HDRLEN - hl, tb, RTA_MAX);
+    uint32_t table = tb[RTA_TABLE] ? rta_u32(tb[RTA_TABLE]) : rt->rtm_table;
+    if (table != RT_TABLE_MAIN) return;
+    int nullroute = rt->rtm_type == RTN_UNREACHABLE && rt->rtm_dst_len > 0;
+    int srcdef = rt->rtm_dst_len == 0 && rt->rtm_src_len > 0;
+    if ((!nullroute && !srcdef) || c->n >= c->max) return;
+    struct rtnl_route6 *r = &c->v[c->n];
+    memset(r, 0, sizeof(*r));
+    r->type = rt->rtm_type;
+    r->dst_len = rt->rtm_dst_len;
+    r->src_len = rt->rtm_src_len;
+    if (tb[RTA_DST] && RTA_PAYLOAD(tb[RTA_DST]) >= 16) memcpy(r->dst, RTA_DATA(tb[RTA_DST]), 16);
+    if (tb[RTA_SRC] && RTA_PAYLOAD(tb[RTA_SRC]) >= 16) memcpy(r->src, RTA_DATA(tb[RTA_SRC]), 16);
+    r->oif = tb[RTA_OIF] ? (int)rta_u32(tb[RTA_OIF]) : 0;
+    c->n++;
+}
+
+int rtnl_main6_routes(struct rtnl_route6 *v, size_t max) {
+    uint8_t buf[64];
+    struct nlbuf b;
+    struct rtmsg rt;
+    memset(&rt, 0, sizeof(rt));
+    rt.rtm_family = AF_INET6;
+    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_GETROUTE,
+                                    NLM_F_REQUEST | NLM_F_DUMP, &rt, sizeof(rt));
+    struct main6_ctx c = { v, 0, max };
+    if (rtnl_talk(buf, msg_end(&b, nh), main6_cb, &c) != 0) return -1;
+    return (int)c.n;
+}

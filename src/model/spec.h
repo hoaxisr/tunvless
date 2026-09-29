@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>              /* inet_ntop у v6pfx_str */
 
 #include "platform.h"
 /* Раньше остальных заголовков: struct err нужен объявлениям load_spec/registry_assign ниже, а
@@ -315,6 +316,41 @@ static inline const char *out_key(const struct out_keys *k, const char *v1, cons
     return k->v2 ? v2 : v1;
 }
 
+/* ---- IPv6 ОТ ХОСТА (шаг 8 выпуска 1.10; docs/spec-v2.md, «ipv6 у выхода») ---------------------
+ *
+ * ЗАЧЕМ. У роутера своего IPv6 от провайдера часто нет, а у сервера на том конце туннеля
+ * WireGuard (хоста) он есть. Хост — «донор»: IPv6 клиентов уходит к нему внутри самого туннеля.
+ * Сторону хоста человек настраивает сам (обычный сервер WireGuard с IPv6), раздачу IPv6 в
+ * локальную сеть — тоже сам, в netifd и odhcpd (`ip6prefix` у интерфейса wg, `ip6assign` у LAN,
+ * `ra_default`, `ula_prefix`): это чужие пакеты, и их настройка принадлежит человеку (раздел 2
+ * docs/architecture.md). steer маршрутизирует и говорит в diag, чего не хватает.
+ *
+ * РЕЖИМЫ — ключ `ipv6` у выхода с устройством, который несёт IPv6 (interface, awg):
+ *   routed — хост маршрутизует на пира ПРЕФИКС (или отвечает за адреса из него NDP proxy), и у
+ *            клиентов LAN адреса из этого префикса. IPv6 клиентов с адресом из префикса идёт по
+ *            правилам: правила в донора ведут его туда, у правил в другие выходы IPv6 отвергается
+ *            (другой сервер отбросит чужой источник по AllowedIPs, провайдер — по BCP38), и имена
+ *            под ними получают пустой AAAA; всё несовпавшее из префикса — в донора. Адрес из
+ *            префикса не уходит ни в другой выход, ни в WAN никогда (fail-closed в forward_v6).
+ *            Донор в спеке один.
+ *   nat    — у пира один адрес, клиенты на ULA: steer сам ставит masquerade IPv6 на устройство
+ *            выхода в своей таблице (исключение из «steer не трогает файрвол» — только по этому
+ *            ключу), и IPv6 идёт по правилам, как IPv4.
+ *   off    — выход IPv6 не несёт, хотя вид умеет: IPv6 его правил отвергается, AAAA пустой.
+ * Ключа нет — поведение 1.9, до байта (снимок генератора). Спека v1 ключа не знает.
+ *
+ * ТЕЛЕФОН. Раздачей IPv6 там владеет модуль Tethering Android, и префикса хоста в раздачу steer
+ * не отдаст. По правилу «выразить всё, неприменимое — предупредить» routed и nat на телефоне
+ * разбираются и хранятся, но действуют как отсутствие ключа (out_ipv6_mode), а apply и diag
+ * говорят об этом; off применим везде. */
+enum out_ipv6 { OUT_V6_KIND = 0, OUT_V6_ROUTED, OUT_V6_NAT, OUT_V6_OFF };
+
+/* Префикс IPv6: адрес в порядке сети и длина; len 0 — префикса нет. */
+struct v6pfx {
+    uint8_t a[16];
+    unsigned char len;
+};
+
 struct output {
     /* Пусто — безымянный выход, член группы, рождённый переводом v1 из `devices` (лежит в
      * sp->out за именованными, см. struct spec). */
@@ -356,6 +392,20 @@ struct output {
     };
     uint32_t mark;      /* 0 for direct: claiming a packet needs no mark */
     int table;
+    /* IPv6 ОТ ХОСТА (ключ `ipv6` спеки v2, шаг 8 выпуска 1.10; устройство — у struct v6pfx ниже):
+     * как написано в спеке. OUT_V6_KIND — ключа нет, поведение 1.9. Спросить, что действует на
+     * этой платформе, — out_ipv6_mode. */
+    enum out_ipv6 ipv6;
+    /* routed: префикс хоста. v6pfx_given — записан в спеке (`prefix:`); иначе это СОСТОЯНИЕ, как
+     * device: выведенный из адресов раздачи префикс (v6donor_derive, failover.c), который apply
+     * вписывает в набор v6donor. len 0 — не известен. */
+    struct v6pfx v6pfx;
+    int v6pfx_given;
+    /* IPv6 правил этого выхода не несётся: `ipv6: off` или рядом есть выход-донор (`ipv6: routed`),
+     * а этот выход не донор и не `ipv6: nat`. Решает spec_v6_resolve один раз после разбора;
+     * out_caps тогда снимает KC_IPV6, и всё, что спрашивает «несёт ли выход IPv6» (маршрут IPv6,
+     * forward_v6, dom6_ok, свойства группы), видит один ответ. */
+    int v6_denied;
 };
 
 /* ---- МОДЕЛЬ v2: кто → что → куда (docs/architecture.md, «4в») -------------------------------
@@ -602,7 +652,12 @@ static inline const struct kind_ops *kind_of(const struct output *o) {
 }
 static inline unsigned out_caps(const struct output *o) {
     const struct kind_ops *k = kind_of(o);
-    return k->caps | (k->caps_of ? k->caps_of(o) : 0);
+    unsigned c = k->caps | (k->caps_of ? k->caps_of(o) : 0);
+    /* IPv6 выхода снят (`ipv6: off` или выход рядом с донором — spec_v6_resolve): вид умеет, но
+     * этот выход IPv6 не несёт. Одним местом здесь, чтобы все вопросы «несёт ли IPv6» (маршрут
+     * IPv6, forward_v6, dom6_ok, свойства группы в group_seal) получили один ответ. */
+    if (o->v6_denied) c &= ~(unsigned)KC_IPV6;
+    return c;
 }
 static inline int out_has_cap(const struct output *o, unsigned cap) { return (out_caps(o) & cap) != 0; }
 
@@ -1030,6 +1085,77 @@ int table_bind(const struct output *o, const char *dev);
  * failover.c, но нужна и клиенту VLESS: он привязывает своё устройство сам, потому что
  * только он знает момент, когда оно готово нести трафик. */
 void bind_device(struct output *o, const char *dev);
+
+/* ---- IPv6 от хоста: вопросы к выходу и спеке (устройство — у enum out_ipv6 выше) ---------- */
+
+/* Набор префикса хоста у донора в нашей таблице inet (compile/generate.c: build_v6donor_set).
+ * Имя знают трое: компилятор, сторож, который переписывает его элементы (v6donor_sync), и сверка
+ * элементов apply (recon.c), которая его не считает — его содержимое ведёт сторож. */
+#define V6DONOR_SET "v6donor"
+
+/* Режим, который ДЕЙСТВУЕТ на этой платформе: routed и nat — только там, где раздачу IPv6 в LAN
+ * ведут netifd и odhcpd (plat()->lan_ipv6_host); на телефоне они значат то же, что отсутствие
+ * ключа, и об этом говорят apply и diag (v6_notes). */
+static inline enum out_ipv6 out_ipv6_mode(const struct output *o) {
+    if ((o->ipv6 == OUT_V6_ROUTED || o->ipv6 == OUT_V6_NAT) && !plat()->lan_ipv6_host)
+        return OUT_V6_KIND;
+    return o->ipv6;
+}
+
+/* Выход-донор (действующий `ipv6: routed`) или NULL. Донор в спеке один — это проверяет разбор. */
+static inline const struct output *spec_v6_donor(const struct spec *sp) {
+    for (size_t i = 0; i < sp->out_n; i++)
+        if (out_ipv6_mode(&sp->out[i]) == OUT_V6_ROUTED) return &sp->out[i];
+    return NULL;
+}
+
+/* Лежит ли адрес a (16 байт, порядок сети) в префиксе p. */
+static inline int v6pfx_has(const struct v6pfx *p, const uint8_t a[16]) {
+    if (!p->len) return 0;
+    unsigned full = p->len / 8u, rest = p->len % 8u;
+    if (memcmp(p->a, a, full) != 0) return 0;
+    if (!rest) return 1;
+    uint8_t m = (uint8_t)(0xffu << (8u - rest));
+    return (p->a[full] & m) == (a[full] & m);
+}
+
+/* Отрезок префикса [lo, hi) — как его держит интервальный набор ядра (начало и маркер конца);
+ * hi — адрес сразу за префиксом. 0 — есть; -1 — префикс до конца адресного пространства (hi не
+ * выражается) или его нет. */
+static inline int v6pfx_range(const struct v6pfx *p, uint8_t lo[16], uint8_t hi[16]) {
+    if (!p->len) return -1;
+    memcpy(lo, p->a, 16);
+    memcpy(hi, p->a, 16);
+    for (unsigned b = p->len; b < 128; b++) {
+        lo[b / 8] &= (uint8_t)~(0x80u >> (b % 8));
+        hi[b / 8] |= (uint8_t)(0x80u >> (b % 8));
+    }
+    for (int i = 15; i >= 0; i--)
+        if (++hi[i] != 0) return 0;
+    return -1;
+}
+
+/* «2001:db8:1::/56» в p. 0 — годен; -1 — нет, причина в why. Хостовые биты — отказ, а не
+ * округление: «2001:db8:1::5/56» — скорее описка в длине, чем префикс. */
+int v6pfx_parse(const char *s, struct v6pfx *p, char *why, size_t n);
+/* Префикс текстом «2001:db8:1::/56» («-» — нет). Здесь, а не в parse.c: зовёт и сторож
+ * (failover.c), а стенд failovermatch собирает его без разбора спеки. */
+static inline void v6pfx_str(const struct v6pfx *p, char *buf, size_t n) {
+    if (!p->len) { snprintf(buf, n, "-"); return; }
+    char a[INET6_ADDRSTRLEN];
+    inet_ntop(AF_INET6, p->a, a, sizeof(a));
+    snprintf(buf, n, "%s/%u", a, p->len);
+}
+/* После разбора: кому снять IPv6 (v6_denied) — см. поле у struct output. Зовёт разбор v2 до
+ * замыкания групп (group_seal берёт свойства членов через out_caps). */
+void spec_v6_resolve(struct spec *sp);
+/* Префикс хоста у донора без `prefix:` — по ядру (устройство и доводы — у определений в
+ * failover.c): 1 — выведен в p; 0 — не найден; -1 — кандидатов больше одного, угадывать нельзя. */
+int v6donor_derive(const struct spec *sp, const struct output *d, struct v6pfx *p);
+/* apply: выведенный префикс — в v6pfx донора (как outputs_adopt_active — устройство). */
+void v6donor_adopt(struct spec *sp);
+/* Сторож: элементы набора v6donor в ядре — к префиксу, который действует сейчас. */
+void v6donor_sync(const struct spec *sp);
 
 /* Раскладка бит метки, реестр меток/таблиц, ход перебора узлов подписки, раскладка правил
  * старого ядра и шаблон временного файла — отдельными модулями (docs/architecture.md), но

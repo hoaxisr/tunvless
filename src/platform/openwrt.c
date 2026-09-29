@@ -98,6 +98,8 @@ const struct platform_ops plat_openwrt = {
      * перезапуск сети целиком — тогда разметку до следующего apply ведёт prerouting (generate.c,
      * «разметка на ingress»). */
     .lan_devs_persist = 1,
+    /* IPv6 в LAN раздают netifd (ip6prefix, ip6assign) и odhcpd — ipv6: routed и nat действуют. */
+    .lan_ipv6_host = 1,
     .warn_iptables_nat = 1,
     .dnsd_origdst = 0,                /* наверх — dnsmasq роутера на петле */
     .ctl_allow_domain = NULL,

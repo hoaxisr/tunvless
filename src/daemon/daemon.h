@@ -15,7 +15,12 @@ struct groups;
  * «apply»: строки с ней пишутся при компиляции и применении спеки. */
 #define LOG_W "steer[warn] apply: "
 
-struct fwcheck { int in_firewall, masqueraded; };
+/* masqueraded — подмена адреса IPv4 на устройстве, masq6 — IPv6 (с 1.10 раздельно, шаг 8): у fw4
+ * это два разных ключа зоны (masq и masq6) и два правила `meta nfproto ipv4|ipv6 masquerade`, а
+ * прежде любое правило masquerade засчитывалось за оба семейства — зона с одним masq6 выглядела
+ * «NAT есть» для IPv4. Правило без семейства (`oifname "wg0" masquerade` в таблице inet) — оба;
+ * в таблице ip — только IPv4, в ip6 — только IPv6. */
+struct fwcheck { int in_firewall, masqueraded, masq6; };
 
 struct fwcheck fw_check(const char *device);
 /* То же по готовому тексту набора правил в форме `nft -t list ruleset` — разбор, которым fw_check
@@ -30,6 +35,8 @@ void fwcheck_reset_cache(void);
 const char *explain_set_phrase(const char *addr, int has_files, int has_domains);
 void report_traceroute_dep(const struct spec *sp);
 void report_output_deps(const struct spec *sp);
+/* Глобальный адрес IPv6 на устройстве раздачи — у клиентов есть IPv6 наружу (fwcheck.c). */
+int lan_has_global_v6(const struct spec *sp);
 
 /* Путь снимка состояния status — снимает apply.c, пишет и отдаёт status.c. */
 void status_snap_path(char *buf, size_t n);

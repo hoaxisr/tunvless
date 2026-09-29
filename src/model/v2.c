@@ -73,6 +73,7 @@ struct v2 {
     const struct ynode *out_members[MAX_OUTPUTS];
     const struct ynode *out_default[MAX_OUTPUTS];
     const struct ynode *out_weights[MAX_OUTPUTS];
+    const struct ynode *out_ipv6[MAX_OUTPUTS], *out_prefix[MAX_OUTPUTS];
     struct v2_client cl[MAX_CLIENTS];
     size_t clients_named, lists_named;
 };
@@ -622,6 +623,40 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             else return fail(x, v, "%s: «%s» — нужен drop, direct или zapret", w, sv);
             continue;
         }
+        if (!strcmp(ks, "ipv6")) {
+            /* IPv6 от хоста (шаг 8 выпуска 1.10, spec.h: enum out_ipv6). off — любому выходу, чей
+             * вид IPv6 несёт (interface, awg, zapret), и группе; routed и nat — только туннелю с
+             * устройством (interface, awg): это свойство пира на том конце, а у группы его нет —
+             * его пишут у члена. */
+            if (str_of(x, v, w, &sv)) return -1;
+            enum out_ipv6 m;
+            if (!strcmp(sv, "routed")) m = OUT_V6_ROUTED;
+            else if (!strcmp(sv, "nat")) m = OUT_V6_NAT;
+            else if (!strcmp(sv, "off")) m = OUT_V6_OFF;
+            else return fail(x, v, "%s: «%s» — нужен routed, nat или off", w, sv);
+            if (!group && !(caps & KC_IPV6))
+                return fail(x, kk, "%s: kind: %s IPv6 не несёт — его правила IPv6 и так отвергаются, "
+                            "ключ ipv6 ему не нужен", where, kd->name);
+            if (m != OUT_V6_OFF && group)
+                return fail(x, v, "%s: %s — свойство туннеля на том конце, у группы его нет: "
+                            "задайте его у члена", w, sv);
+            if (m != OUT_V6_OFF && !(caps & KC_DEVICE))
+                return fail(x, v, "%s: %s — только у выхода с туннелем (kind: interface, awg); "
+                            "у kind: %s есть только off", w, sv, kd->name);
+            o.ipv6 = m;
+            x->out_ipv6[idx] = v;
+            continue;
+        }
+        if (!strcmp(ks, "prefix")) {
+            /* Префикс хоста у ipv6: routed. Что с ним не так — говорит разбор префикса; что он
+             * стоит без routed — проверка после всех ключей (ipv6 может стоять и после). */
+            if (str_of(x, v, w, &sv)) return -1;
+            char why[200];
+            if (v6pfx_parse(sv, &o.v6pfx, why, sizeof(why)) != 0) return fail(x, v, "%s: %s", w, why);
+            o.v6pfx_given = 1;
+            x->out_prefix[idx] = v;
+            continue;
+        }
         if (!strcmp(ks, "over")) {
             if (str_of(x, v, w, &sv)) return -1;
             if (!name_ok(sv)) return fail(x, v, "%s: «%s» — имя другого выхода", w, sv);
@@ -706,6 +741,9 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             size_t l = (size_t)snprintf(list, sizeof(list), "kind%s%s%s", tunnel ? ", protocol" : "",
                                         group || (caps & (KC_DEVICE | KC_MARK)) ? ", on_fail" : "",
                                         !group && (caps & KC_DEVICE) ? ", device, over" : "");
+            if (group || (caps & KC_IPV6))
+                l += (size_t)snprintf(list + l, sizeof(list) - l, ", ipv6%s",
+                                      !group && (caps & KC_DEVICE) ? ", prefix" : "");
             for (size_t b = 0; b < KIND_KEYS_N && l < sizeof(list); b++)
                 if (!group && (kd->keys & KIND_KEYS[b].bit))
                     l += (size_t)snprintf(list + l, sizeof(list) - l, ", %s", KIND_KEYS[b].key);
@@ -750,6 +788,9 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         }
     }
 
+    if (x->out_prefix[idx] && o.ipv6 != OUT_V6_ROUTED)
+        return fail(x, x->out_prefix[idx], "%s: prefix — префикс хоста, он есть только у ipv6: routed",
+                    where);
     if (group) {
         if (!x->out_members[idx]) return fail(x, val, "%s: у группы нужен members", where);
         if (lat_key && o.grp.pick != PICK_LATENCY)
@@ -852,6 +893,21 @@ static int p_outputs_links(struct v2 *x) {
                             "выбирать группе нечего", o->name, m->name, out_kind_name(m));
         }
     }
+    /* ДОНОР IPv6 ОДИН (ipv6: routed): у клиентов LAN адреса из префикса одного хоста, и адрес из
+     * префикса второго первый не пропустит — какой из двух выбрать клиенту, решает его выбор адреса
+     * источника, а не правило. Счёт — по записанному, а не по действующему (на телефоне routed не
+     * действует): спека одна на оба случая и не должна быть годной только на одной платформе. */
+    int donor = -1;
+    for (size_t i = 0; i < s->out_n; i++) {
+        if (s->out[i].ipv6 != OUT_V6_ROUTED) continue;
+        if (donor >= 0)
+            return fail(x, x->out_ipv6[i], "outputs.%s.ipv6: routed уже у выхода %s — донор IPv6 в "
+                        "спеке один: адрес из префикса одного хоста другой хост не пропустит",
+                        s->out[i].name, s->out[donor].name);
+        donor = (int)i;
+    }
+    /* Кому снять IPv6 — до замыкания групп: свойства группы — пересечение out_caps членов. */
+    spec_v6_resolve(s);
     /* ЗАМЫКАНИЕ — ПО ВЛОЖЕННОСТИ: сначала группы, у которых среди членов групп нет, потом те, чьи
      * члены-группы уже замкнуты, и так до конца. Свойства внешней — пересечение свойств членов, и у
      * вложенной они обязаны быть посчитаны раньше; круги отвергнуты выше, так что каждый круг

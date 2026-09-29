@@ -533,6 +533,79 @@ EOF
 "$BIN" spec convert --spec "$tmp/s.yaml" > "$tmp/c1.yaml" 2>&1 && "$BIN" spec convert --spec "$tmp/c1.yaml" > "$tmp/c2.yaml" 2>&1
 if cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml" && grep -q 'tolerance: 80' "$tmp/c1.yaml"; then ok; else bad "convert v2 → v2 — неподвижная точка" "$(head -n 20 "$tmp/c1.yaml")"; fi
 
+# Ключ ipv6 у выхода (шаг 8 выпуска 1.10): режимы, prefix и отказы с местом.
+y <<'EOF'
+version: 2
+outputs:
+  wg0: { kind: interface, device: wg0, ipv6: routed, prefix: "2001:db8:1::/56" }
+  wg1: { kind: interface, device: wg1, ipv6: nat }
+  wg2: { kind: interface, device: wg2, ipv6: off }
+lists:
+  a: { prefixes_file: TMP/a.lst }
+rules:
+  - { to: a, out: wg0 }
+EOF
+accepted "ipv6: routed с prefix, nat и off"
+"$BIN" spec convert --spec "$tmp/s.yaml" > "$tmp/c1.yaml" 2>&1 && "$BIN" spec convert --spec "$tmp/c1.yaml" > "$tmp/c2.yaml" 2>&1
+if cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml" && grep -q 'ipv6: routed, prefix: 2001:db8:1::/56 }' "$tmp/c1.yaml" &&
+   grep -q 'ipv6: nat' "$tmp/c1.yaml" && grep -q 'ipv6: "off"' "$tmp/c1.yaml"; then ok; else
+    bad "convert печатает ключ ipv6 и prefix (неподвижная точка)" "$(grep -n ipv6 "$tmp/c1.yaml")"; fi
+y <<'EOF'
+version: 2
+outputs:
+  wg0: { kind: interface, device: wg0, ipv6: bridged }
+EOF
+refused "ipv6: неизвестный режим — с местом" "outputs.wg0.ipv6: «bridged» — нужен routed, nat или off" 3:46
+y <<'EOF'
+version: 2
+outputs:
+  wg0: { kind: interface, device: wg0, ipv6: nat, prefix: "2001:db8:1::/56" }
+EOF
+refused "prefix без ipv6: routed" "prefix — префикс хоста, он есть только у ipv6: routed" 3:59
+y <<'EOF'
+version: 2
+outputs:
+  wg0: { kind: interface, device: wg0, ipv6: routed, prefix: "2001:db8:1::1/56" }
+EOF
+refused "prefix с битами хоста" "у префикса ненулевые биты хоста: сеть этой длины — 2001:db8:1::/56" 3:62
+y <<'EOF'
+version: 2
+outputs:
+  wg0: { kind: interface, device: wg0, ipv6: routed, prefix: "2001:db8:1::/80" }
+EOF
+refused "prefix длиннее /64" "длина префикса от 1 до 64" 3:62
+y <<'EOF'
+version: 2
+outputs:
+  wg0: { kind: interface, device: wg0, ipv6: routed }
+  wg1: { kind: interface, device: wg1, ipv6: routed }
+EOF
+refused "два донора IPv6" "outputs.wg1.ipv6: routed уже у выхода wg0 — донор IPv6 в спеке один" 4:46
+y <<'EOF'
+version: 2
+outputs:
+  tg: { kind: tgws, domain: example.com, ipv6: off }
+EOF
+refused "ipv6 у вида без IPv6" "kind: tgws IPv6 не несёт" 3:42
+y <<'EOF'
+version: 2
+outputs:
+  wg0: { kind: interface, device: wg0 }
+  g: { kind: group, pick: order, members: [wg0], ipv6: routed }
+EOF
+refused "ipv6: routed у группы" "outputs.g.ipv6: routed — свойство туннеля на том конце, у группы его нет" 4:56
+y <<'EOF'
+version: 2
+outputs:
+  wg0: { kind: interface, device: wg0 }
+  g: { kind: group, pick: order, members: [wg0], ipv6: off }
+lists:
+  a: { prefixes_file: TMP/a.lst }
+rules:
+  - { to: a, out: g }
+EOF
+accepted "ipv6: off у группы"
+
 echo "v2match: разбор v2 — $pass проверок прошли"
 if [ "$fail" -gt 0 ]; then echo "v2match: ПРОВАЛЕНО $fail"; exit 1; fi
 exit 0

@@ -238,6 +238,30 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
                    sp->out[i].device, up ? "true" : "false", failed ? ",\"failed\":true" : "",
                    sp->out[i].mark, sp->out[i].table,
                    c.in_firewall ? "true" : "false", c.masqueraded ? "true" : "false");
+            /* С 1.10 `nat` — подмена IPv4 (masq зоны), а `nat6` — IPv6 (masq6), отдельно
+             * (fw_check по семействам, fwcheck.c): прежде одно поле засчитывало любое правило
+             * masquerade за оба. `nat6` — только у выхода, который несёт IPv6 (out_route6): у
+             * остальных IPv6 его правил отвергается, и вопрос о подмене не стоит. */
+            if (out_route6(&sp->out[i]))
+                fprintf(out, ",\"nat6\":%s", c.masq6 ? "true" : "false");
+            /* Ключ ipv6 спеки v2 (шаг 8 выпуска 1.10) — как записан; `ipv6_applied: false` —
+             * записан, но на этой платформе не действует (телефон, out_ipv6_mode). У донора —
+             * `prefix`: записанный или выведенный по ядру сейчас (v6donor_derive), null — не
+             * узнать. Поля нет у выхода без ключа — status прежний до байта. */
+            const struct output *o6 = &sp->out[i];
+            if (o6->ipv6 != OUT_V6_KIND) {
+                static const char *const V6[] = { "", "routed", "nat", "off" };
+                fprintf(out, ",\"ipv6\":\"%s\"", V6[o6->ipv6]);
+                if (out_ipv6_mode(o6) != o6->ipv6) fprintf(out, ",\"ipv6_applied\":false");
+            }
+            if (spec_v6_donor(sp) == o6) {
+                struct v6pfx p = o6->v6pfx;
+                if (!o6->v6pfx_given && v6donor_derive(sp, o6, &p) != 1) p.len = 0;
+                char ps[64];
+                v6pfx_str(&p, ps, sizeof(ps));
+                if (p.len) fprintf(out, ",\"prefix\":\"%s\"", ps);
+                else fprintf(out, ",\"prefix\":null");
+            }
             /* Кандидаты и режим отказа: без них failover не виден из интерфейса, и
              * человек не может понять, почему выход вдруг ведёт в другое устройство. */
             /* Ход подъёма — рядом с up, а не отдельным вызовом: интерфейс уже читает

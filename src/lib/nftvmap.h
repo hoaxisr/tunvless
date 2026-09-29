@@ -39,4 +39,21 @@ int nfv_map_write(uint8_t family, const char *table, const char *map,
                   const char (*want)[NFV_CHAIN_MAX], const char (*have)[NFV_CHAIN_MAX],
                   size_t slots);
 
+/* ИНТЕРВАЛЬНЫЙ НАБОР ipv6_addr — префикс хоста у донора IPv6 (набор v6donor, шаг 8 выпуска 1.10).
+ * Здесь же, а не в nftnl.c резолвера, по той же причине, что карта: пишет его сторож (v6donor_sync
+ * в failover.c) — без процесса nft и без глобалов резолвера, одной транзакцией.
+ *
+ * Отрезок — [lo, hi): в ядре это два элемента, начало и маркер конца (NFT_SET_ELEM_INTERVAL_END)
+ * с ключом hi, как их кладёт `nft add element … { 2001:db8:1::/56 }`.
+ *
+ * Чтение: сколько отрезков в наборе (в v — первые max, по возрастанию); -1 — набора нет, ядро не
+ * ответило или элементов больше NFV_RANGES6_MAX (errno). Запись: набор целиком становится want —
+ * сброс и новые отрезки в одном батче; 0 или -1 (errno), и тогда ядро не изменилось. */
+#define NFV_RANGES6_MAX 16
+struct nfv_range6 { uint8_t lo[16], hi[16]; };
+int nfv_ranges6_read(uint8_t family, const char *table, const char *set, struct nfv_range6 *v,
+                     size_t max);
+int nfv_ranges6_write(uint8_t family, const char *table, const char *set,
+                      const struct nfv_range6 *want, size_t n);
+
 #endif

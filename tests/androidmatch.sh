@@ -231,5 +231,32 @@ ing="$(STEER_NFT_INGRESS=all STEER_NFT_COMPAT=modern "$BIN" apply --dry-run $S 2
 check "раздача на телефоне — без ingress" "0" "$(printf '%s\n' "$ing" | grep -c 'hook ingress')"
 check "  и текст тот же, что без него" "$out" "$ing"
 
+# IPv6 от хоста (ключ ipv6 у выхода, шаг 8 выпуска 1.10): раздачей IPv6 на телефоне владеет
+# Tethering Android. routed и nat разбираются (спека одна на обе платформы), но действуют как
+# отсутствие ключа — набор правил тот же, что без него, — и apply говорит об этом; off действует.
+printf '203.0.113.0/24\n2001:db8:a::/48\n' > "$tmp/h6.lst"
+h6() {
+    cat > "$tmp/h6.yaml" <<EOF
+version: 2
+lists:
+  a: { prefixes_file: $tmp/h6.lst }
+outputs:
+  wg: { kind: interface, device: wg0$1 }
+rules:
+  - { to: a, out: wg }
+EOF
+    STEER_NFT_COMPAT=modern "$BIN" apply --dry-run --spec "$tmp/h6.yaml" --state-dir "$tmp/state" 2>"$tmp/h6.err"
+}
+h6_none="$(h6 '')"
+h6_r="$(h6 ', ipv6: routed, prefix: "2001:db8:1::/56"')"
+check "ipv6: routed на телефоне — набор правил как без ключа" "$h6_none" "$h6_r"
+check "  и apply говорит, что ключ не действует" "1" \
+    "$(grep -c 'ipv6: routed на этой платформе не действует' "$tmp/h6.err")"
+h6_n="$(h6 ', ipv6: nat')"
+check "ipv6: nat на телефоне — набор правил как без ключа" "$h6_none" "$h6_n"
+h6_o="$(h6 ', ipv6: off')"
+check "ipv6: off на телефоне действует — IPv6 выхода отвергается" "1" \
+    "$(printf '%s\n' "$h6_o" | grep -c 'steer-v6drop:wg')"
+
 printf '\nandroidmatch: %s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

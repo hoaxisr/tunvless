@@ -77,4 +77,17 @@ int rtnl_default6(void);
  * правил, как и у iproute2). 0 — имя в dev; иначе errno, dev пуст. */
 int rtnl_route_dev(struct in_addr dst, char *dev, size_t n);
 
+/* Маршруты таблицы main IPv6, по которым сторож выводит префикс донора (шаг 8 выпуска 1.10,
+ * v6donor_derive в failover.c): нуль-маршруты `unreachable P` (dst_len > 0) — их ставит netifd на
+ * каждый делегированный префикс, чтобы не было петли, — и маршруты по умолчанию с источником
+ * `default from P …` (src_len > 0) — их ставит netifd на префикс провайдера (sourcefilter). Адреса
+ * — 16 байт в порядке сети, oif — номер устройства (0 — нет). Сколько записано (<= max) или -1. */
+struct rtnl_route6 {
+    uint8_t dst[16], src[16];
+    uint8_t dst_len, src_len;
+    unsigned type;
+    int oif;
+};
+int rtnl_main6_routes(struct rtnl_route6 *v, size_t max);
+
 #endif

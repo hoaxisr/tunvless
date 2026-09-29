@@ -302,6 +302,11 @@ static void iptables_masq_sync(const struct spec *sp) {
  * изменилась (apply-сверка, src/daemon/recon.c). */
 static void apply_routing_one(const struct output *o) {
     if (!out_has_device(o)) return;
+    /* IPv6 выхода снят спекой (ipv6: off или выход рядом с донором — spec_v6_resolve): правило и
+     * таблица IPv6, поставленные прежней спекой, снимаются. Вреда от них не было бы — IPv6 такого
+     * выхода отвергает forward_v6 по метке, — но `ip -6 rule` с правилом выхода, который IPv6 не
+     * несёт, путал бы того, кто по нему выясняет, куда уходит IPv6. */
+    if (o->v6_denied) routing6_drop(o->mark, o->table);
     /* Группа спеки v2, у которой по известным приговорам членов взять некого (у manual — не
      * работает выбранный член): подхват outputs_adopt_active_st принял то же решение, что примет
      * проход, и это решение — on_fail. Ставится сразу и тем же кодом, что у прохода, а не
@@ -478,6 +483,31 @@ static int nfqueue_supported(void) {
 }
 
 
+/* IPv6 ОТ ХОСТА — что не так, вслух при apply (подробно и с приговором — diag, `ipv6_host`).
+ * Ключ routed/nat там, где он не действует (телефон), и донор, префикс которого не узнать: без
+ * префикса правила в донора ведут IPv6 по меткам, но «всё несовпавшее из префикса — в донора» и
+ * запрет источника мимо донора стоят пустыми. */
+static void report_v6_host(const struct spec *sp) {
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct output *o = &sp->out[i];
+        if ((o->ipv6 == OUT_V6_ROUTED || o->ipv6 == OUT_V6_NAT) && out_ipv6_mode(o) != o->ipv6)
+            fprintf(stderr, LOG_W "output %s: ipv6: %s на этой платформе не действует — раздачей "
+                            "IPv6 владеет Android, IPv6 выхода идёт как без ключа\n", o->name,
+                    o->ipv6 == OUT_V6_ROUTED ? "routed" : "nat");
+    }
+    const struct output *d = spec_v6_donor(sp);
+    if (!d || d->v6pfx_given || d->v6pfx.len) return;
+    struct v6pfx p;
+    if (v6donor_derive(sp, d, &p) < 0)
+        fprintf(stderr, LOG_W "output %s: ipv6: routed — префиксов, из которых у LAN адреса, "
+                        "несколько, и который из них от хоста, не узнать: задайте prefix: у выхода\n",
+                d->name);
+    else
+        fprintf(stderr, LOG_W "output %s: ipv6: routed — у LAN нет адреса из префикса хоста: задайте "
+                        "ip6prefix у интерфейса %s и ip6assign у LAN (или prefix: у выхода)\n",
+                d->name, d->device);
+}
+
 /* ---- apply: общее начало, одна транзакция, конец ---------------------------------------
  *
  * cmd_apply (подкоманда `steer apply` — init.d, rpcd, init телефона) и служебные apply-plan и
@@ -536,6 +566,10 @@ static void apply_prepare(const char *spec, struct spec *cfg, struct groups *gr,
      * неработающее основное, а при on_fail=drop ещё и ставило запрет — то есть каждое
      * сохранение в интерфейсе роняло бы пул до следующего прохода сторожа (до минуты). */
     outputs_adopt_active(cfg);
+    /* Префикс хоста у донора IPv6 без `prefix:` — по ядру (failover.c, v6donor_derive): он уходит
+     * элементом в набор v6donor. До генерации, как и устройство выше. */
+    v6donor_adopt(cfg);
+    if (report) report_v6_host(cfg);
     /* Проверка списков — ДО генерации и до dry-run.
      *
      * До dry-run намеренно: интерфейс проверяет спеку именно им, перед записью на диск.
