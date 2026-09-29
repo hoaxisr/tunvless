@@ -25,7 +25,9 @@ const struct hy2_cfg *out_hysteria2(const struct output *o) {
 
 static int hy2_parse(struct output *o, const struct out_keys *k, struct err *e) {
     snprintf(o->hy2.sub_file, sizeof(o->hy2.sub_file), "%s", k->sub_file);
-    memcpy(o->hy2.nodes, k->nodes, sizeof(o->hy2.nodes));
+    /* Массив номеров узлов лежит в арене спеки (его завёл читатель формата ровно на nodes_n) —
+     * тот же порядок владения, что у kind vless. */
+    o->hy2.nodes = k->nodes;
     o->hy2.nodes_n = k->nodes_n;
     if (!o->hy2.sub_file[0]) {
         char msg[160];
@@ -49,7 +51,7 @@ static int hy2_parse(struct output *o, const struct out_keys *k, struct err *e) 
 
 static void hy2_keys_of(const struct output *o, struct out_keys *k) {
     snprintf(k->sub_file, sizeof(k->sub_file), "%s", o->hy2.sub_file);
-    memcpy(k->nodes, o->hy2.nodes, sizeof(k->nodes));
+    k->nodes = o->hy2.nodes;
     k->nodes_n = o->hy2.nodes_n;
     char dev[32];
     snprintf(dev, sizeof(dev), "%.15s", o->name);

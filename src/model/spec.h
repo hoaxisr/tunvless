@@ -192,7 +192,7 @@ struct vless_cfg {
  * разбора, а не молча проглоченное слово. */
 struct hy2_cfg {
     char sub_file[256];
-    int nodes[MAX_NODE_SEL];
+    int *nodes;                 /* арена спеки, nodes_n записей (NULL при 0), как у vless_cfg */
     size_t nodes_n;
 };
 
