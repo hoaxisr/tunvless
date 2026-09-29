@@ -81,6 +81,7 @@ static void rules_show(char *out, size_t n);
 static void routes_show(int table, char *out, size_t n);
 static void rules6_show(char *out, size_t n);
 static void routes6_show(int table, char *out, size_t n);
+static char *rules_dump(int fam);
 
 /* Адрес источника устройства: без него правило пробы не к чему привязать, а само
  * отсутствие адреса уже означает, что устройство не готово нести трафик. */
@@ -548,10 +549,10 @@ static void rule_del_at(int fam, unsigned mark, int table, unsigned long pref) {
 static void rule_ensure_fam(int fam, unsigned mark, int table) {
     /* Статический и с запасом — по той же причине, что в route_facts_read: это ВСЕ правила
      * коробки, и обрезанный дамп значил бы «нашего нет» и лишнюю копию. */
-    static char rules[16384];
-    if (fam == 6) rules6_show(rules, sizeof(rules));
-    else rules_show(rules, sizeof(rules));
+    char *rules = rules_dump(fam);
+    if (!rules) return;
     struct rule_copies c = rule_copies_of(rules, mark, table);
+    free(rules);
     /* Прочитать не вышло (нет ip, отказал popen) — добавляем, ничего не снимая: лишняя копия
      * того же правила ничего не меняет в маршрутизации, а снятие вслепую могло бы оставить
      * метку без правила — то есть ту самую утечку, ради которой всё это. */
@@ -1280,6 +1281,23 @@ static void routes_show(int table, char *out, size_t n) {
     rtnl_routes_text(table, out, n);
 }
 
+/* Дамп правил семейства fam (4 или 6) — строка в куче любой длины, free вызывающему (пустая
+ * строка — «не прочитать»). Правил на коробке по одному-два на выход и десятки чужих (mwan3, fw4,
+ * чужие туннели); буфер в 16 КиБ обрезал бы дамп на сотне выходов, и «нашего правила нет» вело бы
+ * к лишней копии каждый проход. Швы стенда (g_ip_show) отвечают в буфер, для них — мегабайт. */
+static char *rules_dump(int fam) {
+    if (g_ip_show || g_ip6_show) {
+        size_t n = 1u << 20;
+        char *b = malloc(n);
+        if (!b) return NULL;
+        if (fam == 6) rules6_show(b, n);
+        else rules_show(b, n);
+        return b;
+    }
+    char *b = rtnl_rules_dup(fam == 6);
+    return b ? b : strdup("");
+}
+
 /* IPv6 — тем же приёмом. Стенд с g_ip_show без g_ip6_show получает пустой текст («не прочитать»). */
 int (*g_ip6_show)(int table, char *out, size_t n);
 
@@ -1318,10 +1336,13 @@ int routing6_live_ok(const struct route_facts *f, const char *dev, int dev_v6) {
 }
 
 static struct route_facts route6_facts_read(const struct output *o) {
-    static char rules[16384], routes[8192];
-    rules6_show(rules, sizeof(rules));
+    static char routes[8192];
+    char *rules = rules_dump(6);
+    if (!rules) { struct route_facts none; memset(&none, 0, sizeof(none)); return none; }
     routes6_show(o->table, routes, sizeof(routes));
-    return route_facts_of(rules, routes, o->mark, o->table);
+    struct route_facts f = route_facts_of(rules, routes, o->mark, o->table);
+    free(rules);
+    return f;
 }
 
 static struct route_facts route_facts_read(const struct output *o) {
@@ -1331,10 +1352,13 @@ static struct route_facts route_facts_read(const struct output *o) {
      * привязки каждую минуту — то есть короткий провал помеченного трафика на ровном
      * месте. Статические: буферы большие, а проход однопоточный (в демоне — на цикле событий,
      * по одному шагу за раз), и делить с ними стек незачем. */
-    static char rules[16384], routes[8192];
-    rules_show(rules, sizeof(rules));
+    static char routes[8192];
+    char *rules = rules_dump(4);
+    if (!rules) { struct route_facts none; memset(&none, 0, sizeof(none)); return none; }
     routes_show(o->table, routes, sizeof(routes));
-    return route_facts_of(rules, routes, o->mark, o->table);
+    struct route_facts f = route_facts_of(rules, routes, o->mark, o->table);
+    free(rules);
+    return f;
 }
 
 /* ---- хранилище состояния сторожа: файлы каталога состояния ---------------------------
@@ -1480,23 +1504,29 @@ void active_get(const char *out, char *dev, size_t n) {
  * читают этот файл в любой момент. */
 static void active_save(struct fo_store *st, const struct spec *sp, const int *streak,
                         const int *failed) {
-    char want[MAX_OUTPUTS * 80 + 1];
-    size_t wn = 0;
+    /* Строка — имя ≤ 31, устройство ≤ 31, число серии и пробелы: не больше 96 байт. Буфер — по
+     * числу выходов (раньше 80 байт на 16 выходов, и хвост записи терялся). */
+    size_t wcap = sp->out_n * 96 + 1, wn = 0;
+    char *want = malloc(wcap);
+    if (!want) return;
     for (size_t i = 0; i < sp->out_n; i++) {
         if (!out_has_device(&sp->out[i])) continue;
-        int w = snprintf(want + wn, sizeof(want) - wn, "%s %s %d\n", sp->out[i].name,
+        int w = snprintf(want + wn, wcap - wn, "%s %s %d\n", sp->out[i].name,
                          !failed[i] && sp->out[i].device[0] ? sp->out[i].device : "-", streak[i]);
-        if (w < 0 || (size_t)w >= sizeof(want) - wn) break;
+        if (w < 0 || (size_t)w >= wcap - wn) break;
         wn += (size_t)w;
     }
     FILE *f = st->ops->open_r(st, "active");
     if (f) {
-        char have[sizeof(want) + 1];
-        size_t hn = fread(have, 1, sizeof(have), f);
+        char *have = malloc(wn + 1);
+        size_t hn = have ? fread(have, 1, wn + 1, f) : (size_t)-1;
         fclose(f);
-        if (hn == wn && memcmp(have, want, wn) == 0) return;
+        int same = have && hn == wn && memcmp(have, want, wn) == 0;
+        free(have);
+        if (same) { free(want); return; }
     }
     st->ops->put(st, "active", want, wn);
+    free(want);
 }
 
 /* Взять устройство, которое НЕСЁТ ТРАФИК СЕЙЧАС, а не первое по списку кандидатов.
@@ -1546,7 +1576,8 @@ void outputs_adopt_active_st(struct spec *sp, struct fo_store *st) {
     fog_adopt(sp, st);
     /* В порядке прохода (fog_order): у вложенной группы устройство — лист её выбора, и внешней
      * оно нужно уже выбранным. */
-    size_t ord[MAX_OUTPUTS];
+    size_t *ord = malloc((sp->out_n ? sp->out_n : 1) * sizeof(*ord));
+    if (!ord) return;
     size_t on = fog_order(sp, ord);
     for (size_t oi = 0; oi < on; oi++) {
         struct output *o = &sp->out[ord[oi]];
@@ -1562,25 +1593,26 @@ void outputs_adopt_active_st(struct spec *sp, struct fo_store *st) {
          * сам, и ответ всегда его устройство. */
         if (!out_group(o)) continue;
 
-        const struct output *m[MAX_MEMBERS];
-        size_t mn = out_members(sp, o, m, MAX_MEMBERS);
+        size_t mn = out_members_n(sp, o);
+#define M(k) out_member(sp, o, (k))
         struct group_cfg *g = &o->grp;
         if (group_named(g)) {
             /* Приговор члена — его проход в том же обходе, и член стоит в порядке раньше группы:
-             * его failed и device (у вложенной группы — её лист) выше уже подхвачены. */
-            unsigned alive = 0;
+             * его failed и device (у вложенной группы — её лист) выше уже подхвачены. Живые —
+             * байты прямо в g->alive (длина members_n): маска в 32 бита ограничивала группу
+             * тридцатью двумя членами. */
+            unsigned char *alive = g->alive;
             for (size_t k = 0; k < mn; k++)
-                if (!m[k]->failed && device_present(m[k]->device)) alive |= 1u << k;
+                alive[k] = !M(k)->failed && device_present(M(k)->device);
             /* Несущий член — как у прохода: по записи groups, пока группа не в отказе; записи
              * groups нет — по устройству из active. */
             int cur = -1;
             if (rec[0] && strcmp(rec, "-") != 0) {
                 cur = g->cur;
                 for (size_t k = 0; k < mn && cur < 0; k++)
-                    if (!strcmp(m[k]->device, rec)) cur = (int)k;
+                    if (!strcmp(M(k)->device, rec)) cur = (int)k;
             }
             int k = fog_pick_known(sp, st, o, alive, cur);
-            g->alive = alive;
             g->cur = k;
             o->failed = k < 0;
             /* В отказе устройство — то, о котором status и diag скажут «не отвечает»: у manual —
@@ -1588,18 +1620,20 @@ void outputs_adopt_active_st(struct spec *sp, struct fo_store *st) {
              * существующий член, как прежде. */
             if (k < 0 && g->pick == PICK_MANUAL) k = fog_manual_pick(sp, st, o);
             for (size_t j = 0; j < mn && k < 0; j++)
-                if (device_present(m[j]->device)) k = (int)j;
-            if (k >= 0 && (size_t)k < mn) snprintf(o->device, sizeof(o->device), "%s", m[k]->device);
+                if (device_present(M(j)->device)) k = (int)j;
+            if (k >= 0 && (size_t)k < mn) snprintf(o->device, sizeof(o->device), "%s", M(k)->device);
             continue;
         }
         const char *pick = NULL;
         if (rec[0] && strcmp(rec, "-") != 0 && device_present(rec))
             for (size_t k = 0; k < mn && !pick; k++)
-                if (!strcmp(m[k]->device, rec)) pick = m[k]->device;
+                if (!strcmp(M(k)->device, rec)) pick = M(k)->device;
         for (size_t k = 0; k < mn && !pick; k++)
-            if (device_present(m[k]->device)) pick = m[k]->device;
+            if (device_present(M(k)->device)) pick = M(k)->device;
         if (pick) snprintf(o->device, sizeof(o->device), "%s", pick);
+#undef M
     }
+    free(ord);
 }
 
 /* Поднять залипший туннель.
@@ -1768,17 +1802,21 @@ struct fo_run {
 
     /* ---- проход (прежние локальные переменные failover_pass) ---- */
     int changed;
-    int streak_new[MAX_OUTPUTS];
-    int alive[MAX_OUTPUTS];           /* кто в ЭТОМ проходе нашёл живое устройство */
+    /* Рабочие массивы прохода — по числу выходов спеки (n_out) и по числу членов самой большой
+     * группы (maxm), выделяются в run_new и отдаются run_free: раньше стояли статическими на 16
+     * выходов и 16 членов. */
+    size_t n_out, maxm;
+    int *streak_new;
+    int *alive;                       /* кто в ЭТОМ проходе нашёл живое устройство */
     /* Кто в этом проходе остался без живого устройства — в файл active он ложится «-». Отдельно
      * от device: устройство выхода проход не стирает (см. out_finish), иначе выход, чьё
      * устройство названо членом группы ниже по спеке, перестал бы быть его владельцем. */
-    int failed[MAX_OUTPUTS];
-    size_t ord[MAX_OUTPUTS], ord_n, oi;
+    int *failed;
+    size_t *ord, ord_n, oi;
     size_t i;
     struct output *o;
     /* Кандидаты текущего выхода: члены группы или он сам (out_members). */
-    const struct output *cand[MAX_MEMBERS];
+    const struct output **cand;
     size_t cand_n;
     const struct output *via;
     int via_down;
@@ -1789,9 +1827,9 @@ struct fo_run {
     int streak, new_streak, by_latency, cur_dead;
     int tol;
     long iv;
-    int ms[MAX_MEMBERS];
+    int *ms;
     /* Замеры по семействам (folat.h): v6 — группа меряется и по IPv6 (folat_want_v6). */
-    int ms4[MAX_MEMBERS], ms6[MAX_MEMBERS];
+    int *ms4, *ms6;
     int v6;
     /* fo_pass_lat_extern: замеры по сроку делает расписание демона (folat.c), проход меряет только
      * живых членов без замера вовсе. */
@@ -1802,9 +1840,9 @@ struct fo_run {
      * живые члены; по выходам — для записи groups в конце прохода. */
     int named;
     int pk;
-    unsigned galive;
-    int grp_cur[MAX_OUTPUTS];
-    unsigned grp_alive[MAX_OUTPUTS];
+    unsigned char *galive;            /* по байту на члена: 1 — жив (раньше маска в 32 бита) */
+    int *grp_cur;
+    unsigned char **grp_alive;        /* по выходу — свои байты по числу членов (или NULL) */
     fo_traffic_fn traffic;            /* трафик через группу — idle_timeout (fostate.h); NULL — нет */
     void *traffic_arg;
     int defer_rev;                    /* fo_pass_defer_revive: членов групп v2 не оживлять здесь */
@@ -1997,8 +2035,8 @@ static int hp_start(struct fo_run *r, int kind, const struct output *o, const ch
  * второй пробы того же устройства из-за группы нет. У пула v1 и выхода-одиночки — проба. */
 static int cand_health(struct fo_run *r, size_t k) {
     if (r->named) {
-        size_t m = (size_t)(r->cand[k] - r->sp->out);
-        r->res = m < MAX_OUTPUTS && r->alive[m];
+        size_t m = spec_out_idx(r->sp, r->cand[k]);
+        r->res = m != (size_t)-1 && r->alive[m];
         return 0;
     }
     return hp_start(r, HP_HEALTH, r->o, r->cand[k]->device);
@@ -2150,10 +2188,42 @@ static void run_kick(struct loop *l, struct loop_timer *t, void *arg) {
     fo_step(arg);
 }
 
+static void run_free_arrays(struct fo_run *r) {
+    if (r->grp_alive)
+        for (size_t i = 0; i < r->n_out; i++) free(r->grp_alive[i]);
+    free(r->grp_alive);
+    free(r->streak_new); free(r->alive); free(r->failed); free(r->ord); free(r->grp_cur);
+    free(r->cand); free(r->ms); free(r->ms4); free(r->ms6); free(r->galive);
+}
+
 static struct fo_run *run_new(struct loop *l, struct spec *sp, struct fo_store *st, int verbose,
                               fo_event_fn ev, void *ev_arg, fo_done_fn done, void *done_arg) {
     struct fo_run *r = calloc(1, sizeof(*r));
     if (!r) return NULL;
+    /* Рабочие массивы: по выходу и по члену самой большой группы. */
+    r->n_out = sp->out_n ? sp->out_n : 1;
+    r->maxm = 1;
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct group_cfg *g = out_group(&sp->out[i]);
+        if (g && g->members_n > r->maxm) r->maxm = g->members_n;
+    }
+    r->streak_new = calloc(r->n_out, sizeof(int));
+    r->alive = calloc(r->n_out, sizeof(int));
+    r->failed = calloc(r->n_out, sizeof(int));
+    r->ord = calloc(r->n_out, sizeof(size_t));
+    r->grp_cur = calloc(r->n_out, sizeof(int));
+    r->grp_alive = calloc(r->n_out, sizeof(*r->grp_alive));
+    r->cand = calloc(r->maxm, sizeof(*r->cand));
+    r->ms = calloc(r->maxm, sizeof(int));
+    r->ms4 = calloc(r->maxm, sizeof(int));
+    r->ms6 = calloc(r->maxm, sizeof(int));
+    r->galive = calloc(r->maxm, 1);
+    if (!r->streak_new || !r->alive || !r->failed || !r->ord || !r->grp_cur || !r->grp_alive ||
+        !r->cand || !r->ms || !r->ms4 || !r->ms6 || !r->galive) {
+        run_free_arrays(r);
+        free(r);
+        return NULL;
+    }
     r->l = l;
     r->sp = sp;
     r->st = st;
@@ -2169,6 +2239,7 @@ static struct fo_run *run_new(struct loop *l, struct spec *sp, struct fo_store *
     if (!r->kick || !r->rv.tm) {
         loop_timer_free(r->kick);
         loop_timer_free(r->rv.tm);
+        run_free_arrays(r);
         free(r);
         return NULL;
     }
@@ -2184,6 +2255,7 @@ static void run_free(struct fo_run *r) {
     rv_nl_close(r);
     loop_timer_free(r->rv.tm);
     loop_timer_free(r->kick);
+    run_free_arrays(r);
     free(r);
 }
 
@@ -2227,7 +2299,8 @@ void fo_pass_lat_extern(struct fo_run *r) {
 
 /* Выход o — член группы спеки v2 (именованные члены)? */
 static int named_member(const struct spec *sp, const struct output *o) {
-    size_t idx = (size_t)(o - sp->out);
+    size_t idx = spec_out_idx(sp, o);
+    if (idx == (size_t)-1) return 0;        /* безымянный член пула v1 — не член группы v2 */
     for (size_t j = 0; j < sp->out_n; j++) {
         const struct group_cfg *g = out_group(&sp->out[j]);
         if (!g || !group_named(g)) continue;
@@ -2250,7 +2323,9 @@ static void out_finish(struct fo_run *r) {
     const struct group_cfg *gcf = out_group(o);
     if (r->named) {
         r->grp_cur[r->i] = chosen ? r->pk : -1;
-        r->grp_alive[r->i] = r->galive;
+        free(r->grp_alive[r->i]);
+        r->grp_alive[r->i] = r->cand_n ? malloc(r->cand_n) : NULL;
+        if (r->grp_alive[r->i]) memcpy(r->grp_alive[r->i], r->galive, r->cand_n);
         if (chosen && r->pk >= 0 && (size_t)r->pk < r->cand_n) member = r->cand[r->pk]->name;
     }
     /* Причину назвать надо: иначе «живых устройств нет» стоит у выхода, чьё устройство на
@@ -2368,12 +2443,14 @@ static void out_finish(struct fo_run *r) {
      * запись — только при расхождении). Переписана — событие balance с составом. */
     if (r->named && gcf && gcf->pick == PICK_BALANCE &&
         fog_balance_sync(r->sp, o, r->galive) == 1) {
-        char al[MAX_MEMBERS * 33];
-        size_t l = 0;
+        /* Список имён — в куче по числу членов (имя ≤ 31 байт и запятая): раньше буфер был на 16. */
+        size_t alc = r->cand_n * 33 + 1, l = 0;
+        char *al = malloc(alc);
+        if (!al) return;
         al[0] = '\0';
-        for (size_t k = 0; k < r->cand_n && l < sizeof(al); k++)
-            if ((r->galive >> k) & 1u)
-                l += (size_t)snprintf(al + l, sizeof(al) - l, "%s%s", l ? "," : "", r->cand[k]->name);
+        for (size_t k = 0; k < r->cand_n; k++)
+            if (r->galive[k])
+                l += (size_t)snprintf(al + l, alc - l, "%s%s", l ? "," : "", r->cand[k]->name);
         fprintf(stderr, LOG_I "выход %s: раздача по членам — %s\n", o->name, al[0] ? al : "никого");
         r->changed = 1;
         if (r->ev) {
@@ -2381,6 +2458,7 @@ static void out_finish(struct fo_run *r) {
                                   .on_fail = on_fail_name(o->on_fail) };
             r->ev(r->ev_arg, &e);
         }
+        free(al);
     }
 }
 
@@ -2415,9 +2493,10 @@ static void fo_step(struct fo_run *r) {
              * группа судит по их приговорам в этом же проходе, поэтому идёт после них (fog_order;
              * для спеки без таких групп порядок тот же, что по одной глубине over). */
             r->ord_n = fog_order(sp, r->ord);
-            for (size_t i = 0; i < MAX_OUTPUTS; i++) {
+            for (size_t i = 0; i < r->n_out; i++) {
                 r->grp_cur[i] = -1;
-                r->grp_alive[i] = 0;
+                free(r->grp_alive[i]);
+                r->grp_alive[i] = NULL;
             }
             r->oi = 0;
             r->s = S_OUT;
@@ -2437,7 +2516,8 @@ static void fo_step(struct fo_run *r) {
             r->via = out_over(sp, o);
             r->via_down = r->via && !r->alive[r->via - sp->out];
             active_get_st(r->st, o->name, r->was, sizeof(r->was));
-            r->cand_n = out_members(sp, o, r->cand, MAX_MEMBERS);
+            r->cand_n = out_members_n(sp, o);
+            for (size_t k = 0; k < r->cand_n; k++) r->cand[k] = out_member(sp, o, k);
             /* Где в списке предпочтения стоит несущее трафик сейчас. -1 — записи нет или её
              * устройство больше не кандидат: тогда гистерезису не за что держаться, берём
              * лучшее здоровое сразу. */
@@ -2448,7 +2528,7 @@ static void fo_step(struct fo_run *r) {
              * делить два члена, а у вложенной лист меняется, пока член тот же). */
             r->named = group_named(out_group(o));
             r->pk = -1;
-            r->galive = 0;
+            memset(r->galive, 0, r->maxm);
             if (r->named) {
                 int gc = fog_groups_cur(r->st, sp, o);
                 if (gc >= 0 && strcmp(r->was, "-") != 0) r->cur = gc;
@@ -2506,8 +2586,8 @@ static void fo_step(struct fo_run *r) {
             const struct group_cfg *g = out_group(o);
             /* Группа v2: живые члены — все сразу, без проб (приговоры их проходов уже есть). */
             for (size_t k = 0; r->named && k < r->cand_n; k++) {
-                size_t m = (size_t)(r->cand[k] - sp->out);
-                if (m < MAX_OUTPUTS && r->alive[m]) r->galive |= 1u << k;
+                size_t m = spec_out_idx(sp, r->cand[k]);
+                if (m != (size_t)-1 && r->alive[m]) r->galive[k] = 1;
             }
             /* manual — член, выбранный человеком (select), или default. Не отвечает — отказ группы
              * с её on_fail: переключиться на другого значило бы решить за человека.
@@ -2538,7 +2618,7 @@ static void fo_step(struct fo_run *r) {
                         r->ms[k] = rc.ms;
                         /* У демона срок замера — его таймер (folat.c), а не проход. */
                         if (!r->lat_extern && (age > r->iv || age < 0)) stale = 1;
-                    } else if (!r->named || ((r->galive >> k) & 1u)) stale = 1;
+                    } else if (!r->named || r->galive[k]) stale = 1;
                 }
                 r->v6 = r->named && folat_want_v6(sp, o, r->galive);
                 /* Без трафика через группу замеров нет (idle_timeout): выбор — по тому, что уже
@@ -2565,7 +2645,8 @@ static void fo_step(struct fo_run *r) {
                  * двух, group_latency_score); мёртвый член группы v2 не мерился (-2) и строки не
                  * получает. */
                 folat_score(r->ms4, r->ms6, r->cand_n, r->v6, r->ms);
-                struct folat_rec rec[MAX_MEMBERS];
+                struct folat_rec *rec = malloc(r->cand_n * sizeof(*rec));
+                if (!rec) { r->s = S_LAT_C; continue; }     /* без памяти — без записи замеров */
                 long now = mono_now();
                 for (size_t k = 0; k < r->cand_n; k++) {
                     int mine = r->ms4[k] != -2;
@@ -2575,10 +2656,11 @@ static void fo_step(struct fo_run *r) {
                     rec[k].at = now;
                 }
                 folat_rec_put(r->st, o->name, r->cand, rec, r->cand_n, r->lat_extern);
+                free(rec);
                 r->s = S_LAT_C;
                 continue;
             }
-            if (r->named && !((r->galive >> r->k) & 1u)) {
+            if (r->named && !r->galive[r->k]) {
                 r->ms4[r->k] = r->ms6[r->k] = -2;
                 r->ms[r->k++] = -1;
                 continue;

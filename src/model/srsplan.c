@@ -183,6 +183,8 @@ void srs_plan_free(struct srs_plan *pl) {
     pl->p = NULL;
     pl->n = 0;
     for (size_t i = 0; i < pl->held_n; i++) srs_release(pl->held[i]);
+    free(pl->held);
+    pl->held = NULL;
     pl->held_n = 0;
 }
 
@@ -234,10 +236,14 @@ int srs_plan_rule(const struct spec *sp, const struct spec_rule *r, int concat,
     const struct spec_client *w = rule_who(sp, r);
     const struct l4match *E = &c->l4;
     int local = w->from_n && from_is_local(w->from[0]);
-    const struct srs_set *sets[MAX_FILES];
+    /* Разборы файлов списка — по числу файлов, а не на предельное число. */
+    const struct srs_set **sets = calloc(c->srs_n ? c->srs_n : 1, sizeof(*sets));
+    pl->held = calloc(c->srs_n ? c->srs_n : 1, sizeof(*pl->held));
     size_t nitems = 0, cap = 0;
     struct item *items = NULL;
+    struct l4match *var = NULL;
     int rc = -1;
+    if (!sets || !pl->held) goto oom;
 
     if (c->prefixes_n || c->domains_n) {
         struct item *it = item_new(&items, &nitems, &cap);
@@ -322,7 +328,10 @@ int srs_plan_rule(const struct spec *sp, const struct spec_rule *r, int concat,
     }
 
     /* Общие клаузы: варианты сужения. */
-    struct l4match var[64];
+    /* Вариантов сужения не больше, чем элементов раскладки, — по нему и размер (раньше стояло
+     * 64, а лишние варианты молча выбрасывались из раскладки). */
+    var = malloc((nitems ? nitems : 1) * sizeof(*var));
+    if (!var) goto oom;
     size_t nvar = 0;
     int have_E = 0;
     for (size_t i = 0; i < nitems; i++) {
@@ -335,7 +344,6 @@ int srs_plan_rule(const struct spec *sp, const struct spec_rule *r, int concat,
         size_t k = 0;
         while (k < nvar && !l4match_same(&var[k], &items[i].eff)) k++;
         if (k == nvar) {
-            if (nvar == sizeof(var) / sizeof(var[0])) { items[i].part = -1; continue; }
             var[nvar++] = items[i].eff;
         }
     }
@@ -404,6 +412,10 @@ int srs_plan_rule(const struct spec *sp, const struct spec_rule *r, int concat,
 
     /* Доп. группы: по одной на набор условий и сужение. */
     size_t ci_idx = (size_t)(r - sp->rule);
+    /* Номер группы у правила — от 1 до 99: он входит в имя набора nft десятичными разрядами
+     * (правило*100 + номер), и от этих имён зависят снимки и уже загруженные таблицы.
+     * Правил с РАЗНЫМИ особыми условиями в одном .srs-правиле сотни не бывает; сверх 99 — лишние
+     * снимаются с предупреждением, в котором названо число. */
     unsigned next_id = 1;
     for (size_t i = 0; i < nitems; i++) {
         struct item *it = &items[i];
@@ -460,6 +472,8 @@ oom:
     err_set(e, "канал %s: не хватило памяти на раскладку наборов", r->name);
 out:
     free(items);
+    free(sets);
+    free(var);
     if (rc != 0) srs_plan_free(pl);
     return rc;
 }

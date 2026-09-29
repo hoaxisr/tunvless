@@ -52,8 +52,7 @@ static struct spec g_spec;
 #define CH_OUT(i)     (rule_out(&g_spec, &g_spec.rule[i])->name)
 /* Сколько кандидатов у выхода: членов группы или одно своё устройство (out_members). */
 static int cand_n(const struct output *o) {
-    const struct output *m[MAX_MEMBERS];
-    return (int)out_members(&g_spec, o, m, MAX_MEMBERS);
+    return (int)out_members_n(&g_spec, o);
 }
 
 static void check(const char *what, int want, int got) {
@@ -76,7 +75,8 @@ static void check_str(const char *what, const char *want, const char *got) {
  * устройств возвращается к умолчанию «один br-lan», g_spec.traceroute_hops — к 0. g_state_dir
  * оставляем как есть: registry_assign в этих тестах не вызывается. */
 static void reset_globals(void) {
-    memset(&g_spec, 0, sizeof(g_spec));
+    spec_release(&g_spec);
+    g_spec.lan_dev = (char (*)[64])spec_alloc(&g_spec, sizeof(*g_spec.lan_dev));
     strcpy(g_spec.lan_dev[0], "br-lan");
     g_spec.lan_dev_n = 1;
 }
@@ -326,19 +326,20 @@ int main(void) {
         check("пустой массив портов: принимается", 0, load_from_str(PORTS("[]")));
         check("пустой массив: ноль диапазонов", 0, (int)CH_LIST(0)->l4.ports_n);
 
-        /* Границы предела. Числа берутся из MAX_PORTS, а не вписаны: следующий, кто его
-         * подвинет, не должен править ещё и стенд. */
+        /* Границы предела. Числа берутся из L4_PORTS_MAX, а не вписаны: следующий, кто его
+         * подвинет, не должен править ещё и стенд. Порты — один из оставленных пределов (причина —
+         * в spec.h у L4_PORTS_MAX: диапазон размножает адреса списка в составном наборе ядра). */
         {
             char big[4096], *q = big;
             q += sprintf(q, "%s\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
                             "\"channels\":[{\"name\":\"p\",\"out\":\"wg\",\"match\":{"
                             "\"prefixes_file\":\"/tmp/p.lst\",\"ports\":[",
                          "{\"schema\":2,\"from_default\":[\"192.168.1.0/24\"],");
-            for (size_t i = 0; i < MAX_PORTS; i++)
+            for (size_t i = 0; i < L4_PORTS_MAX; i++)
                 q += sprintf(q, "%s\"%zu\"", i ? "," : "", 1000 + i * 2);
             q += sprintf(q, "]}}]}");
-            check("ровно MAX_PORTS диапазонов: принимается", 0, load_from_str(big));
-            check("ровно MAX_PORTS: сосчитаны все", (int)MAX_PORTS, (int)CH_LIST(0)->l4.ports_n);
+            check("ровно L4_PORTS_MAX диапазонов: принимается", 0, load_from_str(big));
+            check("ровно L4_PORTS_MAX: сосчитаны все", (int)L4_PORTS_MAX, (int)CH_LIST(0)->l4.ports_n);
         }
         {
             char big[4096], *q = big;
@@ -346,12 +347,12 @@ int main(void) {
                             "\"channels\":[{\"name\":\"p\",\"out\":\"wg\",\"match\":{"
                             "\"prefixes_file\":\"/tmp/p.lst\",\"ports\":[",
                          "{\"schema\":2,\"from_default\":[\"192.168.1.0/24\"],");
-            for (size_t i = 0; i <= MAX_PORTS; i++)
+            for (size_t i = 0; i <= L4_PORTS_MAX; i++)
                 q += sprintf(q, "%s\"%zu\"", i ? "," : "", 1000 + i * 2);
             q += sprintf(q, "]}}]}");
             /* На один больше — отказ, а не тихое обрезание: обрезанный перечень портов это
              * канал ШИРЕ написанного, то есть та же беда, что у обрезанного списка файлов. */
-            check("больше MAX_PORTS диапазонов: отказ", 2, load_from_str(big));
+            check("больше L4_PORTS_MAX диапазонов: отказ", 2, load_from_str(big));
         }
 #undef PORTS
 
@@ -461,95 +462,133 @@ int main(void) {
                                  "\"channels\":[{\"name\":\"x\",\"out\":\"direct\","
                                  "\"match\":{}}]}")));
 
-        /* Слишком много выходов: MAX_OUTPUTS=16 — жёсткий предел (метки/таблицы). */
+        /* Выходов без метки (direct) — сколько написано: предела нет, метка им не нужна. */
         {
-            char big[8192];
+            char *big = malloc(65536);
             char *p = big;
             p += sprintf(p, "%s\"outputs\":{", SPEC_OPEN);
-            for (int i = 0; i < 17; i++)
+            for (int i = 0; i < 300; i++)
                 p += sprintf(p, "\"o%d\":{\"kind\":\"direct\"},", i);
             p += sprintf(p, "\"last\":{\"kind\":\"direct\"}}}");
-            check("больше MAX_OUTPUTS выходов: отказ", 2, load_from_str(big));
+            check("301 выход direct (без метки): принимается", 0, load_from_str(big));
+            check("301 выход direct: сосчитаны все", 301, (int)g_spec.out_n);
+            free(big);
         }
 
-        /* Слишком много каналов: MAX_RULES=64. */
+        /* Выходов с меткой — не больше мест в поле метки (steer_mark_slots): единственный
+         * настоящий предел числа выходов, свойство раскладки. Ровно столько — принимается, на
+         * один больше — отказ, в тексте которого цифры раскладки. */
         {
-            char big[16384];
+            unsigned slots = steer_mark_slots();
+            char *big = malloc(65536);
+            for (int over = 0; over < 2; over++) {
+                char *p = big;
+                p += sprintf(p, "%s\"outputs\":{", SPEC_OPEN);
+                for (unsigned i = 0; i < slots + (unsigned)over; i++)
+                    p += sprintf(p, "%s\"m%u\":{\"kind\":\"interface\",\"device\":\"wg%u\"}",
+                                 i ? "," : "", i, i);
+                p += sprintf(p, "}}");
+                if (!over) {
+                    check("ровно steer_mark_slots() выходов с меткой: принимается", 0, load_from_str(big));
+                } else {
+                    reset_globals();
+                    char tmpf[256];
+                    snprintf(tmpf, sizeof(tmpf), "/tmp/specmatch.slots.%d.json", (int)getpid());
+                    FILE *tf = fopen(tmpf, "w");
+                    if (tf) { fputs(big, tf); fclose(tf); }
+                    struct err le = {0};
+                    int rc = load_spec(tmpf, &g_spec, &le) < 0 ? 2 : 0;
+                    unlink(tmpf);
+                    check("на один больше мест метки: отказ", 2, rc);
+                    char want[64];
+                    snprintf(want, sizeof(want), "не больше %u", slots);
+                    check("отказ называет цифру раскладки", 1, strstr(le.msg, want) != NULL);
+                    check("отказ называет поле метки", 1, strstr(le.msg, "поле метки") != NULL);
+                }
+            }
+            free(big);
+        }
+
+        /* Каналов — сколько написано (раньше «не больше 64»): 300 принимаются, растёт всё. */
+        {
+            char *big = malloc(65536);
             char *p = big;
             p += sprintf(p, "%s\"outputs\":{\"direct\":{\"kind\":\"direct\"}},\"channels\":[",
                          SPEC_OPEN);
-            for (int i = 0; i < 65; i++)
+            for (int i = 0; i < 300; i++)
                 p += sprintf(p, "{\"name\":\"c%d\",\"out\":\"direct\","
-                               "\"match\":{\"domains_file\":\"/tmp/c.lst\"}},", i);
+                               "\"match\":{\"domains_file\":\"/tmp/c%d.lst\"}},", i, i);
             p += sprintf(p, "{\"name\":\"last\",\"out\":\"direct\","
                            "\"match\":{\"domains_file\":\"/tmp/c.lst\"}}]}");
-            check("больше MAX_RULES каналов: отказ", 2, load_from_str(big));
+            check("301 канал: принимается", 0, load_from_str(big));
+            check("301 канал: сосчитаны все", 301, (int)CH_N);
+            check("301 канал: список у каждого свой", 301, (int)g_spec.list_n);
+            free(big);
         }
     }
     {
-        /* Пограничный случай: ровно MAX_FILES списков принимается.
-         *
-         * Предел вырос с шестнадцати до шестидесяти четырёх: в каталоге splify2 под сорок
-         * записей, и «отправить в туннель всё» упиралось в `too many entries in list` уже на
-         * восьмом сервисе. Числа здесь взяты из MAX_FILES, а не вписаны: следующий, кто его
-         * подвинет, не должен править ещё и стенд, чтобы тот остался про границу. */
-        char big[65536];
+        /* Файлов в списке — сколько написано. Раньше «не больше 64», и отказ был честным ради
+         * «тихого обрезания» (I-001); теперь массив растёт, и обрезать нечего — принимаются все,
+         * все сосчитаны, порядок сохранён. */
+        char *big = malloc(65536);
         char *p = big;
         p += sprintf(p, "%s\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
                         "\"channels\":[{\"name\":\"many\",\"out\":\"direct\",\"match\":{"
                         "\"domains_files\":[", SPEC_OPEN);
-        for (size_t i = 0; i < MAX_FILES; i++) {
+        for (size_t i = 0; i < 500; i++) {
             p += sprintf(p, "\"/tmp/d%zu.lst\"", i);
-            if (i + 1 < MAX_FILES) p += sprintf(p, ",");
+            if (i + 1 < 500) p += sprintf(p, ",");
         }
         p += sprintf(p, "]}}]}");
-        check("ровно MAX_FILES domains_files: принимается", 0, load_from_str(big));
-        check("ровно MAX_FILES domains_files: сосчитаны все", (int)MAX_FILES, (int)CH_LIST(0)->domains_n);
+        check("500 domains_files: принимается", 0, load_from_str(big));
+        check("500 domains_files: сосчитаны все", 500, (int)CH_LIST(0)->domains_n);
+        check("500 domains_files: порядок цел", 1,
+              !strcmp(CH_LIST(0)->domains_files[0], "/tmp/d0.lst") &&
+              !strcmp(CH_LIST(0)->domains_files[499], "/tmp/d499.lst"));
+        free(big);
     }
     {
-        /* I-001: на один больше — отказ, а не тихое обрезание. Тихое обрезание здесь хуже
-         * отказа вдвойне: канал остался бы, а часть списков молча выпала — и узкое правило
-         * стало бы шире, чем человек написал. */
-        char big[65536];
-        char *p = big;
-        p += sprintf(p, "%s\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
-                        "\"channels\":[{\"name\":\"many\",\"out\":\"direct\",\"match\":{"
-                        "\"domains_files\":[", SPEC_OPEN);
-        for (size_t i = 0; i <= MAX_FILES; i++) {
-            p += sprintf(p, "\"/tmp/d%zu.lst\"", i);
-            if (i < MAX_FILES) p += sprintf(p, ",");
-        }
-        p += sprintf(p, "]}}]}");
-        check("больше MAX_FILES domains_files: отказ (I-001)", 2, load_from_str(big));
-    }
-    {
-        /* I-001: Больше MAX_FROM from вызывает отказ */
-        char big[16384];
+        /* Адресов «кому» у канала — сколько написано (раньше «не больше 32»). */
+        char *big = malloc(65536);
         char *p = big;
         p += sprintf(p, "%s\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
                         "\"channels\":[{\"name\":\"many\",\"out\":\"direct\","
                         "\"from\":[", SPEC_OPEN);
-        /* Предел берётся из MAX_FROM, а не числом: он уже менялся (16 -> 32), и
-         * записанное руками число превращает проверку предела в проверку прошлого. */
-        for (int i = 0; i < MAX_FROM + 1; i++) {
-            p += sprintf(p, "\"10.0.0.%d\"", i);
-            if (i < MAX_FROM) p += sprintf(p, ",");
+        for (int i = 0; i < 400; i++) {
+            p += sprintf(p, "\"10.%d.0.%d\"", i / 200, i % 200);
+            if (i < 399) p += sprintf(p, ",");
         }
         p += sprintf(p, "],\"match\":{\"any\":true,\"allow_all\":true}}]}");
-        check("больше MAX_FROM from: отказ (I-001)", 2, load_from_str(big));
+        check("400 адресов from: принимается", 0, load_from_str(big));
+        check("400 адресов from: сосчитаны все", 400, (int)CH_WHO(0)->from_n);
+        free(big);
     }
     {
-        /* I-002: Спека больше 256 КБ вызывает отказ */
-        char *huge = malloc(262200);
+        /* Текст спеки читается в кучу и ограничен только защитой от файла-не-спеки (16 МиБ,
+         * parse.c); спека в полмегабайта — обычная, принимается (раньше — отказ на 256 КиБ). */
+        size_t sz = 600000;
+        char *huge = malloc(sz + 1);
         if (huge) {
-            memset(huge, ' ', 262199);
-            huge[262199] = '\0';
+            memset(huge, ' ', sz);
+            huge[sz] = '\0';
             char *p = huge;
             p += sprintf(p, "%s\"outputs\":{\"direct\":{\"kind\":\"direct\"}},\"channels\":[]", SPEC_OPEN);
             *p = ' ';
-            huge[262198] = '}';
-            check("спека больше 256 КБ: отказ (I-002)", 2, load_from_str(huge));
+            huge[sz - 1] = '}';
+            check("спека 600 КБ: принимается", 0, load_from_str(huge));
             free(huge);
+        }
+        size_t big_sz = ((size_t)16 << 20) + 200;
+        char *over = malloc(big_sz + 1);
+        if (over) {
+            memset(over, ' ', big_sz);
+            over[big_sz] = '\0';
+            char *p = over;
+            p += sprintf(p, "%s\"outputs\":{\"direct\":{\"kind\":\"direct\"}},\"channels\":[]", SPEC_OPEN);
+            *p = ' ';
+            over[big_sz - 1] = '}';
+            check("спека больше 16 МиБ: отказ (защита от файла-не-спеки)", 2, load_from_str(over));
+            free(over);
         }
     }
     {
@@ -809,8 +848,9 @@ int main(void) {
               (int)out_node_list(&o, 4, dst, 16));
         check("nodes пуст: порядок подписки", 1, dst[0] == 0 && dst[3] == 3);
 
+        int sel3[3] = { 6, 7, 12 };
+        o.vless.nodes = sel3;
         o.vless.nodes_n = 3;
-        o.vless.nodes[0] = 6; o.vless.nodes[1] = 7; o.vless.nodes[2] = 12;
         check("выбор из трёх: кандидатов трое", 3, (int)out_node_list(&o, 26, dst, 16));
         check("выбор из трёх: порядок предпочтения сохранён", 1,
               dst[0] == 6 && dst[1] == 7 && dst[2] == 12);
@@ -834,10 +874,11 @@ int main(void) {
     {
         struct output o = {0};
         check("подписка из одного узла: узел никем не назван", 0, out_node_named(&o));
-        o.vless.nodes_n = 3; o.vless.nodes[0] = 6; o.vless.nodes[1] = 7; o.vless.nodes[2] = 12;
+        int sel3b[3] = { 6, 7, 12 }, sel1[1] = { 4 };
+        o.vless.nodes = sel3b; o.vless.nodes_n = 3;
         check("из трёх выбранных уцелел один: выбор всё равно не именной", 0,
               out_node_named(&o));
-        o.vless.nodes_n = 1; o.vless.nodes[0] = 4;
+        o.vless.nodes = sel1; o.vless.nodes_n = 1;
         check("номер написан в спеке: узел назван", 1, out_node_named(&o));
     }
 #endif
@@ -916,16 +957,19 @@ int main(void) {
         check("узел в nodes дважды — отказ", 2, load_from_str(s));
     }
     {
-        /* Список строится из MAX_NODE_SEL: предел уже менялся (8 -> 16), и перечисление
-         * номеров руками проверяло бы прежний предел, а не нынешний. */
-        char many[512];
-        int mn = snprintf(many, sizeof(many),
+        /* Выбранных узлов — сколько написано (раньше «не больше 16»). */
+        char *many = malloc(16384);
+        int mn = snprintf(many, 16384,
                           "%s\"outputs\":{\"vpn\":{\"kind\":\"vless\","
                           "\"sub_file\":\"/tmp/sub.txt\",\"nodes\":[", SPEC_OPEN);
-        for (int i = 0; i < MAX_NODE_SEL + 1; i++)
-            mn += snprintf(many + mn, sizeof(many) - (size_t)mn, "%s%d", i ? "," : "", i);
-        snprintf(many + mn, sizeof(many) - (size_t)mn, "]}},\"channels\":[]}");
-        check("nodes длиннее предела — отказ", 2, load_from_str(many));
+        for (int i = 0; i < 500; i++)
+            mn += snprintf(many + mn, 16384 - (size_t)mn, "%s%d", i ? "," : "", i);
+        snprintf(many + mn, 16384 - (size_t)mn, "]}},\"channels\":[]}");
+        check("500 номеров в nodes: принимается", 0, load_from_str(many));
+        const struct vless_cfg *vc = out_vless(&g_spec.out[0]);
+        check("500 номеров в nodes: сосчитаны все", 500, vc ? (int)vc->nodes_n : -1);
+        check("500 номеров в nodes: последний цел", 499, vc && vc->nodes_n == 500 ? vc->nodes[499] : -1);
+        free(many);
     }
     {
         /* Отрицательный номер здесь не «первый рабочий»: в списке кандидатов он не значит
@@ -1098,14 +1142,19 @@ int main(void) {
         steer_set_rt_tables_dir(rdir);
 
         reset_globals();
-        char many[4096];
-        int mn = snprintf(many, sizeof(many), "%s\"outputs\":{", SPEC_OPEN);
-        for (int i = 0; i < MAX_OUTPUTS; i++)
-            mn += snprintf(many + mn, sizeof(many) - (size_t)mn,
-                           "%s\"o%d\":{\"kind\":\"interface\",\"device\":\"wg%d\"}",
+        /* Все места поля метки заняты выходами: столько, сколько даёт раскладка (steer_mark_slots),
+         * а не число, вписанное в стенд. */
+        unsigned nslots = steer_mark_slots();
+        size_t manysz = 96 * (size_t)nslots + 256;
+        char *many = malloc(manysz);
+        int mn = snprintf(many, manysz, "%s\"outputs\":{", SPEC_OPEN);
+        for (unsigned i = 0; i < nslots; i++)
+            mn += snprintf(many + mn, manysz - (size_t)mn,
+                           "%s\"o%u\":{\"kind\":\"interface\",\"device\":\"wg%u\"}",
                            i ? "," : "", i, i);
-        snprintf(many + mn, sizeof(many) - (size_t)mn, "},\"channels\":[]}");
-        check("спека на все MAX_OUTPUTS туннелей загрузилась", 0, load_from_str(many));
+        snprintf(many + mn, manysz - (size_t)mn, "},\"channels\":[]}");
+        check("спека на все места метки загрузилась", 0, load_from_str(many));
+        free(many);
         registry_assign(&g_spec, &e);
 
         int no_mark = 0, off_mask = 0, dup_mark = 0, dup_table = 0, dup_queue = 0;
@@ -1113,18 +1162,20 @@ int main(void) {
         for (size_t i = 0; i < g_spec.out_n; i++) {
             if (!g_spec.out[i].mark) { no_mark++; continue; }
             if (g_spec.out[i].mark & ~STEER_MARK_MASK) off_mask++;
-            if (g_spec.out[i].table < 300 || g_spec.out[i].table > 300 + MAX_OUTPUTS - 1) bad_table++;
+            /* Ряд: 300.. без 316 (там таблица мини-сборки tgws), места — nslots штук. */
+            if (g_spec.out[i].table < 300 || g_spec.out[i].table > 300 + (int)nslots || g_spec.out[i].table == 316)
+                bad_table++;
             for (size_t j = 0; j < i; j++) {
                 if (g_spec.out[j].mark == g_spec.out[i].mark) dup_mark++;
                 if (g_spec.out[j].table == g_spec.out[i].table) dup_table++;
                 if (out_zapret_queue(&g_spec.out[j]) == out_zapret_queue(&g_spec.out[i])) dup_queue++;
             }
         }
-        check("метку получили все MAX_OUTPUTS выходов", 0, no_mark);
+        check("метку получили все выходы (места метки заняты целиком)", 0, no_mark);
         check("метка каждого внутри маски контракта", 0, off_mask);
         check("метки не повторяются", 0, dup_mark);
         check("номера таблиц не повторяются", 0, dup_table);
-        check("номера таблиц в своём ряду (300..315)", 0, bad_table);
+        check("номера таблиц в своём ряду (300.., без 316)", 0, bad_table);
         check("номера очередей обхода не повторяются", 0, dup_queue);
 
         /* РЕЕСТР С ПРЕЖНЕЙ СБОРКИ. Там метки одинокими битами, и старший из них — база,

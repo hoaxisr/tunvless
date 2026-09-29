@@ -11,7 +11,8 @@
  *     возвращается в ответе). DoT отличается от TCP только слоем TLS;
  *   - DoH — HTTP/1.1 поверх TLS, POST application/dns-message (RFC 8484), keep-alive. HTTP/2
  *     не взят нарочно: h2.c у нас — клиент одного потока для xsteer, а мультиплексировать вопросы
- *     на одном соединении ему нечем. Вместо этого до DUP_CONNS соединений, на каждом один вопрос
+ *     на одном соединении ему нечем. Вместо этого соединение на каждый ожидающий вопрос (пул
+ *     растёт по нагрузке до предела дескрипторов, dup_conn_limit), на каждом один вопрос
  *     за раз; следующий ждёт свободного или нового соединения. Номер в теле — 0, как рекомендует
  *     RFC 8484 (кэшируемость), а исходный возвращается в ответе.
  * Соединение TLS создаётся потоком (dial), сокет тогда переходит циклу. Пока соединения нет,
@@ -43,8 +44,27 @@ extern int tls13_has_record(const struct tls13 *t) __attribute__((weak));
 extern int tls13_write(struct tls13 *t, const unsigned char *data, size_t n) __attribute__((weak));
 extern void tls13_free(struct tls13 *t) __attribute__((weak));
 
-#define DUP_CONNS 3
-#define DUP_MAXREQ 256
+/* СОЕДИНЕНИЙ НА АПСТРИМ НЕ «ТРИ», А СКОЛЬКО НУЖНО. Пул растёт по нагрузке: DoH открывает
+ * соединение на каждый ожидающий вопрос (up_want_conns), когда все заняты, а простаивающие
+ * закрываются через DUP_IDLE_MS. Пределом служит ресурс — дескрипторы процесса: четверть
+ * RLIMIT_NOFILE (остальное нужно клиентам, сокетам апстримов и наборам), не меньше трёх. Упёрся —
+ * вопросы ждут свободного соединения, а в состоянии апстрима (status) стоит причина с цифрой.
+ * Раньше константа DUP_CONNS = 3 стояла и в размере массива, и в решении, и десять одновременных
+ * запросов DoH шли через три соединения. */
+#include <sys/resource.h>
+static int dup_conn_limit(void) {
+    static int lim;
+    if (lim) return lim;
+    struct rlimit rl;
+    long v = 1024;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) v = (long)rl.rlim_cur;
+    v /= 4;
+    lim = v < 3 ? 3 : v > 65536 ? 65536 : (int)v;
+    return lim;
+}
+/* Вопросов в полёте — тоже растущий пул блоками (req_ref): предел — очередь ожидающих резолвера
+ * (MAX_PENDING в dnsd_int.h, защита от шторма запросов), а не размер массива здесь. */
+#define DUP_REQ_BLOCK 64
 #define DUP_QMAX 1024
 #define DUP_REQ_MS 4000
 #define DUP_UDP_RETRY_MS 1500
@@ -67,6 +87,7 @@ struct dconn {
     uint8_t *wb;
     size_t wn, woff;
     long last_ms;
+    int idx;                    /* номер в up->c: адрес соединения не переезжает (метка epoll) */
     int busy;                   /* DoH: номер вопроса плюс один; DoT/TCP: число вопросов на нём */
     int close_after;
     /* Разбор ответа HTTP. */
@@ -83,7 +104,12 @@ struct dup {
     int ufd;
     struct sockaddr_storage srv;
     int srv_ok;
-    struct dconn c[DUP_CONNS];
+    /* Соединения — каждое отдельным блоком: адрес dconn — метка epoll, и он не должен переезжать,
+     * когда пул растёт. Блоки живут, пока живёт сам dup (они, как и он, не освобождаются). */
+    struct dconn **c;
+    int c_n, c_cap;
+    char (*ips_own)[46];        /* личные копии адресов cfg.u.ips и cfg.u.boot */
+    char (*boot_own)[46];
     struct sockaddr_storage ad[DIAL_MAXADDR];
     int ad_n;
     long ad_exp_ms;
@@ -98,6 +124,7 @@ struct dup {
 
 struct dreq {
     int used;
+    int slot;                   /* номер места (RQ): busy у DoH — это slot плюс один */
     struct dup *up;
     unsigned up_gen;
     int ci;                     /* соединение или -1 — ждёт */
@@ -111,10 +138,31 @@ struct dreq {
     uint16_t qn;
 };
 
-static struct dup g_store[MAX_DNS_UP * 2];
-static struct dup *g_dups[MAX_DNS_UP];
-static size_t g_dups_n;
-static struct dreq g_req[DUP_MAXREQ];
+/* Хранилище объектов апстримов и таблица текущих — растут по числу апстримов; объекты (struct dup)
+ * лежат каждый в своём блоке и не освобождаются (шапка, «ПАМЯТЬ»): освободившийся (live == 0)
+ * берётся снова. */
+static struct dup **g_store;
+static size_t g_store_n, g_store_cap;
+static struct dup **g_dups;
+static size_t g_dups_n, g_dups_cap;
+/* Вопросы в полёте — блоками по DUP_REQ_BLOCK: адрес вопроса стабилен (его держат вызовы
+ * обратной связи), рост — новый блок. */
+static struct dreq **g_reqb;
+static int g_req_cap;               /* всего мест: кратно DUP_REQ_BLOCK */
+static struct dreq *req_ref(int k) { return &g_reqb[k / DUP_REQ_BLOCK][k % DUP_REQ_BLOCK]; }
+#define RQ(k) (*req_ref(k))
+static int req_grow(void) {
+    struct dreq **nb = realloc(g_reqb, (size_t)(g_req_cap / DUP_REQ_BLOCK + 1) * sizeof(*nb));
+    if (!nb) return -1;
+    g_reqb = nb;
+    struct dreq *blk = calloc(DUP_REQ_BLOCK, sizeof(*blk));
+    if (!blk) return -1;
+    for (int i = 0; i < DUP_REQ_BLOCK; i++) blk[i].slot = g_req_cap + i;
+    g_reqb[g_req_cap / DUP_REQ_BLOCK] = blk;
+    g_req_cap += DUP_REQ_BLOCK;
+    return 0;
+}
+#define CN(up, i) ((up)->c[i])
 
 static long now_ms(void) {
     struct timespec t;
@@ -190,7 +238,7 @@ static void req_finish(struct dreq *r, uint8_t *ans, size_t n) {
     cb(ctx, ans, n, q, qn);
 }
 
-static struct dreq *req_at(int i) { return (i >= 0 && i < DUP_MAXREQ && g_req[i].used) ? &g_req[i] : NULL; }
+static struct dreq *req_at(int i) { return (i >= 0 && i < g_req_cap && RQ(i).used) ? &RQ(i) : NULL; }
 
 /* ---- соединения ------------------------------------------------------------------------------ */
 
@@ -200,7 +248,7 @@ static void conn_free_bufs(struct dconn *c) {
     c->rn = c->rcap = c->wn = c->woff = 0;
 }
 
-static int cidx(const struct dconn *c) { return (int)(c - c->up->c); }
+static int cidx(const struct dconn *c) { return c->idx; }
 
 static void up_kick(struct dup *up);
 
@@ -225,8 +273,8 @@ static void conn_close(struct dconn *c, const char *why) {
     c->hdr_done = 0;
     conn_free_bufs(c);
     int had = 0;
-    for (int k = 0; k < DUP_MAXREQ; k++) {
-        struct dreq *r = &g_req[k];
+    for (int k = 0; k < g_req_cap; k++) {
+        struct dreq *r = &RQ(k);
         if (!r->used || r->up != up || r->ci != i) continue;
         had = 1;
         if (r->tries < 1) { r->tries++; r->ci = -1; }
@@ -309,7 +357,7 @@ static int conn_send(struct dup *up, struct dconn *c, struct dreq *r) {
         memcpy(buf + hn, r->q, r->qn);
         buf[hn] = 0;                                   /* тело — с номером 0 */
         buf[hn + 1] = 0;
-        c->busy = (int)(r - g_req) + 1;
+        c->busy = r->slot + 1;
         c->hdr_done = 0;
         c->chunked = 0;
         c->rn = 0;
@@ -334,22 +382,23 @@ static void dial_event_cb(struct dial *d);
 
 static int up_conns_alive(const struct dup *up) {
     int n = 0;
-    for (int i = 0; i < DUP_CONNS; i++) n += up->c[i].st != CS_FREE;
+    for (int i = 0; i < up->c_n; i++) n += CN(up, i)->st != CS_FREE;
     return n;
 }
 
 static int up_want_conns(const struct dup *up) {
     if (up->cfg.u.proto != DNSP_DOH) return 1;
-    /* DoH: по соединению на ожидающий вопрос, но не больше DUP_CONNS, и уже идущие не считаются. */
-    int waiting = 0;
-    for (int k = 0; k < DUP_MAXREQ; k++)
-        if (g_req[k].used && g_req[k].up == up && g_req[k].ci == -1) waiting++;
-    return waiting > DUP_CONNS ? DUP_CONNS : (waiting ? waiting : 1);
+    /* DoH: по соединению на ожидающий вопрос, но не больше предела дескрипторов (dup_conn_limit),
+     * и уже идущие не считаются. */
+    int waiting = 0, lim = dup_conn_limit();
+    for (int k = 0; k < g_req_cap; k++)
+        if (RQ(k).used && RQ(k).up == up && RQ(k).ci == -1) waiting++;
+    return waiting > lim ? lim : (waiting ? waiting : 1);
 }
 
 static void fail_waiting(struct dup *up) {
-    for (int k = 0; k < DUP_MAXREQ; k++)
-        if (g_req[k].used && g_req[k].up == up && g_req[k].ci == -1) req_finish(&g_req[k], NULL, 0);
+    for (int k = 0; k < g_req_cap; k++)
+        if (RQ(k).used && RQ(k).up == up && RQ(k).ci == -1) req_finish(&RQ(k), NULL, 0);
 }
 
 static void up_backoff(struct dup *up) {
@@ -380,10 +429,42 @@ static int tcp_dial(struct dup *up, struct dconn *c) {
     return 0;
 }
 
+static void *memdup(const void *p, size_t n) {
+    void *q = malloc(n);
+    if (q) memcpy(q, p, n);
+    return q;
+}
+
+static void dial_free(struct dial *d) {
+    if (!d) return;
+    free(d->ips_own);
+    free(d->boot_own);
+    free(d);
+}
+
 static void up_dial(struct dup *up) {
     struct dconn *c = NULL;
-    for (int i = 0; i < DUP_CONNS; i++) if (up->c[i].st == CS_FREE) { c = &up->c[i]; break; }
-    if (!c) return;
+    for (int i = 0; i < up->c_n; i++) if (CN(up, i)->st == CS_FREE) { c = CN(up, i); break; }
+    if (!c) {
+        /* Свободного нет — завести новое, пока не упёрлись в дескрипторы (dup_conn_limit). */
+        if (up->c_n >= dup_conn_limit()) {
+            up_err(up, "открытых соединений %d — предел (четверть дескрипторов процесса, RLIMIT_NOFILE)",
+                   up->c_n);
+            return;
+        }
+        if (up->c_n == up->c_cap) {
+            int nc = up->c_cap ? up->c_cap * 2 : 4;
+            struct dconn **np = realloc(up->c, (size_t)nc * sizeof(*np));
+            if (!np) return;
+            up->c = np;
+            up->c_cap = nc;
+        }
+        c = calloc(1, sizeof(*c));
+        if (!c) return;
+        c->fd = -1;
+        c->idx = up->c_n;
+        up->c[up->c_n++] = c;
+    }
     c->up = up;
     c->tag.magic = DTAG_MAGIC; c->tag.kind = DT_CONN; c->tag.obj = c;
     if (!tls_proto(up)) {
@@ -397,7 +478,7 @@ static void up_dial(struct dup *up) {
     struct dial *d = calloc(1, sizeof(*d));
     int sv[2] = { -1, -1 };
     if (!d || socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) {
-        free(d);
+        dial_free(d);
         up_err(up, "нет ресурсов для соединения");
         up_backoff(up);
         fail_waiting(up);
@@ -409,6 +490,18 @@ static void up_dial(struct dup *up) {
     d->rfd = sv[0]; d->wfd = sv[1];
     d->up = up; d->up_gen = up->gen; d->conn = cidx(c);
     d->u = up->cfg.u;
+    /* Поток читает адреса сервера и bootstrap после того, как апстрим могли перенастроить, — у
+     * него свои копии (освобождает dial_free), а не указатели в память апстрима. */
+    if (d->u.ips_n) {
+        d->ips_own = memdup(d->u.ips, d->u.ips_n * sizeof(*d->u.ips));
+        d->u.ips = d->ips_own;
+        if (!d->ips_own) d->u.ips_n = 0;
+    }
+    if (d->u.boot_n) {
+        d->boot_own = memdup(d->u.boot, d->u.boot_n * sizeof(*d->u.boot));
+        d->u.boot = d->boot_own;
+        if (!d->boot_own) d->u.boot_n = 0;
+    }
     d->mark = up->cfg.mark;
     d->doh = up->cfg.u.proto == DNSP_DOH;
     d->timeout_ms = DUP_DIAL_MS;
@@ -424,7 +517,7 @@ static void up_dial(struct dup *up) {
         epoll_ctl(g_epfd, EPOLL_CTL_DEL, sv[0], NULL);
         close(sv[0]); close(sv[1]);
         up_err(up, "%s", d->err[0] ? d->err : "соединение не начато");
-        free(d);
+        dial_free(d);
         up_backoff(up);
         fail_waiting(up);
         return;
@@ -444,7 +537,7 @@ static void dial_event_cb(struct dial *d) {
     struct dup *up = d->up;
     int same = up->live && up->gen == d->up_gen && !d->cancel;
     int alive = same && k > 0;
-    struct dconn *c = &up->c[d->conn];
+    struct dconn *c = CN(up, d->conn);
     if (same) { c->dial = NULL; up->dialing--; }
     if (!alive || d->rc != 0) {
         if (d->fd >= 0) close(d->fd);
@@ -457,7 +550,7 @@ static void dial_event_cb(struct dial *d) {
             up_backoff(up);
             fail_waiting(up);
         }
-        free(d);
+        dial_free(d);
         return;
     }
     if (d->res_n) {
@@ -473,7 +566,7 @@ static void dial_event_cb(struct dial *d) {
     up->backoff_ms = 0;
     up->retry_at_ms = 0;
     up->err[0] = '\0';
-    free(d);
+    dial_free(d);
     conn_register(c, EPOLLIN);
     up_kick(up);
 }
@@ -482,8 +575,8 @@ static void dial_event_cb(struct dial *d) {
 
 static struct dconn *pick_conn(struct dup *up) {
     struct dconn *best = NULL;
-    for (int i = 0; i < DUP_CONNS; i++) {
-        struct dconn *c = &up->c[i];
+    for (int i = 0; i < up->c_n; i++) {
+        struct dconn *c = CN(up, i);
         if (c->st != CS_READY) continue;
         if (up->cfg.u.proto == DNSP_DOH) { if (!c->busy) return c; }
         else if (!best || c->busy < best->busy) best = c;
@@ -492,27 +585,31 @@ static struct dconn *pick_conn(struct dup *up) {
 }
 
 static void up_kick(struct dup *up) {
-    for (int k = 0; k < DUP_MAXREQ; k++) {
-        struct dreq *r = &g_req[k];
+    for (int k = 0; k < g_req_cap; k++) {
+        struct dreq *r = &RQ(k);
         if (!r->used || r->up != up || r->ci != -1) continue;
         struct dconn *c = pick_conn(up);
         if (!c) break;
         if (conn_send(up, c, r) != 0) { conn_close(c, "запись в соединение не удалась"); k = -1; }
     }
     int waiting = 0;
-    for (int k = 0; k < DUP_MAXREQ; k++) if (g_req[k].used && g_req[k].up == up && g_req[k].ci == -1) waiting++;
+    for (int k = 0; k < g_req_cap; k++) if (RQ(k).used && RQ(k).up == up && RQ(k).ci == -1) waiting++;
     if (!waiting) return;
     if (now_ms() < up->retry_at_ms) { fail_waiting(up); return; }
     int have = 0;
-    for (int i = 0; i < DUP_CONNS; i++) have += up->c[i].st == CS_DIAL || up->c[i].st == CS_TCPCONN;
-    if (have < up_want_conns(up) && up_conns_alive(up) < DUP_CONNS) up_dial(up);
+    for (int i = 0; i < up->c_n; i++) have += CN(up, i)->st == CS_DIAL || CN(up, i)->st == CS_TCPCONN;
+    if (have < up_want_conns(up)) {
+        if (up_conns_alive(up) < up->c_n || up->c_n < dup_conn_limit()) up_dial(up);
+        else up_err(up, "открытых соединений %d — предел (четверть дескрипторов процесса, "
+                        "RLIMIT_NOFILE): вопросы ждут свободного", up->c_n);
+    }
 }
 
 /* ---- чтение ---------------------------------------------------------------------------------- */
 
 static struct dreq *find_by_wid(struct dup *up, int ci, uint16_t wid) {
-    for (int k = 0; k < DUP_MAXREQ; k++) {
-        struct dreq *r = &g_req[k];
+    for (int k = 0; k < g_req_cap; k++) {
+        struct dreq *r = &RQ(k);
         if (r->used && r->up == up && r->ci == ci && r->wid == wid) return r;
     }
     return NULL;
@@ -769,19 +866,19 @@ static void up_reset_state(struct dup *up) {
 
 static void up_retire(struct dup *up) {
     if (!up->live) return;
-    for (int i = 0; i < DUP_CONNS; i++) {
-        struct dconn *c = &up->c[i];
+    for (int i = 0; i < up->c_n; i++) {
+        struct dconn *c = CN(up, i);
         if (c->dial) { c->dial->cancel = 1; c->dial = NULL; }
         if (c->st != CS_FREE && c->st != CS_DIAL) {
             /* Вопросы без повтора: апстрима больше нет. */
-            for (int k = 0; k < DUP_MAXREQ; k++)
-                if (g_req[k].used && g_req[k].up == up && g_req[k].ci == i) g_req[k].tries = 2;
+            for (int k = 0; k < g_req_cap; k++)
+                if (RQ(k).used && RQ(k).up == up && RQ(k).ci == i) RQ(k).tries = 2;
             conn_close(c, NULL);
         }
         c->st = CS_FREE;
     }
-    for (int k = 0; k < DUP_MAXREQ; k++)
-        if (g_req[k].used && g_req[k].up == up) req_finish(&g_req[k], NULL, 0);
+    for (int k = 0; k < g_req_cap; k++)
+        if (RQ(k).used && RQ(k).up == up) req_finish(&RQ(k), NULL, 0);
     if (up->ufd >= 0) {
         epoll_ctl(g_epfd, EPOLL_CTL_DEL, up->ufd, NULL);
         close(up->ufd);
@@ -796,19 +893,20 @@ static int cfg_same(const struct dup_cfg *a, const struct dup_cfg *b) {
         a->mark != b->mark || a->need_mark != b->need_mark || a->u.ips_n != b->u.ips_n ||
         a->u.boot_n != b->u.boot_n)
         return 0;
-    for (int i = 0; i < a->u.ips_n; i++) if (strcmp(a->u.ips[i], b->u.ips[i])) return 0;
-    for (int i = 0; i < a->u.boot_n; i++) if (strcmp(a->u.boot[i], b->u.boot[i])) return 0;
+    for (size_t i = 0; i < a->u.ips_n; i++) if (strcmp(a->u.ips[i], b->u.ips[i])) return 0;
+    for (size_t i = 0; i < a->u.boot_n; i++) if (strcmp(a->u.boot[i], b->u.boot[i])) return 0;
     return 1;
 }
 
 void dup_apply(const struct dup_cfg *c, size_t n) {
-    if (n > MAX_DNS_UP) n = MAX_DNS_UP;
-    struct dup *old[MAX_DNS_UP], *nw[MAX_DNS_UP];
+    /* Число апстримов не ограничено: таблицы прежних и новых — по n. */
     size_t oldn = g_dups_n;
-    memcpy(old, g_dups, sizeof(old));
-    int taken[MAX_DNS_UP] = { 0 };
+    struct dup **old = oldn ? malloc(oldn * sizeof(*old)) : NULL;
+    struct dup **nw = n ? calloc(n, sizeof(*nw)) : NULL;
+    int *taken = oldn ? calloc(oldn, sizeof(int)) : NULL;
+    if ((oldn && (!old || !taken)) || (n && !nw)) { free(old); free(nw); free(taken); return; }
+    if (oldn) memcpy(old, g_dups, oldn * sizeof(*old));
     for (size_t i = 0; i < n; i++) {
-        nw[i] = NULL;
         for (size_t j = 0; j < oldn; j++)
             if (!taken[j] && cfg_same(&old[j]->cfg, &c[i])) { taken[j] = 1; nw[i] = old[j]; break; }
     }
@@ -816,19 +914,51 @@ void dup_apply(const struct dup_cfg *c, size_t n) {
     for (size_t i = 0; i < n; i++) {
         if (nw[i]) continue;
         struct dup *up = NULL;
-        for (size_t k = 0; k < sizeof(g_store) / sizeof(g_store[0]); k++)
-            if (!g_store[k].live) { up = &g_store[k]; break; }
-        if (!up) continue;
+        for (size_t k = 0; k < g_store_n; k++)
+            if (!g_store[k]->live) { up = g_store[k]; break; }
+        if (!up) {
+            if (g_store_n == g_store_cap) {
+                size_t nc = g_store_cap ? g_store_cap * 2 : 8;
+                struct dup **ns = realloc(g_store, nc * sizeof(*ns));
+                if (!ns) continue;
+                g_store = ns;
+                g_store_cap = nc;
+            }
+            up = calloc(1, sizeof(*up));
+            if (!up) continue;
+            g_store[g_store_n++] = up;
+        }
         unsigned gen = up->gen;
+        struct dconn **keepc = up->c;           /* соединения (их блоки) переживают переназначение */
+        int keep_n = up->c_n, keep_cap = up->c_cap;
+        free(up->ips_own);                      /* личные копии адресов прежней настройки */
+        free(up->boot_own);
         memset(up, 0, sizeof(*up));
+        up->c = keepc;
+        up->c_n = keep_n;
+        up->c_cap = keep_cap;
         up->gen = gen + 1;
         up->live = 1;
         up->ufd = -1;
         up->cfg = c[i];
+        /* Адреса в настройке — указатели в таблицу резолвера, которую перечитают; апстриму нужны
+         * свои копии (dial берёт их дальше, у него — ещё свои). */
+        if (up->cfg.u.ips_n) {
+            up->ips_own = memdup(up->cfg.u.ips, up->cfg.u.ips_n * sizeof(*up->cfg.u.ips));
+            up->cfg.u.ips = up->ips_own;
+            if (!up->ips_own) up->cfg.u.ips_n = 0;
+        }
+        if (up->cfg.u.boot_n) {
+            up->boot_own = memdup(up->cfg.u.boot, up->cfg.u.boot_n * sizeof(*up->cfg.u.boot));
+            up->cfg.u.boot = up->boot_own;
+            if (!up->boot_own) up->cfg.u.boot_n = 0;
+        }
+        up->cfg.own = 0;
         up->utag.magic = DTAG_MAGIC; up->utag.kind = DT_UDP; up->utag.obj = up;
-        for (int k = 0; k < DUP_CONNS; k++) {
-            up->c[k].up = up; up->c[k].fd = -1;
-            up->c[k].tag.magic = DTAG_MAGIC; up->c[k].tag.kind = DT_CONN; up->c[k].tag.obj = &up->c[k];
+        for (int k = 0; k < up->c_n; k++) {
+            struct dconn *cc = CN(up, k);
+            cc->up = up; cc->fd = -1; cc->st = CS_FREE;
+            cc->tag.magic = DTAG_MAGIC; cc->tag.kind = DT_CONN; cc->tag.obj = cc;
         }
         up_reset_state(up);
         uint16_t seed = 0;
@@ -848,8 +978,16 @@ void dup_apply(const struct dup_cfg *c, size_t n) {
         }
         nw[i] = up;
     }
+    if (n > g_dups_cap) {
+        struct dup **nd = realloc(g_dups, n * sizeof(*nd));
+        if (nd) { g_dups = nd; g_dups_cap = n; }
+    }
     g_dups_n = 0;
-    for (size_t i = 0; i < n; i++) g_dups[g_dups_n++] = nw[i];
+    if (n <= g_dups_cap)
+        for (size_t i = 0; i < n; i++) g_dups[g_dups_n++] = nw[i];
+    free(old);
+    free(nw);
+    free(taken);
 }
 
 int dup_ask(size_t idx, const uint8_t *q, size_t n, dup_done_fn cb, void *ctx) {
@@ -865,9 +1003,17 @@ int dup_ask(size_t idx, const uint8_t *q, size_t n, dup_done_fn cb, void *ctx) {
         return -1;
     }
     struct dreq *r = NULL;
-    for (int k = 0; k < DUP_MAXREQ; k++) if (!g_req[k].used) { r = &g_req[k]; break; }
-    if (!r) return -1;
+    for (int k = 0; k < g_req_cap; k++) if (!RQ(k).used) { r = &RQ(k); break; }
+    if (!r) {
+        /* Мест нет — новый блок; растёт до нехватки памяти, а число вопросов в полёте держит
+         * очередь ожидающих резолвера (MAX_PENDING). */
+        int first = g_req_cap;
+        if (req_grow() != 0) return -1;
+        r = &RQ(first);
+    }
+    int slot = r->slot;
     memset(r, 0, offsetof(struct dreq, q));
+    r->slot = slot;
     memcpy(r->q, q, n);
     r->qn = (uint16_t)n;
     r->used = 1;
@@ -877,8 +1023,8 @@ int dup_ask(size_t idx, const uint8_t *q, size_t n, dup_done_fn cb, void *ctx) {
     for (;;) {                                          /* номер, не занятый другим вопросом апстрима */
         r->wid = up->next_id++;
         int taken = 0;
-        for (int k = 0; k < DUP_MAXREQ; k++)
-            if (&g_req[k] != r && g_req[k].used && g_req[k].up == up && g_req[k].wid == r->wid) taken = 1;
+        for (int k = 0; k < g_req_cap; k++)
+            if (&RQ(k) != r && RQ(k).used && RQ(k).up == up && RQ(k).wid == r->wid) taken = 1;
         if (!taken) break;
     }
     r->q[0] = (uint8_t)(r->wid >> 8);
@@ -932,8 +1078,8 @@ int dup_event(void *ptr, uint32_t evs) {
 
 void dup_tick(void) {
     long now = now_ms();
-    for (int k = 0; k < DUP_MAXREQ; k++) {
-        struct dreq *r = &g_req[k];
+    for (int k = 0; k < g_req_cap; k++) {
+        struct dreq *r = &RQ(k);
         if (!r->used) continue;
         struct dup *up = r->up;
         if (up->cfg.u.proto == DNSP_UDP && r->ci == -2 && r->tries == 0 && now - r->t0 >= DUP_UDP_RETRY_MS &&
@@ -946,27 +1092,31 @@ void dup_tick(void) {
         int ci = r->ci;
         up_err(up, "нет ответа за %d мс", DUP_REQ_MS);
         req_finish(r, NULL, 0);
-        if (ci >= 0 && up->c[ci].st == CS_READY) {
-            if (up->cfg.u.proto == DNSP_DOH) conn_close(&up->c[ci], NULL);
-            else if (up->c[ci].busy > 0) up->c[ci].busy--;
+        if (ci >= 0 && CN(up, ci)->st == CS_READY) {
+            if (up->cfg.u.proto == DNSP_DOH) conn_close(CN(up, ci), NULL);
+            else if (CN(up, ci)->busy > 0) CN(up, ci)->busy--;
         }
     }
     for (size_t i = 0; i < g_dups_n; i++) {
         struct dup *up = g_dups[i];
-        for (int k = 0; k < DUP_CONNS; k++) {
-            struct dconn *c = &up->c[k];
-            if (c->st == CS_READY && !c->busy && now - c->last_ms > DUP_IDLE_MS) conn_close(c, NULL);
+        for (int k = 0; k < up->c_n; k++) {
+            struct dconn *c = CN(up, k);
+            /* Первое соединение держится DUP_IDLE_MS (пять минут), лишние, выросшие под всплеск
+             * нагрузки, — тридцать секунд: пул растёт по нагрузке и так же сжимается, не держа
+             * дескрипторы впрок. */
+            long idle = k == 0 ? DUP_IDLE_MS : 30000L;
+            if (c->st == CS_READY && !c->busy && now - c->last_ms > idle) conn_close(c, NULL);
         }
     }
 }
 
 int dup_wait_ms(void) {
     long now = now_ms(), best = -1;
-    for (int k = 0; k < DUP_MAXREQ; k++) {
-        if (!g_req[k].used) continue;
-        long t = g_req[k].deadline;
-        if (g_req[k].ci == -2 && g_req[k].tries == 0 && g_req[k].t0 + DUP_UDP_RETRY_MS < t)
-            t = g_req[k].t0 + DUP_UDP_RETRY_MS;
+    for (int k = 0; k < g_req_cap; k++) {
+        if (!RQ(k).used) continue;
+        long t = RQ(k).deadline;
+        if (RQ(k).ci == -2 && RQ(k).tries == 0 && RQ(k).t0 + DUP_UDP_RETRY_MS < t)
+            t = RQ(k).t0 + DUP_UDP_RETRY_MS;
         if (best < 0 || t < best) best = t;
     }
     if (best < 0) return -1;
@@ -974,7 +1124,7 @@ int dup_wait_ms(void) {
 }
 
 int dup_busy(void) {
-    for (int k = 0; k < DUP_MAXREQ; k++) if (g_req[k].used) return 1;
+    for (int k = 0; k < g_req_cap; k++) if (RQ(k).used) return 1;
     return 0;
 }
 
@@ -987,7 +1137,7 @@ static const char *up_state(const struct dup *up) {
     if (up->cfg.need_mark && !up->cfg.mark) return "unmarked";
     if (tls_proto(up) && !dup_have_tls()) return "no-tls";
     if (stream_proto(up)) {
-        for (int i = 0; i < DUP_CONNS; i++) if (up->c[i].st == CS_READY) return "ready";
+        for (int i = 0; i < up->c_n; i++) if (CN(up, i)->st == CS_READY) return "ready";
         if (up->dialing) return "connecting";
         if (now_ms() < up->retry_at_ms) return "down";
         return "idle";
@@ -1012,8 +1162,8 @@ void dup_render(FILE *f) {
     for (size_t i = 0; i < g_dups_n; i++) {
         const struct dup *up = g_dups[i];
         int conns = 0, queued = 0;
-        for (int k = 0; k < DUP_CONNS; k++) conns += up->c[k].st == CS_READY;
-        for (int k = 0; k < DUP_MAXREQ; k++) queued += g_req[k].used && g_req[k].up == up;
+        for (int k = 0; k < up->c_n; k++) conns += CN(up, k)->st == CS_READY;
+        for (int k = 0; k < g_req_cap; k++) queued += RQ(k).used && RQ(k).up == up;
         fprintf(f, "%s{\"name\":\"%s\",\"url\":\"%s\",\"proto\":\"%s\",\"via\":", i ? "," : "",
                 up->cfg.u.name, up->cfg.u.url, proto_name(up->cfg.u.proto));
         if (up->cfg.via[0]) fprintf(f, "\"%s\"", up->cfg.via); else fputs("null", f);

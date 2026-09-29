@@ -69,8 +69,8 @@ struct srs_clause {
     /* Как сужение записано в наборе: протоколы и порты в порядке появления, повторы сняты. Нужно
      * только `srs-read` — его вывод обязан остаться прежним побайтно. */
     int net_tcp, net_udp;
-    struct port_range raw[MAX_PORTS];
-    unsigned char raw_range[MAX_PORTS];   /* 1 — записан как port_range, печатается «a-b» */
+    struct port_range raw[L4_PORTS_MAX];
+    unsigned char raw_range[L4_PORTS_MAX];   /* 1 — записан как port_range, печатается «a-b» */
     size_t raw_n;
     /* source_ip_cidr — ограничение по клиенту (IPv4; IPv6-источники сняты с предупреждением).
      * Отдельной памятью и только у тех клауз, где есть: клауз бывает много, а этого — почти
@@ -132,7 +132,7 @@ int l4_same_set(const struct l4match *a, const struct l4match *b);
 /* Разложение сужения на ящики «протокол × порты» для составного набора nftables
  * (ipv4_addr . inet_proto . inet_service): без сужения — один ящик 0-255 × 0-65535. */
 struct l4box { unsigned char plo, phi; unsigned short lo, hi; };
-#define L4BOX_MAX (2 * MAX_PORTS + 1)
+#define L4BOX_MAX (2 * L4_PORTS_MAX + 1)
 size_t l4_boxes(const struct l4match *m, struct l4box *out);
 /* Объединение нескольких сужений в НЕПЕРЕСЕКАЮЩИЕСЯ ящики: ядро не принимает в составной
  * набор пересекающиеся элементы (EEXIST), а одному адресу бывают нужны два сужения сразу. */

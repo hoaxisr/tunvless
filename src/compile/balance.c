@@ -70,8 +70,8 @@ static void mark_chain(struct nft_table *t, const struct output *o) {
 static void restore_rules(struct nft_table *t, struct nft_chain *c, const struct spec *sp,
                           const struct output *g, int depth) {
     const struct group_cfg *gc = out_group(g);
-    for (size_t k = 0; gc && k < gc->members_n && depth <= MAX_OUTPUTS; k++) {
-        const struct output *m = &sp->out[gc->members[k]];
+    for (size_t k = 0; gc && k < gc->members_n && (size_t)depth <= sp->out_n; k++) {
+        const struct output *m = spec_out(sp, gc->members[k]);
         if (is_balance(m)) {
             restore_rules(t, c, sp, m, depth + 1);
             continue;
@@ -94,7 +94,7 @@ static void restore_rules(struct nft_table *t, struct nft_chain *c, const struct
 static void build_one(struct nft_table *t, const struct spec *sp, const struct output *g, int depth) {
     char chain[32], map[32], fall[32];
     group_bal_chain(g, chain, sizeof(chain));
-    if (ir_chain_find(t, chain) || depth > MAX_OUTPUTS) return;
+    if (ir_chain_find(t, chain) || (size_t)depth > sp->out_n) return;
     group_bal_map(g, map, sizeof(map));
     group_mark_chain(g, fall, sizeof(fall));
     const struct group_cfg *gc = out_group(g);
@@ -103,11 +103,11 @@ static void build_one(struct nft_table *t, const struct spec *sp, const struct o
     struct nft_set *m = ir_map_add(t, ir_strdup(t->rs, map), "mark", "verdict");
     ir_gap(m);
     unsigned char owner[GROUP_BAL_SLOTS];
-    group_balance_slots(gc, (1u << gc->members_n) - 1u, owner);
+    group_balance_slots(gc, NULL, owner);           /* NULL — все члены живы */
     for (unsigned s = 0; s < GROUP_BAL_SLOTS; s++) {
         if (owner[s] == 0xff) continue;
         char tgt[32];
-        group_bal_target(&sp->out[gc->members[owner[s]]], tgt, sizeof(tgt));
+        group_bal_target(spec_out(sp, gc->members[owner[s]]), tgt, sizeof(tgt));
         ir_set_value(m, ir_printf(t->rs, "%u : goto %s", s, tgt));
     }
 
@@ -133,7 +133,7 @@ static void build_one(struct nft_table *t, const struct spec *sp, const struct o
     mark_chain(t, g);
     /* Вложенные balance — свои цепочки и карты. */
     for (size_t k = 0; k < gc->members_n; k++) {
-        const struct output *mm = &sp->out[gc->members[k]];
+        const struct output *mm = spec_out(sp, gc->members[k]);
         if (is_balance(mm)) build_one(t, sp, mm, depth + 1);
     }
 }

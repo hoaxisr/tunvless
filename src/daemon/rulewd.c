@@ -161,8 +161,7 @@
 /* Шторм — больше RULEWD_STORM_N возвратов за RULEWD_STORM_WIN_MS. */
 #define RULEWD_STORM_N      3
 #define RULEWD_STORM_WIN_MS 60000L
-/* Сколько приоритетов снятых правил помнить (выход — метка и семейство). */
-#define RULEWD_PREF_MAX (2 * MAX_OUTPUTS)
+/* Приоритеты снятых правил (выход — метка и семейство) запоминаются растущим массивом. */
 
 struct rulewd {
     struct steerd *d;
@@ -178,8 +177,8 @@ struct rulewd {
     int back_i;
     long storm_said;              /* когда последний раз сказали о шторме в журнал */
     /* Приоритеты снятых правил: с каким вернуть (см. шапку). */
-    struct { int fam; uint32_t mark; uint32_t prio; } pref[RULEWD_PREF_MAX];
-    size_t pref_n;
+    struct { int fam; uint32_t mark; uint32_t prio; } *pref;
+    size_t pref_n, pref_cap;
 };
 
 /* ---- проверка ------------------------------------------------------------------------------ */
@@ -221,9 +220,12 @@ static void list_add(char *list, size_t n, size_t *k, int cnt, const char *name)
 
 /* Дампы правил обоих семейств для out_missing. -1 — правил IPv4 не прочитать; правил IPv6 нет
  * (ядро без IPv6) — rules6 пуст. */
-static int rules_read(char *rules, size_t rn, char *rules6, size_t r6n) {
-    if (rtnl_rules_text(rules, rn) != 0 || !rules[0]) return -1;
-    if (rtnl_rules_text6(rules6, r6n) != 0) rules6[0] = '\0';
+static int rules_read(char **rules, char **rules6) {
+    *rules = rtnl_rules_dup(0);         /* дамп растёт по числу правил: их не 16 КиБ */
+    if (!*rules || !(*rules)[0]) { free(*rules); *rules = NULL; *rules6 = NULL; return -1; }
+    *rules6 = rtnl_rules_dup(1);
+    if (!*rules6) *rules6 = strdup("");
+    if (!*rules6) { free(*rules); *rules = NULL; return -1; }
     return 0;
 }
 
@@ -237,18 +239,18 @@ static int out_held(const struct rulewd *r, const struct output *o) {
  * их проверять после конца команды (rulewd_defer). r == NULL — held не спрашивается. */
 static int missing_x(const struct rulewd *r, const struct spec *sp, char *list, size_t n,
                      int *heldmiss) {
-    static char rules[16384], rules6[16384];
+    char *rules, *rules6;
     if (n) list[0] = '\0';
     if (heldmiss) *heldmiss = 0;
     if (!sp) return 0;
-    if (rules_read(rules, sizeof(rules), rules6, sizeof(rules6)) != 0) return -1;
+    if (rules_read(&rules, &rules6) != 0) return -1;
     int cnt = 0;
     size_t k = 0;
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
         if (!out_has_device(o) || !o->mark || !o->table) continue;
         int m = out_missing(rules, rules6, o);
-        if (m < 0) return -1;
+        if (m < 0) { free(rules); free(rules6); return -1; }
         if (!m) continue;
         if (out_held(r, o)) {
             if (heldmiss) *heldmiss = 1;
@@ -257,6 +259,8 @@ static int missing_x(const struct rulewd *r, const struct spec *sp, char *list, 
         list_add(list, n, &k, cnt, o->name);
         cnt++;
     }
+    free(rules);
+    free(rules6);
     return cnt;
 }
 
@@ -278,7 +282,13 @@ static void pref_note(struct rulewd *r, int fam, uint32_t mark, uint32_t prio) {
     size_t i = 0;
     while (i < r->pref_n && !(r->pref[i].fam == fam && r->pref[i].mark == mark)) i++;
     if (i == r->pref_n) {
-        if (r->pref_n >= RULEWD_PREF_MAX) return;
+        if (r->pref_n == r->pref_cap) {
+            size_t nc = r->pref_cap ? r->pref_cap * 2 : 32;
+            void *np = realloc(r->pref, nc * sizeof(*r->pref));
+            if (!np) return;
+            r->pref = np;
+            r->pref_cap = nc;
+        }
         r->pref_n++;
     }
     r->pref[i].fam = fam;
@@ -291,16 +301,16 @@ static void pref_note(struct rulewd *r, int fam, uint32_t mark, uint32_t prio) {
  * Возврат — сколько выходов тронуто, -1 — ядро не спросить или не приняло. */
 static int rulewd_restore(struct rulewd *r, const struct spec *sp, char *all, char *rl, char *bs,
                           size_t n) {
-    static char rules[16384], rules6[16384];
+    char *rules, *rules6;
     if (n) all[0] = rl[0] = bs[0] = '\0';
-    if (rules_read(rules, sizeof(rules), rules6, sizeof(rules6)) != 0) return -1;
+    if (rules_read(&rules, &rules6) != 0) return -1;
     int cnt = 0, rcnt = 0, bcnt = 0, bad = 0;
     size_t k = 0, rk = 0, bk = 0;
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
         if (!out_has_device(o) || !o->mark || !o->table) continue;
         int m = out_missing(rules, rules6, o);
-        if (m < 0) return -1;
+        if (m < 0) { free(rules); free(rules6); return -1; }
         if (!m || out_held(r, o)) continue;
         if ((m & MISS_R4) && rtnl_rule_fwmark(4, o->mark, STEER_MARK_MASK, o->table,
                                               (int)pref_of(r, 4, o->mark)) != 0) bad = 1;
@@ -313,6 +323,8 @@ static int rulewd_restore(struct rulewd *r, const struct spec *sp, char *all, ch
         if (m & (MISS_R4 | MISS_R6)) list_add(rl, n, &rk, rcnt++, o->name);
         if (m & MISS_BS6) list_add(bs, n, &bk, bcnt++, o->name);
     }
+    free(rules);
+    free(rules6);
     return bad ? -1 : cnt;
 }
 

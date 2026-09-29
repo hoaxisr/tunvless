@@ -135,7 +135,8 @@ LIBSTEER_1 {
     out_hy2_node_named;
     out_hysteria2;
     out_kind_name;
-    out_members;
+    out_member;
+    out_members_n;
     out_node_list;
     out_node_named;
     out_tgws;
@@ -183,6 +184,7 @@ LIBSTEER_1 {
     rtnl_routes_text6;
     rtnl_rule_from;
     rtnl_rule_fwmark;
+    rtnl_rules_dup;
     rtnl_rules_text;
     rtnl_rules_text6;
     rtnl_table_flush;

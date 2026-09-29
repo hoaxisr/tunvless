@@ -31,6 +31,21 @@ static void check(const char *what, int want, int got) {
     if (want != got) fails++;
 }
 
+/* Таблица каналов стенда — на n мест, обнулённая (g_dch теперь куча, а не массив на 64). */
+static void dch_zero(size_t n) {
+    if (g_dch_cap < n) {
+        struct dchan *p = realloc(g_dch, n * sizeof(*p));
+        if (!p) { perror("realloc"); exit(2); }
+        g_dch = p;
+        g_dch_cap = n;
+    }
+    memset(g_dch, 0, g_dch_cap * sizeof(*g_dch));
+    g_dch_n = 0;
+}
+
+/* Набор каналов из двух номеров (chm_t — номер записи в таблице наборов, а не битовая маска). */
+static chm_t chm2(size_t a, size_t b) { return chm_or(chm_one(a), chm_one(b)); }
+
 static void check_str(const char *what, const char *want, const char *got) {
     int ok = strcmp(want, got) == 0;
     printf("%-58s %s\n", what, ok ? "ok" : "ПРОВАЛ");
@@ -371,15 +386,15 @@ int main(void) {
      * СКОЛЬКО их нашлось и кто из них строит ответ. */
     {
         static const char *const yt[] = { "youtube.com", NULL };
+        dch_zero(2);
         g_dch_n = 2;
-        memset(g_dch, 0, sizeof(g_dch[0]) * 2);
         snprintf(g_dch[0].set, sizeof(g_dch[0].set), "%s", "tv_dom");
         snprintf(g_dch[1].set, sizeof(g_dch[1].set), "%s", "all_dom");
         build(&g_dch[0].rules, yt);
         build(&g_dch[1].rules, yt);
 
-        check("пересечение: совпали ОБА канала", 3, (int)dch_match_mask("youtube.com"));
-        check("пересечение: поддомен — тоже оба", 3, (int)dch_match_mask("www.youtube.com"));
+        check("пересечение: совпали ОБА канала", 1, dch_match_mask("youtube.com") == chm2(0, 1));
+        check("пересечение: поддомен — тоже оба", 1, dch_match_mask("www.youtube.com") == chm2(0, 1));
         check("пересечение: ответ строит верхний", 0, dch_first(dch_match_mask("youtube.com")));
         check("пересечение: чужое имя — ни один", 0, (int)dch_match_mask("example.org"));
         check("пересечение: пустой набор — канала нет", -1, dch_first(0));
@@ -388,7 +403,7 @@ int main(void) {
          * настоящие адреса из ответа, а поддельного клиент в этом режиме не получает. */
         g_dch[1].realip = 1;
         check("пересечение: realip не берёт поддельный адрес", 1,
-              (int)dch_fakeip_only(dch_match_mask("youtube.com")));
+              dch_fakeip_only(dch_match_mask("youtube.com")) == chm_one(0));
 
         ruleset_free(&g_dch[0].rules);
         ruleset_free(&g_dch[1].rules);
@@ -483,13 +498,14 @@ int main(void) {
 
                 /* Снимок ровно того, что tabfmt_build напечатала (dch_build уже отработал
                  * внутри неё), — «дч_build по спеке» из требования стенда. */
-                struct { char set[64], out[32], chan[32]; int realip, fam; size_t rules_n;
-                         char rules_path[MAX_FILES][256]; } snap[MAX_RULES];
+                struct snapc { char set[64], out[32], chan[32]; int realip, fam; size_t rules_n;
+                               char rules_path[16][256]; };
+                static struct snapc snap[16];        /* в спеке стенда каналов два */
                 size_t snap_n = g_dch_n;
                 for (size_t i = 0; i < snap_n; i++) {
                     /* memcpy целиком, а не snprintf("%s", ...): поля snap зеркалят размер
                      * g_dch (set[64]/out[32]/chan[32]) один в один, а gcc иначе не может
-                     * доказать границу источника внутри массива структур g_dch[MAX_RULES]
+                     * доказать границу источника внутри массива структур g_dch
                      * и завышает её до размера всего массива (-Wformat-truncation). */
                     memcpy(snap[i].set, g_dch[i].set, sizeof(snap[i].set));
                     memcpy(snap[i].out, g_dch[i].out, sizeof(snap[i].out));
@@ -497,7 +513,7 @@ int main(void) {
                     snap[i].realip = g_dch[i].realip;
                     snap[i].fam = g_dch[i].fam;
                     snap[i].rules_n = g_dch[i].rules_n;
-                    for (size_t k = 0; k < g_dch[i].rules_n; k++)
+                    for (size_t k = 0; k < g_dch[i].rules_n && k < 16; k++)
                         snprintf(snap[i].rules_path[k], sizeof(snap[i].rules_path[k]),
                                  "%s", g_dch[i].rules_path[k]);
                 }
@@ -519,7 +535,8 @@ int main(void) {
                  * В этом стенде — приходят, ради самого сравнения, поэтому перед разбором g_dch
                  * обнуляется руками — так же, как обнулён он в свежем процессе резолвера (BSS),
                  * а не через free() чужих указателей. */
-                memset(g_dch, 0, sizeof(g_dch));
+                for (size_t i = 0; i < g_dch_n; i++) free(g_dch[i].rules_path);   /* массивы; строки — спеки */
+                memset(g_dch, 0, g_dch_cap * sizeof(*g_dch));
                 g_dch_n = 0;
 
                 check("формат таблицы: разбор принял текст", 0,
@@ -638,7 +655,8 @@ int main(void) {
                 free(text);
                 /* g_dch держит указатели внутрь cfg1 — обнулить руками, как перед разбором
                  * выше, чтобы следующий tabfmt_parse не освобождал чужие строки. */
-                memset(g_dch, 0, sizeof(g_dch));
+                for (size_t i = 0; i < g_dch_n; i++) free(g_dch[i].rules_path);
+                memset(g_dch, 0, g_dch_cap * sizeof(*g_dch));
                 g_dch_n = 0;
                 unlink(sp1);
             }
@@ -829,15 +847,15 @@ int main(void) {
               len && out[qe + 3] == 28 && out[qe + 11] == 16 && !memcmp(out + qe + 12, a6, 16));
 
         /* Половина IPv6 имени: все совпавшие каналы обязаны её нести. */
-        memset(g_dch, 0, sizeof(g_dch));
+        dch_zero(3);
         g_dch_n = 3;
         g_dch[0].fam = DCH_V4 | DCH_V6;
         g_dch[1].fam = DCH_V4 | DCH_V6;
         g_dch[2].fam = DCH_V4;
-        check("dch_all_v6: оба канала с IPv6", 1, dch_all_v6(3));
-        check("dch_all_v6: среди совпавших канал без IPv6 — нет", 0, dch_all_v6(5));
+        check("dch_all_v6: оба канала с IPv6", 1, dch_all_v6(chm2(0, 1)));
+        check("dch_all_v6: среди совпавших канал без IPv6 — нет", 0, dch_all_v6(chm2(0, 2)));
         check("dch_all_v6: пусто — нет", 0, dch_all_v6(0));
-        memset(g_dch, 0, sizeof(g_dch));
+        memset(g_dch, 0, g_dch_cap * sizeof(*g_dch));
         g_dch_n = 0;
     }
 

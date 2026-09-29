@@ -69,13 +69,17 @@ struct v2 {
     int realip_default;             /* dns.mode */
     char base[1040];                /* каталог файла спеки — для относительных путей */
     /* Узлы выходов для сообщений и второго прохода. */
-    const struct ynode *out_key[MAX_OUTPUTS];
-    const struct ynode *out_over[MAX_OUTPUTS];
-    const struct ynode *out_members[MAX_OUTPUTS];
-    const struct ynode *out_default[MAX_OUTPUTS];
-    const struct ynode *out_weights[MAX_OUTPUTS];
-    const struct ynode *out_ipv6[MAX_OUTPUTS], *out_prefix[MAX_OUTPUTS];
-    struct v2_client cl[MAX_CLIENTS];
+    /* Растут вместе с числом выходов (v2_room) — по ним ходит второй проход, и предельного числа
+     * выходов у разбора нет: число выходов с меткой ограничивает раскладка метки (check_slots). */
+    const struct ynode **out_key;
+    const struct ynode **out_over;
+    const struct ynode **out_members;
+    const struct ynode **out_default;
+    const struct ynode **out_weights;
+    const struct ynode **out_ipv6, **out_prefix;
+    size_t out_cap;
+    struct v2_client *cl;
+    size_t cl_cap;
     size_t clients_named, lists_named;
 };
 
@@ -162,11 +166,12 @@ static const struct ynode *item(const struct ynode *n, size_t i) {
     return n->kind == YN_SCALAR ? n : ynode_at(n, i);
 }
 
-static int items_ok(struct v2 *x, const struct ynode *n, const char *where, size_t max) {
+/* Число элементов перечня константой не ограничено: массивы под них берутся из арены спеки
+ * ровно по n_items (раньше здесь стояло «больше N элементов» с предельным N на каждый ключ). */
+static int items_ok(struct v2 *x, const struct ynode *n, const char *where) {
     if (n && n->kind == YN_MAP)
         return fail(x, n, "%s — список [a, b] или одно значение, а не отображение", where);
     size_t k = n_items(n);
-    if (k > max) return fail(x, n, "%s: больше %zu элементов", where, max);
     for (size_t i = 0; i < k; i++) {
         const struct ynode *it = item(n, i);
         if (it->kind != YN_SCALAR || ynode_is_null(it) || !it->str[0])
@@ -257,9 +262,15 @@ static int addr_check(struct v2 *x, const struct ynode *n, const char *where, co
     return 0;
 }
 
+/* Место клиенту под cnt записей «кто» вперёд (from_push только заполняет): один кусок арены. */
+static int from_reserve(struct v2 *x, const struct ynode *n, struct spec_client *c, size_t cnt) {
+    if (!cnt) return 0;
+    c->from = (char (*)[64])spec_alloc(x->s, cnt * sizeof(*c->from));
+    return c->from ? 0 : fail(x, n, "недостаточно памяти для спеки (%zu записей клиента)", cnt);
+}
+
 static int from_push(struct v2 *x, const struct ynode *n, const char *where, struct spec_client *c,
                      const char *v) {
-    if (c->from_n >= MAX_FROM) return fail(x, n, "%s: больше %d записей", where, MAX_FROM);
     return copy_to(x, n, where, v, c->from[c->from_n++], sizeof(c->from[0]));
 }
 
@@ -271,9 +282,11 @@ static int p_lan(struct v2 *x, const struct ynode *n) {
     if (want_map(x, n, "lan") || keys_known(x, n, "lan", K)) return -1;
     const struct ynode *dv = ynode_get(n, "devices"), *ad = ynode_get(n, "addr");
     if (dv) {
-        if (items_ok(x, dv, "lan.devices", MAX_LAN_DEV)) return -1;
+        if (items_ok(x, dv, "lan.devices")) return -1;
         if (!n_items(dv)) return fail(x, dv, "lan.devices: пустой список — некому адресовать правила");
         s->lan_dev_n = 0;
+        s->lan_dev = (char (*)[64])spec_alloc(s, n_items(dv) * sizeof(*s->lan_dev));
+        if (!s->lan_dev) return fail(x, dv, "недостаточно памяти для спеки (lan.devices)");
         for (size_t i = 0; i < n_items(dv); i++) {
             const struct ynode *it = item(dv, i);
             if (!name_ok(it->str))
@@ -287,7 +300,7 @@ static int p_lan(struct v2 *x, const struct ynode *n) {
         }
     }
     if (ad) {
-        if (items_ok(x, ad, "lan.addr", MAX_FROM)) return -1;
+        if (items_ok(x, ad, "lan.addr") || from_reserve(x, ad, &s->lan, n_items(ad))) return -1;
         for (size_t i = 0; i < n_items(ad); i++) {
             const struct ynode *it = item(ad, i);
             if (addr_check(x, it, "lan.addr", it->str) || from_push(x, it, "lan.addr", &s->lan, it->str))
@@ -308,7 +321,9 @@ static int p_lan(struct v2 *x, const struct ynode *n) {
 static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *val) {
     struct spec *s = x->s;
     static const char *const K[] = { "addr", "mac", "uid", "self", "app", NULL };
-    if (s->client_n >= MAX_CLIENTS) return fail(x, key, "clients: больше %d клиентов", MAX_CLIENTS);
+    if (spec_reserve_client(s, s->client_n + 1) != 0 ||
+        spec_grow((void **)&x->cl, &x->cl_cap, s->client_n + 1, sizeof(*x->cl)) != 0)
+        return fail(x, key, "недостаточно памяти для спеки (клиентов: %zu)", s->client_n + 1);
     struct spec_client *c = &s->client[s->client_n];
     struct v2_client *f = &x->cl[s->client_n];
     memset(c, 0, sizeof(*c));
@@ -327,9 +342,12 @@ static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *v
                        *ud = ynode_get(val, "uid"), *sf = ynode_get(val, "self"),
                        *ap = ynode_get(val, "app");
     char w[96];
+    /* Записей «кто» у клиента — сколько написано в addr, mac, uid и self вместе: массив берётся
+     * из арены ровно такой длины, предельного числа адресов у клиента нет. */
+    if (from_reserve(x, key, c, n_items(ad) + n_items(mc) + n_items(ud) + 1)) return -1;
     if (ad) {
         snprintf(w, sizeof(w), "%s.addr", where);
-        if (items_ok(x, ad, w, MAX_FROM)) return -1;
+        if (items_ok(x, ad, w)) return -1;
         for (size_t i = 0; i < n_items(ad); i++) {
             const struct ynode *it = item(ad, i);
             if (addr_check(x, it, w, it->str) || from_push(x, it, w, c, it->str)) return -1;
@@ -339,7 +357,7 @@ static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *v
     }
     if (mc) {
         snprintf(w, sizeof(w), "%s.mac", where);
-        if (items_ok(x, mc, w, MAX_FROM)) return -1;
+        if (items_ok(x, mc, w)) return -1;
         for (size_t i = 0; i < n_items(mc); i++) {
             const struct ynode *it = item(mc, i);
             if (!mac_ok(it->str))
@@ -355,7 +373,7 @@ static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *v
         snprintf(w, sizeof(w), "%s.uid", where);
         if (!plat()->local_channels)
             return fail(x, ud, "%s: приложения (uid) — только на телефоне", w);
-        if (items_ok(x, ud, w, MAX_FROM)) return -1;
+        if (items_ok(x, ud, w)) return -1;
         for (size_t i = 0; i < n_items(ud); i++) {
             const struct ynode *it = item(ud, i);
             char one[64];
@@ -386,7 +404,7 @@ static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *v
         snprintf(w, sizeof(w), "%s.app", where);
         if (!plat()->local_channels)
             return fail(x, ap, "%s: приложения — только на телефоне", w);
-        if (items_ok(x, ap, w, MAX_FROM)) return -1;
+        if (items_ok(x, ap, w)) return -1;
         unsup(x, ap, "%s — имена пакетов приложений; пока пишите uid", w);
     }
     if (!c->from_n && !ap)
@@ -407,17 +425,25 @@ static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *v
 
 /* ---- lists -------------------------------------------------------------------------------- */
 
-static int files_of(struct v2 *x, const struct ynode *n, const char *where, const char **dst,
+static int files_of(struct v2 *x, const struct ynode *n, const char *where, const char ***dst,
                     size_t *cnt) {
-    if (items_ok(x, n, where, MAX_FILES)) return -1;
-    for (size_t i = 0; i < n_items(n); i++) {
+    if (items_ok(x, n, where)) return -1;
+    size_t k = n_items(n);
+    if (!k) return 0;
+    /* Массив путей и сами пути — в арене спеки: число файлов в списке не ограничено, и всё это
+     * отдаётся вместе со спекой. */
+    const char **a = (const char **)spec_alloc(x->s, k * sizeof(*a));
+    if (!a) return fail(x, n, "%s: недостаточно памяти для спеки (%zu путей)", where, k);
+    for (size_t i = 0; i < k; i++) {
         const struct ynode *it = item(n, i);
         char p[256];
         if (path_of(x, it, where, it->str, p, sizeof(p))) return -1;
-        const char *kept = keep(p, x->e);
-        if (!kept) return wrap(x, it);
-        dst[(*cnt)++] = kept;
+        const char *kept = spec_strdup(x->s, p);
+        if (!kept) return fail(x, it, "%s: недостаточно памяти для спеки", where);
+        a[i] = kept;
     }
+    *dst = a;
+    *cnt = k;
     return 0;
 }
 
@@ -425,7 +451,8 @@ static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val
     struct spec *s = x->s;
     static const char *const K[] = { "srs", "prefixes_file", "domains_file", "domains", "prefixes",
                                      "proto", "ports", "all", NULL };
-    if (s->list_n >= MAX_LISTS) return fail(x, key, "lists: больше %d списков", MAX_LISTS);
+    if (spec_reserve_list(s, s->list_n + 1) != 0)
+        return fail(x, key, "недостаточно памяти для спеки (списков: %zu)", s->list_n + 1);
     struct spec_list *l = &s->list[s->list_n];
     memset(l, 0, sizeof(*l));
     if (name_of(x, key, "lists", l->name)) return -1;
@@ -440,15 +467,15 @@ static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val
     const struct ynode *n;
     if ((n = ynode_get(val, "srs"))) {
         snprintf(w, sizeof(w), "%s.srs", where);
-        if (files_of(x, n, w, l->srs_files, &l->srs_n)) return -1;
+        if (files_of(x, n, w, &l->srs_files, &l->srs_n)) return -1;
     }
     if ((n = ynode_get(val, "prefixes_file"))) {
         snprintf(w, sizeof(w), "%s.prefixes_file", where);
-        if (files_of(x, n, w, l->prefixes_files, &l->prefixes_n)) return -1;
+        if (files_of(x, n, w, &l->prefixes_files, &l->prefixes_n)) return -1;
     }
     if ((n = ynode_get(val, "domains_file"))) {
         snprintf(w, sizeof(w), "%s.domains_file", where);
-        if (files_of(x, n, w, l->domains_files, &l->domains_n)) return -1;
+        if (files_of(x, n, w, &l->domains_files, &l->domains_n)) return -1;
     }
     /* Встроенные адреса и домены (`work: { domains: [corp.example], prefixes: [10.20.0.0/16] }`
      * в примере раздела 3). Компилятор и резолвер читают списки только файлами — потоком, не
@@ -459,7 +486,7 @@ static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val
     for (size_t a = 0; INL[a]; a++) {
         if (!(n = ynode_get(val, INL[a]))) continue;
         snprintf(w, sizeof(w), "%s.%s", where, INL[a]);
-        if (items_ok(x, n, w, 65536)) return -1;
+        if (items_ok(x, n, w)) return -1;
         for (size_t i = 0; i < n_items(n); i++) {
             const struct ynode *it = item(n, i);
             if (a == 1 && !spec_line_is_addr(it->str))
@@ -487,7 +514,13 @@ static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val
     }
     if ((n = ynode_get(val, "ports"))) {
         snprintf(w, sizeof(w), "%s.ports", where);
-        if (items_ok(x, n, w, MAX_PORTS)) return -1;
+        if (items_ok(x, n, w)) return -1;
+        /* Один из оставленных пределов (L4_PORTS_MAX, spec.h): порты размножают адреса списка в
+         * составном наборе ядра, поэтому число диапазонов ограничено, и отказ называет причину. */
+        if (n_items(n) > L4_PORTS_MAX)
+            return fail(x, n, "%s: диапазонов портов %zu, а не больше %d — каждый диапазон размножает "
+                        "все адреса списка в составном наборе nftables (адрес . протокол . порт), и "
+                        "память роутера кончилась бы раньше", w, n_items(n), L4_PORTS_MAX);
         for (size_t i = 0; i < n_items(n); i++) {
             const struct ynode *it = item(n, i);
             struct port_range *r = &l->l4.ports[l->l4.ports_n];
@@ -550,11 +583,29 @@ static int p_obfs(struct v2 *x, const struct ynode *n, const char *name, struct 
     return 0;
 }
 
+/* Место в семи массивах узлов выходов на n выходов; -1 — нехватка памяти. */
+static int v2_room(struct v2 *x, size_t n) {
+    if (n <= x->out_cap) return 0;
+    size_t nc = x->out_cap ? x->out_cap * 2 : 8;
+    while (nc < n) nc *= 2;
+    const struct ynode ***f[] = { &x->out_key, &x->out_over, &x->out_members, &x->out_default,
+                                  &x->out_weights, &x->out_ipv6, &x->out_prefix };
+    for (size_t i = 0; i < sizeof(f) / sizeof(f[0]); i++) {
+        const struct ynode **p = realloc(*f[i], nc * sizeof(*p));
+        if (!p) return -1;
+        memset(p + x->out_cap, 0, (nc - x->out_cap) * sizeof(*p));
+        *f[i] = p;
+    }
+    x->out_cap = nc;
+    return 0;
+}
+
 /* Первый проход по выходу: вид, общие поля, ключи вида (разбор — у вида), настройка группы.
  * Ссылки на другие выходы (over, members, default) — во втором проходе: цель может стоять ниже. */
 static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *val) {
     struct spec *s = x->s;
-    if (s->out_n >= MAX_OUTPUTS) return fail(x, key, "outputs: больше %d выходов", MAX_OUTPUTS);
+    if (v2_room(x, s->out_n + 1) != 0 || spec_reserve_out(s, s->out_n + 1) != 0)
+        return fail(x, key, "недостаточно памяти для спеки (выходов: %zu)", s->out_n + 1);
     size_t idx = s->out_n;
     struct output o;
     memset(&o, 0, sizeof(o));
@@ -689,7 +740,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
                 else if (!strcmp(sv, "balance")) o.grp.pick = PICK_BALANCE;
                 else return fail(x, v, "%s: «%s» — нужен order, latency, manual или balance", w, sv);
             } else if (!strcmp(ks, "members")) {
-                if (items_ok(x, v, w, MAX_MEMBERS)) return -1;
+                if (items_ok(x, v, w)) return -1;
                 if (!n_items(v)) return fail(x, v, "%s: у группы нет членов", w);
                 x->out_members[idx] = v;
             } else if (!strcmp(ks, "default")) {
@@ -724,12 +775,10 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             } else {
                 /* weights — число на каждого члена, по порядку members; сколько членов, станет
                  * известно во втором проходе — там и сверяется длина. */
-                if (items_ok(x, v, w, MAX_MEMBERS)) return -1;
-                for (size_t i2 = 0; i2 < n_items(v); i2++) {
+                if (items_ok(x, v, w)) return -1;
+                for (size_t i2 = 0; i2 < n_items(v); i2++)
                     if (long_of(x, item(v, i2), w, 1, GROUP_WEIGHT_MAX, &lv)) return -1;
-                    o.grp.weight[i2] = (unsigned char)lv;
-                }
-                x->out_weights[idx] = v;
+                x->out_weights[idx] = v;         /* веса ложатся в группу во втором проходе */
                 w_key = kk;
             }
             continue;
@@ -767,7 +816,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         } else if (!strcmp(ks, "transport")) {
             /* Какими транспортами узлов подписки ходить (фильтр, а не замена — довод у
              * vless_cfg.transports в spec.h): одно имя или список. */
-            if (items_ok(x, v, w, TT_COUNT)) return -1;
+            if (items_ok(x, v, w)) return -1;
             if (!n_items(v)) return fail(x, v, "%s: пустой список — ни одного транспорта", w);
             for (size_t i2 = 0; i2 < n_items(v); i2++) {
                 const struct ynode *it = item(v, i2);
@@ -784,7 +833,11 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             k.stream_port = (int)lv;
         } else if (!strcmp(ks, "nodes")) {
             /* Номера — среди ПРИГОДНЫХ узлов подписки, как печатает `steer vless-nodes`. */
-            if (items_ok(x, v, w, MAX_NODE_SEL)) return -1;
+            if (items_ok(x, v, w)) return -1;
+            if (n_items(v)) {
+                k.nodes = (int *)spec_alloc(s, n_items(v) * sizeof(int));
+                if (!k.nodes) return fail(x, v, "%s: недостаточно памяти для спеки", w);
+            }
             for (size_t i2 = 0; i2 < n_items(v); i2++) {
                 const struct ynode *it = item(v, i2);
                 long lv;
@@ -831,13 +884,15 @@ static int group_cycle(const struct spec *s, int at, int *state, int *path, int 
     const struct group_cfg *g = out_group(&s->out[at]);
     for (size_t i = 0; g && i < g->members_n; i++) {
         int m = g->members[i];
-        if (!out_group(&s->out[m])) continue;
+        if (!spec_is_named((unsigned)m) || !out_group(&s->out[m])) continue;   /* безымянные — не группы */
         if (state[m] == 1) { path[depth + 1] = m; *len = depth + 2; return 1; }
         if (!state[m] && group_cycle(s, m, state, path, depth + 1, len)) return 1;
     }
     state[at] = 2;
     return 0;
 }
+
+static int p_outputs_links_tail(struct v2 *x, int *state, int *path, unsigned char *sealed);
 
 /* Второй проход: ссылки выходов друг на друга. */
 static int p_outputs_links(struct v2 *x) {
@@ -849,6 +904,10 @@ static int p_outputs_links(struct v2 *x) {
                         o->over);
         if (!out_group(o)) continue;
         const struct ynode *mn = x->out_members[i];
+        /* Массивы группы (члены, веса, «жив», замеры) — из арены ровно на число членов. */
+        if (group_members_alloc(s, &o->grp, n_items(mn)) != 0)
+            return fail(x, mn, "outputs.%s.members: недостаточно памяти для спеки (%zu членов)",
+                        o->name, n_items(mn));
         for (size_t k = 0; k < n_items(mn); k++) {
             const struct ynode *it = item(mn, k);
             int m = out_idx(s, it->str);
@@ -856,14 +915,14 @@ static int p_outputs_links(struct v2 *x) {
             if (m == (int)i)
                 return fail(x, it, "outputs.%s.members: группа не может быть членом самой себя", o->name);
             for (size_t b = 0; b < o->grp.members_n; b++)
-                if (o->grp.members[b] == m)
+                if (o->grp.members[b] == (unsigned)m)
                     return fail(x, it, "outputs.%s.members: %s указан дважды", o->name, it->str);
-            o->grp.members[o->grp.members_n++] = (unsigned short)m;
+            o->grp.members[o->grp.members_n++] = (unsigned)m;
         }
         const struct ynode *dn = x->out_default[i];
         if (dn) {
             for (size_t b = 0; b < o->grp.members_n; b++)
-                if (!strcmp(s->out[o->grp.members[b]].name, dn->str)) o->grp.def = (int)b;
+                if (!strcmp(spec_out(s, o->grp.members[b])->name, dn->str)) o->grp.def = (int)b;
             if (o->grp.def < 0)
                 return fail(x, dn, "outputs.%s.default: «%s» — не член группы", o->name, dn->str);
             if (o->grp.pick != PICK_MANUAL)
@@ -873,8 +932,29 @@ static int p_outputs_links(struct v2 *x) {
         if (wn && n_items(wn) != o->grp.members_n)
             return fail(x, wn, "outputs.%s.weights: весов %zu, а членов %zu — по весу на каждого члена, "
                         "по порядку members", o->name, n_items(wn), o->grp.members_n);
+        for (size_t k = 0; wn && k < n_items(wn); k++) {
+            long lv = 0;
+            ynode_long(item(wn, k), &lv);        /* значение уже проверено в первом проходе */
+            o->grp.weight[k] = (unsigned char)lv;
+        }
     }
-    int state[MAX_OUTPUTS] = {0}, path[MAX_OUTPUTS + 1], len = 0;
+    int *state = calloc(s->out_n ? s->out_n : 1, sizeof(int));
+    int *path = malloc((s->out_n + 1) * sizeof(int));
+    unsigned char *sealed = calloc(s->out_n ? s->out_n : 1, 1);
+    if (!state || !path || !sealed) {
+        free(state); free(path); free(sealed);
+        return fail(x, NULL, "недостаточно памяти для проверки спеки");
+    }
+    int rc = p_outputs_links_tail(x, state, path, sealed);
+    free(state); free(path); free(sealed);
+    return rc;
+}
+
+/* Второй проход, продолжение: круги в группах, члены без устройства, донор IPv6, замыкание групп.
+ * Рабочие массивы приходят от p_outputs_links и живут по числу выходов. */
+static int p_outputs_links_tail(struct v2 *x, int *state, int *path, unsigned char *sealed) {
+    struct spec *s = x->s;
+    int len = 0;
     for (size_t i = 0; i < s->out_n; i++) {
         if (!out_group(&s->out[i]) || state[i]) continue;
         if (group_cycle(s, (int)i, state, path, 0, &len)) {
@@ -897,7 +977,7 @@ static int p_outputs_links(struct v2 *x) {
         if (!out_group(o)) continue;
         const struct ynode *mn = x->out_members[i];
         for (size_t k = 0; k < o->grp.members_n; k++) {
-            const struct output *m = &s->out[o->grp.members[k]];
+            const struct output *m = spec_out(s, o->grp.members[k]);
             if (!out_group(m) && !out_has_device(m))
                 return fail(x, item(mn, k), "outputs.%s.members: %s — kind: %s, у него нет устройства, "
                             "выбирать группе нечего", o->name, m->name, out_kind_name(m));
@@ -922,7 +1002,6 @@ static int p_outputs_links(struct v2 *x) {
      * члены-группы уже замкнуты, и так до конца. Свойства внешней — пересечение свойств членов, и у
      * вложенной они обязаны быть посчитаны раньше; круги отвергнуты выше, так что каждый круг
      * этого цикла замыкает хотя бы одну группу. */
-    unsigned char sealed[MAX_OUTPUTS] = {0};
     for (int progress = 1; progress; ) {
         progress = 0;
         for (size_t i = 0; i < s->out_n; i++) {
@@ -931,13 +1010,13 @@ static int p_outputs_links(struct v2 *x) {
             int ready = 1;
             for (size_t k = 0; k < o->grp.members_n; k++) {
                 size_t m = o->grp.members[k];
-                if (m < MAX_OUTPUTS && out_group(&s->out[m]) && !sealed[m]) ready = 0;
+                if (spec_is_named(m) && out_group(&s->out[m]) && !sealed[m]) ready = 0;
             }
             if (!ready) continue;
             if (group_seal(s, o, x->e) != 0) return wrap(x, x->out_key[i]);
             /* Активное устройство до первого прохода сторожа — лист первого по предпочтению члена
              * (у вложенной группы — её собственное такое же, так же делает перевод v1 у пула). */
-            snprintf(o->device, sizeof(o->device), "%s", s->out[o->grp.members[0]].device);
+            snprintf(o->device, sizeof(o->device), "%s", spec_out(s, o->grp.members[0])->device);
             sealed[i] = 1;
             progress = 1;
         }
@@ -948,10 +1027,10 @@ static int p_outputs_links(struct v2 *x) {
 /* Есть ли среди выбора группы (сама она или вложенные по цепочке) pick: balance. */
 static int reaches_balance(const struct spec *s, const struct output *o, int depth) {
     const struct group_cfg *g = out_group(o);
-    if (!g || depth > MAX_OUTPUTS) return 0;
+    if (!g || (size_t)depth > s->out_n) return 0;      /* группы без кругов вкладываются не глубже, чем их всего */
     if (g->pick == PICK_BALANCE) return 1;
     for (size_t k = 0; k < g->members_n; k++)
-        if (g->members[k] < MAX_OUTPUTS && reaches_balance(s, &s->out[g->members[k]], depth + 1))
+        if (spec_is_named(g->members[k]) && reaches_balance(s, &s->out[g->members[k]], depth + 1))
             return 1;
     return 0;
 }
@@ -960,9 +1039,11 @@ static int reaches_balance(const struct spec *s, const struct output *o, int dep
 
 /* Список адресов IP (`ips`, `bootstrap`): не больше MAX_DNS_IPS, каждый — адрес IPv4 или IPv6. */
 static int ips_of(struct v2 *x, const struct ynode *n, const char *where,
-                  char (*dst)[46], unsigned char *cnt) {
-    if (items_ok(x, n, where, MAX_DNS_IPS)) return -1;
+                  char (**dstp)[46], size_t *cnt) {
+    if (items_ok(x, n, where)) return -1;
     size_t k = n_items(n);
+    char (*dst)[46] = k ? (char (*)[46])spec_alloc(x->s, k * sizeof(*dst)) : NULL;
+    if (k && !dst) return fail(x, n, "%s: недостаточно памяти для спеки", where);
     for (size_t i = 0; i < k; i++) {
         const struct ynode *it = item(n, i);
         struct in6_addr a;
@@ -971,7 +1052,8 @@ static int ips_of(struct v2 *x, const struct ynode *n, const char *where,
         if (strlen(it->str) >= 46) return fail(x, it, "%s: адрес слишком длинный", where);
         snprintf(dst[i], 46, "%s", it->str);
     }
-    *cnt = (unsigned char)k;
+    *dstp = dst;
+    *cnt = k;
     return 0;
 }
 
@@ -1013,9 +1095,9 @@ static int p_dns_up(struct v2 *x, const struct ynode *val, const char *where, co
     }
     const struct ynode *in = ynode_get(val, "ips"), *bn = ynode_get(val, "bootstrap");
     snprintf(w, sizeof(w), "%s.ips", where);
-    if (in && ips_of(x, in, w, u->ips, &u->ips_n)) return -1;
+    if (in && ips_of(x, in, w, &u->ips, &u->ips_n)) return -1;
     snprintf(w, sizeof(w), "%s.bootstrap", where);
-    if (bn && ips_of(x, bn, w, u->boot, &u->boot_n)) return -1;
+    if (bn && ips_of(x, bn, w, &u->boot, &u->boot_n)) return -1;
     return 0;
 }
 
@@ -1057,14 +1139,15 @@ static int p_dns(struct v2 *x, const struct ynode *n) {
         if (s->dns.ttl_min > s->dns.ttl_max)
             return fail(x, v, "dns.cache_ttl: min (%ld) больше max (%ld)", s->dns.ttl_min, s->dns.ttl_max);
     }
-    if ((v = ynode_get(n, "bootstrap")) && ips_of(x, v, "dns.bootstrap", s->dns.boot, &s->dns.boot_n))
+    if ((v = ynode_get(n, "bootstrap")) && ips_of(x, v, "dns.bootstrap", &s->dns.boot, &s->dns.boot_n))
         return -1;
     if ((v = ynode_get(n, "upstreams"))) {
         if (want_map(x, v, "dns.upstreams")) return -1;
         for (size_t i = 0; i < ynode_len(v); i++) {
             const struct ynode *key = ynode_key_at(v, i), *val = ynode_val_at(v, i);
-            if (s->dns.up_n >= MAX_DNS_UP)
-                return fail(x, key, "dns.upstreams: больше %d апстримов", MAX_DNS_UP);
+            if (spec_reserve_up(s, s->dns.up_n + 1))
+                return fail(x, key, "dns.upstreams: недостаточно памяти для спеки (%zu апстримов)",
+                            s->dns.up_n + 1);
             char nm[32], where[64];
             if (name_of(x, key, "dns.upstreams", nm)) return -1;
             for (size_t k = 0; k < s->dns.up_n; k++)
@@ -1084,7 +1167,7 @@ static int p_dns(struct v2 *x, const struct ynode *n) {
         size_t u = 0;
         while (u < s->dns.up_n && strcmp(s->dns.up[u].name, sv)) u++;
         if (u == s->dns.up_n) return fail(x, v, "dns.upstream: апстрима «%s» нет в dns.upstreams", sv);
-        s->dns.general = (unsigned char)(u + 1);
+        s->dns.general = (unsigned)(u + 1);
     }
     return 0;
 }
@@ -1118,26 +1201,39 @@ static int merge_lists(struct v2 *x, struct spec_rule *r, const struct ynode *tn
               "правилам", rn);
         return 0;
     }
-    if (s->list_n >= MAX_LISTS)
-        return fail(x, tn, "правило %s: списков вместе с объединёнными больше %d", rn, MAX_LISTS);
+    if (spec_reserve_list(s, s->list_n + 1) != 0)
+        return fail(x, tn, "правило %s: недостаточно памяти для спеки (списков: %zu)", rn, s->list_n + 1);
+    a = &s->list[r->lists[0]];      /* массив мог переехать при росте */
     struct spec_list *m = &s->list[s->list_n];
     memset(m, 0, sizeof(*m));
     m->l4 = a->l4;
+    /* Массивы объединения — ровно по сумме файлов входящих списков. */
+    size_t ns = 0, np = 0, nd = 0;
     for (size_t i = 0; i < r->lists_n; i++) {
         const struct spec_list *b = &s->list[r->lists[i]];
-        if (m->srs_n + b->srs_n > MAX_FILES || m->prefixes_n + b->prefixes_n > MAX_FILES ||
-            m->domains_n + b->domains_n > MAX_FILES)
-            return fail(x, tn, "правило %s: файлов одного вида в списках правила больше %d", rn, MAX_FILES);
-        memcpy(m->srs_files + m->srs_n, b->srs_files, b->srs_n * sizeof(b->srs_files[0]));
+        ns += b->srs_n;
+        np += b->prefixes_n;
+        nd += b->domains_n;
+    }
+    m->srs_files = ns ? (const char **)spec_alloc(s, ns * sizeof(*m->srs_files)) : NULL;
+    m->prefixes_files = np ? (const char **)spec_alloc(s, np * sizeof(*m->prefixes_files)) : NULL;
+    m->domains_files = nd ? (const char **)spec_alloc(s, nd * sizeof(*m->domains_files)) : NULL;
+    if ((ns && !m->srs_files) || (np && !m->prefixes_files) || (nd && !m->domains_files))
+        return fail(x, tn, "правило %s: недостаточно памяти для спеки", rn);
+    for (size_t i = 0; i < r->lists_n; i++) {
+        const struct spec_list *b = &s->list[r->lists[i]];
+        if (b->srs_n) memcpy(m->srs_files + m->srs_n, b->srs_files, b->srs_n * sizeof(b->srs_files[0]));
         m->srs_n += b->srs_n;
-        memcpy(m->prefixes_files + m->prefixes_n, b->prefixes_files,
-               b->prefixes_n * sizeof(b->prefixes_files[0]));
+        if (b->prefixes_n)
+            memcpy(m->prefixes_files + m->prefixes_n, b->prefixes_files,
+                   b->prefixes_n * sizeof(b->prefixes_files[0]));
         m->prefixes_n += b->prefixes_n;
-        memcpy(m->domains_files + m->domains_n, b->domains_files,
-               b->domains_n * sizeof(b->domains_files[0]));
+        if (b->domains_n)
+            memcpy(m->domains_files + m->domains_n, b->domains_files,
+                   b->domains_n * sizeof(b->domains_files[0]));
         m->domains_n += b->domains_n;
     }
-    r->lists[0] = (unsigned char)s->list_n++;
+    r->lists[0] = (unsigned)s->list_n++;
     r->lists_n = 1;
     return 0;
 }
@@ -1157,12 +1253,23 @@ static int merge_clients(struct v2 *x, struct spec_rule *r, const struct ynode *
               "их по правилам", rn);
         return 0;
     }
-    if (s->client_n >= MAX_CLIENTS)
-        return fail(x, fn, "правило %s: клиентов вместе с объединёнными больше %d", rn, MAX_CLIENTS);
+    if (spec_reserve_client(s, s->client_n + 1) != 0 ||
+        spec_grow((void **)&x->cl, &x->cl_cap, s->client_n + 1, sizeof(*x->cl)) != 0)
+        return fail(x, fn, "правило %s: недостаточно памяти для спеки (клиентов: %zu)", rn,
+                    s->client_n + 1);
+    a = &x->cl[r->clients[0]];      /* массив мог переехать при росте */
     struct spec_client *m = &s->client[s->client_n];
     memset(m, 0, sizeof(*m));
     struct v2_client *mf = &x->cl[s->client_n];
     *mf = *a;
+    /* Записей объединения не больше суммы записей входящих клиентов; лишнее (повторы) остаётся
+     * неиспользованным хвостом куска. */
+    size_t total = 0;
+    for (size_t i = 0; i < r->clients_n; i++) total += s->client[r->clients[i]].from_n;
+    if (total) {
+        m->from = (char (*)[64])spec_alloc(s, total * sizeof(*m->from));
+        if (!m->from) return fail(x, fn, "правило %s: недостаточно памяти для спеки", rn);
+    }
     for (size_t i = 0; i < r->clients_n; i++) {
         const struct spec_client *b = &s->client[r->clients[i]];
         if (!x->cl[r->clients[i]].hosts) mf->hosts = 0;
@@ -1170,12 +1277,10 @@ static int merge_clients(struct v2 *x, struct spec_rule *r, const struct ynode *
             size_t d = 0;
             while (d < m->from_n && strcmp(m->from[d], b->from[k])) d++;
             if (d < m->from_n) continue;
-            if (m->from_n >= MAX_FROM)
-                return fail(x, fn, "правило %s: у клиентов правила больше %d записей", rn, MAX_FROM);
             memcpy(m->from[m->from_n++], b->from[k], sizeof(m->from[0]));
         }
     }
-    r->clients[0] = (unsigned char)s->client_n++;
+    r->clients[0] = (unsigned)s->client_n++;
     r->clients_n = 1;
     return 0;
 }
@@ -1184,7 +1289,8 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
     struct spec *s = x->s;
     static const char *const K[] = { "name", "for", "to", "out", "resolve", "dns", "enabled", "scope",
                                      NULL };
-    if (s->rule_n >= MAX_RULES) return fail(x, n, "rules: больше %d правил", MAX_RULES);
+    if (spec_reserve_rule(s, s->rule_n + 1) != 0)
+        return fail(x, n, "rules: недостаточно памяти для спеки (правил: %zu)", s->rule_n + 1);
     struct spec_rule *r = &s->rule[s->rule_n];
     memset(r, 0, sizeof(*r));
     char where[64];
@@ -1212,8 +1318,10 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
     snprintf(w, sizeof(w), "правило %s: to", rn);
     const struct ynode *tn = ynode_get(n, "to");
     if (!tn) return fail(x, n, "правило %s: нет to — списки из lists или all (весь трафик)", rn);
-    if (items_ok(x, tn, w, MAX_RULE_REFS)) return -1;
+    if (items_ok(x, tn, w)) return -1;
     if (!n_items(tn)) return fail(x, tn, "правило %s: to пустой — списки из lists или all", rn);
+    r->lists = (unsigned *)spec_alloc(s, n_items(tn) * sizeof(unsigned));
+    if (!r->lists) return fail(x, tn, "правило %s: недостаточно памяти для спеки", rn);
     int all = 0;
     for (size_t i = 0; i < n_items(tn); i++) {
         const struct ynode *it = item(tn, i);
@@ -1221,8 +1329,8 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
         int li = list_idx(s, x->lists_named, it->str);
         if (li < 0) return fail(x, it, "правило %s: списка «%s» нет в lists", rn, it->str);
         for (size_t b = 0; b < r->lists_n; b++)
-            if (r->lists[b] == li) return fail(x, it, "правило %s: список %s указан дважды", rn, it->str);
-        r->lists[r->lists_n++] = (unsigned char)li;
+            if ((int)r->lists[b] == li) return fail(x, it, "правило %s: список %s указан дважды", rn, it->str);
+        r->lists[r->lists_n++] = (unsigned)li;
     }
     if (all && n_items(tn) > 1)
         return fail(x, tn, "правило %s: all — весь трафик; другие списки рядом с ним ничего не значат", rn);
@@ -1231,16 +1339,20 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
     int lan = 0;
     if (fn) {
         snprintf(w, sizeof(w), "правило %s: for", rn);
-        if (items_ok(x, fn, w, MAX_RULE_REFS)) return -1;
+        if (items_ok(x, fn, w)) return -1;
+        if (n_items(fn)) {
+            r->clients = (unsigned *)spec_alloc(s, n_items(fn) * sizeof(unsigned));
+            if (!r->clients) return fail(x, fn, "правило %s: недостаточно памяти для спеки", rn);
+        }
         for (size_t i = 0; i < n_items(fn); i++) {
             const struct ynode *it = item(fn, i);
             if (!strcmp(it->str, "lan")) { lan = 1; continue; }
             int ci = client_idx(s, x->clients_named, it->str);
             if (ci < 0) return fail(x, it, "правило %s: клиента «%s» нет в clients", rn, it->str);
             for (size_t b = 0; b < r->clients_n; b++)
-                if (r->clients[b] == ci)
+                if ((int)r->clients[b] == ci)
                     return fail(x, it, "правило %s: клиент %s указан дважды", rn, it->str);
-            r->clients[r->clients_n++] = (unsigned char)ci;
+            r->clients[r->clients_n++] = (unsigned)ci;
         }
         if (lan && n_items(fn) > 1)
             return fail(x, fn, "правило %s: lan — клиенты по умолчанию; с другими клиентами в одном for "
@@ -1260,20 +1372,21 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
         if (v->kind == YN_MAP) {
             /* Свой сервер прямо в правиле: тот же набор ключей, что у dns.upstreams. Имя ему
              * даёт правило (для status и журнала). */
-            if (s->dns.up_n >= MAX_DNS_UP)
-                return fail(x, v, "%s: больше %d апстримов вместе с dns.upstreams", w, MAX_DNS_UP);
+            if (spec_reserve_up(s, s->dns.up_n + 1))
+                return fail(x, v, "%s: недостаточно памяти для спеки (%zu апстримов)", w,
+                            s->dns.up_n + 1);
             struct spec_dns_up *u = &s->dns.up[s->dns.up_n];
             if (p_dns_up(x, v, w, rn, u)) return -1;
             u->inl = 1;
             if (!up_has_way(s, u))
                 return fail(x, v, "%s: имя «%s» нечем разрешить — задайте ips или bootstrap", w, u->host);
-            r->dns = (unsigned char)(++s->dns.up_n);
+            r->dns = (unsigned)(++s->dns.up_n);
         } else {
             if (str_of(x, v, w, &sv)) return -1;
             size_t u = 0;
             while (u < s->dns.up_n && strcmp(s->dns.up[u].name, sv)) u++;
             if (u == s->dns.up_n) return fail(x, v, "правило %s: апстрима «%s» нет в dns.upstreams", rn, sv);
-            r->dns = (unsigned char)(u + 1);
+            r->dns = (unsigned)(u + 1);
         }
     }
     if ((v = ynode_get(n, "enabled"))) {
@@ -1291,9 +1404,9 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
     }
 
     /* Ссылки на клиентов правила до объединения — для проверок ниже. */
-    unsigned char refs[MAX_RULE_REFS];
     size_t refs_n = r->clients_n;
-    memcpy(refs, r->clients, sizeof(refs));
+    unsigned *refs = refs_n ? (unsigned *)spec_memdup(s, r->clients, refs_n * sizeof(unsigned)) : NULL;
+    if (refs_n && !refs) return fail(x, n, "правило %s: недостаточно памяти для спеки", rn);
     if (r->lists_n > 1 && merge_lists(x, r, tn, rn)) return -1;
     if (r->clients_n > 1 && merge_clients(x, r, fn, rn)) return -1;
 
@@ -1334,10 +1447,23 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
 
 /* ---- документ ----------------------------------------------------------------------------- */
 
+static struct v2 x;
+static int v2_parse_doc(const struct ydoc *d, struct spec *s, struct err *e);
+
 int spec_parse_v2(const struct ydoc *d, struct spec *s, struct err *e) {
-    /* static: struct v2 — десятки указателей на узлы на каждый выход и клиента, а разбор идёт
-     * по разу на процесс (стек помощника на телефоне беречь, как у v1). */
-    static struct v2 x;
+    int rc = v2_parse_doc(d, s, e);
+    /* Рабочие массивы разбора (узлы выходов, признаки клиентов) — по числу записей спеки; отдаются
+     * здесь, на любом из выходов с отказом. */
+    free(x.out_key); free(x.out_over); free(x.out_members); free(x.out_default);
+    free(x.out_weights); free(x.out_ipv6); free(x.out_prefix); free(x.cl);
+    memset(&x, 0, sizeof(x));
+    if (rc == 0) rc = check_mark_slots(s, e);
+    return rc;
+}
+
+static int v2_parse_doc(const struct ydoc *d, struct spec *s, struct err *e) {
+    /* x — файловый static (объявлен выше): struct v2 маленький, но его массивы растут, и
+     * обёртка отдаёт их на любом из выходов с отказом. */
     memset(&x, 0, sizeof(x));
     x.d = d;
     x.s = s;
@@ -1382,7 +1508,7 @@ int spec_parse_v2(const struct ydoc *d, struct spec *s, struct err *e) {
     /* Петля в локальную сеть, устройство дважды в группе, подложка — общие с v1 (check.c). */
     int bad = -1;
     if (spec_check_outputs(s, "over", &bad, e) != 0)
-        return bad >= 0 && bad < MAX_OUTPUTS && x.out_key[bad] ? wrap(&x, x.out_key[bad]) : -1;
+        return bad >= 0 && (size_t)bad < s->out_n && x.out_key[bad] ? wrap(&x, x.out_key[bad]) : -1;
     if (x.un_node)
         return fail(&x, x.un_node, "ещё не поддерживается в этой версии движка: %s", x.un_what);
     return 0;

@@ -48,7 +48,7 @@
  * элементы по имени набора (g_print_seed, ir.h).
  *
  * ПАМЯТЬ И ВРЕМЯ. Правила всех каналов — как у резолвера при запуске (списки имён целиком, до
- * MAX_RULE_LINES строк на набор), плюс записи файла состояния. Только в процессе загрузки (ребёнок
+ * сколько в них строк), плюс записи файла состояния. Только в процессе загрузки (ребёнок
  * демона apply-commit или подкоманда), только когда в спеке есть канал fake-IP и файл состояния
  * не пуст, и освобождается сразу после печати (fpseed_free). Правила каналов real-ip тоже
  * читаются: без них dch_all_v6 не знает, есть ли среди совпавших канал без IPv6. */
@@ -67,7 +67,8 @@ struct fps_vec {
     size_t out_n;
 };
 
-static struct fps_vec g_fps[MAX_RULES][2];      /* [канал][0 — IPv4, 1 — IPv6] */
+static struct fps_vec (*g_fps)[2];              /* [канал][0 — IPv4, 1 — IPv6]; по числу каналов */
+static size_t g_fps_n;
 static const struct l4match **g_l4;
 static size_t g_l4_n, g_l4_cap;
 static int g_rules_loaded;
@@ -158,12 +159,14 @@ static void fakeip_table_drop(void) {
 }
 
 void fpseed_free(void) {
-    for (size_t i = 0; i < MAX_RULES; i++)
+    for (size_t i = 0; i < g_fps_n; i++)
         for (int f = 0; f < 2; f++) {
             free(g_fps[i][f].b);
             free(g_fps[i][f].out);
-            memset(&g_fps[i][f], 0, sizeof(g_fps[i][f]));
         }
+    free(g_fps);
+    g_fps = NULL;
+    g_fps_n = 0;
     free(g_l4);
     g_l4 = NULL;
     g_l4_n = g_l4_cap = 0;
@@ -173,6 +176,9 @@ void fpseed_free(void) {
             dch_parts_free(g_dch[i].parts, g_dch[i].parts_n);
             g_dch[i].parts = NULL;
             g_dch[i].parts_n = 0;
+            free(g_dch[i].rules_path);              /* массив путей; сами строки — взаймы у спеки */
+            g_dch[i].rules_path = NULL;
+            g_dch[i].rules_n = g_dch[i].rules_cap = 0;
         }
         g_dch_n = 0;
         g_rules_loaded = 0;
@@ -200,27 +206,32 @@ int fpseed_build(const struct spec *sp, const char *path) {
         g_dch[i].parts_n = parts_n;
         g_dch[i].composite = composite;
     }
-    size_t nch = g_dch_n < 64 ? g_dch_n : 64;
+    size_t nch = g_dch_n;
+    if (nch) {
+        g_fps = calloc(nch, sizeof(*g_fps));
+        if (!g_fps) goto oom;
+        g_fps_n = nch;
+    }
     for (size_t k = 0; k < g_fakeip.n; k++) {
         const struct fakeip_entry *e = &g_fakeip.entries[k];
         /* Каналы — ровно как у fakeip_rehydrate: все совпавшие каналы fake-IP (не первый: имя,
          * названное в двух правилах, обязано лечь в оба набора — порядок цепочки решает, кто
          * заберёт пакет), половина IPv6 — у имени с настоящим IPv6 и только если все совпавшие
          * каналы несут IPv6. */
-        uint64_t all = dch_match_mask(e->domain);
-        uint64_t m = dch_fakeip_only(all);
+        chm_t all = dch_match_mask(e->domain);
+        chm_t m = dch_fakeip_only(all);
         if (!m) continue;
-        uint64_t m6 = e->has_real6 && dch_all_v6(all) ? m : 0;
+        chm_t m6 = e->has_real6 && dch_all_v6(all) ? m : 0;
         unsigned char a4[16], a6[16];
         uint32_t n4 = htonl(e->addr);
         memcpy(a4, &n4, 4);
         fakeip6_of(e->addr, a6);
         for (size_t c = 0; c < nch; c++) {
-            if (!(m & (1ULL << c))) continue;
+            if (!chm_has(m, c)) continue;
             size_t off = 0, n = 0;
             if (g_dch[c].composite && l4_of(&g_dch[c], e->domain, &off, &n) != 0) goto oom;
             if (fps_push(&g_fps[c][0], a4, 4, off, n) != 0) goto oom;
-            if ((m6 & (1ULL << c)) && (g_dch[c].fam & DCH_V6) &&
+            if (chm_has(m6, c) && (g_dch[c].fam & DCH_V6) &&
                 fps_push(&g_fps[c][1], a6, 16, off, n) != 0)
                 goto oom;
         }
@@ -236,7 +247,7 @@ oom:
 
 size_t fpseed_els(const char *set, int fam, const struct ir_seed **out) {
     size_t sl = strlen(set);
-    for (size_t c = 0; c < g_dch_n && c < 64; c++) {
+    for (size_t c = 0; c < g_dch_n && c < g_fps_n; c++) {
         if (g_dch[c].realip) continue;
         const char *d = g_dch[c].set;
         size_t dl = strlen(d);

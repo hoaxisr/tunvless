@@ -48,7 +48,7 @@
 /* Состав помощников по спеке — в ДОЧЕРНЕМ процессе (довод в шапке), назад — записями struct
  * helper по трубе: ребёнок — копия этого же процесса без exec, раскладка у них одна. -1 — спека не
  * разобралась. */
-static int sup_list(const char *spec, struct helper *out, size_t *n) {
+static int sup_list(const char *spec, struct helper **outp, size_t *n) {
     int pfd[2];
     if (pipe(pfd) != 0) return -1;
     pid_t pid = fork();
@@ -65,9 +65,11 @@ static int sup_list(const char *spec, struct helper *out, size_t *n) {
          * и есть отдельная точка входа — он живёт в своём адресном пространстве и больше
          * ничего с родителем не делит. */
         static struct spec cfg;
-        static struct helper h[HELPERS_MAX];
         struct err e = {0};
         if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
+        /* Помощников не больше выходов спеки (по одному на выход со своим процессом). */
+        struct helper *h = calloc(cfg.out_n + 1, sizeof(*h));
+        if (!h) _exit(1);
         /* Метки выходов — из реестра: без них out_underlay_mark в подписи вернул бы «мимо
          * каналов» при любой цели, и смена метки цели не была бы видна. Только при via (и у
          * помощника, которому метки нужны сами, — очередь zapret) — у спеки без них реестр здесь
@@ -76,10 +78,10 @@ static int sup_list(const char *spec, struct helper *out, size_t *n) {
         int marks = 0, need = 0;
         for (size_t i = 0; i < cfg.out_n; i++)
             if (cfg.out[i].over[0]) { if (registry_assign(&cfg, &e) < 0) err_die(&e); marks = 1; break; }
-        size_t k = helpers_plan(&cfg, h, HELPERS_MAX, &need);
+        size_t k = helpers_plan(&cfg, h, cfg.out_n + 1, &need);
         if (need && !marks) {
             if (registry_assign(&cfg, &e) < 0) err_die(&e);
-            k = helpers_plan(&cfg, h, HELPERS_MAX, NULL);
+            k = helpers_plan(&cfg, h, cfg.out_n + 1, NULL);
         }
         if (fwrite(&k, sizeof(k), 1, w) != 1 || (k && fwrite(h, sizeof(h[0]), k, w) != k)) _exit(1);
         if (fclose(w) != 0) _exit(1);
@@ -88,12 +90,19 @@ static int sup_list(const char *spec, struct helper *out, size_t *n) {
     close(pfd[1]);
     FILE *r = fdopen(pfd[0], "r");
     size_t k = 0;
-    int ok = r && fread(&k, sizeof(k), 1, r) == 1 && k <= HELPERS_MAX &&
-             (!k || fread(out, sizeof(out[0]), k, r) == k);
+    struct helper *out = NULL;
+    /* Число записей приходит первым; место под них — по нему (не по константе). Потолок числа —
+     * разумная защита от испорченной трубы: записей больше миллиона быть не может. */
+    int ok = r && fread(&k, sizeof(k), 1, r) == 1 && k <= (1u << 20);
+    if (ok && k) {
+        out = calloc(k, sizeof(*out));
+        ok = out && fread(out, sizeof(out[0]), k, r) == k;
+    }
     if (r) fclose(r); else close(pfd[0]);
     int st = 0;
     while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
-    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0 || !ok) return -1;
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0 || !ok) { free(out); return -1; }
+    *outp = out;
     *n = k;
     return 0;
 }
@@ -142,10 +151,17 @@ int cmd_supervise(const char *spec) {
     sigprocmask(SIG_BLOCK, &set, NULL);
 
     static struct helper_set hs;
-    static struct helper fresh[HELPERS_MAX];
     struct sup_run run = { exe, self, spec, seam && *seam, &set };
-    if (sup_list(spec, hs.h, &hs.n) != 0)
-        die("supervise: спека %s не разобралась — поднимать нечего", spec);
+    {
+        struct helper *first = NULL;
+        size_t fn0 = 0;
+        if (sup_list(spec, &first, &fn0) != 0)
+            die("supervise: спека %s не разобралась — поднимать нечего", spec);
+        if (fn0 && helpers_reserve(&hs, fn0) != 0) die("supervise: нет памяти под помощников", NULL);
+        if (fn0) memcpy(hs.h, first, fn0 * sizeof(*first));
+        hs.n = fn0;
+        free(first);
+    }
     if (!hs.n) fprintf(stderr, "steer[info] supervise: выходов со своим процессом в спеке нет\n");
 
     for (;;) {
@@ -166,11 +182,13 @@ int cmd_supervise(const char *spec) {
             helpers_compact(&hs);
         } else if (sig == SIGHUP) {
             size_t fn = 0;
-            if (sup_list(spec, fresh, &fn) != 0) {
+            struct helper *fresh = NULL;
+            if (sup_list(spec, &fresh, &fn) != 0) {
                 fprintf(stderr, "steer[warn] supervise: спека не разобралась — состав прежний\n");
                 continue;
             }
             helpers_merge(&hs, fresh, fn);
+            free(fresh);
             helpers_compact(&hs);
         } else {                                       /* SIGTERM, SIGINT */
             helpers_stop(&hs, 0);

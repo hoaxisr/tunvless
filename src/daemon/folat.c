@@ -111,12 +111,16 @@ void folat_rec_put(struct fo_store *st, const char *out, const struct output *co
 
 /* ---- замер члена ----------------------------------------------------------------------------- */
 
-int folat_want_v6(const struct spec *sp, const struct output *go, unsigned alive) {
+int folat_want_v6(const struct spec *sp, const struct output *go, const unsigned char *alive) {
     const struct group_cfg *g = out_group(go);
     if (!g || !group_named(g) || !alive) return 0;
+    int any = 0;
     for (size_t k = 0; k < g->members_n; k++)
-        if (((alive >> k) & 1u) && !out_route6(&sp->out[g->members[k]])) return 0;
-    return 1;
+        if (alive[k]) {
+            any = 1;
+            if (!out_route6(spec_out(sp, g->members[k]))) return 0;
+        }
+    return any;
 }
 
 void folat_score(const int *ms4, const int *ms6, size_t n, int v6, int *score) {
@@ -165,7 +169,7 @@ struct folat_m *folat_member(struct loop *l, const struct spec *sp, const struct
     if (g_latency_probe) { *ms4 = g_latency_probe(sp, go, dev); *ms6 = -2; return NULL; }
     if (!device_present(dev)) return NULL;
     const struct group_cfg *g = out_group(go);
-    uint32_t mark = m && m >= sp->out && m < sp->out + MAX_OUTPUTS ? m->mark : 0;
+    uint32_t mark = m && spec_out_idx(sp, m) != (size_t)-1 ? m->mark : 0;
     const struct output *o = out_for_device(sp, m && mark ? m : go, dev);
     const struct kind_ops *k = kind_of(o);
     /* Своя мера у вида (xsteer не меряется: его путь — хаб, а не выход в интернет). */
@@ -219,18 +223,47 @@ struct fl_grp {
     /* Идущий замер: ключи членов на момент начала (сверка в конце), кого мерить, итоги. */
     int running;
     size_t n, k;
-    char key[MAX_MEMBERS][32];
-    unsigned todo;
+    /* По числу членов на момент начала замера (fl_alloc): раньше — массивы на 16. */
+    char (*key)[32];
+    unsigned char *todo;              /* по байту на члена: мерить ли */
     int v6;
-    int ms4[MAX_MEMBERS], ms6[MAX_MEMBERS];
+    int *ms4, *ms6;
     struct folat_m *fm;
 };
 
+/* Группы расписания — по указателю на каждую: таймер держит адрес своей группы, и он не должен
+ * переезжать, когда массив растёт. */
 struct folat {
     struct folat_conf c;
-    struct fl_grp g[MAX_OUTPUTS];
+    struct fl_grp **g;
+    size_t g_n, g_cap;
     unsigned long rounds;
 };
+
+/* Массивы замера на n членов. 0 — есть; -1 — нет памяти. */
+static int fl_alloc(struct fl_grp *g, size_t n) {
+    free(g->key); free(g->todo); free(g->ms4); free(g->ms6);
+    g->key = NULL; g->todo = NULL; g->ms4 = g->ms6 = NULL;
+    if (!n) return 0;
+    g->key = calloc(n, sizeof(*g->key));
+    g->todo = calloc(n, 1);
+    g->ms4 = calloc(n, sizeof(int));
+    g->ms6 = calloc(n, sizeof(int));
+    return g->key && g->todo && g->ms4 && g->ms6 ? 0 : -1;
+}
+
+/* Кандидаты группы go — массив в куче (free вызывающему); *n — сколько. NULL при n == 0 и без
+ * памяти (тогда *n == 0). */
+static const struct output **fl_cands(const struct spec *sp, const struct output *go, size_t *n) {
+    size_t c = out_members_n(sp, go);
+    *n = 0;
+    if (!c) return NULL;
+    const struct output **v = malloc(c * sizeof(*v));
+    if (!v) return NULL;
+    for (size_t k = 0; k < c; k++) v[k] = out_member(sp, go, k);
+    *n = c;
+    return v;
+}
 
 /* Группа по имени в спеке прямо сейчас — только latency с двумя членами и больше. */
 static const struct output *fl_group(const struct spec *sp, const char *name) {
@@ -261,9 +294,7 @@ static void fl_abort(struct fl_grp *g) {
 }
 
 /* Члены группы go сейчас те же, что в начале замера? */
-static int fl_same(const struct fl_grp *g, const struct spec *sp, const struct output *go,
-                   const struct output **cand) {
-    size_t n = out_members(sp, go, cand, MAX_MEMBERS);
+static int fl_same(const struct fl_grp *g, const struct output *const *cand, size_t n) {
     if (n != g->n) return 0;
     for (size_t k = 0; k < n; k++)
         if (strcmp(fog_lat_key(cand[k]), g->key[k])) return 0;
@@ -276,15 +307,17 @@ static void fl_finish(struct fl_grp *g) {
     f->rounds++;
     const struct spec *sp = f->c.spec(f->c.arg);
     const struct output *go = fl_group(sp, g->name);
-    const struct output *cand[MAX_MEMBERS];
-    if (!go || !fl_same(g, sp, go, cand)) { fl_rearm(g, go); return; }
+    size_t cn = 0;
+    const struct output **cand = go ? fl_cands(sp, go, &cn) : NULL;
+    if (!go || !cand || !fl_same(g, cand, cn)) { free(cand); fl_rearm(g, go); return; }
     const struct group_cfg *gc = out_group(go);
-    int score[MAX_MEMBERS];
+    int *score = malloc(g->n * sizeof(int));
+    struct folat_rec *rec = malloc(g->n * sizeof(*rec));
+    if (!score || !rec) { free(score); free(rec); free(cand); fl_rearm(g, go); return; }
     folat_score(g->ms4, g->ms6, g->n, g->v6, score);
-    struct folat_rec rec[MAX_MEMBERS];
     long now = mono_s();
     for (size_t k = 0; k < g->n; k++) {
-        int mine = (g->todo >> k) & 1u;
+        int mine = g->todo[k];
         rec[k].ms = mine ? score[k] : -2;
         rec[k].ms4 = mine && g->v6 ? g->ms4[k] : -2;
         rec[k].ms6 = mine && g->v6 ? g->ms6[k] : -2;
@@ -312,6 +345,9 @@ static void fl_finish(struct fl_grp *g) {
     if (cur >= 0 && pick >= 0 && pick != cur &&
         !(score[cur] >= 0 && group_latency_keep(score, cur, pick, tol)) && f->c.kick)
         f->c.kick(f->c.arg, g->name);
+    free(score);
+    free(rec);
+    free(cand);
     fl_rearm(g, go);
 }
 
@@ -330,7 +366,7 @@ static void fl_next(struct fl_grp *g) {
     struct folat *f = g->f;
     while (g->k < g->n) {
         size_t k = g->k;
-        if (!((g->todo >> k) & 1u)) {
+        if (!g->todo[k]) {
             g->ms4[k] = -1;
             g->ms6[k] = g->v6 ? -1 : -2;
             g->k++;
@@ -338,9 +374,16 @@ static void fl_next(struct fl_grp *g) {
         }
         const struct spec *sp = f->c.spec(f->c.arg);
         const struct output *go = fl_group(sp, g->name);
-        const struct output *cand[MAX_MEMBERS];
-        if (!go || !fl_same(g, sp, go, cand)) { g->running = 0; fl_rearm(g, go); return; }
+        size_t cn = 0;
+        const struct output **cand = go ? fl_cands(sp, go, &cn) : NULL;
+        if (!go || !cand || !fl_same(g, cand, cn)) {
+            free(cand);
+            g->running = 0;
+            fl_rearm(g, go);
+            return;
+        }
         const struct output *m = cand[k];
+        free(cand);                       /* m — указатель в спеку, не в этот массив */
         /* Устройство именованного члена — то, что выбрал его проход (запись active; у вложенной
          * группы — её лист); безымянного — его собственное. */
         char dev[32] = "";
@@ -373,20 +416,24 @@ static void fl_timer(struct loop *l, struct loop_timer *t, void *arg) {
     if (!go) return;                          /* ушла — folat_sync снимет слот */
     /* Без трафика через группу замеров нет (idle_timeout) — таймер идёт дальше. */
     if (fog_idle(sp, go, fog_idle_limit(go), f->c.traffic, f->c.arg)) { fl_rearm(g, go); return; }
-    const struct output *cand[MAX_MEMBERS];
-    g->n = out_members(sp, go, cand, MAX_MEMBERS);
-    unsigned alive = 0;
+    size_t cn = 0;
+    const struct output **cand = fl_cands(sp, go, &cn);
+    if (!cand || fl_alloc(g, cn) != 0) { free(cand); fl_rearm(g, go); return; }
+    g->n = cn;
     if (group_named(out_group(go))) {
         /* Живые — по последнему проходу; сторож группу ещё не проходил — мерить некого. */
-        if (!fog_groups_alive(f->c.st, sp, go, &alive) || !alive) { fl_rearm(g, go); return; }
+        int any = 0;
+        if (!fog_groups_alive(f->c.st, sp, go, g->todo)) { free(cand); fl_rearm(g, go); return; }
+        for (size_t k = 0; k < cn; k++) any |= g->todo[k];
+        if (!any) { free(cand); fl_rearm(g, go); return; }
     } else {
-        alive = g->n >= 32 ? ~0u : (1u << g->n) - 1u;
+        memset(g->todo, 1, cn);
     }
     for (size_t k = 0; k < g->n; k++) snprintf(g->key[k], sizeof(g->key[k]), "%s", fog_lat_key(cand[k]));
-    g->todo = alive;
-    g->v6 = folat_want_v6(sp, go, alive);
+    g->v6 = folat_want_v6(sp, go, g->todo);
     g->k = 0;
     g->running = 1;
+    free(cand);
     fl_next(g);
 }
 
@@ -400,22 +447,42 @@ struct folat *folat_new(const struct folat_conf *c) {
 static void fl_free(struct fl_grp *g) {
     fl_abort(g);
     loop_timer_free(g->tm);
+    free(g->key); free(g->todo); free(g->ms4); free(g->ms6);
     memset(g, 0, sizeof(*g));
+}
+
+/* Место в списке групп под ещё одну; слот освобождённой группы (used == 0) берётся снова. */
+static struct fl_grp *fl_slot(struct folat *f) {
+    for (size_t s = 0; s < f->g_n; s++)
+        if (!f->g[s]->used) return f->g[s];
+    if (f->g_n == f->g_cap) {
+        size_t nc = f->g_cap ? f->g_cap * 2 : 8;
+        struct fl_grp **ng = realloc(f->g, nc * sizeof(*ng));
+        if (!ng) return NULL;
+        f->g = ng;
+        f->g_cap = nc;
+    }
+    struct fl_grp *g = calloc(1, sizeof(*g));
+    if (!g) return NULL;
+    f->g[f->g_n++] = g;
+    return g;
 }
 
 void folat_sync(struct folat *f) {
     if (!f) return;
     const struct spec *sp = f->c.spec(f->c.arg);
-    unsigned char seen[MAX_OUTPUTS] = {0};
+    unsigned char *seen = calloc(f->g_n + 1, 1);       /* по слотам, что были до этого вызова */
+    size_t was_n = f->g_n;
+    if (!seen) return;
     for (size_t i = 0; sp && i < sp->out_n; i++) {
         const struct output *go = &sp->out[i];
         if (fl_group(sp, go->name) != go) continue;
-        struct fl_grp *g = NULL, *slot = NULL;
-        for (size_t s = 0; s < MAX_OUTPUTS && !g; s++) {
-            if (f->g[s].used && !strcmp(f->g[s].name, go->name)) g = &f->g[s];
-            else if (!f->g[s].used && !slot) slot = &f->g[s];
-        }
+        struct fl_grp *g = NULL;
+        size_t gi = 0;
+        for (size_t s = 0; s < f->g_n && !g; s++)
+            if (f->g[s]->used && !strcmp(f->g[s]->name, go->name)) { g = f->g[s]; gi = s; }
         if (!g) {
+            struct fl_grp *slot = fl_slot(f);
             if (!slot) continue;
             slot->tm = loop_timer_new(f->c.l, fl_timer, slot);
             if (!slot->tm) continue;
@@ -425,19 +492,26 @@ void folat_sync(struct folat *f) {
             /* Первый замер — проходом (у членов замера ещё нет), дальше — таймером. */
             fl_rearm(slot, go);
             g = slot;
+            for (size_t s = 0; s < f->g_n; s++) if (f->g[s] == slot) gi = s;
         } else if (!g->running && !loop_timer_armed(g->tm)) {
             fl_rearm(g, go);
         }
-        seen[g - f->g] = 1;
+        if (gi < was_n) seen[gi] = 1;
     }
-    for (size_t s = 0; s < MAX_OUTPUTS; s++)
-        if (f->g[s].used && !seen[s]) fl_free(&f->g[s]);
+    for (size_t s = 0; s < was_n; s++)
+        if (f->g[s]->used && !seen[s]) fl_free(f->g[s]);
+    free(seen);
 }
 
 void folat_stop(struct folat *f) {
     if (!f) return;
-    for (size_t s = 0; s < MAX_OUTPUTS; s++)
-        if (f->g[s].used) fl_free(&f->g[s]);
+    for (size_t s = 0; s < f->g_n; s++) {
+        if (f->g[s]->used) fl_free(f->g[s]);
+        free(f->g[s]);
+    }
+    free(f->g);
+    f->g = NULL;
+    f->g_n = f->g_cap = 0;
 }
 
 unsigned long folat_rounds(const struct folat *f) {

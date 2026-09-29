@@ -353,11 +353,14 @@ check "  mtime — секунды Unix, свежие" "yes" \
     "$(printf '%s' "$r" | python3 -c 'import json,sys,time; print("yes" if all(abs(f["mtime"]-time.time())<120 for f in json.load(sys.stdin)["files"]) else "no")')"
 check "  dir — каталог списков" "$L" "$(printf '%s' "$r" | j dir)"
 rm -f "$L/.stray"
-# Пределы каталога: 256 файлов уже лежат — новому имени отказ, замене старого — нет.
-i=0; while [ $i -lt 254 ]; do : > "$L/n$i"; i=$((i + 1)); done
-check "257-й файл — too-large" "too-large" "$(printf 'x' | ctl put-file new.lst - | j error)"
+# Пределы каталога: 4096 файлов уже лежат — новому имени отказ (с числом), замене старого — нет.
+i=0; while [ $i -lt 4094 ]; do : > "$L/n$i"; i=$((i + 1)); done
+check "4097-й файл — too-large" "too-large" "$(printf 'x' | ctl put-file new.lst - | j error)"
+check "  в отказе — число" "yes" "$(printf 'x' | ctl put-file new.lst - | grep -q '4096 файлов' && echo yes || echo no)"
 check "замена при полном каталоге — принята" "0" "$(printf 'x' | ctl put-file n0 - | j code)"
-i=0; while [ $i -lt 254 ]; do rm -f "$L/n$i"; i=$((i + 1)); done
+check "list-files при полном каталоге — все 4096" "4096" \
+    "$(ctl list-files | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["files"]))')"
+i=0; while [ $i -lt 4094 ]; do rm -f "$L/n$i"; i=$((i + 1)); done
 r="$(ctl rm-file big.lst)"
 check "rm-file: removed=true, файла нет" "0 true no" \
     "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j removed) $([ -e "$L/big.lst" ] && echo yes || echo no)"

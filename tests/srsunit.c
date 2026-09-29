@@ -441,7 +441,8 @@ static struct spec g_sp;
 
 /* Канал спеки v1 в модели v2 — правило «discord» → выход «vpn» с одним безымянным списком. */
 static struct spec_rule *chan(const char *srs, const char *l4) {
-    memset(&g_sp, 0, sizeof(g_sp));
+    spec_release(&g_sp);
+    if (spec_reserve_out(&g_sp, 1) || spec_reserve_rule(&g_sp, 1) || spec_reserve_list(&g_sp, 1)) exit(2);
     g_sp.out_n = 1;
     snprintf(g_sp.out[0].name, sizeof(g_sp.out[0].name), "vpn");
     struct spec_rule *c = &g_sp.rule[0];
@@ -450,7 +451,9 @@ static struct spec_rule *chan(const char *srs, const char *l4) {
     c->out = 0;
     struct spec_list *l = &g_sp.list[0];
     g_sp.list_n = 1;
+    c->lists = (unsigned *)spec_alloc(&g_sp, sizeof(unsigned));
     c->lists[c->lists_n++] = 0;
+    l->srs_files = (const char **)spec_alloc(&g_sp, sizeof(char *));
     l->srs_files[0] = srs;
     l->srs_n = 1;
     if (l4) l4_from_text(l4, strlen(l4), &l->l4);

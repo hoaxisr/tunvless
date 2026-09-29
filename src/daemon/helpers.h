@@ -22,7 +22,8 @@
 
 #include "spec.h"
 
-#define HELPERS_MAX 32
+/* Помощников не «не больше 32»: по одному на выход с собственным процессом плюс резолвер, то есть
+ * не больше выходов спеки + 1. Наборы (helper_set, планы) растут по этому числу. */
 /* Первый перезапуск упавшего — через пять секунд, как у procd; дальше пауза удваивается, пока
  * помощник живёт меньше минуты, до пяти минут (см. helpers_exited). */
 #define HELPERS_DELAY_MS 5000L
@@ -105,9 +106,12 @@ struct helper {
 };
 
 struct helper_set {
-    struct helper h[HELPERS_MAX];
-    size_t n;
+    struct helper *h;             /* куча: helpers_reserve растит; адреса элементов не хранятся вне вызова */
+    size_t n, cap;
 };
+
+/* Место в наборе на n помощников. 0 — есть; -1 — нет памяти. */
+int helpers_reserve(struct helper_set *s, size_t n);
 
 /* Состав помощников по разобранной спеке — в порядке зависимостей via: цель раньше того, чей
  * туннель через неё идёт. Метки выходов с via (и zapret) уже должны быть назначены реестром;
@@ -174,10 +178,11 @@ struct supd *supd_start(struct steerd *d, const struct supd_conf *c);
 /* Что тронула сверка (apply-сверка, docs/ctl.md, поле changed): выходы, чей помощник поднят,
  * перезапущен ради новых параметров или погашен; написана ли резолверу новая таблица. */
 struct supd_changes {
-    char helpers[HELPERS_MAX][32];
-    size_t helpers_n;
+    char (*helpers)[32];          /* куча, по числу тронутых; отдаёт supd_changes_free */
+    size_t helpers_n, helpers_cap;
     int dnsd;
 };
+void supd_changes_free(struct supd_changes *ch);
 /* Спека в памяти сменилась (apply, reload, SIGHUP): сверить помощников по подписям, послать
  * резолверу таблицу — только если изменился её текст или файлы списков, на которые она
  * ссылается. ch (может быть NULL) — что тронуто. replaced — набор правил только что заменён

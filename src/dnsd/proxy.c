@@ -557,7 +557,7 @@ static void sec_bind(struct pending *p);
 static void sec_done(void *ctx, const uint8_t *ans, size_t n, const uint8_t *q, size_t qn);
 
 static void pending_arm(struct pending *p, const struct sockaddr_storage *from, socklen_t fromlen,
-                        const struct dnsd_local *local, int have_local, int hit, uint64_t sets,
+                        const struct dnsd_local *local, int have_local, int hit, chm_t sets,
                         int quiet) {
     p->in_use = 1;
     g_live = 1;
@@ -581,11 +581,11 @@ static void pending_arm(struct pending *p, const struct sockaddr_storage *from, 
 
 /* Каналы, которым принадлежит вопрос. Для A — только каналы с IPv4 (DCH_V4): канал «6» из
  * таблицы (без набора IPv4) ответ A не забирает. Остальные типы — все совпавшие. */
-static uint64_t match_for(const char *qname, uint16_t qtype) {
-    uint64_t m = dch_match_mask(qname);
-    if (qtype == DNS_TYPE_A)
-        for (size_t i = 0; i < g_dch_n && i < 64; i++)
-            if (!(g_dch[i].fam & DCH_V4)) m &= ~(1ULL << i);
+static chm_t match_for(const char *qname, uint16_t qtype) {
+    chm_t m = dch_match_mask(qname);
+    if (qtype == DNS_TYPE_A && m)
+        for (size_t i = 0; i < g_dch_n; i++)
+            if (!(g_dch[i].fam & DCH_V4) && chm_has(m, i)) m = chm_andn(m, chm_one(i));
     return m;
 }
 
@@ -665,7 +665,7 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
     size_t qend = 0;
     int quiet = 0;
     int hit = -2; /* -2 = вопрос не разобрался; см. struct pending */
-    uint64_t sets = 0;
+    chm_t sets = 0;
     if (parse_query(buf, (size_t)n, qname, sizeof(qname), &qtype, &qend) == 0) {
         /* Совпавшие каналы — ВСЕ, а решает ответ первый из них: он старший по
          * порядку правил, а ответ клиенту всё равно один. */
@@ -995,7 +995,7 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
      * отбрасываем»). Прежде поддельный адрес ложился в набор ОДНОГО канала, и для
      * клиентов остальных имя переставало открываться вовсе. */
     int hit = -1;
-    uint64_t sets = 0;
+    chm_t sets = 0;
     if (nips >= 0) {
         if (p->hit >= 0 && p->rules_gen == g_rules_gen) {
             hit = p->hit; /* матчинг уже сделан на приёме запроса */
@@ -1055,7 +1055,7 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
          * а не ждут следующего ответа на это имя. */
         if (qtype == DNS_TYPE_A) {
             for (size_t c = 0; c < g_dch_n; c++) {
-                if (!(sets & (1ULL << c)) || !g_dch[c].realip) continue;
+                if (!chm_has(sets, c) || !g_dch[c].realip) continue;
                 for (int k = 0; k < nips; k++)
                     dch_add(c, qname, ntohl(ips[k].addr), set_ttl_clamp(ips[k].ttl));
             }
@@ -1066,7 +1066,7 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
          * Сюда доходит только имя, у всех каналов которого половина IPv6 есть (выше). */
         if (qtype == DNS_TYPE_AAAA) {
             for (size_t c = 0; c < g_dch_n; c++) {
-                if (!(sets & (1ULL << c)) || !g_dch[c].realip) continue;
+                if (!chm_has(sets, c) || !g_dch[c].realip) continue;
                 for (int k = 0; k < n6; k++)
                     dch_add6(c, qname, ips6[k].addr, set_ttl_clamp(ips6[k].ttl));
             }

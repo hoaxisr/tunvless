@@ -242,13 +242,16 @@ static int kernel_route(const struct spec *sp, const struct output *so, struct f
         *why = "маршрутизация выхода в отказе — не та, что ставит его on_fail";
         return KR_WATCH;
     }
-    const struct output *m[MAX_MEMBERS];
-    size_t mn = out_members(sp, so, m, MAX_MEMBERS);
-    if (!mn) { m[0] = so; mn = 1; }
+    size_t mn = out_members_n(sp, so);
     int present = 0, member = 0;
+    if (!mn) {
+        present = device_present(so->device);
+        member = f.table == TBL_DEV && !strcmp(f.dev, so->device);
+    }
     for (size_t k = 0; k < mn; k++) {
-        if (device_present(m[k]->device)) present = 1;
-        if (f.table == TBL_DEV && !strcmp(f.dev, m[k]->device)) member = 1;
+        const struct output *mo = out_member(sp, so, k);
+        if (device_present(mo->device)) present = 1;
+        if (f.table == TBL_DEV && !strcmp(f.dev, mo->device)) member = 1;
     }
     if (!f.rule) { *why = "правила fwmark нет"; return KR_REBIND; }
     /* Таблица ведёт в одно из устройств выхода — годится (TBL_OTHER — маршрут есть, но устройство
@@ -278,7 +281,7 @@ static int kernel_route(const struct spec *sp, const struct output *so, struct f
     return KR_OK;
 }
 
-static const struct output *spec_out(const struct spec *sp, const char *name) {
+static const struct output *recon_spec_out(const struct spec *sp, const char *name) {
     for (size_t i = 0; sp && i < sp->out_n; i++)
         if (!strcmp(sp->out[i].name, name)) return &sp->out[i];
     return NULL;
@@ -294,8 +297,40 @@ void recon_forget(struct recon_state *st) {
     st->n = 0;
 }
 
-int recon_plan_parse(const char *text, size_t n, struct recon_plan *p) {
+void recon_plan_free(struct recon_plan *p) {
+    free(p->out);
+    free(p->stale);
     memset(p, 0, sizeof(*p));
+}
+
+void recon_diff_free(struct recon_diff *d) {
+    free(d->route);
+    free(d->route_kern);
+    free(d->drop);
+    memset(d, 0, sizeof(*d));
+}
+
+void recon_state_free(struct recon_state *st) {
+    free(st->out);
+    free(st->w);
+    memset(st, 0, sizeof(*st));
+    st->nftc = -1;
+}
+
+/* Место в растущем массиве под ещё одну запись: 0 — есть, -1 — нет памяти. */
+static int room(void **arr, size_t *cap, size_t n, size_t esz) {
+    if (n < *cap) return 0;
+    size_t nc = *cap ? *cap * 2 : 16;
+    void *p = realloc(*arr, nc * esz);
+    if (!p) return -1;
+    *arr = p;
+    *cap = nc;
+    return 0;
+}
+
+int recon_plan_parse(const char *text, size_t n, struct recon_plan *p) {
+    recon_plan_free(p);
+    p->nftc = -1;
     p->nftc = -1;
     int have_fp = 0;
     const char *end = text + n;
@@ -315,7 +350,7 @@ int recon_plan_parse(const char *text, size_t n, struct recon_plan *p) {
         } else if (!strncmp(line, "counts ", 7)) {
             if (sscanf(line + 7, "%zu %zu", &p->ch_n, &p->out_n) != 2) return -1;
         } else if (!strncmp(line, "out ", 4)) {
-            if (p->n >= MAX_OUTPUTS) return -1;
+            if (room((void **)&p->out, &p->cap, p->n, sizeof(*p->out)) != 0) return -1;
             struct recon_out *o = &p->out[p->n];
             if (sscanf(line + 4, "%31s %x %d %d %d %llx %llx", o->name, &o->mark, &o->table,
                        &o->routed, &o->awg, &o->rsig, &o->wsig) != 7)
@@ -329,7 +364,7 @@ int recon_plan_parse(const char *text, size_t n, struct recon_plan *p) {
                 p->kel_n = en;
             }
         } else if (!strncmp(line, "stale ", 6)) {
-            if (p->stale_n >= MAX_OUTPUTS) continue;
+            if (room((void **)&p->stale, &p->stale_cap, p->stale_n, sizeof(*p->stale)) != 0) return -1;
             if (sscanf(line + 6, "%x %d", &p->stale[p->stale_n].mark,
                        &p->stale[p->stale_n].table) == 2)
                 p->stale_n++;
@@ -350,7 +385,7 @@ static void drop_add(struct recon_diff *d, const struct recon_plan *p, unsigned 
         if (p->out[i].mark == mark) return;      /* метку несёт выход новой спеки */
     for (size_t i = 0; i < d->drop_n; i++)
         if (d->drop[i].mark == mark && d->drop[i].table == table) return;
-    if (d->drop_n >= sizeof(d->drop) / sizeof(d->drop[0])) return;
+    if (room((void **)&d->drop, &d->drop_cap, d->drop_n, sizeof(*d->drop)) != 0) return;
     d->drop[d->drop_n].mark = mark;
     d->drop[d->drop_n].table = table;
     d->drop_n++;
@@ -391,7 +426,7 @@ void recon_decide(const struct recon_state *st, const struct recon_plan *p, cons
                 (unsigned long long)p->kel_n, (unsigned long long)st->kel_n);
     }
     /* Правила выходов — одним дампом на все выходы, и только если сверять есть что. */
-    static char rules[16384], rules6[16384];
+    char *rules = NULL, *rules6 = NULL;      /* дампы правил — в куче, любой длины (rtnl_rules_dup) */
     int rules_read = 0;
     for (size_t i = 0; i < p->n; i++) {
         const struct recon_out *o = &p->out[i];
@@ -402,24 +437,33 @@ void recon_decide(const struct recon_state *st, const struct recon_plan *p, cons
             /* Подпись та же — сверить с ядром. Выход берётся из спеки в памяти: при той же
              * подписи вид, метка, таблица, on_fail, устройства и IPv6 у неё те же, что в плане
              * (сверяются ещё метка и таблица — на случай, если спека в памяти не та). */
-            const struct output *so = spec_out(sp, o->name);
+            const struct output *so = recon_spec_out(sp, o->name);
             if (!so || !out_has_device(so) || so->mark != o->mark || so->table != o->table)
                 continue;
             if (!rules_read) {
                 rules_read = 1;
-                if (rtnl_rules_text(rules, sizeof(rules)) != 0) rules[0] = '\0';
-                if (rtnl_rules_text6(rules6, sizeof(rules6)) != 0) rules6[0] = '\0';
+                rules = rtnl_rules_dup(0);
+                rules6 = rtnl_rules_dup(1);
             }
             /* Пустой дамп правил — «спросить не вышло» (на живой коробке правил ядра три). */
-            if (!rules[0]) continue;
+            if (!rules || !rules[0]) continue;
             const char *why = "";
-            int kr = kernel_route(sp, so, outs ? outs : &fo_store_files, rules, rules6, &why);
+            int kr = kernel_route(sp, so, outs ? outs : &fo_store_files, rules, rules6 ? rules6 : "",
+                                  &why);
             if (kr == KR_OK) continue;
             d->watch = 1;
             fprintf(stderr, LOG_W "выход %s: %s — %s\n", o->name, why,
                     kr == KR_REBIND ? "привязываю заново" : "сторожу внеочередной проход");
             if (kr == KR_WATCH) continue;
             kern = 1;
+        }
+        /* route и route_kern растут вместе (одна ёмкость): рост route_kern — по ёмкости route. */
+        size_t old_cap = d->route_cap;
+        if (room((void **)&d->route, &d->route_cap, d->route_n, sizeof(*d->route)) != 0) continue;
+        if (d->route_cap != old_cap) {
+            unsigned char *nk = realloc(d->route_kern, d->route_cap);
+            if (!nk) { d->route_cap = old_cap; continue; }
+            d->route_kern = nk;
         }
         d->route_kern[d->route_n] = (unsigned char)kern;
         snprintf(d->route[d->route_n++], sizeof(d->route[0]), "%s", o->name);
@@ -434,6 +478,8 @@ void recon_decide(const struct recon_state *st, const struct recon_plan *p, cons
             drop_add(d, p, was->mark, was->table);
             if (was->awg && (!now || !now->awg)) d->awg = 1;
         }
+    free(rules);
+    free(rules6);
     if (full) d->awg = d->masq = 1;
     else d->masq = d->route_n || d->drop_n;
 }
@@ -442,8 +488,13 @@ int recon_diff_any(const struct recon_diff *d) {
     return d->ruleset || d->route_n || d->drop_n || d->awg;
 }
 
-void recon_commit_argv(const struct recon_diff *d, const char *exe, const char *spec,
-                       const char *state_dir, int nftc, char *buf, size_t n, char **av) {
+char *recon_commit_argv(const struct recon_diff *d, const char *exe, const char *spec,
+                        const char *state_dir, int nftc, char **av) {
+    /* Размер по построению: имя выхода ≤ 31 + запятая, метка:таблица ≤ 8 + 1 + 11 + запятая,
+     * плюс nftc. Ровно столько и выделяется — списки любой длины помещаются целиком. */
+    size_t n = 64 + d->route_n * 33 + d->drop_n * 22;
+    char *buf = malloc(n);
+    if (!buf) return NULL;
     size_t k = 0, off = 0;
     av[k++] = (char *)exe;
     av[k++] = "apply-commit";
@@ -462,7 +513,7 @@ void recon_commit_argv(const struct recon_diff *d, const char *exe, const char *
     if (d->route_n && off < n) {
         char *s = buf + off;
         size_t l = 0;
-        for (size_t i = 0; i < d->route_n && off + l + 40 < n; i++)
+        for (size_t i = 0; i < d->route_n; i++)
             l += (size_t)snprintf(s + l, n - off - l, "%s%s", i ? "," : "", d->route[i]);
         av[k++] = "--route";
         av[k++] = s;
@@ -471,7 +522,7 @@ void recon_commit_argv(const struct recon_diff *d, const char *exe, const char *
     if (d->drop_n && off < n) {
         char *s = buf + off;
         size_t l = 0;
-        for (size_t i = 0; i < d->drop_n && off + l + 40 < n; i++)
+        for (size_t i = 0; i < d->drop_n; i++)
             l += (size_t)snprintf(s + l, n - off - l, "%s%x:%d", i ? "," : "", d->drop[i].mark,
                                   d->drop[i].table);
         av[k++] = "--drop";
@@ -479,6 +530,7 @@ void recon_commit_argv(const struct recon_diff *d, const char *exe, const char *
         off += l + 1;
     }
     av[k] = NULL;
+    return buf;
 }
 
 void recon_applied(struct recon_state *st, const struct recon_plan *p, const struct recon_diff *d,
@@ -510,7 +562,14 @@ void recon_applied(struct recon_state *st, const struct recon_plan *p, const str
     }
     st->valid = 1;
     st->fp = p->fp;
-    memcpy(st->out, p->out, p->n * sizeof(p->out[0]));
+    if (p->n > st->cap) {
+        size_t nc = p->n;
+        struct recon_out *no = realloc(st->out, nc * sizeof(*no));
+        if (!no) { recon_forget(st); return; }      /* не запомнили — следующий apply применит всё */
+        st->out = no;
+        st->cap = nc;
+    }
+    if (p->n) memcpy(st->out, p->out, p->n * sizeof(p->out[0]));
     st->n = p->n;
 }
 
@@ -703,6 +762,12 @@ int recon_watch_changed(struct recon_state *st, const struct recon_plan *p) {
         size_t k = 0;
         while (k < st->wn && strcmp(st->w[k].name, p->out[i].name)) k++;
         if (k == st->wn || st->w[k].wsig != p->out[i].wsig) changed = 1;
+    }
+    if (p->n > st->wcap) {
+        void *nw = realloc(st->w, p->n * sizeof(*st->w));
+        if (!nw) { st->wvalid = 0; st->wn = 0; return 1; }   /* не запомнили — в следующий раз «изменилось» */
+        st->w = nw;
+        st->wcap = p->n;
     }
     for (size_t i = 0; i < p->n; i++) {
         snprintf(st->w[i].name, sizeof(st->w[i].name), "%s", p->out[i].name);

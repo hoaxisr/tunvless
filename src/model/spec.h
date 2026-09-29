@@ -25,43 +25,19 @@
  * ниже — вопросы к её битам. Заголовок объявляет struct output и struct spec только по имени. */
 #include "kind.h"
 
-/* Правил в спеке. Столько же, сколько было каналов схемы v1: перевод v1 (model/v1.c) делает из
- * канала одно правило, и предел, который v1 обещал, обязан остаться прежним. Списков и клиентов
- * — столько же: у каждого канала v1 свои безымянные список и клиент. */
-#define MAX_RULES    64
-#define MAX_LISTS    MAX_RULES
-#define MAX_CLIENTS  MAX_RULES
-/* Ссылок у правила на клиентов и на списки (`for`, `to` в спеке v2). Перевод v1 даёт по одной. */
-#define MAX_RULE_REFS 8
-#define MAX_OUTPUTS  16
-#define MAX_FROM     32
-/* Локальных устройств в спеке. Столько же, сколько адресных записей в `from_default`, и по
- * той же причине: это две формы одного ответа на «кто наши клиенты», и разные пределы у них
- * означали бы, что один способ описать сеть богаче другого без всякого основания. */
-#define MAX_LAN_DEV  32
-/* Several lists can feed ONE channel. Enabling "youtube" and "google" must not force
- * two channels with two rules and two sets — they are one destination as far as
- * routing is concerned. Read as several files rather than concatenated into one by
- * the caller: on a box with 6MB of overlay, duplicating list bytes to express "and"
- * is a cost with nothing to show for it. */
-/* Списков одного вида в правиле. Шестнадцати не хватало на очевидное желание: в каталоге
- * splify2 под сорок записей, и «отправить в туннель всё» упиралось в `too many entries in
- * list` уже на восьмом сервисе. Шестьдесят четыре покрывают весь каталог с запасом.
+/* ПРЕДЕЛОВ ПО ЧИСЛУ ПРАВИЛ, СПИСКОВ, КЛИЕНТОВ, АДРЕСОВ, ФАЙЛОВ, ПОРТОВ, ЧЛЕНОВ ГРУППЫ И УЗЛОВ В
+ * СПЕКЕ НЕТ. Раньше каждое из этих чисел было константой (64 правила, 16 выходов, 32 адреса у
+ * клиента, 16 членов группы…) и массивом такой длины внутри struct spec, то есть предел был
+ * записан в коде, а не в железе: спека на сто правил отвергалась при свободной памяти, а
+ * struct spec занимал под 250 КБ bss на роутере, где нужно три правила. Теперь массивы растут
+ * по числу записей в спеке: верхние массивы (выходы, правила, списки, клиенты) — realloc с
+ * удвоением, внутренние (адреса клиента, файлы списка, порты, члены группы) — одним куском из
+ * арены спеки ровно по числу записей. Пределом служит память, а её нехватка называется как
+ * нехватка памяти (spec_nomem), а не как «превышен MAX_X».
  *
- * Расти этому числу стало дёшево: пути больше не лежат в правиле массивом по 256 байт на
- * каждый (это было 8 КБ на правило и полмегабайта на все), а хранятся указателями на копии
- * строк. Шестьдесят четыре указателя на два вида — килобайт на правило. */
-#define MAX_FILES    64
-
-/* Диапазонов портов в правиле канала.
- *
- * Discord'у нужно два (50000-65535 и 19000-20000), шестнадцать — с запасом. Столько же,
- * сколько адресов в «кому», и по той же причине: это перечень, который человек пишет
- * руками, а не выгружает файлом, поэтому предел здесь стоит ради фиксированного бюджета
- * памяти слабого роутера, а не ради смысла. Хранится массивом прямо в правиле: шестнадцать
- * пар по два байта — это 64 байта на правило, дешевле указателя с выделением. */
-#define MAX_PORTS    16
-
+ * Остаётся ОДИН настоящий предел, и он — свойство раскладки, а не выбор кода: выходов, которым
+ * нужна метка, не больше STEER_MARK_SLOTS (marks.h) — поле метки конечно, и номера таблиц маршрутизации
+ * выходят из него же. Его называет spec_outputs_full() с цифрой и причиной. */
 /* Протокол, которым канал ограничен.
  *
  * ANY — НУЛЬ, и это не случайность: спека, написанная до появления поля, обязана значить
@@ -75,6 +51,17 @@ enum chan_proto { CH_PROTO_ANY = 0, CH_PROTO_TCP, CH_PROTO_UDP };
 /* Диапазон портов назначения. Одиночный порт — это lo == hi: одна форма во внутреннем виде
  * избавляет и разбор, и генератор правил от ветки «а это порт или диапазон». */
 struct port_range { unsigned short lo, hi; };
+
+/* Диапазонов портов в сужении списка: ОДИН ИЗ ОСТАВЛЕННЫХ ПРЕДЕЛОВ, и причина у него — ресурс,
+ * а не осторожность. Порты не фильтр в правиле, а часть элемента составного набора nftables
+ * (адрес . протокол . порт): у списка на сотню тысяч подсетей каждый диапазон портов размножает
+ * ВСЕ его подсети ещё раз (ящики l4_boxes, compile/print.c), то есть два диапазона — вдвое
+ * больше элементов в ядре, шестнадцать — в шестнадцать раз, и память роутера кончается раньше,
+ * чем человек поймёт, откуда. Сужение копируется по значению в компиляторе, планировщике наборов
+ * .srs, резолвере и построителе правил, поэтому это массив в самой структуре, а не указатель, у
+ * которого пришлось бы завести владельца. Шестнадцать перекрывают самое длинное из виденного
+ * (discord: два диапазона). Отказ называет цифру и причину (port_limit_msg). */
+#define L4_PORTS_MAX 16
 
 /* Сужение канала по транспортному уровню: протокол и порты назначения.
  *
@@ -93,7 +80,7 @@ struct port_range { unsigned short lo, hi; };
  * молча поделивших один набор адресов. */
 struct l4match {
     enum chan_proto proto;
-    struct port_range ports[MAX_PORTS];
+    struct port_range ports[L4_PORTS_MAX];
     size_t ports_n;
 };
 
@@ -118,30 +105,20 @@ static inline int l4match_empty(const struct l4match *m) {
 enum on_fail { FAIL_DROP, FAIL_DIRECT, FAIL_ZAPRET };
 
 /* Членов группы (kind: group) в порядке предпочтения: у `pick: order` первый живой побеждает.
- * Шестнадцать — прежний предел `devices` у выхода v1: пул устройств и есть группа
- * (docs/architecture.md, «4в»), и перевод v1 обязан принять всё, что принимал v1. */
-#define MAX_MEMBERS 16
-/* Безымянных выходов — членов групп, которые рождает перевод v1 из `devices` (по выходу на
- * устройство). Они лежат в sp->out за именованными (см. struct spec) и наружу не видны: ни
- * метки, ни таблицы, ни строки в status. Предел общий на спеку, а не на группу: шестнадцать
- * групп по шестнадцать членов — 256 выходов, то есть лишние ~100 КБ в каждом экземпляре
- * struct spec, который обнуляется при каждом разборе (страницы становятся резидентными), ради
- * спеки, которой никто не пишет. Шестьдесят четыре — четыре полных пула. */
-#define MAX_ANON 64
-
-/* Узлов подписки, выбранных в один выход kind=vless.
+ * Число членов константой не ограничено: массивы членов (номера, веса, замеры, «жив») лежат в
+ * арене спеки ровно на members_n записей (group_members_alloc, kinds/group.c). Пул устройств
+ * выхода v1 (`devices`) — та же группа (docs/architecture.md, «4в») и тоже любой длины.
  *
- * Столько же, сколько устройств у выхода, и по той же причине, по которой у lan_devices
- * предел общий с from_default: это ОДНО понятие — список кандидатов, первый живой забирает
- * трафик, — записанное для разных видов выхода. У kind=interface кандидаты называются
- * устройствами, у kind=vless — номерами узлов подписки, и разные пределы означали бы, что
- * одна форма перебора богаче другой без всякого основания.
- *
- * Восемь — это ещё и предел терпения при подъёме: каждый неотвечающий кандидат стоит восьми
- * секунд таймаута, и подписка из двадцати шести узлов целиком превратила бы «выход не
- * поднялся» в три с половиной минуты тишины. Кто хочет перебирать всю подписку, тот не
- * перечисляет узлы вовсе — пустой список и есть «первый рабочий среди всех пригодных». */
-#define MAX_NODE_SEL 16
+ * Безымянные члены — выходы, которые рождает перевод v1 из `devices` (по выходу на устройство).
+ * Они лежат НЕ в sp->out, а в sp->anon, и номер безымянного члена в group_cfg.members — это
+ * SPEC_ANON_BASE + позиция в sp->anon. Раздельные массивы, а не хвост за out_n, по двум
+ * причинам. Первая: любой обход «выходов спеки» (реестр меток, status, помощники, правила
+ * видов) — это обход [0, out_n), и безымянный член в него не попадает сам, без проверки в
+ * каждом из двадцати мест. Вторая: у безымянных нет ни метки, ни таблицы, и их число не
+ * связано с полем метки — растут они отдельно от именованных. Доступ по номеру члена — только
+ * spec_out(). Номер члена — unsigned, база 2^30: именованных выходов при любой раскладке
+ * метки на порядки меньше, безымянных — миллиард. */
+#define SPEC_ANON_BASE (1u << 30)
 
 /* Обфускация транспорта выхода: WireGuard поверх поддельного TCP (см. obfs.c).
  *
@@ -189,7 +166,7 @@ struct vless_cfg {
      *
      * Номера — среди ПРИГОДНЫХ узлов, то есть те же, что печатает `steer vless-nodes`. Одно
      * значение слова «номер узла» на весь проект (см. cmd_vless_nodes). */
-    int nodes[MAX_NODE_SEL];
+    int *nodes;                 /* арена спеки, nodes_n записей (NULL при 0) */
     size_t nodes_n;
     /* Ключ `transport:` спеки v2 — какими транспортами узлов подписки туннелю ходить: биты
      * TT_* ниже, 0 — любыми (ключа нет; v1 его не знает).
@@ -294,7 +271,10 @@ enum group_pick { PICK_ORDER = 0, PICK_LATENCY, PICK_MANUAL, PICK_BALANCE };
 
 struct group_cfg {
     enum group_pick pick;
-    unsigned short members[MAX_MEMBERS];
+    /* Арена спеки (group_members_alloc): members, weight, alive, lat_ms, lat4_ms, lat6_ms — все
+     * на members_n записей. Номер члена < SPEC_ANON_BASE — именованный выход, иначе безымянный
+     * (spec_out). */
+    unsigned *members;
     size_t members_n;
     /* manual: номер члена по умолчанию — выбор до первой команды select; -1 — первый. */
     int def;
@@ -308,20 +288,20 @@ struct group_cfg {
     char url[192];
     int idle_timeout_s;
     /* balance: вес члена (1..100; 0 — не задан, то есть 1) — доля новых соединений. */
-    unsigned char weight[MAX_MEMBERS];
+    unsigned char *weight;
     /* СОСТОЯНИЕ, а не настройка (как device и failed у выхода): что сторож выбрал в последнем
      * проходе. Заполняет outputs_adopt_active_st из памяти сторожа, разбор оставляет -1/нулями.
      * У группы с именованными членами cur и alive — решение подхвата по приговорам членов
      * (fog_pick_known): то же, что примет проход, поэтому есть и до первого прохода.
-     * cur — номер выбранного члена (-1 — нет: отказ или сторож не проходил); alive — битовая маска
-     * живых членов; sel — выбор человека у manual (-1 — нет, действует def); lat_ms — задержка,
+     * cur — номер выбранного члена (-1 — нет: отказ или сторож не проходил); alive — по байту на
+     * члена, 1 — жив; sel — выбор человека у manual (-1 — нет, действует def); lat_ms — задержка,
      * по которой выбирает сторож (-1 — не измерен); lat4_ms, lat6_ms — замеры по IPv4 и IPv6,
      * когда группа мерилась по обоим (-2 — по семействам не мерили: lat_ms и есть замер IPv4). */
     int cur;
-    unsigned alive;
+    unsigned char *alive;               /* по байту на члена: 1 — жив (раньше маска в 32 бита) */
     int sel;
-    int lat_ms[MAX_MEMBERS];
-    int lat4_ms[MAX_MEMBERS], lat6_ms[MAX_MEMBERS];
+    int *lat_ms;
+    int *lat4_ms, *lat6_ms;
     /* Свойства группы — пересечение свойств её членов (group_seal в src/kinds/group.c): у пула
      * интерфейсов это ровно свойства интерфейса. Считаются один раз, когда члены известны, —
      * вопрос out_caps приходит без спеки, и спросить членов ему нечем. */
@@ -343,16 +323,16 @@ struct out_keys {
     char opts_file[256];
     char domain[128];
     int stream, stream_port;
-    int nodes[MAX_NODE_SEL];
-    size_t nodes_n;
+    int *nodes;                 /* арена спеки, nodes_n записей (NULL при 0) */
+    size_t nodes_n, nodes_cap;  /* nodes_cap ведёт spec_push у читателя формата */
     /* Какой из двух форм записан выбор узлов: `node` (сокращение) или `nodes` (список). */
     int node_one, node_many;
     unsigned transports;        /* `transport:` спеки v2 (vless_cfg.transports) */
     /* `devices` спеки v1 — кандидаты в порядке предпочтения. В модели поля нет: пул устройств —
      * это группа (kind: group), её собирает перевод v1 (model/v1.c), а вид выхода только
      * решает, принимает ли он такой список вообще (KK_DEVICES — у interface). */
-    char devices[MAX_MEMBERS][32];
-    size_t devices_n;
+    char (*devices)[32];        /* арена спеки, devices_n записей */
+    size_t devices_n, devices_cap;
     /* Ключи записаны спекой v2 (model/v2.c): отказ вида называет ключ именем v2 (out_key). */
     int v2;
     /* keys_of: устройство выхода — то, что parse вывел бы сам (из имени), писать его незачем. */
@@ -471,24 +451,23 @@ struct spec_client {
     char name[32];                  /* пусто — безымянный (перевод v1) */
     /* Адреса, подсети и MAC — как на роутере; на телефоне ещё «self» и «uid:N[-M]» (см.
      * from_is_local). Адреса и MAC в одном клиенте нельзя: nft не умеет «или» внутри правила. */
-    char from[MAX_FROM][64];
+    char (*from)[64];               /* арена спеки, from_n записей (NULL при 0) */
     size_t from_n;
 };
 
 /* ЧТО: назначения правила. */
 struct spec_list {
     char name[32];                  /* пусто — безымянный (перевод v1) */
-    /* Пути — указатели на копии строк, живущие до конца процесса: спека разбирается один
-     * раз, освобождать их некому и незачем. Массив фиксированных буферов стоил бы 32 КБ на
-     * список при нынешнем пределе. */
-    const char *prefixes_files[MAX_FILES];
+    /* Пути — указатели на копии строк в арене спеки, а сами массивы указателей — тоже куски
+     * арены ровно на *_n записей: число файлов в списке константой не ограничено. */
+    const char **prefixes_files;
     size_t prefixes_n;
-    const char *domains_files[MAX_FILES];
+    const char **domains_files;
     size_t domains_n;
     /* Наборы правил sing-box (`.srs`): и имена, и подсети, и сужение в одном файле. Читает их
      * не разбор спеки, а те, кому нужно содержимое: компилятор (подсети и сужение — src/compile/
      * groups.c) и резолвер (имена — src/dnsd/table.c); общий читатель — src/model/srs.c. */
-    const char *srs_files[MAX_FILES];
+    const char **srs_files;
     size_t srs_n;
     /* Сужение по протоколу и портам назначения (схема 2 спеки v1, `proto`/`ports` у списка v2).
      * Пусто — сужения нет, и поведение прежнее до последнего байта текста правил. */
@@ -507,10 +486,10 @@ struct spec_rule {
     /* Выход или группа — индекс в sp->out. */
     int out;
     /* Клиенты — индексы в sp->client; ни одного — клиенты по умолчанию (sp->lan). */
-    unsigned char clients[MAX_RULE_REFS];
+    unsigned *clients;              /* арена спеки, clients_n номеров */
     size_t clients_n;
     /* Списки — индексы в sp->list; ни одного — весь трафик клиентов (v1: `any`). */
-    unsigned char lists[MAX_RULE_REFS];
+    unsigned *lists;                /* арена спеки, lists_n номеров */
     size_t lists_n;
     /* fake-IP (default) or real-IP for a domain rule. See dnsd: fake-IP is
      * precise per domain but makes every traceroute hop show the fake address,
@@ -549,7 +528,7 @@ struct spec_rule {
      *  внутри хранится обратное — так поле, которого нет, даёт нуль и означает «работает». */
     int disabled;
     /* Апстрим DNS правила (`dns` правила v2): номер в sp->dns.up плюс один; 0 — общий. */
-    unsigned char dns;
+    unsigned dns;
 };
 
 /* DNS спеки v2 (раздел `dns`, docs/spec-v2.md): кэш ответов, апстримы и путь запроса к ним.
@@ -564,8 +543,6 @@ struct spec_rule {
  * апстриму уходит напрямую (out == -1) или с меткой выхода out: это метка выхода-подложки, та же,
  * что у сокета туннеля `over` (out_underlay_mark), и та же цепочка postrouting_guard не даёт ему
  * уйти мимо устройства выхода. */
-#define MAX_DNS_UP 8
-#define MAX_DNS_IPS 4
 enum dns_proto { DNSP_NONE = 0, DNSP_UDP, DNSP_TCP, DNSP_DOT, DNSP_DOH, DNSP_QUIC };
 struct spec_dns_up {
     char name[32];
@@ -577,24 +554,24 @@ struct spec_dns_up {
     char host[128];
     char path[128];
     /* Адреса сервера, записанные в спеке (минуют bootstrap), и серверы bootstrap апстрима. */
-    char ips[MAX_DNS_IPS][46];
-    unsigned char ips_n;
-    char boot[MAX_DNS_IPS][46];
-    unsigned char boot_n;
-    unsigned char inl;              /* задан в самом правиле (`dns: { url: … }`), а не в dns.upstreams */
+    char (*ips)[46];                /* арена спеки, ips_n записей */
+    size_t ips_n;
+    char (*boot)[46];               /* арена спеки, boot_n записей */
+    size_t boot_n;
+    unsigned char inl;             /* задан в самом правиле (`dns: { url: … }`), а не в dns.upstreams */
 };
 struct spec_dns {
     long cache;                     /* записей кэша; 0 — кэша нет */
     /* Пределы срока жизни записи кэша, секунд: ответ живёт не меньше ttl_min и не дольше
      * ttl_max, отрицательный (NXDOMAIN, пустой ответ) — ttl_neg. Умолчания ставит разбор. */
     long ttl_min, ttl_max, ttl_neg;
-    struct spec_dns_up up[MAX_DNS_UP];
-    size_t up_n;
+    struct spec_dns_up *up;         /* куча, растёт по числу апстримов (spec_grow) */
+    size_t up_n, up_cap;
     /* Общий апстрим доменных правил без своего: номер в up плюс один; 0 — нет (имена спрашивают
      * прежним путём: dnsmasq на роутере, исходный сервер запроса на телефоне). */
-    unsigned char general;
-    char boot[MAX_DNS_IPS][46];     /* общие серверы bootstrap */
-    unsigned char boot_n;
+    unsigned general;
+    char (*boot)[46];               /* общие серверы bootstrap, арена спеки */
+    size_t boot_n;
     /* ИМЕНА ПРАВИЛ — ТОЛЬКО IPv4: на AAAA имени под доменным правилом резолвер отвечает пустым
      * ответом, какой бы ни был выход. Ставит перевод v1 (spec_parse_v1, src/model/v1.c) и больше
      * никто; у спеки v2 поле нулевое.
@@ -643,28 +620,45 @@ int dnsurl_parse(const char *url, struct spec_dns_up *u, char *why, size_t why_n
  * делает то же самое видимым в сигнатуре: функция, которая спеку не получает, спеку не
  * читает — это проверяет компилятор, а не память того, кто её писал.
  *
- * ГДЕ ЖИВЁТ ЭКЗЕМПЛЯР. struct spec большой (правила, списки и клиенты — под 250 КБ при MAX_RULES=64), и
- * на стеке его не держат: каждая точка входа (cmd_* в daemon/, dnsd, tgws, vless-команды,
- * awg-команды) заводит свой `static struct spec` и передаёт указатель вниз по вызовам. Один
- * процесс — один экземпляр за время своей жизни, но эти экземпляры не делят состояние между
- * собой, и это и есть разница со старыми глобалами: явную, а не подразумеваемую. */
+ * ГДЕ ЖИВЁТ ЭКЗЕМПЛЯР. Сам struct spec теперь маленький (указатели и счётчики; замер bss — в
+ * отчёте к выпуску), а всё, что растёт с числом правил, лежит в куче: каждая точка входа
+ * (cmd_* в daemon/, dnsd, tgws, vless-команды, awg-команды) заводит свой `static struct spec`
+ * и передаёт указатель вниз по вызовам. Один процесс — один экземпляр за время своей жизни,
+ * но эти экземпляры не делят состояние между собой, и это и есть разница со старыми глобалами:
+ * явную, а не подразумеваемую.
+ *
+ * ВЛАДЕНИЕ. Два рода памяти.
+ *   - Выходы (out, anon) — обычные кучи с удвоением (spec_grow): их правит сторож
+ *     (device, приговоры, состояние групп), и у каждого экземпляра они свои.
+ *   - Всё остальное — правила, списки, клиенты, апстримы DNS и всё, что висит на элементах
+ *     (адреса клиента, файлы списка, члены группы…) — арена sp->mem (spec_alloc), которая
+ *     ЧИТАЕТСЯ и не меняется после разбора. Арена с счётчиком ссылок (struct spec_mem): копия
+ *     для прохода сторожа (spec_clone) берёт ту же арену, а не переписывает её, и загрузка новой
+ *     спеки посреди прохода (spec_release старой) её не освобождает, пока проход не кончился.
+ *     Раньше сторож копировал struct spec целиком memcpy (под 250 КБ на проход) — теперь
+ *     копируются только выходы, ради которых копия и нужна.
+ * spec_release() отдаёт своё и снимает ссылку с арены; load_spec зовёт её сам перед разбором,
+ * поэтому повторная загрузка в тот же экземпляр (цикл демона) не течёт. Указатель на элемент
+ * растущего массива живёт до следующего роста того же массива: кто добавляет запись, держит
+ * индекс, а не указатель. */
+struct spec_mem;
 struct spec {
-    /* Выходы: [0, out_n) — именованные, в порядке спеки; [MAX_OUTPUTS, MAX_OUTPUTS + anon_n) —
-     * безымянные члены групп, которых рождает перевод v1 из `devices`. Раздельные области, а не
-     * хвост за out_n, по двум причинам. Первая: любой обход «выходов спеки» (реестр меток,
-     * status, помощники, правила видов) — это обход [0, out_n), и безымянный член в него не
-     * попадает сам, без проверки в каждом из двадцати мест. Вторая: стенд, собирающий спеку
-     * руками, может добавить выход после группы, и хвост за out_n он бы затёр. Обращаться к
-     * члену — по индексу из group_cfg.members. */
-    struct output out[MAX_OUTPUTS + MAX_ANON];
-    size_t out_n;
-    size_t anon_n;
-    struct spec_rule rule[MAX_RULES];
-    size_t rule_n;
-    struct spec_list list[MAX_LISTS];
-    size_t list_n;
-    struct spec_client client[MAX_CLIENTS];
-    size_t client_n;
+    /* Именованные выходы: [0, out_n), в порядке спеки. Их число ограничено раскладкой метки
+     * (spec_outputs_max), больше ничем. */
+    struct output *out;
+    size_t out_n, out_cap;
+    /* Безымянные члены групп, которых рождает перевод v1 из `devices`; номер в
+     * group_cfg.members — SPEC_ANON_BASE + позиция здесь. Обращаться — spec_out(). */
+    struct output *anon;
+    size_t anon_n, anon_cap;
+    struct spec_rule *rule;
+    size_t rule_n, rule_cap;
+    struct spec_list *list;
+    size_t list_n, list_cap;
+    struct spec_client *client;
+    size_t client_n, client_cap;
+    struct spec_mem *mem;           /* арена (spec_alloc), с счётчиком ссылок */
+    void *own;                      /* личные массивы копии (spec_clone): состояние групп */
     /* Клиенты по умолчанию (`lan` спеки v2): у правила без своих клиентов «кто» — это они.
      * Адреса — `from_default` спеки v1; пусто — клиенты узнаются по устройству (lan_dev ниже). */
     struct spec_client lan;
@@ -682,11 +676,232 @@ struct spec {
      * Имя устройства отвечает на тот же вопрос точнее и там, где адрес не отвечает вовсе:
      * заодно в правило попадают клиенты за вторым роутером в LAN, у которых адреса чужой
      * подсети, а интерфейс тот же. Умолчание — один "br-lan", выставляется в load_spec. */
-    char lan_dev[MAX_LAN_DEV][64];
+    char (*lan_dev)[64];            /* арена спеки, lan_dev_n записей */
     size_t lan_dev_n;
     int traceroute_hops;
     struct spec_dns dns;
 };
+
+/* ---- память спеки --------------------------------------------------------------------------
+ *
+ * ЗАЧЕМ АРЕНА. Внутренние массивы (адреса клиента, файлы списка, члены группы…) знают свою длину
+ * в момент разбора и живут ровно столько же, сколько спека. Отдельный malloc под каждый значил
+ * бы отдельный free под каждый и путь очистки по всем видам записей; арена — это цепочка
+ * кусков, освобождаемая одним обходом (spec_release), и кусок в 4 КБ вмещает спеку роутера
+ * целиком (три правила — это сотни байт). Записи выдаются обнулёнными (calloc куска).
+ *
+ * ПОЧЕМУ УКАЗАТЕЛИ В ЭЛЕМЕНТАХ, А НЕ ВСТРОЕННЫЕ МАССИВЫ. Встроенный массив на предел — это
+ * память под предел у КАЖДОЙ записи: 32 адреса по 64 байта — 2 КБ на клиента, 64 файла — по
+ * 512 байт на вид списка, и пустое правило стоило столько же, сколько правило на пределе.
+ * Указатель на кусок ровно нужной длины стоит восемь байт плюс то, что реально записано.
+ *
+ * НЕХВАТКА ПАМЯТИ. spec_alloc и spec_grow возвращают NULL/-1, а не рвут процесс: разбор
+ * отдаёт человеку «недостаточно памяти для спеки (что растили и до скольких)», и это
+ * настоящая причина отказа — предела в коде, который можно было бы упомянуть, у спеки нет. */
+struct spec_chunk {
+    struct spec_chunk *next;
+    size_t used, cap;
+};
+/* Арена: цепочка кусков и счётчик ссылок (spec_clone берёт ссылку, spec_release снимает). */
+struct spec_mem {
+    size_t refs;
+    struct spec_chunk *head;
+};
+
+static inline void *spec_alloc(struct spec *s, size_t n) {
+    if (!n) return NULL;
+    n = (n + 7u) & ~(size_t)7u;
+    if (!s->mem) {
+        s->mem = (struct spec_mem *)calloc(1, sizeof(*s->mem));
+        if (!s->mem) return NULL;
+        s->mem->refs = 1;
+    }
+    struct spec_chunk *c = s->mem->head;
+    if (!c || c->cap - c->used < n) {
+        size_t cap = n > 4096 ? n : 4096;
+        struct spec_chunk *nc = (struct spec_chunk *)calloc(1, sizeof(*nc) + cap);
+        if (!nc) return NULL;
+        nc->cap = cap;
+        if (n > 4096 && c) {            /* большой кусок — за головой: голова ещё принимает мелочь */
+            nc->next = c->next;
+            c->next = nc;
+            nc->used = n;
+            return nc + 1;
+        }
+        nc->next = s->mem->head;
+        s->mem->head = nc;
+        c = nc;
+    }
+    void *p = (unsigned char *)(c + 1) + c->used;
+    c->used += n;
+    return p;
+}
+
+/* Копия строки/массива в арене; NULL при нехватке памяти (и при n == 0 для массива). */
+static inline char *spec_strdup(struct spec *s, const char *str) {
+    size_t n = strlen(str) + 1;
+    char *p = (char *)spec_alloc(s, n);
+    if (p) memcpy(p, str, n);
+    return p;
+}
+static inline void *spec_memdup(struct spec *s, const void *src, size_t n) {
+    void *p = spec_alloc(s, n);
+    if (p) memcpy(p, src, n);
+    return p;
+}
+
+/* Дописать запись в массив из арены, длину которого заранее не знаешь: место под запись номер n
+ * (cap — ёмкость, ведёт вызывающий; начальный ноль — «массива ещё нет»). Полный массив
+ * переезжает в арену вдвое больше, прежний остаётся в ней мёртвым куском — это не утечка
+ * (арена отдаётся целиком) и не больше удвоения от нужного. NULL — нехватка памяти. */
+static inline void *spec_push(struct spec *s, void **arr, size_t n, size_t *cap, size_t esz) {
+    if (n >= *cap) {
+        size_t nc = *cap ? *cap * 2 : 4;
+        void *p = spec_alloc(s, nc * esz);
+        if (!p) return NULL;
+        if (n) memcpy(p, *arr, n * esz);
+        *arr = p;
+        *cap = nc;
+    }
+    return (unsigned char *)*arr + n * esz;
+}
+
+/* Дать верхнему массиву место на need записей: realloc с удвоением, новый хвост — нули. 0 — есть
+ * место; -1 — нехватка памяти (массив цел). Прежние указатели на элементы после успеха
+ * недействительны. */
+static inline int spec_grow(void **arr, size_t *cap, size_t need, size_t esz) {
+    if (need <= *cap) return 0;
+    size_t nc = *cap ? *cap : 4;
+    while (nc < need) nc *= 2;
+    void *p = realloc(*arr, nc * esz);
+    if (!p) return -1;
+    memset((unsigned char *)p + *cap * esz, 0, (nc - *cap) * esz);
+    *arr = p;
+    *cap = nc;
+    return 0;
+}
+
+/* То же для массива из арены (правила, списки, клиенты, апстримы): читаемая часть спеки живёт в
+ * общей арене, а не в realloc-куче. Прежний кусок остаётся в арене мёртвым — не больше удвоения. */
+static inline int spec_grow_a(struct spec *s, void **arr, size_t *cap, size_t need, size_t esz) {
+    if (need <= *cap) return 0;
+    size_t nc = *cap ? *cap : 4;
+    while (nc < need) nc *= 2;
+    void *p = spec_alloc(s, nc * esz);
+    if (!p) return -1;
+    if (*cap) memcpy(p, *arr, *cap * esz);
+    *arr = p;
+    *cap = nc;
+    return 0;
+}
+
+/* Отдать всё, что держит спека, и обнулить её. Безопасно на нулевой и на уже отданной. Арену
+ * отпускает по счётчику ссылок: копия для прохода (spec_clone) может ещё читать её. */
+static inline void spec_release(struct spec *s) {
+    if (s->mem && --s->mem->refs == 0) {
+        for (struct spec_chunk *c = s->mem->head, *n; c; c = n) { n = c->next; free(c); }
+        free(s->mem);
+    }
+    free(s->out);
+    free(s->anon);
+    free(s->own);
+    memset(s, 0, sizeof(*s));
+}
+
+/* Выход по номеру, каким его хранит group_cfg.members и о каком говорит rule.out: меньше
+ * SPEC_ANON_BASE — именованный (sp->out), иначе безымянный член (sp->anon). */
+static inline struct output *spec_out(const struct spec *s, size_t idx) {
+    return idx >= SPEC_ANON_BASE ? &s->anon[idx - SPEC_ANON_BASE] : &s->out[idx];
+}
+static inline int spec_is_named(size_t idx) { return idx < SPEC_ANON_BASE; }
+/* Номер именованного выхода по указателю; (size_t)-1 — указатель не в sp->out (безымянный член
+ * пула, копия на стеке). Вычитание указателей из разных массивов было бы неопределённым, поэтому
+ * сравнение идёт по адресам. */
+static inline size_t spec_out_idx(const struct spec *s, const struct output *o) {
+    uintptr_t a = (uintptr_t)o, b = (uintptr_t)s->out;
+    if (!s->out || a < b || a >= b + s->out_n * sizeof(*s->out)) return (size_t)-1;
+    return (size_t)(o - s->out);
+}
+
+/* Стенды, собирающие спеку руками, и парсеры: место на n именованных выходов / правил / списков /
+ * клиентов вперёд. 0 — есть; -1 — нехватка памяти. */
+static inline int spec_reserve_out(struct spec *s, size_t n) {
+    return spec_grow((void **)&s->out, &s->out_cap, n, sizeof(*s->out));
+}
+static inline int spec_reserve_rule(struct spec *s, size_t n) {
+    return spec_grow_a(s, (void **)&s->rule, &s->rule_cap, n, sizeof(*s->rule));
+}
+static inline int spec_reserve_list(struct spec *s, size_t n) {
+    return spec_grow_a(s, (void **)&s->list, &s->list_cap, n, sizeof(*s->list));
+}
+static inline int spec_reserve_client(struct spec *s, size_t n) {
+    return spec_grow_a(s, (void **)&s->client, &s->client_cap, n, sizeof(*s->client));
+}
+static inline int spec_reserve_up(struct spec *s, size_t n) {
+    return spec_grow_a(s, (void **)&s->dns.up, &s->dns.up_cap, n, sizeof(*s->dns.up));
+}
+
+/* Копия спеки для того, кто её меняет (проход сторожа). Общее и читаемое — правила, списки,
+ * клиенты, апстримы, всё в арене — берётся по ссылке; выходы копируются, а состояние групп
+ * (alive, замеры) получает свои массивы: проход пишет в них, и демон должен видеть свою спеку
+ * нетронутой. d обязана быть нулевой или ранее отданной. 0 — готово; -1 — нехватка памяти
+ * (d пуста). */
+static inline int spec_clone(struct spec *d, const struct spec *s) {
+    spec_release(d);
+    *d = *s;
+    if (d->mem) d->mem->refs++;
+    d->out = d->anon = NULL;
+    d->out_cap = d->anon_cap = 0;
+    d->own = NULL;
+    size_t members = 0;
+    for (size_t i = 0; i < s->out_n; i++)
+        if (out_group(&s->out[i])) members += s->out[i].grp.members_n;
+    for (size_t i = 0; i < s->anon_n; i++)
+        if (out_group(&s->anon[i])) members += s->anon[i].grp.members_n;
+    if (s->out_n) {
+        d->out = (struct output *)malloc(s->out_n * sizeof(*d->out));
+        if (!d->out) goto fail;
+        memcpy(d->out, s->out, s->out_n * sizeof(*d->out));
+        d->out_cap = s->out_n;
+    }
+    if (s->anon_n) {
+        d->anon = (struct output *)malloc(s->anon_n * sizeof(*d->anon));
+        if (!d->anon) goto fail;
+        memcpy(d->anon, s->anon, s->anon_n * sizeof(*d->anon));
+        d->anon_cap = s->anon_n;
+    }
+    if (members) {
+        /* alive (байт) и три массива int на члена — одним куском. */
+        size_t per = 1 + 3 * sizeof(int);
+        unsigned char *blk = (unsigned char *)malloc(members * per + 3 * sizeof(int));
+        if (!blk) goto fail;
+        d->own = blk;
+        int *iv = (int *)blk;               /* выровнено: сначала int-массивы */
+        unsigned char *bv = (unsigned char *)(iv + 3 * members);
+        for (int pass = 0; pass < 2; pass++) {
+            size_t n = pass ? d->anon_n : d->out_n;
+            struct output *arr = pass ? d->anon : d->out;
+            for (size_t i = 0; i < n; i++) {
+                if (!out_group(&arr[i])) continue;
+                struct group_cfg *g = &arr[i].grp;
+                size_t m = g->members_n;
+                if (!m) continue;
+                memcpy(iv, g->lat_ms, m * sizeof(int));
+                g->lat_ms = iv; iv += m;
+                memcpy(iv, g->lat4_ms, m * sizeof(int));
+                g->lat4_ms = iv; iv += m;
+                memcpy(iv, g->lat6_ms, m * sizeof(int));
+                g->lat6_ms = iv; iv += m;
+                memcpy(bv, g->alive, m);
+                g->alive = bv; bv += m;
+            }
+        }
+    }
+    return 0;
+fail:
+    spec_release(d);
+    return -1;
+}
 /* Каталог состояния (steer_state_dir) и каталог имён таблиц iproute2 (steer_rt_tables_dir) —
  * пути платформы со швом переопределения: src/platform/platform.h. */
 

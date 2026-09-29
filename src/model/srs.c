@@ -440,8 +440,8 @@ struct drule {
     unsigned items;             /* какие группы условий есть: см. G_* */
     size_t n_dom, n_v4, n_v6;
     int net_tcp, net_udp;
-    struct port_range ports[MAX_PORTS];
-    unsigned char ports_range[MAX_PORTS];
+    struct port_range ports[L4_PORTS_MAX];
+    unsigned char ports_range[L4_PORTS_MAX];
     size_t ports_n;
     unsigned drop;              /* DR_*: из-за чего правило не выражается */
     unsigned skip;              /* DR_*: что снято без снятия правила (adguard_domain) */
@@ -564,7 +564,7 @@ static int scan_strings(struct rd *r, size_t *count) {
 static void port_add(struct drule *d, unsigned lo, unsigned hi, int range) {
     for (size_t i = 0; i < d->ports_n; i++)
         if (d->ports[i].lo == lo && d->ports[i].hi == hi) return;
-    if (d->ports_n >= MAX_PORTS) { d->drop |= DR_PORTS; return; }
+    if (d->ports_n >= L4_PORTS_MAX) { d->drop |= DR_PORTS; return; }
     d->ports[d->ports_n].lo = (unsigned short)lo;
     d->ports[d->ports_n].hi = (unsigned short)hi;
     d->ports_range[d->ports_n] = (unsigned char)range;
@@ -874,7 +874,7 @@ static void set_free(struct srs_set *s) {
 /* Множество портов: отсортированные непересекающиеся диапазоны, all — «любой порт». */
 struct pset {
     int all;
-    struct port_range r[MAX_PORTS * 2 + 2];
+    struct port_range r[L4_PORTS_MAX * 2 + 2];
     size_t n;
 };
 
@@ -945,7 +945,7 @@ static void pset_not(struct pset *p) {
 }
 
 /* Протоколы и порты → struct l4match. 0 — пусто (ни один пакет), -1 — не выражается
- * (портов больше MAX_PORTS), -2 — не выражается (остались только протоколы без портов, не tcp
+ * (портов больше L4_PORTS_MAX), -2 — не выражается (остались только протоколы без портов, не tcp
  * и не udp), 1 — готово.
  *
  * Прочие протоколы выражаются только вместе с tcp и udp («без сужения»): у канала нет «tcp и
@@ -967,7 +967,7 @@ static int l4_make(unsigned pm, const struct pset *ps, struct l4match *out) {
         }
         return 1;
     }
-    if (ps->n > MAX_PORTS) return -1;
+    if (ps->n > L4_PORTS_MAX) return -1;
     for (size_t i = 0; i < ps->n; i++) out->ports[i] = ps->r[i];
     out->ports_n = ps->n;
     return 1;
@@ -1939,7 +1939,7 @@ int l4_from_text(const char *s, size_t len, struct l4match *m) {
             while (i < len && s[i] >= '0' && s[i] <= '9') hi = hi * 10 + (unsigned long)(s[i++] - '0');
             if (i == st || hi > 65535 || hi < lo) return -1;
         }
-        if (m->ports_n >= MAX_PORTS) return -1;
+        if (m->ports_n >= L4_PORTS_MAX) return -1;
         m->ports[m->ports_n].lo = (unsigned short)lo;
         m->ports[m->ports_n].hi = (unsigned short)hi;
         m->ports_n++;

@@ -45,13 +45,21 @@
 /* ---- порядок обхода ---------------------------------------------------------------------- */
 
 size_t fog_order(const struct spec *sp, size_t *ord) {
-    unsigned char placed[MAX_OUTPUTS] = {0};
+    /* Рабочие массивы — по числу выходов (раньше на стеке под 16). Без памяти — порядок спеки. */
+    unsigned char *placed = calloc(sp->out_n ? sp->out_n : 1, 1);
+    size_t *add = malloc((sp->out_n ? sp->out_n : 1) * sizeof(*add));
     size_t n = 0;
+    if (!placed || !add) {
+        free(placed);
+        free(add);
+        for (size_t i = 0; i < sp->out_n; i++) ord[n++] = i;
+        return n;
+    }
     for (int progress = 1; progress && n < sp->out_n; ) {
         progress = 0;
         /* Круг: все, чьи зависимости уже в порядке. Кладутся после круга, а не сразу, — так внутри
          * круга остаётся порядок спеки, и выходы одной глубины over идут как прежде. */
-        size_t add[MAX_OUTPUTS], an = 0;
+        size_t an = 0;
         for (size_t i = 0; i < sp->out_n; i++) {
             if (placed[i]) continue;
             const struct output *o = &sp->out[i];
@@ -72,6 +80,8 @@ size_t fog_order(const struct spec *sp, size_t *ord) {
     /* Не бывает (круги отвергает разбор), но стенд может собрать спеку руками: остаток — как есть. */
     for (size_t i = 0; i < sp->out_n; i++)
         if (!placed[i]) ord[n++] = i;
+    free(placed);
+    free(add);
     return n;
 }
 
@@ -146,7 +156,7 @@ static void rec_set(struct fo_store *st, const char *name, const char *key, cons
 
 static int member_idx(const struct spec *sp, const struct group_cfg *g, const char *name) {
     for (size_t k = 0; k < g->members_n; k++)
-        if (!strcmp(sp->out[g->members[k]].name, name)) return (int)k;
+        if (!strcmp(spec_out(sp, g->members[k])->name, name)) return (int)k;
     return -1;
 }
 
@@ -191,32 +201,34 @@ const char *fog_lat_key(const struct output *m) {
  * когда не измерился никто (S_LAT_C → S_HYST). После перезагрузки замеров нет (они в том же
  * tmpfs), и latency до первого замера идёт по порядку — это сказано в docs/ctl.md. */
 int fog_pick_known(const struct spec *sp, struct fo_store *st, const struct output *go,
-                   unsigned alive, int cur) {
+                   const unsigned char *alive, int cur) {
     const struct group_cfg *g = out_group(go);
     if (!g || !g->members_n) return -1;
     size_t n = g->members_n;
     int first = -1;
     for (size_t k = 0; k < n && first < 0; k++)
-        if ((alive >> k) & 1u) first = (int)k;
+        if (alive[k]) first = (int)k;
     if (g->pick == PICK_MANUAL) {
         /* Не работает выбранный — отказ группы с её on_fail: переключиться на другого значило бы
          * решить за человека. */
         int k = fog_manual_pick(sp, st, go);
-        return k >= 0 && ((alive >> k) & 1u) ? k : -1;
+        return k >= 0 && alive[k] ? k : -1;
     }
     if (g->pick == PICK_BALANCE) return first;
-    if (cur >= 0 && (size_t)cur < n && ((alive >> cur) & 1u)) return cur;
+    if (cur >= 0 && (size_t)cur < n && alive[cur]) return cur;
     if (g->pick == PICK_LATENCY && first >= 0) {
-        int ms[MAX_MEMBERS], best = -1;
+        int best = -1;
+        int *ms = malloc(n * sizeof(int));
+        if (!ms) return first;
         for (size_t k = 0; k < n; k++) {
             struct folat_rec rc;
             ms[k] = -1;
-            if (((alive >> k) & 1u) &&
-                folat_rec_get(st, go->name, fog_lat_key(&sp->out[g->members[k]]), &rc))
+            if (alive[k] && folat_rec_get(st, go->name, fog_lat_key(spec_out(sp, g->members[k])), &rc))
                 ms[k] = rc.ms;
         }
         int tol = g->lat_tolerance_ms > 0 ? g->lat_tolerance_ms : FOLAT_TOLERANCE_MS;
         int p = group_latency_pick(ms, n, tol, &best);
+        free(ms);
         if (p >= 0) return p;
     }
     return first;
@@ -240,7 +252,10 @@ struct idle_rec {
     long changed;       /* CLOCK_MONOTONIC, с: когда счётчик последний раз рос */
     int seen;
 };
-static struct idle_rec g_idle[MAX_OUTPUTS];
+/* Записи простоя групп растут по числу групп (раньше — 16 мест, и 17-я группа считалась
+ * «трафик есть» навсегда). */
+static struct idle_rec *g_idle;
+static size_t g_idle_n, g_idle_cap;
 
 static long mono_s(void) {
     struct timespec t;
@@ -252,15 +267,20 @@ int fog_idle(const struct spec *sp, const struct output *go, int limit, fo_traff
     if (limit <= 0 || !fn) return 0;
     unsigned long long pk = 0;
     if (fn(arg, sp, go, &pk) != 0) return 0;
-    struct idle_rec *r = NULL, *free_slot = NULL;
-    for (size_t i = 0; i < MAX_OUTPUTS && !r; i++) {
+    struct idle_rec *r = NULL;
+    for (size_t i = 0; i < g_idle_n && !r; i++)
         if (g_idle[i].seen && !strcmp(g_idle[i].name, go->name)) r = &g_idle[i];
-        else if (!g_idle[i].seen && !free_slot) free_slot = &g_idle[i];
-    }
     long now = mono_s();
     if (!r) {
-        if (!free_slot) return 0;
-        r = free_slot;
+        if (g_idle_n == g_idle_cap) {
+            size_t nc = g_idle_cap ? g_idle_cap * 2 : 16;
+            struct idle_rec *ni = realloc(g_idle, nc * sizeof(*ni));
+            if (!ni) return 0;
+            g_idle = ni;
+            g_idle_cap = nc;
+        }
+        r = &g_idle[g_idle_n++];
+        memset(r, 0, sizeof(*r));
         snprintf(r->name, sizeof(r->name), "%s", go->name);
         r->seen = 1;
         r->pkts = pk;
@@ -277,7 +297,7 @@ int fog_idle(const struct spec *sp, const struct output *go, int limit, fo_traff
 
 /* ---- balance: карта в ядре --------------------------------------------------------------- */
 
-int fog_balance_sync(const struct spec *sp, const struct output *go, unsigned alive) {
+int fog_balance_sync(const struct spec *sp, const struct output *go, const unsigned char *alive) {
     static int told;
     const struct group_cfg *g = out_group(go);
     if (!g || g->pick != PICK_BALANCE) return 0;
@@ -300,7 +320,7 @@ int fog_balance_sync(const struct spec *sp, const struct output *go, unsigned al
     unsigned char owner[GROUP_BAL_SLOTS];
     group_balance_slots(g, alive, owner);
     for (unsigned s = 0; s < GROUP_BAL_SLOTS; s++)
-        if (owner[s] != 0xff) group_bal_target(&sp->out[g->members[owner[s]]], want[s], NFV_CHAIN_MAX);
+        if (owner[s] != 0xff) group_bal_target(spec_out(sp, g->members[owner[s]]), want[s], NFV_CHAIN_MAX);
     if (!memcmp(have, want, sizeof(have))) return 0;
     if (nfv_map_write(NFD_INET, nft_table(), map, (const char (*)[NFV_CHAIN_MAX])want,
                       (const char (*)[NFV_CHAIN_MAX])have, GROUP_BAL_SLOTS) != 0) {
@@ -327,63 +347,105 @@ void fog_balance_adopt(const struct spec *sp) {
 
 /* ---- запись groups ------------------------------------------------------------------------- */
 
-static void alive_csv(const struct spec *sp, const struct group_cfg *g, unsigned alive, char *dst,
-                      size_t n) {
-    size_t l = 0;
+/* Имена живых членов через запятую — строка в куче (NULL — нет памяти). Длина по числу членов:
+ * раньше буфер был на 16 имён, и запись groups у группы побольше обрывалась на середине имени. */
+static char *alive_csv(const struct spec *sp, const struct group_cfg *g, const unsigned char *alive) {
+    size_t cap = g->members_n * 33 + 1, l = 0;
+    char *dst = malloc(cap);
+    if (!dst) return NULL;
     dst[0] = '\0';
-    for (size_t k = 0; k < g->members_n && l < n; k++)
-        if ((alive >> k) & 1u)
-            l += (size_t)snprintf(dst + l, n - l, "%s%s", l ? "," : "", sp->out[g->members[k]].name);
+    for (size_t k = 0; k < g->members_n; k++)
+        if (alive && alive[k])
+            l += (size_t)snprintf(dst + l, cap - l, "%s%s", l ? "," : "", spec_out(sp, g->members[k])->name);
+    return dst;
 }
 
-void fog_groups_save(struct fo_store *st, const struct spec *sp, const int *cur, const unsigned *alive) {
-    char want[MAX_OUTPUTS * 600];
+void fog_groups_save(struct fo_store *st, const struct spec *sp, const int *cur,
+                     unsigned char *const *alive) {
+    /* Строка группы: имя ≤ 31, выбранный ≤ 31, живые ≤ 33 на члена — буфер по сумме. */
+    size_t wcap = 1;
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct group_cfg *g = out_group(&sp->out[i]);
+        if (group_named(g)) wcap += 96 + g->members_n * 33;
+    }
+    char *want = malloc(wcap);
+    if (!want) return;
     size_t wn = 0;
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct group_cfg *g = out_group(&sp->out[i]);
         if (!group_named(g)) continue;
-        char al[MAX_MEMBERS * 33];
-        alive_csv(sp, g, alive[i], al, sizeof(al));
-        int w = snprintf(want + wn, sizeof(want) - wn, "%s %s %s\n", sp->out[i].name,
-                         cur[i] >= 0 && (size_t)cur[i] < g->members_n ? sp->out[g->members[cur[i]]].name
+        char *al = alive_csv(sp, g, alive[i]);
+        if (!al) { free(want); return; }
+        int w = snprintf(want + wn, wcap - wn, "%s %s %s\n", sp->out[i].name,
+                         cur[i] >= 0 && (size_t)cur[i] < g->members_n ? spec_out(sp, g->members[cur[i]])->name
                                                                      : "-",
                          al[0] ? al : "-");
-        if (w < 0 || (size_t)w >= sizeof(want) - wn) break;
+        free(al);
+        if (w < 0 || (size_t)w >= wcap - wn) break;
         wn += (size_t)w;
     }
     char *have = rec_read(st, "groups");
-    if (have && strlen(have) == wn && !memcmp(have, want, wn)) { free(have); return; }
+    if (have && strlen(have) == wn && !memcmp(have, want, wn)) { free(have); free(want); return; }
     free(have);
     st->ops->put(st, "groups", want, wn);
+    free(want);
+}
+
+/* Значение записи key из text — строка в куче ровно нужной длины (NULL — записи нет или нет
+ * памяти). Буфер под значение не «700 байт»: у группы на десятки членов строка живых длиннее. */
+static char *rec_dup(const char *text, const char *key) {
+    if (!text) return NULL;
+    char *val = malloc(strlen(text) + 1);
+    if (!val) return NULL;
+    if (!rec_get(text, key, val, strlen(text) + 1)) { free(val); return NULL; }
+    return val;
+}
+
+/* Разрезать значение записи groups «<выбранный> <живые через запятую>» на два слова на месте.
+ * 1 — оба есть. */
+static int groups_split(char *val, char **cur, char **al) {
+    char *sp1 = val + strcspn(val, " \t");
+    if (!*sp1) return 0;
+    *sp1++ = '\0';
+    sp1 += strspn(sp1, " \t");
+    if (!*sp1) return 0;
+    *al = sp1;
+    sp1[strcspn(sp1, " \t\r\n")] = '\0';
+    *cur = val;
+    return 1;
 }
 
 int fog_groups_cur(struct fo_store *st, const struct spec *sp, const struct output *go) {
     const struct group_cfg *g = out_group(go);
     if (!g) return -1;
     char *text = rec_read(st, "groups");
-    char val[700], m[64] = "";
+    char *val = rec_dup(text, go->name);
     int k = -1;
-    if (text && rec_get(text, go->name, val, sizeof(val)) && sscanf(val, "%63s", m) == 1)
-        k = member_idx(sp, g, m);
+    if (val) {
+        val[strcspn(val, " \t\r\n")] = '\0';        /* первое слово — выбранный член */
+        if (val[0]) k = member_idx(sp, g, val);
+    }
+    free(val);
     free(text);
     return k;
 }
 
 int fog_groups_alive(struct fo_store *st, const struct spec *sp, const struct output *go,
-                     unsigned *alive) {
+                     unsigned char *alive) {
     const struct group_cfg *g = out_group(go);
-    *alive = 0;
     if (!g) return 0;
+    memset(alive, 0, g->members_n);
     char *text = rec_read(st, "groups");
-    char val[700], m[64], al[640];
+    char *val = rec_dup(text, go->name), *cur, *al;
     int found = 0;
-    if (text && rec_get(text, go->name, val, sizeof(val)) && sscanf(val, "%63s %639s", m, al) == 2) {
+    if (val && groups_split(val, &cur, &al)) {
         found = 1;
         for (char *tok = strtok(al, ","); tok; tok = strtok(NULL, ",")) {
             int k = member_idx(sp, g, tok);
-            if (k >= 0) *alive |= 1u << k;
+            if (k >= 0) alive[k] = 1;
         }
     }
+    free(val);
     free(text);
     return found;
 }
@@ -394,30 +456,35 @@ void fog_adopt(struct spec *sp, struct fo_store *st) {
     for (size_t i = 0; i < sp->out_n; i++) {
         struct group_cfg *g = (struct group_cfg *)out_group(&sp->out[i]);
         if (!g) continue;
-        char val[700], m[64], al[640];
         g->cur = -1;
-        g->alive = 0;
+        if (g->alive) memset(g->alive, 0, g->members_n);
         g->sel = -1;
-        if (groups && rec_get(groups, sp->out[i].name, val, sizeof(val)) &&
-            sscanf(val, "%63s %639s", m, al) == 2) {
-            g->cur = member_idx(sp, g, m);
-            for (char *tok = strtok(al, ","); tok; tok = strtok(NULL, ",")) {
+        char *gv = rec_dup(groups, sp->out[i].name), *gcur, *gal;
+        if (gv && g->alive && groups_split(gv, &gcur, &gal)) {
+            g->cur = member_idx(sp, g, gcur);
+            for (char *tok = strtok(gal, ","); tok; tok = strtok(NULL, ",")) {
                 int k = member_idx(sp, g, tok);
-                if (k >= 0) g->alive |= 1u << k;
+                if (k >= 0) g->alive[k] = 1;
             }
         }
+        free(gv);
         if (g->pick == PICK_MANUAL) {
-            if (sel && rec_get(sel, sp->out[i].name, val, sizeof(val))) g->sel = member_idx(sp, g, val);
+            char *sv = rec_dup(sel, sp->out[i].name);
+            if (sv) {
+                sv[strcspn(sv, " \t\r\n")] = '\0';
+                g->sel = member_idx(sp, g, sv);
+            }
+            free(sv);
             if (g->sel < 0) g->sel = g->def >= 0 ? g->def : 0;
         }
         /* Замеры: запись latency (формат — folat.h). */
-        for (size_t k = 0; k < MAX_MEMBERS; k++) {
+        for (size_t k = 0; k < g->members_n; k++) {
             g->lat_ms[k] = -1;
             g->lat4_ms[k] = g->lat6_ms[k] = -2;
         }
         for (size_t k = 0; lat && k < g->members_n; k++) {
             struct folat_rec rc;
-            if (!folat_rec_get(st, sp->out[i].name, fog_lat_key(&sp->out[g->members[k]]), &rc))
+            if (!folat_rec_get(st, sp->out[i].name, fog_lat_key(spec_out(sp, g->members[k])), &rc))
                 continue;
             g->lat_ms[k] = rc.ms;
             g->lat4_ms[k] = rc.ms4;
@@ -501,7 +568,7 @@ int fog_select(struct spec *sp, struct fo_store *st, const char *gname, const ch
 
     /* Лист члена и жив ли он — по памяти сторожа: приговор последнего прохода члена (запись
      * active: «-» — отказ). Записи нет (сторож ещё не проходил) — по наличию устройства. */
-    const struct output *m = &sp->out[g->members[k]];
+    const struct output *m = spec_out(sp, g->members[k]);
     char mdev[32];
     active_of(st, m->name, mdev, sizeof(mdev), NULL);
     int alive = strcmp(mdev, "-") != 0;

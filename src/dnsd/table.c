@@ -1,50 +1,190 @@
 #include "dnsd_int.h"
 #include "srsplan.h"
 
-struct dchan g_dch[MAX_RULES];
-size_t g_dch_n;
+struct dchan *g_dch;
+size_t g_dch_n, g_dch_cap;
+
+/* Место под ещё один доменный канал (обнулённый). Каналов не «не больше 64»: массив растёт. */
+struct dchan *dch_new(void) {
+    if (g_dch_n == g_dch_cap) {
+        size_t nc = g_dch_cap ? g_dch_cap * 2 : 16;
+        struct dchan *p = realloc(g_dch, nc * sizeof(*p));
+        if (!p) return NULL;
+        g_dch = p;
+        g_dch_cap = nc;
+    }
+    struct dchan *d = &g_dch[g_dch_n];
+    memset(d, 0, sizeof(*d));
+    return d;
+}
 
 /* Апстримы и кэш из таблицы (dup.h). Здесь, а не в dup.c: демон линкует только table.c и
  * tabfmt.c (DNSD_TABLE_SRC), без транспортов резолвера. */
-struct dup_cfg g_dup_cfg[MAX_DNS_UP];
-size_t g_dup_cfg_n;
+struct dup_cfg *g_dup_cfg;
+size_t g_dup_cfg_n, g_dup_cfg_cap;
 struct dcache_cfg g_dcache_cfg;
 
-/* Все доменные каналы, которым принадлежит имя, — по биту на канал.
+/* ---- наборы каналов имени (chm_t, dnsd_int.h) ------------------------------------------------
+ *
+ * Различные наборы — битовые строки любой длины, каждая под своим номером (с единицы). Строка без
+ * старших нулевых слов, поэтому набор из первых 64 каналов — одно слово, а набор с каналом 300 —
+ * пять. Поиск по содержимому — открытой адресацией по FNV: различных наборов единицы, а спросить
+ * номер надо на каждый запрос имени. */
+struct chm_blk { size_t nw; uint64_t *w; };
+static struct chm_blk *g_chm;
+static size_t g_chm_n, g_chm_cap;
+static uint32_t *g_chm_ht;          /* номер набора; 0 — свободно */
+static size_t g_chm_ht_cap;
+
+static uint64_t chm_hash(const uint64_t *w, size_t nw) {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < nw; i++) { h ^= w[i]; h *= 1099511628211ULL; h ^= h >> 29; }
+    return h;
+}
+
+static int chm_ht_grow(void) {
+    size_t nc = g_chm_ht_cap ? g_chm_ht_cap * 2 : 64;
+    uint32_t *nt = calloc(nc, sizeof(*nt));
+    if (!nt) return -1;
+    for (size_t i = 0; i < g_chm_n; i++) {
+        size_t k = chm_hash(g_chm[i].w, g_chm[i].nw) & (nc - 1);
+        while (nt[k]) k = (k + 1) & (nc - 1);
+        nt[k] = (uint32_t)(i + 1);
+    }
+    free(g_chm_ht);
+    g_chm_ht = nt;
+    g_chm_ht_cap = nc;
+    return 0;
+}
+
+/* Номер набора с такими словами (старшие нулевые слова отбрасываются). 0 — набор пуст. При
+ * нехватке памяти — 0: имя остаётся без набора, то есть идёт прежним путём наверх. */
+static chm_t chm_intern(const uint64_t *w, size_t nw) {
+    while (nw && !w[nw - 1]) nw--;
+    if (!nw) return 0;
+    if ((g_chm_n + 1) * 2 > g_chm_ht_cap && chm_ht_grow() != 0) return 0;
+    size_t k = chm_hash(w, nw) & (g_chm_ht_cap - 1);
+    while (g_chm_ht[k]) {
+        const struct chm_blk *b = &g_chm[g_chm_ht[k] - 1];
+        if (b->nw == nw && !memcmp(b->w, w, nw * sizeof(*w))) return g_chm_ht[k];
+        k = (k + 1) & (g_chm_ht_cap - 1);
+    }
+    if (g_chm_n == g_chm_cap) {
+        size_t nc = g_chm_cap ? g_chm_cap * 2 : 32;
+        struct chm_blk *nb = realloc(g_chm, nc * sizeof(*nb));
+        if (!nb) return 0;
+        g_chm = nb;
+        g_chm_cap = nc;
+    }
+    uint64_t *cp = malloc(nw * sizeof(*cp));
+    if (!cp) return 0;
+    memcpy(cp, w, nw * sizeof(*cp));
+    g_chm[g_chm_n].w = cp;
+    g_chm[g_chm_n].nw = nw;
+    g_chm_n++;
+    g_chm_ht[k] = (uint32_t)g_chm_n;
+    return (chm_t)g_chm_n;
+}
+
+static size_t chm_words(chm_t m, const uint64_t **w) {
+    if (!m || m > g_chm_n) { *w = NULL; return 0; }
+    *w = g_chm[m - 1].w;
+    return g_chm[m - 1].nw;
+}
+
+chm_t chm_one(size_t ch) {
+    size_t nw = ch / 64 + 1;
+    uint64_t *w = calloc(nw, sizeof(*w));
+    if (!w) return 0;
+    w[ch / 64] = 1ULL << (ch % 64);
+    chm_t r = chm_intern(w, nw);
+    free(w);
+    return r;
+}
+
+int chm_has(chm_t m, size_t ch) {
+    const uint64_t *w;
+    size_t nw = chm_words(m, &w);
+    return ch / 64 < nw && (w[ch / 64] >> (ch % 64)) & 1u;
+}
+
+chm_t chm_or(chm_t a, chm_t b) {
+    if (!a) return b;
+    if (!b || a == b) return a;
+    const uint64_t *wa, *wb;
+    size_t na = chm_words(a, &wa), nb = chm_words(b, &wb), n = na > nb ? na : nb;
+    uint64_t *w = calloc(n, sizeof(*w));
+    if (!w) return a;
+    for (size_t i = 0; i < n; i++) w[i] = (i < na ? wa[i] : 0) | (i < nb ? wb[i] : 0);
+    chm_t r = chm_intern(w, n);
+    free(w);
+    return r;
+}
+
+chm_t chm_andn(chm_t a, chm_t b) {
+    if (!a || !b) return a;
+    const uint64_t *wa, *wb;
+    size_t na = chm_words(a, &wa), nb = chm_words(b, &wb);
+    uint64_t *w = calloc(na, sizeof(*w));
+    if (!w) return a;
+    for (size_t i = 0; i < na; i++) w[i] = wa[i] & ~(i < nb ? wb[i] : 0);
+    chm_t r = chm_intern(w, na);
+    free(w);
+    return r;
+}
+
+chm_t chm_upto(chm_t m, size_t n) {
+    const uint64_t *wm;
+    size_t nm = chm_words(m, &wm);
+    if (!nm) return 0;
+    if (nm * 64 <= n) return m;
+    size_t nw = n / 64 + (n % 64 ? 1 : 0);
+    uint64_t *w = calloc(nw ? nw : 1, sizeof(*w));
+    if (!w) return m;
+    for (size_t i = 0; i < nw && i < nm; i++) w[i] = wm[i];
+    if (n % 64 && nw) w[nw - 1] &= (1ULL << (n % 64)) - 1ULL;
+    chm_t r = chm_intern(w, nw);
+    free(w);
+    return r;
+}
+
+/* Все доменные каналы, которым принадлежит имя, — набор каналов.
  *
  * ВСЕ, а не первый: одно имя законно названо в нескольких правилах (правило на
  * телевизор и правило на всю сеть), и каждому из них нужен свой набор, иначе клиенты
  * второго остаются с поддельным адресом, которого нет ни в одном правиле. Кто из
  * правил заберёт пакет, решает порядок цепочки — тот же порядок, в котором правила
  * стоят у человека на экране. */
-uint64_t dch_match_mask(const char *host) {
-    uint64_t m = 0;
-    for (size_t i = 0; i < g_dch_n && i < 64; i++)
-        if (dch_matches(&g_dch[i], host)) m |= 1ULL << i;
+chm_t dch_match_mask(const char *host) {
+    chm_t m = 0;
+    for (size_t i = 0; i < g_dch_n; i++)
+        if (dch_matches(&g_dch[i], host)) m = chm_or(m, chm_one(i));
     return m;
 }
 
 /* Первый (то есть старший по порядку правил) канал из набора; -1 — набор пуст.
  * Он и решает, каким будет ОТВЕТ клиенту: ответ один, а режимов у каналов два. */
-int dch_first(uint64_t mask) {
-    for (size_t i = 0; i < g_dch_n && i < 64; i++)
-        if (mask & (1ULL << i)) return (int)i;
+int dch_first(chm_t mask) {
+    const uint64_t *w;
+    size_t nw = chm_words(mask, &w);
+    for (size_t i = 0; i < nw; i++)
+        if (w[i]) return (int)(i * 64 + (size_t)__builtin_ctzll(w[i]));
     return -1;
 }
 
 /* Только каналы поддельного адреса из набора. Канал реального адреса поддельный к
  * себе не берёт: в его наборе лежат настоящие адреса из ответа, а поддельного клиент
  * в этом режиме и не получает. */
-uint64_t dch_fakeip_only(uint64_t mask) {
-    for (size_t i = 0; i < g_dch_n && i < 64; i++)
-        if ((mask & (1ULL << i)) && g_dch[i].realip) mask &= ~(1ULL << i);
+chm_t dch_fakeip_only(chm_t mask) {
+    for (size_t i = 0; i < g_dch_n; i++)
+        if (g_dch[i].realip && chm_has(mask, i)) mask = chm_andn(mask, chm_one(i));
     return mask;
 }
 
-int dch_all_v6(uint64_t mask) {
+int dch_all_v6(chm_t mask) {
     if (!mask) return 0;
-    for (size_t i = 0; i < g_dch_n && i < 64; i++)
-        if ((mask & (1ULL << i)) && !(g_dch[i].fam & DCH_V6)) return 0;
+    for (size_t i = 0; i < g_dch_n; i++)
+        if (chm_has(mask, i) && !(g_dch[i].fam & DCH_V6)) return 0;
     return 1;
 }
 
@@ -140,8 +280,9 @@ static void dch_name(const struct spec *sp, char *dst, size_t n, const struct sp
  * компилятора, поэтому имена наборов и то, какие клаузы в какой набор, совпадают без сговора.
  * Доменная «единица» — это обычный канал или часть такого канала; имя её набора считается так
  * же, как его считает build_groups для группы этой части. */
-static struct srs_plan g_plans[MAX_RULES];
-static int g_plan_ok[MAX_RULES];
+static struct srs_plan *g_plans;       /* по правилу спеки; растёт (dch_build) */
+static int *g_plan_ok;
+static size_t g_plan_cap;
 
 static void unit_name(const struct spec *sp, const struct spec_rule *c, const struct srs_part *p,
                       int realip, char *dst, size_t n) {
@@ -314,14 +455,15 @@ static struct dchan *dch_slot(const char *set, int realip, int up, const char *o
     for (; k < g_dch_n; k++)
         if (!strcmp(g_dch[k].set, set) && g_dch[k].realip == realip && g_dch[k].up == up)
             return &g_dch[k];
-    if (g_dch_n >= MAX_RULES) return NULL;
-    memset(&g_dch[g_dch_n], 0, sizeof(g_dch[g_dch_n]));
-    snprintf(g_dch[g_dch_n].set, sizeof(g_dch[g_dch_n].set), "%s", set);
-    snprintf(g_dch[g_dch_n].out, sizeof(g_dch[g_dch_n].out), "%.31s", out);
-    g_dch[g_dch_n].realip = realip;
-    g_dch[g_dch_n].up = up;
-    g_dch[g_dch_n].fam = fam;
-    return &g_dch[g_dch_n++];
+    struct dchan *nd = dch_new();
+    if (!nd) return NULL;
+    snprintf(nd->set, sizeof(nd->set), "%s", set);
+    snprintf(nd->out, sizeof(nd->out), "%.31s", out);
+    nd->realip = realip;
+    nd->up = up;
+    nd->fam = fam;
+    g_dch_n++;
+    return nd;
 }
 
 static void dch_name_rule(struct dchan *d, const struct spec_rule *c, int dom) {
@@ -331,8 +473,17 @@ static void dch_name_rule(struct dchan *d, const struct spec_rule *c, int dom) {
     }
 }
 
+/* Путь в список канала: число путей не ограничено (массив растёт), строка — взаймы. */
 static void dch_src(struct dchan *d, const char *src) {
-    if (src && d->rules_n < MAX_FILES) d->rules_path[d->rules_n++] = src;
+    if (!src) return;
+    if (d->rules_n == d->rules_cap) {
+        size_t nc = d->rules_cap ? d->rules_cap * 2 : 8;
+        const char **np = realloc(d->rules_path, nc * sizeof(*np));
+        if (!np) return;
+        d->rules_path = np;
+        d->rules_cap = nc;
+    }
+    d->rules_path[d->rules_n++] = src;
 }
 
 /* Канал с наборами: его части с именами — каналы резолвера (или, без имён, но со своими
@@ -379,21 +530,28 @@ static void dch_add_srs_channel(const struct spec *sp, size_t ci) {
  * mark == 0 при need_mark: dup_ask такой апстрим не использует (dup.c) — «через туннель» без
  * метки означало бы «напрямую». */
 static void dch_up_finalize(const struct spec *sp) {
-    int map[MAX_DNS_UP + 1];
-    memset(map, 0, sizeof(map));
-    memset(g_dup_cfg, 0, sizeof(g_dup_cfg));
-    g_dup_cfg_n = 0;
+    /* Номера апстримов спеки → номера таблицы: по числу апстримов, а не по константе. */
+    int *map = calloc(sp->dns.up_n + 1, sizeof(int));
+    if (!map) return;
+    dup_cfg_list_reset();
     for (size_t i = 0; i < g_dch_n; i++) {
         int u = g_dch[i].up;
         if (!u) continue;
         if ((size_t)u > sp->dns.up_n) { g_dch[i].up = 0; continue; }
         if (!map[u]) {
             const struct spec_dns_up *s = &sp->dns.up[u - 1];
+            if (g_dup_cfg_n == g_dup_cfg_cap) {
+                size_t nc = g_dup_cfg_cap ? g_dup_cfg_cap * 2 : 8;
+                struct dup_cfg *np = realloc(g_dup_cfg, nc * sizeof(*np));
+                if (!np) { g_dch[i].up = 0; continue; }
+                g_dup_cfg = np;
+                g_dup_cfg_cap = nc;
+            }
             struct dup_cfg *c = &g_dup_cfg[g_dup_cfg_n];
-            c->u = *s;
+            memset(c, 0, sizeof(*c));
+            c->u = *s;                      /* ips и boot — указатели в спеку: она живёт дольше печати */
             if (!c->u.boot_n) {
-                for (size_t k = 0; k < sp->dns.boot_n && k < MAX_DNS_IPS; k++)
-                    snprintf(c->u.boot[k], sizeof(c->u.boot[k]), "%s", sp->dns.boot[k]);
+                c->u.boot = sp->dns.boot;
                 c->u.boot_n = sp->dns.boot_n;
             }
             if (s->out >= 0 && (size_t)s->out < sp->out_n) {
@@ -408,16 +566,38 @@ static void dch_up_finalize(const struct spec *sp) {
         }
         g_dch[i].up = map[u];
     }
+    free(map);
     g_dcache_cfg.entries = sp->dns.cache;
     g_dcache_cfg.ttl_min = sp->dns.ttl_min;
     g_dcache_cfg.ttl_max = sp->dns.ttl_max;
     g_dcache_cfg.ttl_neg = sp->dns.ttl_neg;
 }
 
+/* Список апстримов таблицы — пустым; массивы адресов освобождаются у тех, кто ими владеет
+ * (разобранных из текста, tabfmt_parse), у взятых взаймы из спеки — нет. */
+void dup_cfg_list_reset(void) {
+    for (size_t i = 0; i < g_dup_cfg_n; i++)
+        if (g_dup_cfg[i].own) { free(g_dup_cfg[i].u.ips); free(g_dup_cfg[i].u.boot); }
+    g_dup_cfg_n = 0;
+}
+
 void dch_build(const struct spec *sp) {
+    for (size_t i = 0; i < g_dch_n; i++) free(g_dch[i].rules_path);     /* только массив: строки взаймы */
     g_dch_n = 0;
     strs_free();
-    for (size_t i = 0; i < sp->rule_n && i < MAX_RULES; i++) {
+    /* Раскладки наборов .srs — по правилу спеки; массивы растут вместе с ней. */
+    if (sp->rule_n > g_plan_cap) {
+        struct srs_plan *np = realloc(g_plans, sp->rule_n * sizeof(*np));
+        int *nok = realloc(g_plan_ok, sp->rule_n * sizeof(int));
+        if (np) g_plans = np;
+        if (nok) g_plan_ok = nok;
+        if (np && nok) {
+            memset(g_plans + g_plan_cap, 0, (sp->rule_n - g_plan_cap) * sizeof(*np));
+            memset(g_plan_ok + g_plan_cap, 0, (sp->rule_n - g_plan_cap) * sizeof(int));
+            g_plan_cap = sp->rule_n;
+        }
+    }
+    for (size_t i = 0; i < sp->rule_n && i < g_plan_cap; i++) {
         if (g_plan_ok[i]) srs_plan_free(&g_plans[i]);
         g_plan_ok[i] = 0;
         if (!rule_list(sp, &sp->rule[i])->srs_n || sp->rule[i].disabled) continue;
@@ -487,26 +667,24 @@ void dch_build(const struct spec *sp) {
         for (; k < g_dch_n; k++)
             if (!strcmp(g_dch[k].set, set) && g_dch[k].realip == realip && g_dch[k].up == up) break;
         if (k == g_dch_n) {
-            if (g_dch_n >= MAX_RULES) break;
-            memset(&g_dch[g_dch_n], 0, sizeof(g_dch[g_dch_n]));
-            snprintf(g_dch[g_dch_n].set, sizeof(g_dch[g_dch_n].set), "%s", set);
-            snprintf(g_dch[g_dch_n].out, sizeof(g_dch[g_dch_n].out), "%.31s", rule_out(sp, r)->name);
-            g_dch[g_dch_n].realip = realip;
-            g_dch[g_dch_n].up = up;
-            g_dch[g_dch_n].fam = dch_fam(sp, r, realip, 0);
+            struct dchan *nd = dch_new();
+            if (!nd) break;
+            snprintf(nd->set, sizeof(nd->set), "%s", set);
+            snprintf(nd->out, sizeof(nd->out), "%.31s", rule_out(sp, r)->name);
+            nd->realip = realip;
+            nd->up = up;
+            nd->fam = dch_fam(sp, r, realip, 0);
             k = g_dch_n++;
         }
         if (!g_dch[k].chan[0] || (!g_dch[k].chan_dom && l->domains_n)) {
             snprintf(g_dch[k].chan, sizeof(g_dch[k].chan), "%.31s", r->name);
             g_dch[k].chan_dom = l->domains_n > 0;
         }
-        for (size_t f = 0; f < l->domains_n && g_dch[k].rules_n < MAX_FILES; f++)
-            g_dch[k].rules_path[g_dch[k].rules_n++] = l->domains_files[f];
+        for (size_t f = 0; f < l->domains_n; f++) dch_src(&g_dch[k], l->domains_files[f]);
         /* Адресные файлы того же канала — сюда же: доменные строки в них есть у половины
          * категорий издателя (список «Хостинги и CDN» лежит в адресных и целиком состоит
          * из имён), и раньше они пропадали с предупреждением. */
-        for (size_t f = 0; f < l->prefixes_n && g_dch[k].rules_n < MAX_FILES; f++)
-            g_dch[k].rules_path[g_dch[k].rules_n++] = l->prefixes_files[f];
+        for (size_t f = 0; f < l->prefixes_n; f++) dch_src(&g_dch[k], l->prefixes_files[f]);
     }
     dch_up_finalize(sp);
 }

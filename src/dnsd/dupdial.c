@@ -246,7 +246,7 @@ static void dial_run(struct dial *d) {
     if (sa_from(d->u.host, d->u.port, &lit) == 0) {
         list[ln++] = lit;
     } else if (d->u.ips_n) {
-        for (int i = 0; i < d->u.ips_n && ln < DIAL_MAXADDR; i++)
+        for (size_t i = 0; i < d->u.ips_n && ln < DIAL_MAXADDR; i++)
             if (sa_from(d->u.ips[i], d->u.port, &list[ln]) == 0) ln++;
     } else {
         if (d->cached_n && d->cached_fresh) {

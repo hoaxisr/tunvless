@@ -137,7 +137,8 @@ struct supd {
     int (*enabled)(void);
     const char *dnsd_flags[SUPD_DNSD_FLAGS + 1];
     struct helper_set set;
-    struct helper fresh[HELPERS_MAX];
+    struct helper *fresh;          /* план сверки: по выходу спеки + резолвер (supd_plan) */
+    size_t fresh_cap;
     struct loop_timer *tm;
     char exe[PATH_MAX];       /* движок или шов STEER_SUPERVISE_EXE */
     char self[PATH_MAX];      /* настоящий файл движка: резолвер и помощники-программы */
@@ -650,7 +651,8 @@ static int orphan_of(pid_t pid, char *what, size_t wn) {
     return 1;
 }
 
-#define ORPHANS_MAX 32
+/* Сирот прежнего демона — сколько нашлось: массивы pid и времён старта растут (раньше — 32 места,
+ * и при большем числе туннелей часть сирот оставалась жить и держала устройства). */
 
 /* Погасить помощников прежнего демона этого каталога состояния (шапка, признак 3): SIGTERM всем
  * сразу, три секунды на выход — столько же, сколько helpers_stop даёт своим, — дальше SIGKILL и
@@ -661,18 +663,29 @@ static int orphan_of(pid_t pid, char *what, size_t wn) {
 static int orphans_stop(const char *who) {
     DIR *d = opendir("/proc");
     if (!d) return 0;
-    pid_t pid[ORPHANS_MAX];
-    unsigned long long st[ORPHANS_MAX];
-    size_t n = 0;
+    pid_t *pid = NULL;
+    unsigned long long *st = NULL;
+    size_t n = 0, cap = 0;
     pid_t me = getpid();
     struct dirent *e;
-    while ((e = readdir(d)) && n < ORPHANS_MAX) {
+    while ((e = readdir(d))) {
         char *end = NULL;
         long p = strtol(e->d_name, &end, 10);
         if (!end || *end || p <= 1 || p == me) continue;
         char what[128];
         if (!orphan_of((pid_t)p, what, sizeof(what))) continue;
-        if (!(st[n] = proc_start((pid_t)p, NULL))) continue;
+        unsigned long long started = proc_start((pid_t)p, NULL);
+        if (!started) continue;
+        if (n == cap) {
+            size_t nc = cap ? cap * 2 : 16;
+            pid_t *np = realloc(pid, nc * sizeof(*np));
+            unsigned long long *ns = realloc(st, nc * sizeof(*ns));
+            if (np) pid = np;
+            if (ns) st = ns;
+            if (!np || !ns) break;
+            cap = nc;
+        }
+        st[n] = started;
         pid[n++] = (pid_t)p;
         kill((pid_t)p, SIGTERM);
         fprintf(stderr, "steer[info] %s: помощник прежнего демона (pid %ld, %s) остался без него — "
@@ -703,6 +716,8 @@ static int orphans_stop(const char *who) {
         struct timespec ts = { 0, 50000000L };
         nanosleep(&ts, NULL);
     }
+    free(pid);
+    free(st);
     return (int)n;
 }
 
@@ -1134,7 +1149,15 @@ int dnsd_wanted(void) {
 static size_t supd_plan(struct supd *s) {
     size_t n = 0;
     if (!s->d->have || (s->enabled && !s->enabled())) return 0;
-    n = helpers_plan(s->d->sp, s->fresh, HELPERS_MAX - 1, NULL);
+    /* Помощников не больше выходов спеки + резолвер. */
+    size_t need = s->d->sp->out_n + 1;
+    if (need > s->fresh_cap) {
+        struct helper *nf = realloc(s->fresh, need * sizeof(*nf));
+        if (!nf) return 0;
+        s->fresh = nf;
+        s->fresh_cap = need;
+    }
+    n = helpers_plan(s->d->sp, s->fresh, s->fresh_cap - 1, NULL);
     if (dnsd_wanted()) {
         struct helper *h = &s->fresh[n++];
         memset(h, 0, sizeof(*h));
@@ -1178,7 +1201,8 @@ struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
     probe_source(probe_mem);
     status_extra_source(status_fields);
     size_t fn = supd_plan(s);
-    memcpy(s->set.h, s->fresh, fn * sizeof(s->fresh[0]));
+    if (fn && helpers_reserve(&s->set, fn) != 0) { free(s->fresh); free(s); return NULL; }
+    if (fn) memcpy(s->set.h, s->fresh, fn * sizeof(s->fresh[0]));
     s->set.n = fn;
     if (d->have && fn == (size_t)(dnsd_wanted() && (!s->enabled || s->enabled())))
         fprintf(stderr, "steer[info] supervise: выходов со своим процессом в спеке нет\n");
@@ -1192,6 +1216,23 @@ struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
 /* Кого тронет сверка: помощник новый (или возвращён, пока прежний гас), с новой подписью,
  * убранный. Считается ДО helpers_merge по тем же признакам, что у неё (команда и выход, подпись),
  * — сама сверка общая с `steer supervise` и отчёта не ведёт. */
+/* Имя тронутого помощника — в список ch (растёт по числу). */
+static void changes_add(struct supd_changes *ch, const char *name) {
+    if (ch->helpers_n == ch->helpers_cap) {
+        size_t nc = ch->helpers_cap ? ch->helpers_cap * 2 : 8;
+        char (*np)[32] = realloc(ch->helpers, nc * sizeof(*np));
+        if (!np) return;
+        ch->helpers = np;
+        ch->helpers_cap = nc;
+    }
+    snprintf(ch->helpers[ch->helpers_n++], sizeof(ch->helpers[0]), "%s", name);
+}
+
+void supd_changes_free(struct supd_changes *ch) {
+    free(ch->helpers);
+    memset(ch, 0, sizeof(*ch));
+}
+
 static void changes_of(const struct supd *s, size_t fn, struct supd_changes *ch) {
     const struct helper *h = s->set.h;
     for (size_t k = 0; k < fn; k++) {
@@ -1202,8 +1243,7 @@ static void changes_of(const struct supd *s, size_t fn, struct supd_changes *ch)
             if (!h[i].gone && !strcmp(h[i].cmd, f->cmd) && !strcmp(h[i].name, f->name) &&
                 h[i].sig == f->sig)
                 same = 1;
-        if (!same && ch->helpers_n < HELPERS_MAX)
-            snprintf(ch->helpers[ch->helpers_n++], sizeof(ch->helpers[0]), "%s", f->name);
+        if (!same) changes_add(ch, f->name);
     }
     for (size_t i = 0; i < s->set.n; i++) {
         if (h[i].table || h[i].gone) continue;
@@ -1211,8 +1251,7 @@ static void changes_of(const struct supd *s, size_t fn, struct supd_changes *ch)
         for (size_t k = 0; k < fn; k++)
             if (!strcmp(h[i].cmd, s->fresh[k].cmd) && !strcmp(h[i].name, s->fresh[k].name))
                 keep = 1;
-        if (!keep && ch->helpers_n < HELPERS_MAX)
-            snprintf(ch->helpers[ch->helpers_n++], sizeof(ch->helpers[0]), "%s", h[i].name);
+        if (!keep) changes_add(ch, h[i].name);
     }
 }
 

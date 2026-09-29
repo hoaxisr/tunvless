@@ -34,14 +34,16 @@
 struct v1_chan {
     char name[32];
     char out[32];
-    const char *prefixes_files[MAX_FILES];
+    /* Массивы — куски арены спеки ровно по числу записей (js_count): число файлов, адресов и
+     * портов в канале константой не ограничено. */
+    const char **prefixes_files;
     size_t prefixes_n;
-    const char *domains_files[MAX_FILES];
+    const char **domains_files;
     size_t domains_n;
-    const char *srs_files[MAX_FILES];
+    const char **srs_files;
     size_t srs_n;
     int realip;
-    char from[MAX_FROM][64];
+    char (*from)[64];
     size_t from_n;
     int dev_scope;
     int any;
@@ -63,10 +65,84 @@ struct v1_chan {
  * выхода (выход может стоять в спеке ниже канала), согласие allow_all и ключи схемы 2 (у JSON
  * нет порядка ключей, и `schema` законно стоит после `channels`). По номеру правила. */
 struct v1_ctx {
-    char out[MAX_RULES][32];
-    unsigned char allow_all[MAX_RULES];
-    unsigned char l4_written[MAX_RULES];
+    char (*out)[32];
+    unsigned char *allow_all;
+    unsigned char *l4_written;
+    size_t cap;                     /* сколько правил вмещают три массива (ctx_at) */
 };
+
+/* Место под сведения о правиле i: три массива растут вместе с числом каналов, а не лежат на
+ * предельное число. Вызывается до записи по номеру. -1 — нехватка памяти. */
+static int ctx_at(struct v1_ctx *x, size_t i) {
+    if (i < x->cap) return 0;
+    size_t nc = x->cap ? x->cap * 2 : 16;
+    while (nc <= i) nc *= 2;
+    char (*o)[32] = realloc(x->out, nc * sizeof(*x->out));
+    if (!o) return -1;
+    x->out = o;
+    unsigned char *a = realloc(x->allow_all, nc), *l = realloc(x->l4_written, nc);
+    if (a) x->allow_all = a;
+    if (l) x->l4_written = l;
+    if (!a || !l) return -1;
+    memset(x->allow_all + x->cap, 0, nc - x->cap);
+    memset(x->l4_written + x->cap, 0, nc - x->cap);
+    memset(x->out + x->cap, 0, (nc - x->cap) * sizeof(*x->out));
+    x->cap = nc;
+    return 0;
+}
+static void ctx_free(struct v1_ctx *x) {
+    free(x->out);
+    free(x->allow_all);
+    free(x->l4_written);
+    memset(x, 0, sizeof(*x));
+}
+
+static int v1_nomem(struct err *e) {
+    return err_set(e, "%s", "недостаточно памяти для спеки");
+}
+
+/* Массив путей под j — в арену спеки ровно по числу записей. Строки str_list берёт в куче
+ * (keep), здесь они переезжают в арену и отдаются обратно: спека владеет всем, что держит.
+ * *n — число прочитанных (мягкая остановка на нестроке — не отказ), (size_t)-1 — отказ. */
+static const char **v1_paths(struct spec *s, struct js *j, size_t *n, struct err *e) {
+    size_t cnt = js_count(j);
+    const char **tmp = cnt ? (const char **)calloc(cnt, sizeof(*tmp)) : NULL;
+    if (cnt && !tmp) { v1_nomem(e); *n = (size_t)-1; return NULL; }
+    size_t got = str_list(j, tmp, cnt, e);
+    const char **out = NULL;
+    if (got != (size_t)-1 && got) {
+        out = (const char **)spec_alloc(s, got * sizeof(*out));
+        if (!out) { v1_nomem(e); got = (size_t)-1; }
+    }
+    for (size_t i = 0; i < cnt; i++) {
+        if (out && i < got) out[i] = spec_strdup(s, tmp[i]);
+        free((char *)tmp[i]);
+        if (out && i < got && !out[i]) { v1_nomem(e); got = (size_t)-1; out = NULL; }
+    }
+    free(tmp);
+    *n = got;
+    return got == (size_t)-1 ? NULL : out;
+}
+
+/* Один путь как массив из одного элемента (`prefixes_file` и родня). */
+static const char **v1_path1(struct spec *s, const char *str, struct err *e) {
+    const char **a = (const char **)spec_alloc(s, sizeof(*a));
+    if (a) a[0] = spec_strdup(s, str);
+    if (!a || !a[0]) { v1_nomem(e); return NULL; }
+    return a;
+}
+
+/* Массив строк по 64 байта (адреса и устройства) — в арену ровно по числу записей. Возврат как у
+ * str_array: 0 — разобрано (*n записей), -1 — не разобрано, e->msg заполнен или пуст (мягкий
+ * отказ, решает вызывающий). */
+static int v1_strs64(struct spec *s, struct js *j, char (**dst)[64], size_t *n, struct err *e) {
+    size_t cnt = js_count(j);
+    char (*a)[64] = cnt ? (char (*)[64])spec_alloc(s, cnt * sizeof(*a)) : NULL;
+    if (cnt && !a) { v1_nomem(e); return -1; }
+    int rc = str_array(j, a, cnt, n, e);
+    if (*n) *dst = a;               /* пустой массив прежнее значение не трогает (br-lan у lan_dev) */
+    return rc;
+}
 
 /* «443» или «50000-65535» → диапазон портов — port_range_parse (check.c, общий с v2). Отказ
  * громкий делает вызывающий: только он знает имя канала, а без имени сообщение не говорит, что
@@ -90,7 +166,7 @@ static int port_list(struct js *j, const char *chan, struct port_range *dst, siz
     /* Буфер с запасом: строки русские, в UTF-8 это два байта на букву, и обрезка по границе
      * буфера разрубила бы букву посередине — на этом ломался вывод при первом прогоне
      * стенда однажды уже (см. I-029). */
-    char msg[320];
+    char msg[512];
     if (js_lit(j, '[') != 0) {
         snprintf(msg, sizeof(msg), "channels.%.24s: ports — массив строк вида "
                  "[\"443\", \"50000-65535\"]", chan);
@@ -109,8 +185,9 @@ static int port_list(struct js *j, const char *chan, struct port_range *dst, siz
             return err_set(e, "%s", msg);
         }
         if (n >= max) {
-            snprintf(msg, sizeof(msg), "channels.%.24s: слишком много диапазонов портов "
-                     "(предел %zu)", chan, max);
+            snprintf(msg, sizeof(msg), "channels.%.24s: диапазонов портов больше %zu — каждый "
+                     "диапазон размножает все адреса списка в составном наборе nftables "
+                     "(адрес . протокол . порт), и память роутера кончилась бы раньше", chan, max);
             return err_set(e, "%s", msg);
         }
         if (port_range_parse(t, &dst[n]) != 0) {
@@ -223,9 +300,12 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
                         char t[32];
                         int r = js_str(j, t, sizeof(t), e);
                         if (r != 0) { if (e->msg[0]) return -1; break; }
-                        if (k.devices_n >= MAX_MEMBERS) return err_set(e, "outputs.%s: too many devices", o.name);
                         if (!name_ok(t)) return err_set(e, "outputs.%s: имя устройства негодного состава", o.name);
-                        snprintf(k.devices[k.devices_n++], 32, "%s", t);
+                        char (*slot)[32] = spec_push(s, (void **)&k.devices, k.devices_n, &k.devices_cap,
+                                                     sizeof(*k.devices));
+                        if (!slot) return v1_nomem(e);
+                        snprintf(*slot, 32, "%s", t);
+                        k.devices_n++;
                         js_ws(j);
                         if (*j->p == ',') {
                             /* См. str_list: trailing comma → отказ, не продвижение к ']' и
@@ -281,11 +361,19 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
                 long v = 0;
                 if (js_num(j, &v, e) != 0) return -1;
                 k.node_one = 1;
-                if (v >= 0) { k.nodes[0] = (int)v; k.nodes_n = 1; }
+                if (v >= 0) {
+                    k.nodes = (int *)spec_alloc(s, sizeof(int));
+                    if (!k.nodes) return v1_nomem(e);
+                    k.nodes[0] = (int)v;
+                    k.nodes_n = 1;
+                }
                 else k.nodes_n = 0;
             }
             else if (!strcmp(key, "nodes")) {
-                if (num_array(j, k.nodes, MAX_NODE_SEL, &k.nodes_n, e) != 0)
+                size_t nc = js_count(j);
+                k.nodes = nc ? (int *)spec_alloc(s, nc * sizeof(int)) : NULL;
+                if (nc && !k.nodes) return v1_nomem(e);
+                if (num_array(j, k.nodes, nc, &k.nodes_n, e) != 0)
                     return err_prop(e, "outputs.%s: nodes — массив номеров узлов подписки", o.name);
                 k.node_many = 1;
             }
@@ -399,7 +487,6 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
             for (size_t b = a + 1; b < k.nodes_n; b++)
                 if (k.nodes[a] == k.nodes[b])
                     return err_set(e, "outputs.%s: узел подписки указан в nodes дважды", o.name);
-        if (s->out_n >= MAX_OUTPUTS) return err_set(e, "too many outputs", NULL);
         /* Два выхода с одним именем: реестр раздаст две метки, init поднимет два процесса
          * на одно имя, а out_by_name всегда возьмёт первый — как у devices и nodes, это
          * отказ, не молчаливая победа одного из двух. */
@@ -426,6 +513,7 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
             o.grp.lat_tolerance_ms = lat_tolerance_ms;
             o.grp.lat_interval_s = lat_interval_s;
         }
+        if (spec_reserve_out(s, s->out_n + 1) != 0) return v1_nomem(e);
         s->out[s->out_n++] = o;
         js_ws(j);
         if (*j->p == ',') { j->p++; continue; }
@@ -439,7 +527,9 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
 
 /* Канал → правило с безымянными клиентом и списком (перевод — в шапке файла). */
 static int chan_store(struct spec *s, struct v1_ctx *x, const struct v1_chan *c, struct err *e) {
-    if (s->rule_n >= MAX_RULES) return err_set(e, "too many channels", NULL);
+    if (spec_reserve_rule(s, s->rule_n + 1) != 0 || spec_reserve_list(s, s->list_n + 1) != 0 ||
+        spec_reserve_client(s, s->client_n + 1) != 0 || ctx_at(x, s->rule_n) != 0)
+        return v1_nomem(e);
     size_t i = s->rule_n++;
     struct spec_rule *r = &s->rule[i];
     memset(r, 0, sizeof(*r));
@@ -450,12 +540,17 @@ static int chan_store(struct spec *s, struct v1_ctx *x, const struct v1_chan *c,
     r->disabled = c->disabled;
     struct spec_list *l = &s->list[s->list_n];
     memset(l, 0, sizeof(*l));
-    r->lists[r->lists_n++] = (unsigned char)s->list_n++;
-    memcpy(l->prefixes_files, c->prefixes_files, sizeof(l->prefixes_files));
+    /* Канал v1 — ровно один список и не больше одного клиента (шапка файла). */
+    r->lists = (unsigned *)spec_alloc(s, sizeof(unsigned));
+    r->clients = c->from_n ? (unsigned *)spec_alloc(s, sizeof(unsigned)) : NULL;
+    if (!r->lists || (c->from_n && !r->clients)) return v1_nomem(e);
+    r->lists[r->lists_n++] = (unsigned)s->list_n++;
+    /* Массивы канала уже лежат в арене спеки: список забирает их по указателю. */
+    l->prefixes_files = c->prefixes_files;
     l->prefixes_n = c->prefixes_n;
-    memcpy(l->domains_files, c->domains_files, sizeof(l->domains_files));
+    l->domains_files = c->domains_files;
     l->domains_n = c->domains_n;
-    memcpy(l->srs_files, c->srs_files, sizeof(l->srs_files));
+    l->srs_files = c->srs_files;
     l->srs_n = c->srs_n;
     l->l4 = c->l4;
     /* `any` рядом со списками ничего не значит (так было всегда: группа «весь трафик» — только
@@ -464,9 +559,9 @@ static int chan_store(struct spec *s, struct v1_ctx *x, const struct v1_chan *c,
     if (c->from_n) {
         struct spec_client *cl = &s->client[s->client_n];
         memset(cl, 0, sizeof(*cl));
-        memcpy(cl->from, c->from, sizeof(cl->from));
+        cl->from = c->from;
         cl->from_n = c->from_n;
-        r->clients[r->clients_n++] = (unsigned char)s->client_n++;
+        r->clients[r->clients_n++] = (unsigned)s->client_n++;
     }
     snprintf(x->out[i], sizeof(x->out[i]), "%s", c->out);
     x->allow_all[i] = (unsigned char)c->allow_all;
@@ -491,7 +586,7 @@ static int parse_channels(struct js *j, struct spec *s, struct v1_ctx *x, struct
             if (js_lit(j, ':') != 0) return err_set(e, "channels: после ключа «%s» нет двоеточия", key);
             if (!strcmp(key, "name")) { if (js_str(j, c.name, sizeof(c.name), e) != 0 && e->msg[0]) return -1; }
             else if (!strcmp(key, "out")) { if (js_str(j, c.out, sizeof(c.out), e) != 0 && e->msg[0]) return -1; }
-            else if (!strcmp(key, "from")) { if (str_array(j, c.from, MAX_FROM, &c.from_n, e) != 0 && e->msg[0]) return -1; }
+            else if (!strcmp(key, "from")) { if (v1_strs64(s, j, &c.from, &c.from_n, e) != 0 && e->msg[0]) return -1; }
             /* СХЕМА 2: правило на одно устройство, старше глобальных по построению.
              * Разрешено только при `schema: 2` — проверяется ниже, вместе с proto/ports, и
              * по той же причине: движок постарше ключ пропустит и положит правило в порядке
@@ -548,9 +643,8 @@ static int parse_channels(struct js *j, struct spec *s, struct v1_ctx *x, struct
                         int r = js_str(j, one, sizeof(one), e);
                         if (r != 0 && e->msg[0]) return -1;
                         if (r == 0) {
-                            const char *kept = keep(one, e);
-                            if (!kept) return -1;
-                            c.prefixes_files[0] = kept;
+                            c.prefixes_files = v1_path1(s, one, e);
+                            if (!c.prefixes_files) return -1;
                             c.prefixes_n = 1;
                         }
                     } else if (!strcmp(mk, "domains_file")) {
@@ -560,21 +654,22 @@ static int parse_channels(struct js *j, struct spec *s, struct v1_ctx *x, struct
                         int r = js_str(j, one, sizeof(one), e);
                         if (r != 0 && e->msg[0]) return -1;
                         if (r == 0) {
-                            const char *kept = keep(one, e);
-                            if (!kept) return -1;
-                            c.domains_files[0] = kept;
+                            c.domains_files = v1_path1(s, one, e);
+                            if (!c.domains_files) return -1;
                             c.domains_n = 1;
                         }
                     } else if (!strcmp(mk, "prefixes_files")) {
                         if (pf_one) return err_set(e, "channels.%s: prefixes_files рядом с prefixes_file", c.name);
                         pf_many = 1;
-                        size_t sl = str_list(j, c.prefixes_files, MAX_FILES, e);
+                        size_t sl;
+                        c.prefixes_files = v1_paths(s, j, &sl, e);
                         if (sl == (size_t)-1) return -1;
                         c.prefixes_n = sl;
                     } else if (!strcmp(mk, "domains_files")) {
                         if (df_one) return err_set(e, "channels.%s: domains_files рядом с domains_file", c.name);
                         df_many = 1;
-                        size_t sl = str_list(j, c.domains_files, MAX_FILES, e);
+                        size_t sl;
+                        c.domains_files = v1_paths(s, j, &sl, e);
                         if (sl == (size_t)-1) return -1;
                         c.domains_n = sl;
                     }
@@ -591,15 +686,15 @@ static int parse_channels(struct js *j, struct spec *s, struct v1_ctx *x, struct
                         int r = js_str(j, one, sizeof(one), e);
                         if (r != 0 && e->msg[0]) return -1;
                         if (r == 0) {
-                            const char *kept = keep(one, e);
-                            if (!kept) return -1;
-                            c.srs_files[0] = kept;
+                            c.srs_files = v1_path1(s, one, e);
+                            if (!c.srs_files) return -1;
                             c.srs_n = 1;
                         }
                     } else if (!strcmp(mk, "srs_files")) {
                         if (sf_one) return err_set(e, "channels.%s: srs_files рядом с srs_file", c.name);
                         sf_many = 1;
-                        size_t sl = str_list(j, c.srs_files, MAX_FILES, e);
+                        size_t sl;
+                        c.srs_files = v1_paths(s, j, &sl, e);
                         if (sl == (size_t)-1) return -1;
                         c.srs_n = sl;
                     }
@@ -655,7 +750,7 @@ static int parse_channels(struct js *j, struct spec *s, struct v1_ctx *x, struct
                     }
                     else if (!strcmp(mk, "ports")) {
                         c.l4_written = 1;
-                        if (port_list(j, c.name, c.l4.ports, MAX_PORTS, &c.l4.ports_n, e) != 0) return -1;
+                        if (port_list(j, c.name, c.l4.ports, L4_PORTS_MAX, &c.l4.ports_n, e) != 0) return -1;
                     }
                     /* «Да» — и `true`, и `1`. Спеку пишет не только человек: jshn у OpenWrt
                      * в разных сборках выдаёт логическое значение то словом, то единицей, а
@@ -707,11 +802,21 @@ static int parse_channels(struct js *j, struct spec *s, struct v1_ctx *x, struct
 
 /* Проверка `via` (over модели) — spec_check_outputs в check.c, общая с v2: смысл и отказы там. */
 
+/* Что из каналов понадобится проверкам после разбора всего документа (см. struct v1_ctx). Растёт
+ * с числом каналов и отдаётся после разбора (spec_parse_v1); файловый static, а не локальный —
+ * чтобы обёртка освободила его на любом из десятков выходов с отказом. */
+static struct v1_ctx x;
+static int v1_parse(const char *text, struct spec *s, struct err *e);
+
 int spec_parse_v1(const char *text, struct spec *s, struct err *e) {
-    /* Что из каналов понадобится проверкам после разбора всего документа (см. struct v1_ctx).
-     * static: 2,5 КБ, а зовут разбор по разу на процесс — стек помощника на телефоне беречь. */
-    static struct v1_ctx x;
-    memset(&x, 0, sizeof(x));
+    ctx_free(&x);
+    int rc = v1_parse(text, s, e);
+    ctx_free(&x);
+    if (rc == 0) rc = check_mark_slots(s, e);
+    return rc;
+}
+
+static int v1_parse(const char *text, struct spec *s, struct err *e) {
     /* Имена правил v1 — только IPv4: на AAAA имени под доменным каналом резолвер отвечает пустым
      * ответом, как до 1.9, и в выход с IPv6 тоже (доводы — у поля, spec.h). Ставится до разбора,
      * а не после: у функции десятки выходов с отказом, а отказ v1 и так обнуляет спеку
@@ -741,7 +846,7 @@ int spec_parse_v1(const char *text, struct spec *s, struct err *e) {
         else if (!strcmp(key, "channels")) { if (parse_channels(&j, s, &x, e) != 0) return -1; }
         /* Клиенты по умолчанию — адресами (`lan` модели). */
         else if (!strcmp(key, "from_default")) {
-            if (str_array(&j, s->lan.from, MAX_FROM, &s->lan.from_n, e) != 0 && e->msg[0]) return -1;
+            if (v1_strs64(s, &j, &s->lan.from, &s->lan.from_n, e) != 0 && e->msg[0]) return -1;
         }
         else if (!strcmp(key, "lan_device")) {
             /* Одиночная форма — сокращение для списка из одного элемента, ровно как
@@ -751,7 +856,7 @@ int spec_parse_v1(const char *text, struct spec *s, struct err *e) {
             lan_one = 1;
         }
         else if (!strcmp(key, "lan_devices")) {
-            if (str_array(&j, s->lan_dev, MAX_LAN_DEV, &s->lan_dev_n, e) != 0)
+            if (v1_strs64(s, &j, &s->lan_dev, &s->lan_dev_n, e) != 0)
                 return err_prop(e, "lan_devices: ожидался массив строк", NULL);
             lan_many = 1;
         }

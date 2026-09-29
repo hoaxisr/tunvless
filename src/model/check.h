@@ -29,4 +29,9 @@ int obfs_set(const char *name, const char *mode, const char *server, const char 
  * 0 — годится; -1 — отказ в e, а в *bad (если не NULL) — номер выхода, о котором он. */
 int spec_check_outputs(const struct spec *sp, const char *over_word, int *bad, struct err *e);
 
+/* Выходов с меткой (out_needs_mark) не больше, чем мест в поле метки (steer_mark_slots, marks.h).
+ * Это единственный настоящий предел числа выходов, и он свойство раскладки: отказ называет цифры
+ * раскладки — сколько мест, какие биты поля, сколько выходов в спеке. 0 — годится. */
+int check_mark_slots(const struct spec *sp, struct err *e);
+
 #endif

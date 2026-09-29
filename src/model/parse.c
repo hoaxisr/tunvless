@@ -391,10 +391,15 @@ static int json_top_key(const char *text, const char *key) {
     return 0;
 }
 
-static void spec_defaults(struct spec *s) {
-    memset(s, 0, sizeof(*s));
+static int spec_defaults(struct spec *s) {
+    /* Прежняя загрузка в этот же экземпляр (цикл демона) отдаётся здесь, а не оставляется на
+     * вызывающего: спека владеет своими массивами (spec.h, «память спеки»). */
+    spec_release(s);
+    s->lan_dev = (char (*)[64])spec_alloc(s, sizeof(*s->lan_dev));
+    if (!s->lan_dev) return -1;
     snprintf(s->lan_dev[0], sizeof(s->lan_dev[0]), "br-lan");
     s->lan_dev_n = 1;
+    return 0;
 }
 
 /* Спека v2 из текста: дерево YAML (JSON читается им же) и разбор v2. */
@@ -434,25 +439,48 @@ static int spec_pick_default(const char **path, struct err *e) {
     return 0;
 }
 
+#define SPEC_TEXT_MAX (16 << 20)
+static int load_text(char *buf, size_t n, const char *path, struct spec *s, struct err *e);
+
 int load_spec(const char *path, struct spec *s, struct err *e) {
     /* Спека — значение (правило 6): экземпляр обнуляется здесь, а не оставляется на
      * совести вызывающего, и получает те же умолчания, что раньше стояли инициализаторами
      * глобалов — один br-lan клиентским устройством, всё остальное пусто/нуль. */
-    spec_defaults(s);
+    if (spec_defaults(s) != 0) return err_set(e, "%s", "недостаточно памяти для спеки");
     if (spec_pick_default(&path, e) != 0) return -1;
     FILE *f = strcmp(path, "-") ? fopen(path, "r") : stdin;
     if (!f) return err_set(e, "%s: cannot open", path);
-    static char buf[262144];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    if (n == sizeof(buf) - 1) {
-        int c = fgetc(f);
-        if (c != EOF) {
-            if (f != stdin) fclose(f);
-            return err_set(e, "spec too large (max 256 KiB)", NULL);
+    /* Текст читается в кучу по мере надобности (раньше — статический буфер в 256 КиБ, то есть
+     * 256 КиБ bss ради спеки, которая занимает полкилобайта). Потолок — 16 МиБ: столько же,
+     * сколько принимает ctl (CTL_FILE_MAX), — защита от файла-невпопад (лог вместо спеки), а не
+     * размер спеки: спека на тысячи правил — сотни килобайт. */
+    size_t cap = 16384, n = 0;
+    char *buf = malloc(cap);
+    if (!buf) { if (f != stdin) fclose(f); return err_set(e, "%s", "недостаточно памяти для спеки"); }
+    for (;;) {
+        if (n + 1 >= cap) {
+            if (cap >= SPEC_TEXT_MAX) {
+                free(buf);
+                if (f != stdin) fclose(f);
+                return err_set(e, "%s", "spec too large (max 16 MiB)");
+            }
+            char *nb = realloc(buf, cap * 2);
+            if (!nb) { free(buf); if (f != stdin) fclose(f); return err_set(e, "%s", "недостаточно памяти для спеки"); }
+            buf = nb;
+            cap *= 2;
         }
+        size_t got = fread(buf + n, 1, cap - 1 - n, f);
+        if (!got) break;
+        n += got;
     }
     buf[n] = '\0';
     if (f != stdin) fclose(f);
+    int rc = load_text(buf, n, path, s, e);
+    free(buf);
+    return rc;
+}
+
+static int load_text(char *buf, size_t n, const char *path, struct spec *s, struct err *e) {
     /* ФОРМАТ — ПО СОДЕРЖИМОМУ, а не по имени файла: ctl apply кладёт тело в тот файл, который
      * сейчас спека, каким бы форматом тело ни было записано.
      *
@@ -474,7 +502,7 @@ int load_spec(const char *path, struct spec *s, struct err *e) {
         if (!ver) {
             int rc = spec_parse_v1(buf, s, e);
             if (rc == 0 || sch || !strstr(buf, "version")) return rc;
-            spec_defaults(s);
+            if (spec_defaults(s) != 0) return err_set(e, "%s", "недостаточно памяти для спеки");
             e->msg[0] = '\0';
         }
     }

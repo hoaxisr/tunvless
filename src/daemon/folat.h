@@ -40,7 +40,7 @@ void folat_rec_put(struct fo_store *st, const char *out, const struct output *co
 
 /* Мерить ли группу go ещё и по IPv6: группа v2 (именованные члены — у каждого своя метка и своё
  * правило IPv6), и каждый живой член (alive — маска) несёт IPv6 (KC_IPV6). */
-int folat_want_v6(const struct spec *sp, const struct output *go, unsigned alive);
+int folat_want_v6(const struct spec *sp, const struct output *go, const unsigned char *alive);
 
 struct folat_m;
 /* Итог замера члена: ms4, ms6 — мс (-1 — не измерилось; ms6 = -2 — по IPv6 не мерили). */

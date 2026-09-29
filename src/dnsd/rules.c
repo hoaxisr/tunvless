@@ -1,8 +1,6 @@
 #include "dnsd_int.h"
 #include "srs.h"
 
-#define MAX_RULE_LINES 65536
-
 /* ---------------------------------------------------------------------- */
 /* rule matching                                                          */
 /* ---------------------------------------------------------------------- */
@@ -44,8 +42,7 @@ static int clean_line(char *line) {
 }
 
 int ruleset_add(struct ruleset *rs, const char *raw) {
-    if (rs->n >= MAX_RULE_LINES) return -1;
-    if (rs->n == rs->cap) {
+    if (rs->n == rs->cap) {                 /* число правил набора — память, не константа */
         size_t newcap = rs->cap ? rs->cap * 2 : 64;
         struct rule *nr = realloc(rs->rules, newcap * sizeof(*nr));
         if (!nr) return -1;

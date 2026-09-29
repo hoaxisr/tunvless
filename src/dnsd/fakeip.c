@@ -507,13 +507,13 @@ void dch_del6(size_t i, const char *domain, const uint8_t addr[16]) {
     for (size_t j = 0; j < n; j++) nft_concat_element6(0, s6, addr, &b[j], 0);
 }
 
-void fakeip_route_set(const char *domain, uint64_t want) {
+void fakeip_route_set(const char *domain, chm_t want) {
     long at = fakeip_find(domain);
     if (at < 0) return;
-    if (g_dch_n < 64) want &= (1ULL << g_dch_n) - 1ULL;
+    want = chm_upto(want, g_dch_n);
     if (!want) return;
 
-    uint64_t old = g_fakeip.entries[at].sets;
+    chm_t old = g_fakeip.entries[at].sets;
     if (old == want) {
         /* Те же наборы: постоянные элементы уже стоят (или пережили прошлый запуск).
          * Переутверждаем идемпотентно — ядро, потерявшее их (fw4 reload смывает
@@ -529,7 +529,7 @@ void fakeip_route_set(const char *domain, uint64_t want) {
             return;
         g_fakeip.entries[at].route_asserted = now;
         for (size_t i = 0; i < g_dch_n; i++)
-            if (want & (1ULL << i))
+            if (chm_has(want, i))
                 dch_add(i, domain, g_fakeip.entries[at].addr, 0);
         return;
     }
@@ -538,14 +538,14 @@ void fakeip_route_set(const char *domain, uint64_t want) {
      * удалили или переписали его списки. ENOENT законен — удалять нечего
      * (перезапуск, или элемент туда и не лёг). */
     for (size_t i = 0; i < g_dch_n; i++) {
-        if (!(old & (1ULL << i)) || (want & (1ULL << i))) continue;
+        if (!chm_has(old, i) || chm_has(want, i)) continue;
         dch_del(i, domain, g_fakeip.entries[at].addr);
     }
 
     /* И кладём во все, где его ещё нет, постоянным элементом. EEXIST — уже
      * желаемое состояние. */
     for (size_t i = 0; i < g_dch_n; i++)
-        if ((want & (1ULL << i)) && !(old & (1ULL << i)))
+        if (chm_has(want, i) && !chm_has(old, i))
             dch_add(i, domain, g_fakeip.entries[at].addr, 0);
     g_fakeip.entries[at].sets = want;
     g_fakeip.entries[at].route_asserted = time(NULL);
@@ -554,29 +554,29 @@ void fakeip_route_set(const char *domain, uint64_t want) {
 /* То же для поддельного IPv6 — постоянный элемент в «<канал>6» каждого канала из want, с тем же
  * дросселем переутверждения и тем же переездом между каналами. want — только каналы с DCH_V6:
  * у остальных набора IPv6 нет (и AAAA им адресом не отвечают — dch_all_v6). */
-void fakeip_route_set6(const char *domain, uint64_t want) {
+void fakeip_route_set6(const char *domain, chm_t want) {
     long at = fakeip_find(domain);
     if (at < 0) return;
-    if (g_dch_n < 64) want &= (1ULL << g_dch_n) - 1ULL;
-    for (size_t i = 0; i < g_dch_n && i < 64; i++)
-        if (!(g_dch[i].fam & DCH_V6)) want &= ~(1ULL << i);
+    want = chm_upto(want, g_dch_n);
+    for (size_t i = 0; i < g_dch_n; i++)
+        if (!(g_dch[i].fam & DCH_V6) && chm_has(want, i)) want = chm_andn(want, chm_one(i));
     if (!want) return;
     struct fakeip_entry *e = &g_fakeip.entries[at];
     uint8_t f6[16];
     fakeip6_of(e->addr, f6);
-    uint64_t old = e->sets6;
+    chm_t old = e->sets6;
     time_t now = time(NULL);
     if (old == want) {
         if (now - e->route6_asserted < FAKEIP_ANSWER_TTL) return;
         e->route6_asserted = now;
         for (size_t i = 0; i < g_dch_n; i++)
-            if (want & (1ULL << i)) dch_add6(i, domain, f6, 0);
+            if (chm_has(want, i)) dch_add6(i, domain, f6, 0);
         return;
     }
     for (size_t i = 0; i < g_dch_n; i++)
-        if ((old & (1ULL << i)) && !(want & (1ULL << i))) dch_del6(i, domain, f6);
+        if (chm_has(old, i) && !chm_has(want, i)) dch_del6(i, domain, f6);
     for (size_t i = 0; i < g_dch_n; i++)
-        if ((want & (1ULL << i)) && !(old & (1ULL << i))) dch_add6(i, domain, f6, 0);
+        if (chm_has(want, i) && !chm_has(old, i)) dch_add6(i, domain, f6, 0);
     e->sets6 = want;
     e->route6_asserted = now;
 }
@@ -588,26 +588,26 @@ void fakeip_route_set6(const char *domain, uint64_t want) {
  * want, и fakeip_route_set молчал бы до конца дросселя, а клиент с поддельным адресом в кэше всё
  * это время шёл бы мимо выхода: пакет к поддельному адресу набор не метит, а карта dnat, которую
  * apply засевает из файла состояния, разворачивает его в настоящий адрес — напрямую. */
-static void route_reassert(struct fakeip_entry *e, uint64_t want) {
-    if (g_dch_n < 64) want &= (1ULL << g_dch_n) - 1ULL;
-    for (size_t i = 0; i < g_dch_n && i < 64; i++)
-        if ((e->sets & (1ULL << i)) && !(want & (1ULL << i))) dch_del(i, e->domain, e->addr);
-    for (size_t i = 0; i < g_dch_n && i < 64; i++)
-        if (want & (1ULL << i)) dch_add(i, e->domain, e->addr, 0);
+static void route_reassert(struct fakeip_entry *e, chm_t want) {
+    want = chm_upto(want, g_dch_n);
+    for (size_t i = 0; i < g_dch_n; i++)
+        if (chm_has(e->sets, i) && !chm_has(want, i)) dch_del(i, e->domain, e->addr);
+    for (size_t i = 0; i < g_dch_n; i++)
+        if (chm_has(want, i)) dch_add(i, e->domain, e->addr, 0);
     e->sets = want;
     e->route_asserted = time(NULL);
 }
 
-static void route_reassert6(struct fakeip_entry *e, uint64_t want) {
-    if (g_dch_n < 64) want &= (1ULL << g_dch_n) - 1ULL;
-    for (size_t i = 0; i < g_dch_n && i < 64; i++)
-        if (!(g_dch[i].fam & DCH_V6)) want &= ~(1ULL << i);
+static void route_reassert6(struct fakeip_entry *e, chm_t want) {
+    want = chm_upto(want, g_dch_n);
+    for (size_t i = 0; i < g_dch_n; i++)
+        if (!(g_dch[i].fam & DCH_V6) && chm_has(want, i)) want = chm_andn(want, chm_one(i));
     uint8_t f6[16];
     fakeip6_of(e->addr, f6);
-    for (size_t i = 0; i < g_dch_n && i < 64; i++)
-        if ((e->sets6 & (1ULL << i)) && !(want & (1ULL << i))) dch_del6(i, e->domain, f6);
-    for (size_t i = 0; i < g_dch_n && i < 64; i++)
-        if (want & (1ULL << i)) dch_add6(i, e->domain, f6, 0);
+    for (size_t i = 0; i < g_dch_n; i++)
+        if (chm_has(e->sets6, i) && !chm_has(want, i)) dch_del6(i, e->domain, f6);
+    for (size_t i = 0; i < g_dch_n; i++)
+        if (chm_has(want, i)) dch_add6(i, e->domain, f6, 0);
     e->sets6 = want;
     e->route6_asserted = time(NULL);
 }
@@ -666,7 +666,7 @@ size_t fakeip_rehydrate(int nk_open, size_t *routed_out) {
     g_fakeip_fixed = 0;
     for (size_t i = 0; i < g_fakeip.n; i++) {
         struct fakeip_entry *e = &g_fakeip.entries[i];
-        uint64_t all = 0, m = 0;
+        chm_t all = 0, m = 0;
         if (nk_open == 0) {
             /* Re-derive the channels for the stored domain and re-assert the permanent route
              * elements — БЕЗ дросселя и во все каналы, а не только в новые (route_reassert ниже):
@@ -702,7 +702,7 @@ size_t fakeip_rehydrate(int nk_open, size_t *routed_out) {
          * прежние элементы IPv6 снимаются — на AAAA такого имени адресом больше не отвечают.
          * Настоящий IPv6 остаётся у записи, только если ядро приняло элемент карты fakeip6; иначе
          * быстрый путь AAAA закрыт до нового ответа, и элементы IPv6 снимаются тоже. */
-        uint64_t m6 = e->has_real6_saved && m && dch_all_v6(all) ? m : 0;
+        chm_t m6 = e->has_real6_saved && m && dch_all_v6(all) ? m : 0;
         if (m6 || e->sets6) route_reassert6(e, m6);
         if (e->has_real6_saved) {
             uint8_t f6[16];

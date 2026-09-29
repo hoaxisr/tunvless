@@ -556,24 +556,14 @@ static void hdrs_load(const char *path, char *out, size_t n) {
  * Буфера — в куче, а не статикой: команда живёт один вызов, а статика легла бы в BSS того
  * же бинарника, который работает демоном туннеля. Полмегабайта постоянно занятой памяти на
  * коробке с 64 МБ ради разового вызова — плохой обмен. */
-#define SUB_BUF 262144
-#define SUB_MAX_NODES 128
 
 static size_t usable_nodes(const char *path, struct vless_sub_stats *st) {
     memset(st, 0, sizeof *st);
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    char *raw = malloc(SUB_BUF), *dec = malloc(SUB_BUF);
-    struct vless_node *nodes = malloc(sizeof(struct vless_node) * SUB_MAX_NODES);
     size_t cnt = 0;
-    if (raw && dec && nodes) {
-        size_t n = fread(raw, 1, SUB_BUF - 1, f);
-        raw[n] = 0;
-        const char *text = vless_sub_text(raw, n, dec, SUB_BUF);
-        cnt = vless_parse_sub(text, nodes, SUB_MAX_NODES, st);
-    }
-    fclose(f);
-    free(raw); free(dec); free(nodes);
+    /* Буферы и узлы — по размеру файла и числу узлов в нём (vless_load_sub, sub.c): раньше 256 КиБ
+     * и 128 узлов, а хвост подписки не считался пригодным. */
+    struct vless_node *nodes = vless_load_sub(path, &cnt, st);
+    free(nodes);
     return cnt;
 }
 
