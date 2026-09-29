@@ -15,6 +15,7 @@
 #ifndef STEER_TRPATH_H
 #define STEER_TRPATH_H
 #include <stddef.h>
+#include <stdint.h>
 
 /* Строка запроса (request-target) для пути узла.
  *
@@ -28,5 +29,11 @@
  * вдобавок процентные последовательности в пути обязаны быть целыми — иначе url.Parse отказывает,
  * и Xray не соединяется вовсе. */
 int tr_upgrade_target(const char *path, int ws, char *out, size_t cap, const char **why);
+
+/* То же и Ed — число ранних данных, как его считает Build у Xray (`uint32(strconv.Atoi(ed))`):
+ * 0, если `ed=` не вырезался (нет его, пусто, путь не разобрался) или не число. ed_out допускает
+ * NULL. Что Ed меняет на проводе — trws.c и trupgrade.c. */
+int tr_upgrade_target_ed(const char *path, int ws, char *out, size_t cap, const char **why,
+                         uint32_t *ed_out);
 
 #endif

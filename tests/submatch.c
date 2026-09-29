@@ -1116,6 +1116,10 @@ int main(void) {
         n = vless_parse_sub(XO("{\"network\":\"ws\",\"wsSettings\":{\"headers\":{\"Upgrade\":\"x\"}}}"),
                             nodes, 4, &st);
         check_n("конфиг ws с Upgrade в headers: пропущен", 0, (long)n);
+        /* У httpupgrade Xray такой заголовок принимает (gorilla там нет) — принимается и здесь. */
+        n = vless_parse_sub(XO("{\"network\":\"httpupgrade\",\"httpupgradeSettings\":{\"headers\":"
+                               "{\"connection\":\"keep-alive\"}}}"), nodes, 4, &st);
+        check_n("конфиг httpupgrade с Connection в headers: пригоден", 1, (long)n);
         n = vless_parse_sub(XO("{\"network\":\"ws\",\"wsSettings\":{\"headers\":{\"X\":1}}}"), nodes, 4, &st);
         check_n("конфиг ws: заголовок не строкой — пропущен", 0, (long)n);
         n = vless_parse_sub(XO("{\"network\":\"xhttp\",\"xhttpSettings\":{\"path\":\"/x\"},"

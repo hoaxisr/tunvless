@@ -12,6 +12,7 @@
  * процентные последовательности, путь без ведущего слэша) — стенд tests/wsmatch.c против
  * значений, которые печатает net/url Go 1.22 на тех же входах. */
 #include <string.h>
+#include <stdint.h>
 
 #include "trpath.h"
 
@@ -135,7 +136,28 @@ static void put_qesc(struct sb *b, const char *s, size_t n) {
  * ключи по алфавиту (байтово), значения одного ключа — в порядке появления, каждое через
  * QueryEscape. *stripped — вырезано ли; тогда в out новый запрос (может быть пустым). */
 #define QP_MAX 64
-static int strip_ed(const char *q, size_t qn, struct sb *out, int *stripped) {
+
+/* Ed, как его считает Build: `Ed, _ := strconv.Atoi(q.Get("ed")); ed = uint32(Ed)`. Atoi — знак и
+ * цифры, ничего больше; ошибка (буквы, пусто после знака, выход за int) — ноль. int у Xray на
+ * роутере 32-битный на mips и arm и 64-битный на arm64 и x86_64; повторено 64-битное — отличие
+ * только у чисел за 2^31, которых в ссылках не бывает. Отрицательное становится огромным
+ * uint32 — у Xray тоже: `ed=-1` значит «ранние данные при любой длине первой записи». */
+static uint32_t go_atoi_u32(const char *s, size_t n) {
+    size_t i = 0;
+    int neg = 0;
+    if (i < n && (s[i] == '+' || s[i] == '-')) { neg = s[i] == '-'; i++; }
+    if (i == n) return 0;
+    uint64_t v = 0;
+    for (; i < n; i++) {
+        if (s[i] < '0' || s[i] > '9') return 0;
+        v = v * 10 + (uint64_t)(s[i] - '0');
+        if (v > (uint64_t)INT64_MAX + (uint64_t)neg) return 0;
+    }
+    int64_t sv = neg ? (int64_t)(0 - v) : (int64_t)v;
+    return (uint32_t)sv;
+}
+
+static int strip_ed(const char *q, size_t qn, struct sb *out, int *stripped, uint32_t *ed) {
     struct { size_t ko, kl, vo, vl; } pr[QP_MAX];
     size_t np = 0;
     char dec[1024];
@@ -166,6 +188,7 @@ static int strip_ed(const char *q, size_t qn, struct sb *out, int *stripped) {
     for (size_t a = 0; a < np; a++)
         if (pr[a].kl == 2 && !memcmp(dec + pr[a].ko, "ed", 2)) { first_ed = a; break; }
     if (first_ed == np || pr[first_ed].vl == 0) return 0;
+    *ed = go_atoi_u32(dec + pr[first_ed].vo, pr[first_ed].vl);
 
     /* Устойчивая сортировка по ключу вставками: пар единицы, а устойчивость здесь и есть правило
      * Encode (значения одного ключа — в порядке появления). */
@@ -195,9 +218,17 @@ static int strip_ed(const char *q, size_t qn, struct sb *out, int *stripped) {
 }
 
 int tr_upgrade_target(const char *path, int ws, char *out, size_t cap, const char **why) {
+    return tr_upgrade_target_ed(path, ws, out, cap, why, NULL);
+}
+
+int tr_upgrade_target_ed(const char *path, int ws, char *out, size_t cap, const char **why,
+                         uint32_t *ed_out) {
     const char *dummy;
+    uint32_t ed_dummy;
     if (!why) why = &dummy;
+    if (!ed_out) ed_out = &ed_dummy;
     *why = "";
+    *ed_out = 0;
     size_t n = strlen(path);
 
     /* Что Xray не разобрал бы однозначно — отказ с причиной (см. trpath.h). */
@@ -229,7 +260,7 @@ int tr_upgrade_target(const char *path, int ws, char *out, size_t cap, const cha
     if (path_ok && qm) {
         char qb[1024];
         struct sb bq = { qb, 0, sizeof(qb), 0 };
-        if (strip_ed(qm + 1, n - pn - 1, &bq, &stripped) != 0 || bq.over) {
+        if (strip_ed(qm + 1, n - pn - 1, &bq, &stripped, ed_out) != 0 || bq.over) {
             *why = "path слишком длинный";
             return -1;
         }

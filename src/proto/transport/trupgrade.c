@@ -47,24 +47,21 @@
  * даты со сдвигом от процессора, то есть у двух клиентов Xray тоже разная. Строка sec-ch-ua — та,
  * что Xray собрал бы для нашей версии (h2.h).
  *
- * ЧЕГО НЕ ШЛЁМ. Ранних данных (`?ed=N`): Xray при них откладывает весь апгрейд до первой записи и
- * кладёт её в Sec-WebSocket-Protocol (base64url). Путь `ed=` из пути вырезается ровно как у Xray
- * (trpath.c), а запрос уходит без Sec-WebSocket-Protocol — ровно то, что шлёт Xray, когда первая
- * запись длиннее ed. Почему так, а не байт-в-байт с ранними данными:
- *   - выигрыш ранних данных — один круг до сервера на новом соединении, а у нас соединения к
- *     узлу открываются ЗАРАНЕЕ, пулом запасных (DC_PRECONNECT в vldial.c): у соединения из пула
- *     апгрейд уже сделан, и первая запись уходит сразу;
- *   - апгрейд в первой записи шёл бы из цикла туннеля, а ждать там ответа нельзя (цикл один на
- *     все соединения). Не ждать тоже нельзя: сервер ws у Xray стоит на gorilla/websocket, и тот
- *     рвёт соединение, если клиент прислал данные раньше ответа 101 («websocket: client sent data
- *     before handshake is complete», server.go) — Xray этого не делает, потому что его запись
- *     блокирует горутину до ответа. Вторую запись пришлось бы задерживать, то есть не
- *     подтверждать клиенту пакет, и клиент повторял бы его по своему таймеру — сотни
- *     миллисекунд там, где ранние данные экономили десятки.
- * У httpupgrade `ed` у Xray значит «не ждать 101 перед данными»; мы ждём всегда — сервер
- * httpupgrade Xray читает запрос через bufio и отдаёт дальше голое соединение (hub.go), так что
- * данные, приехавшие одним куском с запросом, у него теряются. Ожидание нам ничего не стоит по
- * той же причине пула.
+ * Где Xray и sing-box расходятся — делаем как Xray (решение владельца 2026-09-29: эталон байтов на
+ * проводе для VLESS и его транспортов — Xray-core). В том числе:
+ *   - прочие облики по слову в своём User-Agent узла (firefox, safari, edge, curl, golang) —
+ *     try_default_ws ниже;
+ *   - РАННИЕ ДАННЫЕ (`?ed=N`, Ed у Xray, trpath.h). У ws — delayDialConn: запрос откладывается до
+ *     первой записи, и она, если не длиннее Ed, уезжает в Sec-WebSocket-Protocol (base64url без
+ *     выравнивания, tr_h1_send), иначе — кадрами после 101 (trws.c). У httpupgrade — ConnRF: запрос
+ *     уходит при открытии, но ответа не ждём, данные идут следом, ответ разбирает первое чтение
+ *     (hu_read_wait). sing-box делает иначе (режет первую запись по Ed и шлёт хвост отдельно) — ему
+ *     не следуем. Что у ws цикл туннеля не может, как Xray, ждать ответа внутри записи, закрыто
+ *     очередью: записи до 101 копятся и уходят сразу за ним, то есть на проводе тот же порядок —
+ *     запрос, ответ, кадры (слать кадры раньше 101 нельзя: gorilla на стороне сервера рвёт такое
+ *     соединение, «client sent data before handshake is complete»). Цена одна: у отложенного
+ *     ответа нет своего срока (у Xray — HandshakeTimeout 8 с); молчащий сервер снимает простой
+ *     соединения в стеке туннеля.
  *
  * ALPN — только http/1.1, как у Xray (tls.WithNextProto("http/1.1") и WebsocketHandshakeContext у
  * uTLS: он переписывает расширение ALPN отпечатка на один http/1.1). С парой «h2, http/1.1»
@@ -250,20 +247,76 @@ static void hm_set_empty(struct hmap *m, const char *k, const char *v) {
     if (!e || !e->vn) hm_set(m, k, v);
 }
 
-/* applyMasqueradedHeaders(header, "chrome", "ws") из common/utils/browser.go. */
-static void chrome_ws(struct hmap *m) {
-    hm_set(m, "Sec-CH-UA", UA_CH_CHROME);
-    hm_set(m, "Sec-CH-UA-Mobile", "?0");
-    hm_set(m, "Sec-CH-UA-Platform", "\"Windows\"");
-    hm_set(m, "DNT", "1");
-    hm_set(m, "User-Agent", UA_CHROME);
-    hm_set(m, "Accept-Language", "en-US,en;q=0.9");
+/* Прочие облики Xray (common/utils/browser.go) — для узла, чей User-Agent в headers задан словом
+ * firefox, safari, edge, curl или golang: Xray понимает это слово как «представляйся этим
+ * клиентом». Версии у Xray считаются от даты со сдвигом от процессора (FirefoxVersion,
+ * SafariVersion, CurlVersion); здесь они зашиты тем же правилом, что UA_CHROME в h2.h, —
+ * значением формулы на сентябрь 2026 при срединном сдвиге. Edge у Xray — ChromeUA и сразу, без
+ * пробела, «Edg/…»: так в browser.go, так и здесь. sec-ch-ua у Edge собран правилом
+ * getGreasedChUa для версии 149 (перестановка {2,1,0}, та же поддельная марка, что у Chrome). */
+#define UA_FIREFOX \
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0"
+#define UA_SAFARI \
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) " \
+    "Version/26.6 Safari/605.1.15"
+#define UA_EDGE UA_CHROME "Edg/" UA_CHROME_MAJOR ".0.0.0"
+#define UA_CH_EDGE \
+    "\"Microsoft Edge\";v=\"" UA_CHROME_MAJOR "\", \"Chromium\";v=\"" UA_CHROME_MAJOR \
+    "\", \"Not)A;Brand\";v=\"24\""
+#define UA_CURL "curl/8.20.0"
+
+enum browser { BR_CHROME, BR_EDGE, BR_FIREFOX, BR_SAFARI, BR_CURL, BR_GOLANG };
+
+/* applyMasqueradedHeaders(header, browser, "ws") — построчно. */
+static void masq_ws(struct hmap *m, enum browser b) {
+    switch (b) {
+    case BR_CHROME:
+    case BR_EDGE:
+        hm_set(m, "Sec-CH-UA", b == BR_EDGE ? UA_CH_EDGE : UA_CH_CHROME);
+        hm_set(m, "Sec-CH-UA-Mobile", "?0");
+        hm_set(m, "Sec-CH-UA-Platform", "\"Windows\"");
+        hm_set(m, "DNT", "1");
+        hm_set(m, "User-Agent", b == BR_EDGE ? UA_EDGE : UA_CHROME);
+        hm_set(m, "Accept-Language", "en-US,en;q=0.9");
+        break;
+    case BR_FIREFOX:
+        hm_set(m, "User-Agent", UA_FIREFOX);
+        hm_set(m, "DNT", "1");
+        hm_set(m, "Accept-Language", "en-US,en;q=0.5");
+        break;
+    case BR_SAFARI:
+        hm_set(m, "User-Agent", UA_SAFARI);
+        hm_set(m, "Accept-Language", "en-US,en;q=0.9");
+        break;
+    case BR_GOLANG:
+        /* «Показать умолчание net/http»: User-Agent снимается, дальше http.Request.Write сам
+         * поставит Go-http-client/1.1; заголовков варианта нет (return в browser.go). */
+        hm_del(m, "User-Agent");
+        return;
+    case BR_CURL:
+        hm_set(m, "User-Agent", UA_CURL);
+        return;
+    }
     hm_set(m, "Sec-Fetch-Mode", "websocket");
-    hm_set(m, "Sec-Fetch-Dest", "empty");
+    /* «Safari is NOT web-compliant here!» — у Safari Sec-Fetch-Dest другой (browser.go). */
+    hm_set(m, "Sec-Fetch-Dest", b == BR_SAFARI ? "websocket" : "empty");
     hm_set(m, "Sec-Fetch-Site", "same-origin");
     hm_set_empty(m, "Cache-Control", "no-cache");
     hm_set_empty(m, "Pragma", "no-cache");
     hm_set_empty(m, "Accept", "*/*");
+}
+
+/* TryDefaultHeadersWith(header, "ws"): своего User-Agent нет — облик Chrome; есть и это одно из
+ * слов Xray — облик этого клиента; иначе — ничего, User-Agent уходит как написан. */
+static void try_default_ws(struct hmap *m) {
+    const struct hent *ua = hm_get(m, "User-Agent");
+    if (!ua) { masq_ws(m, BR_CHROME); return; }
+    static const struct { const char *w; enum browser b; } W[] = {
+        { "chrome", BR_CHROME }, { "firefox", BR_FIREFOX }, { "safari", BR_SAFARI },
+        { "edge", BR_EDGE }, { "curl", BR_CURL }, { "golang", BR_GOLANG },
+    };
+    for (size_t i = 0; i < sizeof(W) / sizeof(*W); i++)
+        if (ua->vn == strlen(W[i].w) && !strncmp(ua->v, W[i].w, ua->vn)) { masq_ws(m, W[i].b); return; }
 }
 
 struct wb { char *p; size_t n, cap; int over; };
@@ -290,7 +343,8 @@ static const char *host_of(const struct tr_node *n, char *buf, size_t cap) {
     return n->host;
 }
 
-size_t tr_h1_request(const struct tr_node *n, int ws, const char *key, char *out, size_t cap) {
+size_t tr_h1_request(const struct tr_node *n, int ws, const char *key, const char *proto,
+                     char *out, size_t cap) {
     char target[1024];
     if (tr_upgrade_target(n->path ? n->path : "", ws, target, sizeof(target), NULL) != 0) return 0;
 
@@ -321,13 +375,22 @@ size_t tr_h1_request(const struct tr_node *n, int ws, const char *key, char *out
         h += ln + (eol ? 1 : 0);
     }
 
-    /* TryDefaultHeadersWith(header, "ws"): облик Chrome, если своего User-Agent нет или он —
-     * слово «chrome». Прочие слова Xray (firefox, safari, edge, curl, golang) у нас не
-     * повторены: такой User-Agent уходит как написан, без набора заголовков браузера. */
-    const struct hent *ua = hm_get(&m, "User-Agent");
-    if (!ua || (ua->vn == 6 && !strncmp(ua->v, "chrome", 6))) chrome_ws(&m);
+    try_default_ws(&m);
 
     if (ws) {
+        /* Ранние данные: Xray — header.Set("Sec-WebSocket-Protocol", …), то есть канонический
+         * ключ Sec-Websocket-Protocol (перекрывает свой такой же у узла), а gorilla перекладывает
+         * его под ключ Sec-WebSocket-Protocol. Своё значение узла без ранних данных — так же
+         * переложенным ключом. */
+        const struct hent *sp = hm_get(&m, "Sec-Websocket-Protocol");
+        if (proto) {
+            hm_del(&m, "Sec-Websocket-Protocol");
+            hm_set(&m, "Sec-WebSocket-Protocol", proto);
+        } else if (sp) {
+            struct hent e = *sp;
+            hm_del(&m, "Sec-Websocket-Protocol");
+            hm_add(&m, "Sec-WebSocket-Protocol", e.v, e.vn);
+        }
         /* gorilla/websocket (client.go, DialContext): четыре своих заголовка точными ключами. */
         hm_set(&m, "Upgrade", "websocket");
         hm_set(&m, "Connection", "Upgrade");
@@ -348,7 +411,7 @@ size_t tr_h1_request(const struct tr_node *n, int ws, const char *key, char *out
     w_z(&b, " HTTP/1.1\r\nHost: ");
     w_z(&b, host);
     w_z(&b, "\r\n");
-    ua = hm_get(&m, "User-Agent");
+    const struct hent *ua = hm_get(&m, "User-Agent");
     const char *uav = ua ? ua->v : "Go-http-client/1.1";
     size_t uan = ua ? ua->vn : strlen(uav);
     if (uan) { w_z(&b, "User-Agent: "); w_s(&b, uav, uan); w_z(&b, "\r\n"); }
@@ -498,20 +561,68 @@ static int64_t mono_ms(void) {
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-int tr_h1_upgrade(struct transport *t, const struct tr_node *n, int ws, int timeout_s) {
-    char key[32] = "", accept[29] = "";
+/* base64.RawURLEncoding — ранние данные у Xray («RawURLEncoding is support by both V2Ray/V2Fly
+ * and XRay», websocket/dialer.go): алфавит URL и без выравнивания `=`. */
+static size_t b64_url(const unsigned char *in, size_t n, char *out) {
+    static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    size_t o = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        unsigned v = (unsigned)in[i] << 16;
+        if (i + 1 < n) v |= (unsigned)in[i + 1] << 8;
+        if (i + 2 < n) v |= in[i + 2];
+        out[o++] = T[(v >> 18) & 63];
+        out[o++] = T[(v >> 12) & 63];
+        if (i + 1 < n) out[o++] = T[(v >> 6) & 63];
+        if (i + 2 < n) out[o++] = T[v & 63];
+    }
+    out[o] = '\0';
+    return o;
+}
+
+int tr_h1_send(struct transport *t, int ws, const unsigned char *ed, size_t ed_n) {
+    struct h1_state *s = &t->h1;
+    char key[32] = "";
     if (ws) {
         unsigned char r[16];
         if (tr_h1_random(r, sizeof(r)) != 0) return TR_EIO;
         b64_std(r, sizeof(r), key);
-        tr_ws_accept(key, accept);
+        tr_ws_accept(key, s->accept);
     }
-    static __thread char req[4096];
-    size_t rn = tr_h1_request(n, ws, ws ? key : NULL, req, sizeof(req));
-    if (!rn) return TR_EUPTOOBIG;
-    int rc = tr_link_write(&t->link, (const unsigned char *)req, rn);
-    if (rc) return rc;
+    /* В куче, а не __thread: с ранними данными запрос несёт до всей первой записи в base64 —
+     * десятки килобайт, которые держать на каждый поток незачем. */
+    size_t bn = ed ? (ed_n + 2) / 3 * 4 + 1 : 0;
+    size_t cap = 4096 + bn;
+    char *req = malloc(cap + bn);
+    if (!req) return TR_EIO;
+    char *proto = NULL;
+    if (ed) { proto = req + cap; b64_url(ed, ed_n, proto); }
+    size_t rn = tr_h1_request(&s->node, ws, ws ? key : NULL, proto, req, cap);
+    int rc = rn ? tr_link_write(&t->link, (const unsigned char *)req, rn) : TR_EUPTOOBIG;
+    free(req);
+    return rc;
+}
 
+int tr_h1_lazy(struct transport *t, int ws, const unsigned char *in, size_t n, size_t *used) {
+    struct h1_state *s = &t->h1;
+    *used = 0;
+    if (!s->resp) return TR_EIO;
+    tr_h1_resp_feed(s->resp, ws, ws ? s->accept : NULL, in, n, used);
+    if (s->resp->bad) return TR_EUPTOOBIG;
+    if (!s->resp->done) return 0;
+    int rc = tr_h1_resp_verdict(s->resp, ws);
+    if (rc == TR_EUPSTATUS) g_last_status = s->resp->status;
+    free(s->resp);
+    s->resp = NULL;
+    if (rc) return rc;
+    s->phase = H1_OPEN;
+    s->upgraded = 1;
+    return 1;
+}
+
+/* Ответ 101 синхронно — путь без ранних данных. */
+static int h1_wait(struct transport *t, int ws, int timeout_s) {
+    int rc;
+    const char *accept = t->h1.accept;
     /* Ответ ждём здесь, синхронно: открытие идёт в потоке установщика, со сроком соединения. */
     struct h1_resp r;
     memset(&r, 0, sizeof(r));
@@ -546,7 +657,7 @@ int tr_h1_upgrade(struct transport *t, const struct tr_node *n, int ws, int time
         }
         if (!got) continue;
         size_t used = 0;
-        tr_h1_resp_feed(&r, ws, accept, in, got, &used);
+        tr_h1_resp_feed(&r, ws, ws ? accept : NULL, in, got, &used);
         if (r.bad) return TR_EUPTOOBIG;
         if (!r.done) continue;
         rc = tr_h1_resp_verdict(&r, ws);
@@ -560,14 +671,53 @@ int tr_h1_upgrade(struct transport *t, const struct tr_node *n, int ws, int time
             t->h1.stash_n = (uint32_t)(got - used);
             t->h1.stash_off = 0;
         }
+        t->h1.upgraded = 1;
         return 0;
     }
+}
+
+/* Открытие по Ed — как у Xray:
+ *   ws, Ed > 0          delayDialConn: ничего не шлём до первой записи (trws.c, H1_DEFER). У Xray
+ *                       отложен даже сам TCP; у нас TCP и TLS открыты заранее — байты на проводе
+ *                       те же, раньше лишь время;
+ *   httpupgrade, Ed > 0 запрос сразу, а ответ читает первое чтение (ConnRF у Xray, H1_WAIT): данные
+ *                       клиента идут вслед за запросом, не дожидаясь 101;
+ *   Ed == 0             запрос и ответ синхронно. */
+int tr_h1_upgrade(struct transport *t, const struct tr_node *n, int ws, int timeout_s) {
+    struct h1_state *s = &t->h1;
+    s->node = *n;
+    char target[1024];
+    if (tr_upgrade_target_ed(n->path ? n->path : "", ws, target, sizeof(target), NULL, &s->ed) != 0)
+        return TR_EUPTOOBIG;
+    if (ws && s->ed) { s->phase = H1_DEFER; return 0; }
+    int rc = tr_h1_send(t, ws, NULL, 0);
+    if (rc) return rc;
+    /* httpupgrade с Ed > 0 не ждёт ответа — но только поверх TLS или REALITY. Без TLS (security=
+     * none) ответ ждём, как при Ed == 0: сервер httpupgrade у Xray читает запрос через bufio и
+     * дальше отдаёт голое соединение (hub.go), поэтому данные, приехавшие с запросом ОДНИМ
+     * сегментом TCP, у него пропадают — снято на Xray 26.3.27: наш запрос и первая запись,
+     * ушедшие подряд, давали «invalid request version» на каждом соединении. Клиент Xray на этом
+     * не спотыкается лишь потому, что его первая запись уходит позже, уже отдельным сегментом.
+     * Поверх TLS сервер читает запись TLS целиком и не больше, и потери нет. Байты на проводе в
+     * обоих случаях те же, что у Xray, — различается только момент, когда уходит первая запись. */
+    if (s->ed && !t->link.plain) {
+        s->resp = calloc(1, sizeof(*s->resp));
+        if (!s->resp) return TR_EIO;
+        s->phase = H1_WAIT;
+        return 0;
+    }
+    return h1_wait(t, ws, timeout_s);
 }
 
 void tr_h1_free(struct transport *t) {
     free(t->h1.stash);
     t->h1.stash = NULL;
     t->h1.stash_n = t->h1.stash_off = 0;
+    free(t->h1.resp);
+    t->h1.resp = NULL;
+    free(t->h1.q);
+    t->h1.q = NULL;
+    t->h1.q_n = t->h1.q_cap = 0;
 }
 
 /* ---- транспорт httpupgrade ----------------------------------------------------------------- */
@@ -576,14 +726,40 @@ static int hu_open(struct transport *t, const struct tr_node *n, int timeout_s) 
     return tr_h1_upgrade(t, n, 0, timeout_s);
 }
 
+/* Как ConnRF.Write у Xray — поток как есть, и в H1_WAIT тоже: ответа 101 запись не ждёт. */
 static int hu_write(struct transport *t, const unsigned char *d, size_t n) {
     return tr_link_write(&t->link, d, n);
+}
+
+/* Отложенный ответ 101 (Ed > 0): первое чтение сперва дочитывает ответ, а то, что за ним, — уже
+ * поток (ConnRF.Read у Xray отдаёт буферизованное за ответом тем же вызовом). */
+static int hu_read_wait(struct transport *t, unsigned char *d, size_t cap, size_t *got) {
+    const unsigned char *in = d;
+    size_t n = 0;
+    if (t->link.plain) {
+        ssize_t k = read(t->link.fd, d, cap);
+        if (k <= 0) return k == 0 ? TR_ECLOSED : TR_EIO;
+        n = (size_t)k;
+    } else {
+        int rc = tls13_read_ref(&t->link.tls, &in, &n);
+        if (rc) return rc;
+    }
+    if (!n) return 0;
+    size_t used = 0;
+    int rc = tr_h1_lazy(t, 0, in, n, &used);
+    if (rc <= 0) return rc;
+    size_t rest = n - used;
+    if (rest > cap) return H2_ETOOBIG;
+    memmove(d, in + used, rest);
+    *got = rest;
+    return 0;
 }
 
 /* Сначала — остаток, приехавший вместе с ответом 101: это начало потока, и отдать его позже
  * следующего чтения сокета значило бы переставить байты. */
 static int hu_read(struct transport *t, unsigned char *d, size_t cap, size_t *got) {
     struct h1_state *s = &t->h1;
+    if (s->phase == H1_WAIT) return hu_read_wait(t, d, cap, got);
     if (s->stash) {
         size_t left = s->stash_n - s->stash_off;
         size_t take = left < cap ? left : cap;
@@ -598,12 +774,14 @@ static int hu_read(struct transport *t, unsigned char *d, size_t cap, size_t *go
 
 static int hu_pending(const struct transport *t) { return t->h1.stash != NULL; }
 
+static int hu_busy(const struct transport *t) { return t->h1.phase == H1_WAIT; }
+
 static void hu_close(struct transport *t) { tr_h1_free(t); }
 
 /* zc = 1: после ответа 101 данные лежат в записях TLS как есть, как у tcp, и чтение без копии
- * годится — пока остатка нет (transport_read_zc спрашивает pending). */
+ * годится — пока остатка нет и ответ разобран (transport_read_zc спрашивает pending и busy). */
 const struct transport_ops tr_httpupgrade = {
     .name = "httpupgrade", .alpn = "http/1.1", .zc = 1,
     .open = hu_open, .write = hu_write, .read = hu_read,
-    .moved = NULL, .close = hu_close, .pending = hu_pending,
+    .moved = NULL, .close = hu_close, .pending = hu_pending, .busy = hu_busy,
 };

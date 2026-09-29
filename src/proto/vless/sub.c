@@ -685,9 +685,10 @@ static int ci_eq(const char *a, const char *b) {
  *   - значение не строкой — Xray такой конфиг не загрузит вовсе;
  *   - имя не из знаков токена HTTP или длиннее 40, значение с управляющим знаком (перевод строки
  *     сделал бы из одного заголовка два) или длиннее 250 — запрос у нас собирается из строк;
- *   - Upgrade, Connection и Sec-WebSocket-Key/Version/Extensions — их ставит сам транспорт; у ws
- *     gorilla на них отказывает («duplicate header not allowed»), то есть и у Xray узел не
- *     открылся бы;
+ *   - у ws — Upgrade, Connection и Sec-WebSocket-Key/Version/Extensions: gorilla на них отказывает
+ *     («duplicate header not allowed»), то есть и у Xray узел не открылся бы. У httpupgrade Xray их
+ *     принимает (ключ как написан, Connection и Upgrade транспорт ставит поверх своими
+ *     каноническими ключами) — и здесь принимаются, запрос повторяет Xray (trupgrade.c);
  *   - Host у httpupgrade — Xray отвергает конфиг («"headers" can't contain "host"»). У ws Host
  *     из headers Xray переносит в host (если тот пуст) и из заголовков убирает — так и здесь.
  *   - не влезло в буфер узла. */
@@ -717,8 +718,9 @@ static void xray_headers(struct sj *j, struct upg_cfg *u, int hu) {
             unsigned char c = (unsigned char)val[i];
             if ((c < 0x20 && c != '\t') || c == 0x7f) ok = 0;
         }
-        if (ci_eq(key, "upgrade") || ci_eq(key, "connection") || ci_eq(key, "sec-websocket-key") ||
-            ci_eq(key, "sec-websocket-version") || ci_eq(key, "sec-websocket-extensions"))
+        if (!hu && (ci_eq(key, "upgrade") || ci_eq(key, "connection") ||
+                    ci_eq(key, "sec-websocket-key") || ci_eq(key, "sec-websocket-version") ||
+                    ci_eq(key, "sec-websocket-extensions")))
             ok = 0;
         if (!ok || o + kn + 2 + vn + 1 >= sizeof(u->headers)) { u->bad = 1; continue; }
         o += (size_t)snprintf(u->headers + o, sizeof(u->headers) - o, "%s: %s\n", key, val);
