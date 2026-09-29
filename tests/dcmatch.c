@@ -17,7 +17,8 @@
 #include "../src/proto/tgws/tgws.c"
 
 /* Заглушки того, что мост берёт из соседних файлов: стенд проверяет одну таблицу, и тянуть
- * ради неё TLS-часть значило бы собирать полдвижка с настоящим mbedtls. */
+ * ради неё TLS-часть значило бы собирать полдвижка с настоящей криптобиблиотекой. Гамма
+ * AES-CTR подменена тождеством — шифр здесь не проверяется (его векторы — в scryptomatch.c). */
 int xc_random(unsigned char *out, size_t n) { memset(out, 0, n); return 0; }
 int xc_x25519_keypair(unsigned char priv[32], unsigned char pub[32])
                                         { memset(priv, 0, 32); memset(pub, 0, 32); return 0; }
@@ -37,14 +38,11 @@ int tls13_read(struct tls13 *t, unsigned char *o, size_t c, size_t *g)
 void tls13_free(struct tls13 *t) { (void)t; }
 int tls12_handshake(struct tls13 *t, int fd, const char *sni)
 { (void)t; (void)fd; (void)sni; return -1; }
-void mbedtls_aes_init(mbedtls_aes_context *c) { (void)c; }
-void mbedtls_aes_free(mbedtls_aes_context *c) { (void)c; }
-int mbedtls_aes_setkey_enc(mbedtls_aes_context *c, const unsigned char *k, unsigned int b)
-                                        { (void)c; (void)k; (void)b; return 0; }
-int mbedtls_aes_crypt_ctr(mbedtls_aes_context *c, size_t n, size_t *off, unsigned char *nc,
-                          unsigned char *sb, const unsigned char *in, unsigned char *out)
-                                        { (void)c; (void)off; (void)nc; (void)sb;
-                                          memcpy(out, in, n); return 0; }
+int sc_aesctr_init(struct sc_aesctr *c, const unsigned char key[32], const unsigned char iv[16])
+                                        { (void)key; (void)iv; c->ready = 1; return 0; }
+int sc_aesctr_xor(struct sc_aesctr *c, const unsigned char *in, unsigned char *out, size_t n)
+                                        { (void)c; memmove(out, in, n); return 0; }
+void sc_aesctr_free(struct sc_aesctr *c) { c->ready = 0; }
 /* Мосту (cmd_tgws) эти две функции нужны на этапе разбора спеки — этот стенд его ни разу не
  * зовёт (проверяются dc_of/dc_add напрямую), но символы обязаны разрешиться на линковке: спека
  * — значение, а не глобалы (правило 6, docs/architecture.md, раздел 2), поэтому здесь больше
@@ -116,18 +114,17 @@ int main(void) {
 
     /* ---- выравнивание контекстов AES -------------------------------------------------
      *
-     * Ловушка, стоившая разбора с ядерным SIGSEGV: aesni.c в нашей сборке собран на
-     * интринсиках (ключ -maes даётся только ему) и ждёт раундовые ключи по адресу, кратному
-     * шестнадцати, а aes.c собран без этого ключа, считает, что работает ассемблерная
-     * вставка, и ничего не выравнивает. Контекст на стеке по адресу, кратному четырём, роняет
-     * setkey. Полное объяснение — у STEER_AES_ALIGN16 в src/proto/tgws/tgws.c.
+     * Ловушка, стоившая разбора с ядерным SIGSEGV при mbedtls: раундовые ключи AES читаются
+     * выровненными командами (AES-NI, ARMv8 Crypto), и контекст на стеке по адресу, кратному
+     * четырём, ронял setkey. Теперь выравнивание — свойство типа struct sc_aesctr (SC_ALIGN в
+     * src/lib/scrypto.h), см. шапку src/proto/tgws/tgws.c.
      *
-     * Проверять тут нечего, кроме одного: что объявление выравнивания на месте. Снятое, оно
-     * не ломает ни сборку, ни один стенд — падение случается на живом роутере и только когда
-     * кадр стека сложится не так. */
+     * Проверять тут нечего, кроме одного: что объявление выравнивания на месте и доходит до
+     * хранилища внутри struct obf. Снятое, оно не ломает ни сборку, ни один стенд — падение
+     * случается на живом роутере и только когда кадр стека сложится не так. */
     yes(_Alignof(struct obf) >= 16, "у контекстов обфускации выравнивание на 16");
-    yes(offsetof(struct obf, enc) % 16 == 0, "первый контекст AES выровнен");
-    yes(offsetof(struct obf, dec) % 16 == 0, "второй тоже");
+    yes(offsetof(struct obf, enc.st) % 16 == 0, "первый контекст AES выровнен");
+    yes(offsetof(struct obf, dec.st) % 16 == 0, "второй тоже");
 
     /* ---- карта «дата-центр → путь» --------------------------------------------------
      *

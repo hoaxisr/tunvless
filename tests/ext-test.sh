@@ -1,47 +1,44 @@
 #!/bin/sh
-# Прогон стендов расширенной части, которым нужен НАСТОЯЩИЙ mbedtls, а не заглушки из tests/stub:
+# Прогон стендов расширенной части, которым нужна НАСТОЯЩАЯ криптобиблиотека (wolfSSL за слоем
+# src/lib/scrypto.h), а не подменённые функции, как в `make test`:
 #
+#   tests/hellofreeze.c — ClientHello байт в байт против заморозки (tests/chello-frozen.h):
+#                        сборщик Hello зовёт X25519 слоя, и отпечаток не должен сдвинуться ни на бит;
+#   tests/xsepochmatch.c — ратчет эпох xsteer против векторов реализации на Go;
 #   tests/xsloop.c     — рукопожатие Noise IK целиком: сборка ClientHello, ответ хаба,
 #                        подтверждение, отказ по аутентификации, затирание состояния.
 #   tests/spokematch.c — освобождение транспортных ключей при неудачном рукопожатии;
-#                        собирается под AddressSanitizer, потому что утекает именно
-#                        контекст шифра в куче (I-067).
+#                        собирается под AddressSanitizer (I-067).
 #   tests/vlessmatch.c — ветви отказа vless_connect: код возврата, дескрипторы и куча на
-#                        каждом «нет». Собирается под AddressSanitizer по той же причине,
-#                        что spokematch: утекают контексты AES/GCM в куче (R-114). Сюда же
-#                        входит серверная половина TLS 1.3 — та, которой в проекте не было
-#                        вовсе, и без которой до серверного Finished не доходил ни один стенд.
+#                        каждом «нет», под AddressSanitizer (R-114), и серверная половина
+#                        TLS 1.3 со своей цепочкой X.509 для security=tls (R-118).
+#   tests/androidroots.c — склейка каталога корней Android в хранилище для certverify.
 #   tests/hubmatch.c   — арифметика записи в хабе: правило набора кадров в пачку против
-#                        объявленной строки воркера (I-070). Включает src/proto/xsteer/xshub.c, отсюда
-#                        и mbedtls: цикл хаба тянет за собой reality.c и TLS 1.3.
-#   tests/devupmatch.c — подъём устройства туннеля: каждый отказ `ip` обязан быть назван, и
-#                        назван своим тоном (I-114). Включает src/tunnel/tunnel.c — оттуда та же
-#                        зависимость от mbedtls.
+#                        объявленной строки воркера (I-070).
+#   tests/devupmatch.c — подъём устройства туннеля: каждый отказ `ip` обязан быть назван (I-114).
+#   tests/probe.sh     — активное зондирование хаба настоящим openssl s_client (нужен root).
 #
-# В обычный `make test` они НЕ входят: там mbedtls нет по построению (R-014, см. ext-syntax),
-# а роутерная сборка расширенной части идёт только docker'ом через build.sh. Из-за этого первые два стенда
-# до запуска 42 не прогонялись НИ РАЗУ — и первый же прогон дал I-066 (xsloop был красным с
-# 18 августа) и I-067 (утечка 576 байт на попытку). Эта цель закрывает разрыв: проверяемость
-# расширенной части хоть где-то, кроме релизной сборки (R-058).
+# В обычный `make test` они НЕ входят: там библиотеки нет по построению (R-014, см. ext-syntax в
+# Makefile), а роутерная сборка расширенной части идёт только docker'ом через build.sh. Из-за
+# этого xsloop и spokematch до запуска 42 не прогонялись НИ РАЗУ — и первый же прогон дал I-066
+# и I-067. Эта цель закрывает разрыв: проверяемость расширенной части хоть где-то, кроме
+# релизной сборки (R-058).
 #
-# Библиотека ищется в таком порядке, первое найденное выигрывает:
-#   1) STEER_MBEDTLS — install-префикс (include/ + lib/) или дерево исходников (include/ +
-#      library/libmbedcrypto.a);
-#   2) pkg-config --exists mbedcrypto;
-#   3) системные пути (/usr/include, /usr/local/include).
-# Не нашлась — ГРОМКИЙ пропуск (echo + выход 0), а не падение и не молчание: молчаливый
-# пропуск читается как «прошло», ровно как молчаливо пропущенный ui-harness в splify2.
+# БИБЛИОТЕКА — ТА ЖЕ, ЧТО В ДВИЖКЕ. wolfSSL собирается здесь из исходников той же версии
+# (build/wolfssl/fetch.sh: версия и sha256 записаны там) и с теми же опциями
+# (build/wolfssl/user_settings.h), что у роутерной сборки, — тем же рецептом build/wolfssl/build.sh.
+# Прежде стенды шли на той mbedtls, что стояла у человека (2.28 системная против 3.6 в релизе), и
+# «зелёное здесь» не значило «зелёное в релизе» (R-058). Теперь версия одна по построению.
+# Единственная добавка — WOLFSSL_CERT_GEN (и WOLFSSL_CERT_EXT): выпуск сертификатов нужен стендам
+# security=tls (tests/certgen.c), а движку — нет; раскладку того, что зовёт движок, ключи не меняют.
 #
-# В РЕЛИЗЕ этот же файл зовётся ВНУТРИ образа сборщика, где mbedtls та самая, которой собирается
-# расширенный пакет: обвязка — build/ext-test-image.sh, шаг — в .github/workflows/release.yml
-# (R-063). Оттуда приходят STEER_MBEDTLS и CC="zig cc".
+# Исходники: STEER_WOLFSSL — каталог готовых исходников; иначе они скачиваются в $BUILD/wolfssl-host
+# со сверкой суммы. Не нашлись и не скачались — ГРОМКИЙ пропуск (echo + выход 0), а не падение и
+# не молчание: молчаливый пропуск читается как «прошло», ровно как пропущенный ui-harness в splify2.
 #
-# ВЕРСИЯ. src/proto/tls/reality.c писан под mbedtls 3.x и пользуется макросом MBEDTLS_PRIVATE:
-# в 2.x его нет, поэтому нужна заглушка -D'MBEDTLS_PRIVATE(x)=x'; в 3.x доступ к приватным
-# полям открывает -DMBEDTLS_ALLOW_PRIVATE_ACCESS. Флаг выбирается по мажорной версии. Прогон
-# ПЕЧАТАЕТ версию, на которой шёл: зелёное на 2.28 НЕ равно зелёному в релизе — там docker
-# собирает 3.x, и стенд, зелёный на 2.28 и красный на 3.x, был бы хуже отсутствующего
-# (R-058, поле risks).
+# В РЕЛИЗЕ этот же файл зовётся ВНУТРИ образа сборщика: обвязка — build/ext-test-image.sh, шаг — в
+# .github/workflows/release.yml (R-063). Оттуда приходят STEER_WOLFSSL (исходники в образе) и
+# CC="zig cc".
 set -e
 
 CC=${CC:-cc}
@@ -61,111 +58,53 @@ MODEL_SRC="$(profile_var MODEL_SRC)"
 BUILD=${BUILD:-build}
 mkdir -p "$BUILD"
 
-MBED_INC=""
-MBED_LIB=""
-VH=""
-
-# 1) STEER_MBEDTLS
-if [ -n "$STEER_MBEDTLS" ] && [ -f "$STEER_MBEDTLS/include/mbedtls/version.h" ]; then
-	MBED_INC="-I$STEER_MBEDTLS/include"
-	VH="$STEER_MBEDTLS/include/mbedtls/version.h"
-	if [ -f "$STEER_MBEDTLS/library/libmbedcrypto.a" ]; then
-		# x509 из ТОГО ЖЕ дерева и первым: иначе проба ниже добавит -lmbedx509, и компоновщик
-		# возьмёт системную библиотеку другой версии (на Ubuntu — 2.28 рядом с деревом 3.6).
-		MBED_LIB="$STEER_MBEDTLS/library/libmbedcrypto.a"
-		[ -f "$STEER_MBEDTLS/library/libmbedx509.a" ] &&
-			MBED_LIB="$STEER_MBEDTLS/library/libmbedx509.a $MBED_LIB"
-	else
-		MBED_LIB="-L$STEER_MBEDTLS/lib -lmbedcrypto"
-	fi
-fi
-
-# 2) pkg-config
-if [ -z "$MBED_LIB" ] && command -v pkg-config >/dev/null 2>&1 && \
-   pkg-config --exists mbedcrypto 2>/dev/null; then
-	MBED_INC=$(pkg-config --cflags mbedcrypto)
-	MBED_LIB=$(pkg-config --libs mbedcrypto)
-fi
-
-# 3) системные пути
-if [ -z "$MBED_LIB" ]; then
-	for d in /usr/include /usr/local/include; do
-		if [ -f "$d/mbedtls/version.h" ]; then
-			MBED_LIB="-lmbedcrypto"
-			VH="$d/mbedtls/version.h"
-			break
-		fi
-	done
-fi
-
-# Не нашли — громкий пропуск, не падение.
-if [ -z "$MBED_LIB" ]; then
-	echo "ext-test: mbedtls не найден — ПРОПУСК (это не падение)."
-	echo "ext-test:   Debian/Ubuntu: apt-get install libmbedtls-dev"
-	echo "ext-test:   либо STEER_MBEDTLS=/путь (install-префикс или дерево исходников)."
-	echo "ext-test: под этими стендами лежат I-066 и I-067 — без прогона они не видны."
-	exit 0
-fi
-
-# Версия из version.h (если pkg-config дал только флаги, ищем заголовок в системных путях).
-if [ -z "$VH" ]; then
-	for d in /usr/include /usr/local/include; do
-		[ -f "$d/mbedtls/version.h" ] && VH="$d/mbedtls/version.h" && break
-	done
-fi
-MBED_VER=""
-[ -n "$VH" ] && MBED_VER=$(sed -n 's/.*MBEDTLS_VERSION_STRING  *"\([^"]*\)".*/\1/p' "$VH" | head -1)
-# В 3.x строка версии переехала из version.h в build_info.h рядом с ним.
-[ -z "$MBED_VER" ] && [ -n "$VH" ] && [ -f "$(dirname "$VH")/build_info.h" ] &&
-	MBED_VER=$(sed -n 's/.*MBEDTLS_VERSION_STRING  *"\([^"]*\)".*/\1/p' "$(dirname "$VH")/build_info.h" | head -1)
-MBED_MAJOR=$(printf '%s' "$MBED_VER" | cut -d. -f1)
-
-if [ "$MBED_MAJOR" = "3" ]; then
-	PRIV="-DMBEDTLS_ALLOW_PRIVATE_ACCESS"
-else
-	PRIV="-DMBEDTLS_PRIVATE(x)=x"
-fi
-
-echo "ext-test: mbedtls ${MBED_VER:-неизвестной версии}, флаг доступа: $PRIV"
-echo "ext-test: ВНИМАНИЕ — релиз собирается docker'ом с mbedtls 3.x; зелёное здесь"
-echo "ext-test:            не равно зелёному в релизе (R-058)."
-
-# ---- разбор X.509: отдельная библиотека там, где она отдельная -----------------
-# certverify.c зовёт mbedtls_x509_crt_* — единственное место расширенной части, где нужен разбор
-# сертификатов, и появилось оно вместе с security=tls. В образе сборщика вся библиотека
-# сложена в один libmbedcrypto.a (build/ext-test-image.sh: объекты всех модулей в один
-# архив), и добавлять там нечего. В системной mbedtls она разделена на три —
-# crypto, x509, tls, — и стенды падали на неопределённых mbedtls_x509_crt_init.
-#
-# ПРОБА, А НЕ ДОГАДКА: тот же приём, что ниже у AddressSanitizer, и по той же причине. Путь
-# к библиотеке приходит четырьмя разными способами (см. выше), и «-lmbedx509 всегда»
-# сломало бы ровно образ сборщика, где такой библиотеки не существует.
-x509p="$BUILD/x509-probe"
-printf '%s\n' '#include "mbedtls/x509_crt.h"' \
-	'int main(void){mbedtls_x509_crt c;mbedtls_x509_crt_init(&c);mbedtls_x509_crt_free(&c);return 0;}' \
-	> "$x509p.c"
-# shellcheck disable=SC2086
-if ! $CC -O0 -w $MBED_INC "$PRIV" -o "$x509p" "$x509p.c" $MBED_LIB >/dev/null 2>&1; then
-	# shellcheck disable=SC2086
-	if $CC -O0 -w $MBED_INC "$PRIV" -o "$x509p" "$x509p.c" -lmbedx509 $MBED_LIB >/dev/null 2>&1; then
-		MBED_LIB="-lmbedx509 $MBED_LIB"
-		echo "ext-test: разбор X.509 — отдельной библиотекой (-lmbedx509)"
-	else
-		# Громкий пропуск, как и при ненайденной библиотеке: без X.509 не компонуется ни
-		# один стенд, потому что tls13.c зовёт certverify.c во всех сборках.
-		echo "ext-test: в этой mbedtls нет разбора X.509 — ПРОПУСК (это не падение)."
-		echo "ext-test:   Debian/Ubuntu: apt-get install libmbedtls-dev (в нём libmbedx509)."
-		rm -f "$x509p" "$x509p.c"
+# ---- wolfSSL: исходники и сборка ----------------------------------------------------------------
+WSRC="${STEER_WOLFSSL:-$BUILD/wolfssl-host/src}"
+if [ ! -f "$WSRC/wolfssl/wolfcrypt/settings.h" ]; then
+	if [ -n "${STEER_WOLFSSL:-}" ] || ! sh build/wolfssl/fetch.sh "$WSRC"; then
+		echo "ext-test: исходников wolfSSL нет ($WSRC) — ПРОПУСК (это не падение)."
+		echo "ext-test:   STEER_WOLFSSL=/путь к распакованному выпуску, либо сеть для"
+		echo "ext-test:   build/wolfssl/fetch.sh (версия и сумма записаны там)."
+		echo "ext-test: под этими стендами лежат I-066 и I-067 — без прогона они не видны."
 		exit 0
 	fi
 fi
-rm -f "$x509p" "$x509p.c"
+WVER=$(sh build/wolfssl/fetch.sh version)
+# Архив — на компилятор: gcc хоста и zig в образе дают разные объекты, и один архив на обоих
+# собирался бы заново на каждом переключении.
+CCTAG=$(printf '%s' "$CC" | tr -c 'a-zA-Z0-9' '_')
+WLIB="$BUILD/wolfssl-host/libwolfssl-$CCTAG.a"
+case "$CC" in zig*) WAR="zig ar" ;; *) WAR="${AR:-ar}" ;; esac
+echo "ext-test: wolfSSL $WVER, опции build/wolfssl/user_settings.h (+ выпуск сертификатов для стендов)"
+CC="$CC" AR="$WAR" CFLAGS="-O2 -g" STEER_WOLFSSL_DEFS="-DWOLFSSL_CERT_GEN -DWOLFSSL_CERT_EXT" \
+	sh build/wolfssl/build.sh "$WSRC" "$WLIB" asm
+WCFLAGS=$(cat "$WLIB.cflags")
+
+# Слой и выпуск сертификатов — отдельными объектами, со своими ключами: заголовки wolfSSL видят
+# только они, как в движке (остальные файлы собираются без -I на библиотеку).
+# shellcheck disable=SC2086
+$CC -O2 -g -w $STEER_INC $WCFLAGS -c src/lib/scrypto.c -o "$BUILD/wolfssl-host/scrypto-$CCTAG.o"
+# shellcheck disable=SC2086
+$CC -O2 -g -w $STEER_INC $WCFLAGS -c tests/certgen.c -o "$BUILD/wolfssl-host/certgen-$CCTAG.o"
+CRYPTO="$BUILD/wolfssl-host/scrypto-$CCTAG.o $WLIB"
+CERTGEN="$BUILD/wolfssl-host/certgen-$CCTAG.o"
+
+# ---- заморозка Hello ---------------------------------------------------------------------------
+echo "ext-test: собираю и прогоняю hellofreeze..."
+$CC -O2 -w $STEER_INC -o "$BUILD/hellofreeze" tests/hellofreeze.c $CRYPTO -lpthread
+"$BUILD/hellofreeze"
+
+echo "ext-test: собираю и прогоняю xsepochmatch..."
+$CC -O2 -w $STEER_INC -o "$BUILD/xsepochmatch" tests/xsepochmatch.c src/proto/xsteer/xsepoch.c \
+	src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c src/proto/tls/h2.c \
+	$CRYPTO -lpthread
+"$BUILD/xsepochmatch"
 
 # xsloop — рукопожатие целиком.
 echo "ext-test: собираю и прогоняю xsloop..."
-$CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/xsloop" tests/xsloop.c \
+$CC -O2 -w $STEER_INC -o "$BUILD/xsloop" tests/xsloop.c \
 	src/proto/xsteer/xshake.c src/proto/tls/chello.c src/proto/xsteer/xswire.c src/proto/tls/reality.c \
-	src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c $MBED_LIB
+	src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c $CRYPTO -lpthread
 "$BUILD/xsloop"
 
 # spokematch — освобождение ключей при неудаче, под AddressSanitizer.
@@ -185,7 +124,6 @@ $CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/xsloop" tests/xsloop.c \
 # «все проверки прошли», то есть барьер под I-067 снимался переменной окружения молча.
 ASAN="-fsanitize=address"
 probe="$BUILD/asan-probe"
-mkdir -p "$BUILD"
 printf '#include <stdlib.h>\nint main(void){char*p=malloc(16);p[0]=1;free(p);return 0;}\n' \
 	> "$probe.c"
 printf '#include <stdlib.h>\nint main(void){char*p=malloc(64);p[0]=1;return 0;}\n' \
@@ -211,108 +149,87 @@ echo "ext-test: собираю и прогоняю spokematch (ASan: ${ASAN:-н�
 # xslink.c в списке ОБЯЗАТЕЛЕН: командная строка клиента принимает и ссылку xs://, и файл
 # одним xs_conf_load_any, и живёт эта функция там. Без неё сборка стенда падает на компоновке,
 # то есть весь ext-test не доходит даже до первой проверки — а именно в нём и живёт ASan.
-$CC -O1 -g -w $STEER_INC $ASAN $MBED_INC "$PRIV" -o "$BUILD/spokematch" \
+# src/lib/ctlcall.c — там же и по той же причине: xsclient.c зовёт сокет управления демона
+# (ctlcall_socket и ctlcall_forward в cmd_xsteer_peers), и без файла стенд не компоновался — до
+# шага 1 выпуска 1.10 ext-test был из-за этого красным ещё до первой проверки.
+$CC -O1 -g -w $STEER_INC $ASAN -o "$BUILD/spokematch" \
 	tests/spokematch.c \
 	src/proto/xsteer/xsconn.c src/proto/xsteer/xswire.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xsroute.c \
 	src/proto/xsteer/xsconf.c src/proto/xsteer/xslink.c src/proto/xsteer/xsstream.c src/proto/xsteer/xshake.c src/proto/tls/chello.c \
 	src/proto/tls/reality.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c src/tunnel/tun.c src/proto/obfs/obfs.c \
-	src/lib/jsonw.c src/lib/evline.c \
-	$MODEL_SRC $KINDS_SRC $MBED_LIB -lpthread
+	src/lib/jsonw.c src/lib/evline.c src/lib/ctlcall.c \
+	$MODEL_SRC $KINDS_SRC $CRYPTO -lpthread
 "$BUILD/spokematch"
 
 # vlessmatch — ветви отказа vless_connect, под тем же AddressSanitizer.
 #
-# ASAN здесь уже определён пробой выше: второй экземпляр этой пробы разошёлся бы с первым,
-# ровно как разошлись бы два определения mbedtls. Если санитайзера нет, стенд об этом
-# ГОВОРИТ САМ (последние строки его вывода) — проверки кодов возврата и дескрипторов
-# прогонятся, куча нет.
+# ASAN здесь уже определён пробой выше: второй экземпляр этой пробы разошёлся бы с первым. Если
+# санитайзера нет, стенд об этом ГОВОРИТ САМ (последние строки его вывода) — проверки кодов
+# возврата и дескрипторов прогонятся, куча нет.
 #
 # Список исходников повторяет devupmatch без client.c: сам client.c стенд ВКЛЮЧАЕТ (шов
 # установления TCP статический, см. заголовок стенда), и вторая его копия при компоновке
-# дала бы дубли символов.
-# ---- выпуск X.509: нужен vlessmatch для случаев security=tls -------------------
-# Стенд выпускает свою пару «корень + лист» на месте (R-118): иначе проверка сервера не
-# может ПРОЙТИ, а через удавшуюся проверку достижима ветвь VLESS_CONN_ENOH2 — та, ради
-# которой в клиенте появился vless_close. Для выпуска нужен MBEDTLS_X509_CRT_WRITE_C, и
-# он есть не в каждой сборке: в урезанной конфигурации роутера его нет вовсе.
-#
-# Проба, а не догадка — тот же приём, что у разбора X.509 выше и у AddressSanitizer ниже.
-# Не нашлось — стенд собирается БЕЗ этих случаев и ГОВОРИТ об этом сам последними строками
-# вывода: молчаливый пропуск читался бы как «прошло» (I-232).
-X509W=""
-x509wp="$BUILD/x509write-probe"
-printf '%s\n' '#include "mbedtls/x509_crt.h"' \
-	'int main(void){mbedtls_x509write_cert c;mbedtls_x509write_crt_init(&c);' \
-	'mbedtls_x509write_crt_free(&c);return 0;}' > "$x509wp.c"
-# shellcheck disable=SC2086
-if $CC -O0 -w $MBED_INC "$PRIV" -o "$x509wp" "$x509wp.c" $MBED_LIB >/dev/null 2>&1; then
-	X509W="-DSTEER_HAVE_X509WRITE"
-	echo "ext-test: выпуск X.509 есть — случаи security=tls в vlessmatch включены"
-else
-	echo "ext-test: ВНИМАНИЕ — в этой mbedtls нет выпуска X.509 (MBEDTLS_X509_CRT_WRITE_C):"
-	echo "ext-test:            случаи security=tls в vlessmatch будут ПРОПУЩЕНЫ (R-118)."
-fi
-rm -f "$x509wp" "$x509wp.c"
-
+# дала бы дубли символов. Выпуск сертификатов (R-118) — tests/certgen.c, он есть всегда, поэтому
+# STEER_HAVE_X509WRITE задаётся безусловно (прежде — пробой mbedtls на MBEDTLS_X509_CRT_WRITE_C).
 echo "ext-test: собираю и прогоняю vlessmatch (ASan: ${ASAN:-нет})..."
-$CC -O1 -g -w $STEER_INC $ASAN $MBED_INC "$PRIV" $X509W -o "$BUILD/vlessmatch" tests/vlessmatch.c \
+$CC -O1 -g -w $STEER_INC -Itests $ASAN -DSTEER_HAVE_X509WRITE -o "$BUILD/vlessmatch" tests/vlessmatch.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
 	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
-	$MODEL_SRC $KINDS_SRC $MBED_LIB -lpthread
+	$MODEL_SRC $KINDS_SRC $CERTGEN $CRYPTO -lpthread
 "$BUILD/vlessmatch"
 
 # androidroots — склейка каталога корней Android в файл для certverify (cert_roots в
 # client.c на платформе с системным хранилищем корней). Платформа — телефон (умолчание сборки),
 # каталоги хранилища — свои, во временном месте (ключ STEER_ANDROID_CA_DIRS читает
-# src/platform/android.c): стенд не трогает ни /data, ни /apex. Выпуск X.509 нужен тот же, что у
-# случаев security=tls выше.
+# src/platform/android.c): стенд не трогает ни /data, ни /apex.
 echo "ext-test: собираю и прогоняю androidroots..."
-$CC -O1 -g -w $STEER_INC $MBED_INC "$PRIV" $X509W -DSTEER_DEFAULT_PLATFORM=android \
+$CC -O1 -g -w $STEER_INC -Itests -DSTEER_HAVE_X509WRITE -DSTEER_DEFAULT_PLATFORM=android \
 	'-DSTEER_ANDROID_CA_DIRS="/tmp/steer-androidroots/nope","/tmp/steer-androidroots/empty","/tmp/steer-androidroots/cacerts"' \
 	-o "$BUILD/androidroots" tests/androidroots.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
 	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
-	$MODEL_SRC $KINDS_SRC $MBED_LIB -lpthread
+	$MODEL_SRC $KINDS_SRC $CERTGEN $CRYPTO -lpthread
 "$BUILD/androidroots"
 
 # hubmatch — согласие правила набора пачки с размером строки воркера.
 echo "ext-test: собираю и прогоняю hubmatch..."
-$CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/hubmatch" tests/hubmatch.c \
+$CC -O2 -w $STEER_INC -o "$BUILD/hubmatch" tests/hubmatch.c \
 	src/proto/xsteer/xsconn.c src/proto/xsteer/xswire.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xsroute.c \
 	src/proto/xsteer/xsconf.c src/proto/xsteer/xslink.c src/proto/xsteer/xsstream.c src/proto/xsteer/xshake.c src/proto/tls/chello.c \
 	src/proto/tls/reality.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c src/tunnel/tun.c src/proto/obfs/obfs.c \
 	src/lib/jsonw.c src/lib/evline.c \
-	$MODEL_SRC $KINDS_SRC $MBED_LIB -lpthread
+	$MODEL_SRC $KINDS_SRC $CRYPTO -lpthread
 "$BUILD/hubmatch"
 
 # devupmatch — подъём устройства туннеля называет свои отказы (I-114).
 echo "ext-test: собираю и прогоняю devupmatch..."
-$CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.c \
+$CC -O2 -w $STEER_INC -o "$BUILD/devupmatch" tests/devupmatch.c \
 	src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
 	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c src/lib/jsonw.c src/lib/evline.c \
-	$MODEL_SRC $KINDS_SRC $MBED_LIB -lpthread
+	$MODEL_SRC $KINDS_SRC $CRYPTO -lpthread
 "$BUILD/devupmatch"
 
 # probe — активное зондирование настоящим openssl s_client. Здесь, а не отдельной целью
-# Makefile: определение mbedtls уже сделано выше, а второй экземпляр этого определения
-# разошёлся бы с первым. Стенд требует root и сетевых пространств и без них ГРОМКО
-# пропускается, поэтому в ext-test он безопасен.
+# Makefile: библиотека уже собрана выше, а второй экземпляр её сборки разошёлся бы с первым.
+# Стенд требует root и сетевых пространств и без них ГРОМКО пропускается, поэтому в ext-test он
+# безопасен.
 #
 # Бинарник СЕРВЕРНЫЙ (профиль server): хаб живёт только в нём, у роутерной сборки подкоманда
 # xsteer-hub — штатная заглушка «ставится из архива steer-hub». Список исходников — профиль
-# server манифеста, тот же, что у build/build-ext.sh (раньше он был переписан здесь руками — см.
-# ниже, чем это кончилось).
+# server манифеста, тот же, что у build/build-ext.sh, без слоя примитивов: его объект собран
+# выше со своими ключами (профиль перечисляет src/lib/scrypto.c, а заголовки wolfSSL нужны только
+# ему).
 #
-# И РАЗОШЛИСЬ. `src/tools/srs.c` появился в движке 5 сентября, в этот список его не внесли, и с того
-# дня `make ext-test` не собирался вовсе — падал на `undefined reference to srs_dump`. Комментарий
-# выше при этом обещал обратное: «расходиться им негде». Обещание держалось на том, что кто-то
-# запустит цель, а её не запускали: она требует настоящей mbedtls и потому не входит в `make
-# test`. Урок ровно про это: барьер, который нужно ЗАПУСТИТЬ РУКАМИ, не барьер.
+# РАЗОШЛИСЬ ОДНАЖДЫ И ЗДЕСЬ. `src/tools/srs.c` появился в движке 5 сентября, в прежний
+# переписанный руками список его не внесли, и с того дня `make ext-test` не собирался вовсе — падал
+# на `undefined reference to srs_dump`. Урок ровно про это: барьер, который нужно ЗАПУСТИТЬ
+# РУКАМИ, не барьер, а список, переписанный руками, — второй список.
 echo "ext-test: собираю серверный бинарник для стенда зондирования..."
-$CC -O1 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/steer-hub-native" \
-	$(profile_src server) \
-	$MBED_LIB -lpthread
+SERVER_SRC="$(for f in $(profile_src server); do
+    [ "$f" = "$(profile_var CRYPTO_SRC)" ] || printf '%s ' "$f"; done)"
+# shellcheck disable=SC2086
+$CC -O1 -w $STEER_INC -o "$BUILD/steer-hub-native" $SERVER_SRC $CRYPTO -lpthread
 echo "ext-test: прогоняю probe (зондирование порта хаба)..."
 BUILD="$BUILD" sh tests/probe.sh
 
-echo "ext-test: все стенды прошли на mbedtls ${MBED_VER:-?}"
+echo "ext-test: все стенды прошли на wolfSSL $WVER"

@@ -55,13 +55,9 @@ cleanup
 command -v openssl >/dev/null 2>&1 || { echo "probe: ПРОПУЩЕН — нет openssl, прибором быть нечем"; exit 0; }
 command -v ip >/dev/null 2>&1 || { echo "probe: ПРОПУЩЕН — нет iproute2"; exit 0; }
 [ -x "$BIN" ] || {
-    echo "probe: ПРОПУЩЕН — нет $BIN. Серверная сборка собирается так (mbedtls системный):"
-    echo "        cc -O1 -w $(make -s print-inc) -DHAVE_CONFIG_H \\"
-    echo "           \"-DMBEDTLS_PRIVATE(x)=x\" -o build/steer-hub-native \\"
-    echo "           \$(. build/sources.sh; profile_src server) \\"
-    echo "           -lmbedtls -lmbedx509 -lmbedcrypto -lpthread"
-    echo "        (список файлов — профиль server в build/sources.mk; make ext-test собирает так же)"
-    echo "        (на mbedtls 3.x флаг доступа другой: -DMBEDTLS_ALLOW_PRIVATE_ACCESS)"
+    echo "probe: ПРОПУЩЕН — нет $BIN. Серверную сборку с wolfSSL собирает make ext-test"
+    echo "        (tests/ext-test.sh: профиль server из build/sources.mk, слой src/lib/scrypto.c"
+    echo "        и wolfSSL из build/wolfssl-host) — запустите его, он и позовёт этот стенд."
     exit 0
 }
 ip netns add "$NSH" 2>/dev/null || { echo "probe: ПРОПУЩЕН — netns недоступны в этом окружении"; exit 0; }

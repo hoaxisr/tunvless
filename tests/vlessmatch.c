@@ -12,8 +12,10 @@
  * 739, 769, 777, 792, 822, 825, 827) и три успешных, и каждый путь отказа сам решает, чем
  * закрыться: четыре зовут close(fd), четыре — vless_close(conn), а самый первый уходит до
  * того, как дескриптор появился. Перечисление с разбором — A-139. Выбор не косметический —
- * после развёртывания ключей трафика контексты AES/GCM живут в КУЧЕ (tls13.c:
- * mbedtls_gcm_setkey → mbedtls_cipher_setup → calloc), и дескриптор их не держит.
+ * после развёртывания ключей трафика в соединении живут развёрнутые контексты шифра (у
+ * mbedtls, на которой стенд родился, — в КУЧЕ, через calloc внутри setkey; у wolfCrypt за
+ * слоем scrypto — внутри struct tls13, но затереть их обязан всё тот же vless_close), а на пути
+ * проверки сертификата куча есть и сейчас (разбор цепочки wolfSSL), и дескриптор её не держит.
  * Вызывающие тоже не убирают: пул запасных сессий на отказе лишь помечает слот пустым, а
  * проверка узла возвращается сразу. Значит цена ошибки в выборе — утечка НА КАЖДУЮ попытку
  * при том, что попытки не кончаются: пул пополняется на каждый SYN, сторож перебирает узлы
@@ -31,13 +33,14 @@
  *
  * ПОЧЕМУ СЕРВЕРНАЯ ПОЛОВИНА ЗДЕСЬ, А НЕ НА ПИТОНЕ. Стенд живёт в `make ext-test`, и та же
  * цель запускается ВНУТРИ образа сборщика при релизе (build/ext-test-image.sh). Питона там
- * может не быть вовсе, а mbedtls есть по построению — на ней и собран сам движок. Вторая
- * причина: расписание ключей обязано совпасть с клиентским до байта, и когда обе половины
- * стоят на одной библиотеке, расхождение означает ошибку в нашем коде, а не разницу
- * реализаций.
+ * может не быть вовсе, а криптобиблиотека есть по построению — на ней и собран сам движок.
+ * Вторая причина: расписание ключей обязано совпасть с клиентским до байта, и когда обе
+ * половины стоят на одних примитивах (слой scrypto), расхождение означает ошибку в нашем коде
+ * TLS, а не разницу реализаций. Метка HKDF и приставка подписи при этом собираются здесь своими
+ * копиями — иначе ошибка в них сошлась бы сама с собой.
  *
- * Нужен настоящий mbedtls (в куче лежит контекст AES — это и есть то, что может утечь),
- * поэтому в `make test` стенд не входит, как xsloop и spokematch.
+ * Нужна настоящая криптобиблиотека, поэтому в `make test` стенд не входит, как xsloop и
+ * spokematch.
  *
  * ВТОРАЯ ПОЛОВИНА: security=tls СО СВОИМИ КОРНЯМИ (R-118). Ветвей Reality мало для того,
  * чтобы охватить установление соединения целиком: у Reality доказательством служит HMAC в
@@ -45,7 +48,7 @@
  * хранилища корней — то есть все шесть случаев выше проходят мимо certverify.c, у которого
  * не было ни одного стенда. Главное же в том, что при отказе проверки соединение не
  * доходит до конца никогда, а ровно та ветвь, ради которой в клиенте появился vless_close
- * (VLESS_CONN_ENOH2, ключи уже развёрнуты и контексты AES/GCM лежат в куче), достижима
+ * (VLESS_CONN_ENOH2, ключи трафика уже развёрнуты в соединении), достижима
  * ТОЛЬКО через УДАВШУЮСЯ проверку сервера.
  *
  * Поэтому стенд выпускает цепочку сам: корень и лист на имя SNI, ключи ECDSA P-256, сроки
@@ -61,10 +64,10 @@
  * подписи не из предложенных и лист, подписанный сам собой. Без второго стенда все семь
  * ветвей были недостижимы.
  *
- * Выпуск сертификатов требует MBEDTLS_X509_CRT_WRITE_C. Есть он не везде, и если его нет,
- * случаи security=tls ПРОПУСКАЮТСЯ ГРОМКО (проба в tests/ext-test.sh задаёт
- * STEER_HAVE_X509WRITE, стенд говорит о пропуске сам) — молчаливый пропуск читался бы как
- * «прошло», ровно как в I-232.
+ * Выпуск сертификатов — tests/certgen.c на wolfCrypt с WOLFSSL_CERT_GEN (его даёт библиотеке
+ * стендов tests/ext-test.sh, в сборке движка выпуска нет). ext-test задаёт STEER_HAVE_X509WRITE
+ * всегда; собранный руками без него стенд случаи security=tls ПРОПУСКАЕТ ГРОМКО и говорит об
+ * этом сам — молчаливый пропуск читался бы как «прошло», ровно как в I-232.
  */
 /* До любого include: client.c просит расширения GNU, а первый подключённый заголовок
  * фиксирует набор. */
@@ -81,16 +84,9 @@
  * подмены ради стенда. Тот же приём, что в tests/devupmatch.c и tests/failovermatch.c. */
 #include "../src/proto/vless/client.c"
 
-#include "mbedtls/hkdf.h"
-#include "mbedtls/md.h"
-#include "mbedtls/gcm.h"
-#include "mbedtls/sha256.h"
-#include "mbedtls/version.h"
+#include "scrypto.h"
 #if defined(STEER_HAVE_X509WRITE)
-# include "mbedtls/x509_crt.h"
-# include "mbedtls/pk.h"
-# include "mbedtls/ecp.h"
-# include "mbedtls/bignum.h"
+# include "certgen.h"
 #endif
 
 /* Общий секрет с эфемерным ключом собеседника: та же функция, которой пользуется tls13.c,
@@ -175,13 +171,9 @@ struct srv {
     unsigned char key[16], iv[12];
     unsigned char s_hs[HLEN];
     uint64_t seq;
-    mbedtls_sha256_context tr;         /* транскрипт рукопожатия */
+    struct sc_hash_ctx tr;             /* транскрипт рукопожатия */
     int rc;                            /* !=0 — половина сломалась сама, а не по замыслу */
 };
-
-static const mbedtls_md_info_t *md256(void) {
-    return mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-}
 
 /* HKDF-Expand-Label из RFC 8446 §7.1. Своя копия, а не вызов статической из tls13.c:
  * стенд обязан считать метку САМ, иначе ошибка в клиентской обёртке сошлась бы сама с
@@ -199,15 +191,14 @@ static int xlabel(const unsigned char *secret, const char *label,
     memcpy(info + n, label, ln);    n += ln;
     info[n++] = (unsigned char)ctx_n;
     if (ctx_n) { memcpy(info + n, ctx, ctx_n); n += ctx_n; }
-    return mbedtls_hkdf_expand(md256(), secret, HLEN, info, n, out, out_n);
+    return sc_hkdf_expand(SC_SHA256, secret, HLEN, info, n, out, out_n);
 }
 
-static void tr_snapshot(const mbedtls_sha256_context *tr, unsigned char out[HLEN]) {
-    mbedtls_sha256_context c;
-    mbedtls_sha256_init(&c);
-    mbedtls_sha256_clone(&c, tr);
-    mbedtls_sha256_finish(&c, out);
-    mbedtls_sha256_free(&c);
+static void tr_snapshot(const struct sc_hash_ctx *tr, unsigned char out[HLEN]) {
+    struct sc_hash_ctx c;
+    if (sc_hash_clone(&c, tr) != 0) { memset(out, 0, HLEN); return; }
+    sc_hash_final(&c, out);
+    sc_hash_free(&c);
 }
 
 static int wr_all(int fd, const unsigned char *b, size_t n) {
@@ -253,7 +244,8 @@ static int rd_rec(int fd, unsigned char *type, unsigned char *body, size_t cap, 
  *
  * Ключи ECDSA P-256, а не RSA: генерация RSA-2048 занимает секунды и делала бы стенд
  * заметно медленнее без всякой пользы для проверяемого — certverify.c принимает и то, и
- * другое, а подпись CertificateVerify проверяется одной и той же mbedtls_pk_verify.
+ * другое, а подпись CertificateVerify проверяется одной и той же sc_cert_verify_sig (RSA и
+ * PSS против подписей OpenSSL проверяет tests/scryptomatch.c).
  *
  * СРОКИ СЧИТАЮТСЯ ОТ ТЕКУЩЕГО ВРЕМЕНИ, а не зашиты строкой: замороженный сертификат
  * однажды истекает и красит стенд не по своей вине — это named risk у самого R-118, и
@@ -272,115 +264,47 @@ static int rd_rec(int fd, unsigned char *type, unsigned char *body, size_t cap, 
 struct leaf {
     unsigned char der[2048];
     size_t der_n;
-    mbedtls_pk_context key;      /* ключ листа — им подписывается CertificateVerify */
+    struct tcg_key *key;         /* ключ листа — им подписывается CertificateVerify */
 };
 
 static struct leaf g_leaf[4];        /* [0] не используется: номера совпадают с LEAF_* */
 static char g_roots_file[64];
 static int g_chain_ready;
 
-/* RNG для mbedtls в форме обратного вызова. Своего DRBG стенд не поднимает: xc_random —
- * тот же источник, которым пользуется движок, и второй в одном процессе означал бы два
- * разных ответа на вопрос «откуда случайность». */
-static int rng_cb(void *ctx, unsigned char *out, size_t n) {
-    (void)ctx;
-    return xc_random(out, n) == 0 ? 0 : -1;
-}
-
-static int gen_key(mbedtls_pk_context *k) {
-    mbedtls_pk_init(k);
-    const mbedtls_pk_info_t *info = mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY);
-    if (!info || mbedtls_pk_setup(k, info) != 0) return -1;
-    return mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(*k), rng_cb, NULL);
-}
-
-/* «YYYYMMDDHHMMSS» от текущего времени со сдвигом в сутках. */
-static void when(int days, char out[16]) {
-    time_t t = time(NULL) + (time_t)days * 24 * 3600;
-    struct tm g;
-    gmtime_r(&t, &g);
-    snprintf(out, 16, "%04d%02d%02d%02d%02d%02d", g.tm_year + 1900, g.tm_mon + 1, g.tm_mday,
-             g.tm_hour, g.tm_min, g.tm_sec);
-}
-
-/* Выписать сертификат. pem != NULL — вернуть заодно PEM (нужен только корню: хранилище
- * корней читается как PEM, см. roots_load в certverify.c). */
-static int issue(const char *subject, mbedtls_pk_context *skey,
-                 const char *issuer, mbedtls_pk_context *ikey, int is_ca,
-                 unsigned char *der, size_t *der_n, char *pem, size_t pem_n) {
-    mbedtls_x509write_cert c;
-    mbedtls_x509write_crt_init(&c);
-    mbedtls_x509write_crt_set_version(&c, MBEDTLS_X509_CRT_VERSION_3);
-    mbedtls_x509write_crt_set_md_alg(&c, MBEDTLS_MD_SHA256);
-    mbedtls_x509write_crt_set_subject_key(&c, skey);
-    mbedtls_x509write_crt_set_issuer_key(&c, ikey);
-    int rc = mbedtls_x509write_crt_set_subject_name(&c, subject);
-    if (rc == 0) rc = mbedtls_x509write_crt_set_issuer_name(&c, issuer);
-    if (rc == 0) rc = mbedtls_x509write_crt_set_basic_constraints(&c, is_ca, is_ca ? 1 : -1);
-
-    /* Серийный номер. В 3.x старая форма через mbedtls_mpi объявлена устаревшей и в сборке
-     * с MBEDTLS_DEPRECATED_REMOVED её нет вовсе, поэтому ветка по мажорной версии — та же
-     * дисциплина, что у флага доступа к приватным полям в ext-test.sh. */
-    if (rc == 0) {
-#if MBEDTLS_VERSION_MAJOR >= 3
-        unsigned char serial[] = { 0x01, 0x02, 0x03 };
-        serial[2] = (unsigned char)is_ca + 1;
-        rc = mbedtls_x509write_crt_set_serial_raw(&c, serial, sizeof(serial));
-#else
-        mbedtls_mpi sn;
-        mbedtls_mpi_init(&sn);
-        rc = mbedtls_mpi_lset(&sn, is_ca ? 1 : 2);
-        if (rc == 0) rc = mbedtls_x509write_crt_set_serial(&c, &sn);
-        mbedtls_mpi_free(&sn);
-#endif
-    }
-    char nb[16], na[16];
-    when(-1, nb);
-    when(365 * 5, na);
-    if (rc == 0) rc = mbedtls_x509write_crt_set_validity(&c, nb, na);
-
-    if (rc == 0) {
-        /* der пишется В КОНЕЦ буфера — так устроен mbedtls_x509write_crt_der, — поэтому
-         * готовое сдвигается к началу: дальше оно уезжает в сообщение как есть. */
-        int n = mbedtls_x509write_crt_der(&c, der, 2048, rng_cb, NULL);
-        if (n < 0) rc = n;
-        else {
-            memmove(der, der + 2048 - n, (size_t)n);
-            *der_n = (size_t)n;
-        }
-    }
-    if (rc == 0 && pem)
-        rc = mbedtls_x509write_crt_pem(&c, (unsigned char *)pem, pem_n, rng_cb, NULL);
-    mbedtls_x509write_crt_free(&c);
-    return rc;
-}
-
 /* Корень, три листа и файл хранилища. Один раз на процесс: certverify.c разбирает корни
  * под pthread_once, и второе хранилище в том же процессе не подействовало бы (I-217) —
- * значит все случаи обязаны проверяться ОДНИМ набором корней. */
+ * значит все случаи обязаны проверяться ОДНИМ набором корней. Сроки — от текущего времени
+ * (tests/certgen.c), имя — в CN: SAN стенд не выпускает, и проверка имени обязана найти его
+ * там, как находила прежде. */
 static int chain_build(void) {
-    mbedtls_pk_context root_key;
-    if (gen_key(&root_key) != 0) return -1;
+    struct tcg_key *root_key = tcg_key_new();
+    if (!root_key) return -1;
 
     static char pem[4096];
     unsigned char root_der[2048];
     size_t root_n = 0;
-    if (issue("CN=steer test root", &root_key, "CN=steer test root", &root_key, 1,
-              root_der, &root_n, pem, sizeof(pem)) != 0) return -1;
+    if (tcg_issue(root_key, "steer test root", NULL, 1, NULL, NULL, 0,
+                  root_der, sizeof(root_der), &root_n) != 0 ||
+        tcg_der_to_pem(root_der, root_n, pem, sizeof(pem)) != 0) {
+        tcg_key_free(root_key);
+        return -1;
+    }
 
     struct { int idx; const char *cn; int self; } want[] = {
-        { LEAF_OK,   "CN=" TLS_SNI,          0 },
-        { LEAF_NAME, "CN=other.invalid",     0 },
-        { LEAF_SELF, "CN=" TLS_SNI,          1 },
+        { LEAF_OK,   TLS_SNI,          0 },
+        { LEAF_NAME, "other.invalid",  0 },
+        { LEAF_SELF, TLS_SNI,          1 },
     };
     for (size_t i = 0; i < sizeof(want) / sizeof(*want); i++) {
         struct leaf *l = &g_leaf[want[i].idx];
-        if (gen_key(&l->key) != 0) return -1;
-        const char *issuer = want[i].self ? want[i].cn : "CN=steer test root";
-        mbedtls_pk_context *ikey = want[i].self ? &l->key : &root_key;
-        if (issue(want[i].cn, &l->key, issuer, ikey, 0, l->der, &l->der_n, NULL, 0) != 0)
-            return -1;
+        if (!(l->key = tcg_key_new())) { tcg_key_free(root_key); return -1; }
+        int rc = want[i].self
+            ? tcg_issue(l->key, want[i].cn, NULL, 0, NULL, NULL, 0, l->der, sizeof(l->der), &l->der_n)
+            : tcg_issue(l->key, want[i].cn, NULL, 0, root_key, root_der, root_n,
+                        l->der, sizeof(l->der), &l->der_n);
+        if (rc != 0) { tcg_key_free(root_key); return -1; }
     }
+    tcg_key_free(root_key);
 
     snprintf(g_roots_file, sizeof(g_roots_file), "%s", "/tmp/vlessmatch-roots-XXXXXX");
     int fd = mkstemp(g_roots_file);
@@ -388,14 +312,13 @@ static int chain_build(void) {
     size_t pn = strlen(pem);
     int ok = wr_all(fd, (const unsigned char *)pem, pn) == 0;
     close(fd);
-    mbedtls_pk_free(&root_key);
     if (!ok) return -1;
     g_chain_ready = 1;
     return 0;
 }
 
 static void chain_free(void) {
-    for (int i = 1; i <= LEAF_SELF; i++) mbedtls_pk_free(&g_leaf[i].key);
+    for (int i = 1; i <= LEAF_SELF; i++) { tcg_key_free(g_leaf[i].key); g_leaf[i].key = NULL; }
     if (g_roots_file[0]) unlink(g_roots_file);
 }
 
@@ -437,21 +360,13 @@ static size_t cv_msg(const struct leaf *l, const unsigned char thash[HLEN],
     content[cn++] = 0x00;
     memcpy(content + cn, thash, HLEN); cn += HLEN;
 
-    /* Без проверки кода возврата намеренно: в 2.x mbedtls_sha256 объявлена void (значение
-     * возвращает mbedtls_sha256_ret), в 3.x — int, и ветка по версии здесь ничего бы не
-     * дала. Так же зовёт её и расписание ключей выше. */
     unsigned char digest[HLEN];
-    mbedtls_sha256(content, cn, digest, 0);
+    if (sc_hash(SC_SHA256, content, cn, digest) != 0) return 0;
 
-    unsigned char sig[MBEDTLS_PK_SIGNATURE_MAX_SIZE];
+    /* DER-подпись ECDSA P-256 — не длиннее 72 байт; запас на любой вид. */
+    unsigned char sig[160];
     size_t sig_n = 0;
-#if MBEDTLS_VERSION_MAJOR >= 3
-    if (mbedtls_pk_sign(&((struct leaf *)l)->key, MBEDTLS_MD_SHA256, digest, HLEN,
-                        sig, sizeof(sig), &sig_n, rng_cb, NULL) != 0) return 0;
-#else
-    if (mbedtls_pk_sign(&((struct leaf *)l)->key, MBEDTLS_MD_SHA256, digest, HLEN,
-                        sig, &sig_n, rng_cb, NULL) != 0) return 0;
-#endif
+    if (tcg_sign_sha256(l->key, digest, sig, sizeof(sig), &sig_n) != 0) return 0;
     if (pl->cv_bad_sig) sig[sig_n / 2] ^= 0xFF;
 
     if (4 + 4 + sig_n > cap) return 0;
@@ -534,13 +449,14 @@ static int send_enc(struct srv *s, const unsigned char *msg, size_t n) {
     memcpy(nonce, s->iv, 12);
     for (int i = 0; i < 8; i++) nonce[11 - i] ^= (unsigned char)(s->seq >> (8 * i));
 
-    mbedtls_gcm_context g;
-    mbedtls_gcm_init(&g);
-    int rc = mbedtls_gcm_setkey(&g, MBEDTLS_CIPHER_ID_AES, s->key, 128);
-    if (rc == 0)
-        rc = mbedtls_gcm_crypt_and_tag(&g, MBEDTLS_GCM_ENCRYPT, n + 1, nonce, 12,
-                                       out, 5, out + 5, out + 5, 16, out + 5 + n + 1);
-    mbedtls_gcm_free(&g);
+    /* Одноразовый ключ на запись — половина сервера не про скорость. Контекст в куче: на
+     * стеке этого потока ему (больше килобайта) не место. */
+    struct sc_aead *g = malloc(sizeof(*g));
+    if (!g) return -1;
+    int rc = sc_aead_setkey(g, SC_AES128_GCM, s->key);
+    if (rc == 0) rc = sc_aead_seal(g, nonce, out, 5, out + 5, n + 1, out + 5 + n + 1);
+    sc_aead_free(g);
+    free(g);
     if (rc) return -1;
     s->seq++;
     return wr_all(s->fd, out, 5 + total);
@@ -595,21 +511,20 @@ static void *server_half(void *arg) {
     memcpy(rec + 5, sh, m);
     if (wr_all(s->fd, rec, 5 + m)) return NULL;
 
-    mbedtls_sha256_init(&s->tr);
-    mbedtls_sha256_starts(&s->tr, 0);
-    mbedtls_sha256_update(&s->tr, ch, ch_n);
-    mbedtls_sha256_update(&s->tr, sh, m);
+    if (sc_hash_init(&s->tr, SC_SHA256) != 0) return NULL;
+    sc_hash_update(&s->tr, ch, ch_n);
+    sc_hash_update(&s->tr, sh, m);
 
     if (pl->no_keyshare) { s->rc = 0; return NULL; }   /* дальше клиент уже не слушает */
 
     /* ---- расписание ключей рукопожатия, RFC 8446 §7.1 ---- */
     unsigned char zeros[HLEN] = {0}, empty[HLEN];
     unsigned char early[HLEN], derived[HLEN], hs[HLEN], ecdhe[32], th[HLEN];
-    mbedtls_sha256(zeros, 0, empty, 0);
-    if (mbedtls_hkdf_extract(md256(), NULL, 0, zeros, HLEN, early) != 0) return NULL;
+    if (sc_hash(SC_SHA256, zeros, 0, empty) != 0) return NULL;
+    if (sc_hkdf_extract(SC_SHA256, NULL, 0, zeros, HLEN, early) != 0) return NULL;
     if (xlabel(early, "derived", empty, HLEN, derived, HLEN) != 0) return NULL;
     if (x25519_shared_ext(spriv, cpub, ecdhe) != 0) return NULL;
-    if (mbedtls_hkdf_extract(md256(), derived, HLEN, ecdhe, 32, hs) != 0) return NULL;
+    if (sc_hkdf_extract(SC_SHA256, derived, HLEN, ecdhe, 32, hs) != 0) return NULL;
     tr_snapshot(&s->tr, th);
     if (xlabel(hs, "s hs traffic", th, HLEN, s->s_hs, HLEN) != 0) return NULL;
     if (xlabel(s->s_hs, "key", NULL, 0, s->key, sizeof(s->key)) != 0) return NULL;
@@ -632,7 +547,7 @@ static void *server_half(void *arg) {
     ee[elist_at + 1] = (unsigned char)(en - elist_at - 2);
     ee[1] = 0; ee[2] = (unsigned char)((en - 4) >> 8); ee[3] = (unsigned char)(en - 4);
     if (send_enc(s, ee, en)) return NULL;
-    mbedtls_sha256_update(&s->tr, ee, en);
+    sc_hash_update(&s->tr, ee, en);
 
 #if defined(STEER_HAVE_X509WRITE)
     /* ---- Certificate и CertificateVerify настоящей цепочкой (путь security=tls) ---- */
@@ -642,7 +557,7 @@ static void *server_half(void *arg) {
         size_t mn = cert_msg(l, msg, sizeof(msg));
         if (!mn) return NULL;
         if (send_enc(s, msg, mn)) return NULL;
-        mbedtls_sha256_update(&s->tr, msg, mn);
+        sc_hash_update(&s->tr, msg, mn);
 
         if (!pl->no_cv) {
             /* Хеш снимается ПОСЛЕ Certificate и ДО CertificateVerify — ровно то, что
@@ -654,7 +569,7 @@ static void *server_half(void *arg) {
             size_t cn = cv_msg(l, th_cv, pl, msg, sizeof(msg));
             if (!cn) return NULL;
             if (send_enc(s, msg, cn)) return NULL;
-            mbedtls_sha256_update(&s->tr, msg, cn);
+            sc_hash_update(&s->tr, msg, cn);
         }
         goto finished;
     }
@@ -676,7 +591,7 @@ static void *server_half(void *arg) {
         cr[0] = 0x0B; cr[1] = 0; cr[2] = 0; cr[3] = 32;
         memset(cr + 4, 0xA5, 32);
         if (send_enc(s, cr, 36)) return NULL;
-        mbedtls_sha256_update(&s->tr, cr, 36);
+        sc_hash_update(&s->tr, cr, 36);
     }
 
     /* ---- Finished ---- */
@@ -686,13 +601,13 @@ finished:;
     unsigned char fkey[HLEN], hash[HLEN], vd[HLEN];
     tr_snapshot(&s->tr, hash);
     if (xlabel(s->s_hs, "finished", NULL, 0, fkey, HLEN) != 0) return NULL;
-    if (mbedtls_md_hmac(md256(), fkey, HLEN, hash, HLEN, vd) != 0) return NULL;
+    if (sc_hmac(SC_SHA256, fkey, HLEN, hash, HLEN, vd) != 0) return NULL;
     if (pl->bad_finished) vd[0] ^= 0xFF;
     unsigned char fin[4 + HLEN];
     fin[0] = 0x14; fin[1] = 0; fin[2] = 0; fin[3] = (unsigned char)HLEN;
     memcpy(fin + 4, vd, HLEN);
     if (send_enc(s, fin, sizeof(fin))) return NULL;
-    mbedtls_sha256_update(&s->tr, fin, sizeof(fin));
+    sc_hash_update(&s->tr, fin, sizeof(fin));
 
     s->rc = 0;
     return NULL;
@@ -834,7 +749,7 @@ int main(void) {
     struct vless_node node;
     node_reality(&node, "tcp");
 
-    /* Прогрев. Первое рукопожатие тянет за собой одноразовые выделения самой mbedtls и
+    /* Прогрев. Первое рукопожатие тянет за собой одноразовые выделения криптобиблиотеки и
      * подъём потока, и без него первая же проверка кучи показала бы их как утечку. Что
      * прогрев сработал, видно по коду возврата: он обязан быть тем же, что в первом
      * измеряемом случае ниже. */
@@ -1012,7 +927,7 @@ int main(void) {
         chain_free();
     }
 #else
-    printf("\nВНИМАНИЕ: собрано БЕЗ выпуска сертификатов (нет MBEDTLS_X509_CRT_WRITE_C) —\n");
+    printf("\nВНИМАНИЕ: собрано БЕЗ выпуска сертификатов (нет STEER_HAVE_X509WRITE, tests/certgen.c) —\n");
     printf("          семь случаев security=tls ПРОПУЩЕНЫ: ни удавшаяся проверка сервера,\n");
     printf("          ни ветвь ENOH2 с её vless_close здесь не проверены (R-118).\n\n");
 #endif

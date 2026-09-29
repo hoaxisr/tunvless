@@ -5,10 +5,7 @@
 #include <string.h>
 #include <time.h>
 
-#include "mbedtls/hkdf.h"
-#include "mbedtls/md.h"
-#include "mbedtls/sha256.h"
-
+#include "scrypto.h"
 #include "xshake.h"
 #include "xswire.h"
 #include "chello.h"
@@ -42,14 +39,16 @@
 
 /* ---- Noise: транскрипт и цепочка ключей ------------------------------------ */
 
+/* Отказ хеша не возвращается: у SHA-256 без устройств отказать нечему, а если всё-таки
+ * случилось — h выйдет не тем, транскрипт разойдётся с собеседником, и рукопожатие упадёт на
+ * первой же проверке тега, а не пройдёт. */
 static void mix_hash(struct xs_hs *hs, const uint8_t *data, size_t n) {
-    mbedtls_sha256_context c;
-    mbedtls_sha256_init(&c);
-    mbedtls_sha256_starts(&c, 0);
-    mbedtls_sha256_update(&c, hs->h, 32);
-    mbedtls_sha256_update(&c, data, n);
-    mbedtls_sha256_finish(&c, hs->h);
-    mbedtls_sha256_free(&c);
+    struct sc_hash_ctx c;
+    if (sc_hash_init(&c, SC_SHA256) != 0) { memset(hs->h, 0, 32); return; }
+    sc_hash_update(&c, hs->h, 32);
+    sc_hash_update(&c, data, n);
+    sc_hash_final(&c, hs->h);
+    sc_hash_free(&c);
 }
 
 /* MixKey(ikm) = HKDF(ck, ikm, 2): ck' и k одним расширением на 64 байта.
@@ -59,11 +58,9 @@ static void mix_hash(struct xs_hs *hs, const uint8_t *data, size_t n) {
  * — буква в букву цепочка Noise. Стенд tests/xscrypto.c сверяет это с независимым
  * подсчётом, потому что «должно совпадать» и «совпадает» — разные утверждения. */
 static int mix_key(struct xs_hs *hs, const uint8_t *ikm, size_t ikm_n) {
-    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    if (!md) return XS_ECRYPTO;
     uint8_t prk[32], out[64];
-    if (mbedtls_hkdf_extract(md, hs->ck, 32, ikm, ikm_n, prk) != 0) return XS_ECRYPTO;
-    if (mbedtls_hkdf_expand(md, prk, 32, NULL, 0, out, sizeof(out)) != 0) return XS_ECRYPTO;
+    if (sc_hkdf_extract(SC_SHA256, hs->ck, 32, ikm, ikm_n, prk) != 0) return XS_ECRYPTO;
+    if (sc_hkdf_expand(SC_SHA256, prk, 32, NULL, 0, out, sizeof(out)) != 0) return XS_ECRYPTO;
     memcpy(hs->ck, out, 32);
     memcpy(hs->k, out + 32, 32);
     /* Контекст шифра разворачивается заново на каждый шаг: ключ сменился, а держать старый
@@ -112,12 +109,10 @@ static int decrypt_and_hash(struct xs_hs *hs, const uint8_t *ct, size_t ct_n, ui
  * Поэтому сборка, которая про эпохи ничего не знает, продолжает считать в точности прежние
  * ключи: совместимость на проводе не тронута, и поддельный TCP не задет вовсе. */
 static int split_keys(struct xs_hs *hs, struct tls13_keys *i2r, struct tls13_keys *r2i) {
-    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    if (!md) return XS_ECRYPTO;
     uint8_t prk[32], out[152];
-    if (mbedtls_hkdf_extract(md, hs->ck, 32, (const uint8_t *)"", 0, prk) != 0) return XS_ECRYPTO;
-    if (mbedtls_hkdf_expand(md, prk, 32, (const uint8_t *)"xsteer split", 12,
-                            out, sizeof(out)) != 0) return XS_ECRYPTO;
+    if (sc_hkdf_extract(SC_SHA256, hs->ck, 32, (const uint8_t *)"", 0, prk) != 0) return XS_ECRYPTO;
+    if (sc_hkdf_expand(SC_SHA256, prk, 32, (const uint8_t *)"xsteer split", 12,
+                       out, sizeof(out)) != 0) return XS_ECRYPTO;
     size_t kn = hs->aead == TLS13_AEAD_AES128 ? 16 : 32;
     memset(i2r, 0, sizeof(*i2r));
     memset(r2i, 0, sizeof(*r2i));
@@ -238,12 +233,10 @@ static void payload_unpack(const uint8_t in[XS_SID_PLAIN], struct xs_payload *p)
  * этой же операцией шифруется полезная нагрузка Noise, и переиспользовать ключ с тем же
  * нулевым nonce означало бы повтор пары «ключ, nonce» — то есть полную потерю защиты. */
 static int auth_key(const struct xs_hs *hs, struct tls13_keys *k) {
-    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    if (!md) return XS_ECRYPTO;
     uint8_t prk[32], out[44];
-    if (mbedtls_hkdf_extract(md, hs->ck, 32, (const uint8_t *)"", 0, prk) != 0) return XS_ECRYPTO;
-    if (mbedtls_hkdf_expand(md, prk, 32, (const uint8_t *)"xsteer auth", 11,
-                            out, sizeof(out)) != 0) return XS_ECRYPTO;
+    if (sc_hkdf_extract(SC_SHA256, hs->ck, 32, (const uint8_t *)"", 0, prk) != 0) return XS_ECRYPTO;
+    if (sc_hkdf_expand(SC_SHA256, prk, 32, (const uint8_t *)"xsteer auth", 11,
+                       out, sizeof(out)) != 0) return XS_ECRYPTO;
     memset(k, 0, sizeof(*k));
     k->aead = hs->aead;
     k->key_n = hs->aead == TLS13_AEAD_AES128 ? 16 : 32;

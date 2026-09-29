@@ -20,8 +20,8 @@
  * ClientHello должен быть НЕОТЛИЧИМ от браузерного. Не «похож» — именно неотличим по
  * набору и порядку расширений, списку шифров, GREASE-значениям. Любое отклонение делает
  * нас нетипичным клиентом, и это само по себе признак, даже если аутентификатор верен.
- * Поэтому Hello собирается здесь вручную, а не библиотекой: mbedtls прислал бы свой
- * порядок расширений, который на браузер не похож.
+ * Поэтому Hello собирается здесь вручную, а не библиотекой: TLS-стек любой библиотеки прислал
+ * бы свой порядок расширений, который на браузер не похож.
  *
  * И: неудача выглядит как успех. Сервер не отвечает ошибкой — он отдаёт настоящий сайт.
  * Проверить «получилось ли» можно только по тому, отвечает ли туннель VLESS дальше.
@@ -39,13 +39,7 @@
 #include <sys/auxv.h>
 #endif
 
-#include "mbedtls/ecdh.h"
-#include "mbedtls/ecp.h"
-#include "mbedtls/hkdf.h"
-#include "mbedtls/sha256.h"
-#include "mbedtls/aes.h"
-#include "mbedtls/gcm.h"
-
+#include "scrypto.h"
 #include "reality.h"
 
 /* base64url без выравнивания — в таком виде pbk приходит в ссылке. */
@@ -131,58 +125,33 @@ static int cpu_has_aes(void) {
     return (getauxval(AT_HWCAP) & (1ul << 3)) != 0;      /* HWCAP_AES */
 #else
     /* Всё остальное — включая 32-битный ARM с расширениями криптографии. Вопрос здесь не
-     * «есть ли инструкции у процессора», а «воспользуется ли ими НАША сборка»: путь
-     * MBEDTLS_AESCE_C существует только для aarch64 (см. steer_mbedtls_config.h). На armv7 с
-     * crypto extensions AES у нас всё равно табличный, то есть медленный, и объявлять его
-     * предпочтительным означало бы выбрать заведомо худший шифр. */
+     * «есть ли инструкции у процессора», а «воспользуется ли ими НАША сборка»: аппаратный
+     * путь AES в нашей сборке wolfSSL есть только для x86_64 (AES-NI) и aarch64 (ARMv8
+     * Crypto), см. build/wolfssl/user_settings.h. На armv7 с crypto extensions AES у нас
+     * табличный, то есть медленный, и объявлять его предпочтительным означало бы выбрать
+     * заведомо худший шифр. */
     return 0;
 #endif
 }
 
-/* Обёртка в форме, которую ждёт mbedtls. Нужна не для красоты: ecp_mul ТРЕБУЕТ источник
- * случайности и отказывается работать с NULL, потому что использует его для ослепления —
- * рандомизации промежуточных значений, без которой время операции выдаёт биты приватного
- * ключа. Первая версия передавала NULL и получала -20352 (ECP_BAD_INPUT_DATA); соблазн
- * «обойти» это своей реализацией умножения был бы ровно тем случаем, когда код работает,
- * а защита тихо не работает. */
-static int rng_cb(void *ctx, unsigned char *out, size_t n) {
-    (void)ctx;
-    return fill_random(out, n) == 0 ? 0 : MBEDTLS_ERR_ECP_RANDOM_FAILED;
-}
-
 /* ---- X25519 --------------------------------------------------------------- */
-/* Через mbedtls ECP: своя реализация тут была бы худшим решением в проекте. */
+/* Через слой примитивов (wolfCrypt): своя реализация тут была бы худшим решением в проекте.
+ *
+ * Случайный скаляр берётся ЗДЕСЬ, через fill_random, а не внутри слоя, и это не случайность:
+ * tests/hellofreeze.c подменяет getrandom макросом до включения этого файла и сверяет собранный
+ * Hello байт в байт с заморозкой. Ключ, сгенерированный в другом файле, в подмену не попал бы, и
+ * Hello перестал бы быть воспроизводимым. Прижатие скаляра — тоже здесь: оно не нужно слою
+ * (X25519 из RFC 7748 прижимает сам), но нужно тому, кто хранит priv и передаёт его дальше —
+ * tls13.c считает им секрет с эфемерным ключом сервера, и в st->priv должен лежать ровно тот
+ * скаляр, которым посчитан pub. */
 static int x25519_keypair(unsigned char priv[32], unsigned char pub[32]) {
-    mbedtls_ecp_group grp;
-    mbedtls_mpi d;
-    mbedtls_ecp_point Q;
-    mbedtls_ecp_group_init(&grp);
-    mbedtls_mpi_init(&d);
-    mbedtls_ecp_point_init(&Q);
-    int rc = -1;
-
-    if (mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_CURVE25519) != 0) goto out;
-    if (fill_random(priv, 32) != 0) goto out;
+    if (fill_random(priv, 32) != 0) return -1;
     /* Ограничения X25519 на скаляр: снять три младших бита, снять старший, поставить
-     * второй по старшинству. Без этого ключ выходит за подгруппу, и общий секрет не
-     * совпадёт с посчитанным сервером. */
+     * второй по старшинству. */
     priv[0] &= 248;
     priv[31] &= 127;
     priv[31] |= 64;
-
-    /* mbedtls хранит скаляр как big-endian mpi, а X25519 — little-endian байты. */
-    unsigned char be[32];
-    for (int i = 0; i < 32; i++) be[i] = priv[31 - i];
-    if (mbedtls_mpi_read_binary(&d, be, 32) != 0) goto out;
-
-    if (mbedtls_ecp_mul(&grp, &Q, &d, &grp.G, rng_cb, NULL) != 0) goto out;
-    if (mbedtls_mpi_write_binary_le(&Q.MBEDTLS_PRIVATE(X), pub, 32) != 0) goto out;
-    rc = 0;
-out:
-    mbedtls_ecp_group_free(&grp);
-    mbedtls_mpi_free(&d);
-    mbedtls_ecp_point_free(&Q);
-    return rc;
+    return sc_x25519_base(pub, priv) == 0 ? 0 : -1;
 }
 
 int x25519_shared_ext(const unsigned char priv[32], const unsigned char peer[32],
@@ -190,31 +159,7 @@ int x25519_shared_ext(const unsigned char priv[32], const unsigned char peer[32]
 
 static int x25519_shared(const unsigned char priv[32], const unsigned char peer[32],
                          unsigned char out[32]) {
-    mbedtls_ecp_group grp;
-    mbedtls_mpi d, z;
-    mbedtls_ecp_point P;
-    mbedtls_ecp_group_init(&grp);
-    mbedtls_mpi_init(&d);
-    mbedtls_mpi_init(&z);
-    mbedtls_ecp_point_init(&P);
-    int rc = -1;
-
-    if (mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_CURVE25519) != 0) goto out;
-    unsigned char be[32];
-    for (int i = 0; i < 32; i++) be[i] = priv[31 - i];
-    if (mbedtls_mpi_read_binary(&d, be, 32) != 0) goto out;
-    if (mbedtls_mpi_read_binary_le(&P.MBEDTLS_PRIVATE(X), peer, 32) != 0) goto out;
-    if (mbedtls_mpi_lset(&P.MBEDTLS_PRIVATE(Z), 1) != 0) goto out;
-
-    if (mbedtls_ecp_mul(&grp, &P, &d, &P, rng_cb, NULL) != 0) goto out;
-    if (mbedtls_mpi_write_binary_le(&P.MBEDTLS_PRIVATE(X), out, 32) != 0) goto out;
-    rc = 0;
-out:
-    mbedtls_ecp_group_free(&grp);
-    mbedtls_mpi_free(&d);
-    mbedtls_mpi_free(&z);
-    mbedtls_ecp_point_free(&P);
-    return rc;
+    return sc_x25519(out, priv, peer) == 0 ? 0 : -1;
 }
 
 /* ---- сборка ClientHello --------------------------------------------------- */
@@ -660,7 +605,7 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
          * сервер молча отвечает маскировочным сайтом — то есть ошибка неотличима от
          * неверного ключа. Смещение 39 в Xray и наше совпадают: 4+2+32+1 = 39. */
         /* Открытый текст — 16 значимых байт session_id. Сохраняем их ДО обнуления:
-         * mbedtls шифрует на месте, а обнуление нужно только в AAD.
+         * шифрование идёт на месте, а обнуление нужно только в AAD.
          *
          * Первая версия обнуляла sid_at перед вызовом и подписывала нули вместо версии,
          * времени и short id. Сервер, естественно, не признавал такую подпись — и, как
@@ -677,7 +622,7 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
         /* __thread, не общий static: рукопожатие асинхронное (CONNECTORS потоков в
          * tunnel.c), и этот буфер пишется прямо перед AEAD. Общий static под
          * параллельными соединителями один перетирал бы AAD другому посреди
-         * mbedtls_gcm_crypt_and_tag — тег не сходился, и сервер Reality молча
+         * шифрования AES-GCM — тег не сходился, и сервер Reality молча
          * проксировал на маскировочный сайт. Все sibling-буферы в этом коде тоже
          * __thread; этот был единственным исключением. */
         static __thread unsigned char aad[4096];
@@ -700,22 +645,19 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
          * свой сертификат, и проверка этой подписи — единственное, чем он доказывает
          * подлинность нам (tls13.c). Раньше ключ здесь и умирал, и доказательства не было. */
         unsigned char *authkey = st->authkey;
-        const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-        if (!md) return REALITY_ECRYPTO;
-        if (mbedtls_hkdf(md, random, 20, st->shared, 32,
-                         (const unsigned char *)"REALITY", 7, authkey, 32) != 0)
+        if (sc_hkdf(SC_SHA256, random, 20, st->shared, 32,
+                    (const unsigned char *)"REALITY", 7, authkey, 32) != 0)
             return REALITY_ECRYPTO;
 
+        /* AES-256-GCM одноразовым ключом: одно шифрование на рукопожатие, держать контекст
+         * дольше незачем. Контекст — в потоке, а не на стеке: он больше килобайта, а
+         * рукопожатия идут в потоках соединителей со скромным стеком (см. b_ks выше). */
         unsigned char tag[16];
-        mbedtls_gcm_context gcm;
-        mbedtls_gcm_init(&gcm);
-        int crc = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, authkey, 256);
-        if (crc == 0)
-            crc = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, 16,
-                                            random + 20, 12,
-                                            aad, aad_n,
-                                            plain, sid_at, 16, tag);
-        mbedtls_gcm_free(&gcm);
+        static __thread struct sc_aead gcm;
+        memcpy(sid_at, plain, 16);
+        int crc = sc_aead_setkey(&gcm, SC_AES256_GCM, authkey);
+        if (crc == 0) crc = sc_aead_seal(&gcm, random + 20, aad, aad_n, sid_at, 16, tag);
+        sc_aead_free(&gcm);
         if (crc != 0) return REALITY_ECRYPTO;
         memcpy(sid_at + 16, tag, 16);
         memcpy(st->session_id, sid_at, 32);
@@ -748,23 +690,8 @@ int xc_x25519_keypair(unsigned char priv[32], unsigned char pub[32]) {
  * конфигурации приватной половиной (как у wg), а публичная выводится, а не переписывается
  * руками — два значения, выведенных одно из другого, обязаны считаться. */
 int xc_x25519_public(const unsigned char priv[32], unsigned char pub[32]) {
-    mbedtls_ecp_group grp;
-    mbedtls_mpi d;
-    mbedtls_ecp_point Q;
-    mbedtls_ecp_group_init(&grp);
-    mbedtls_mpi_init(&d);
-    mbedtls_ecp_point_init(&Q);
-    int rc = -1;
-    if (mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_CURVE25519) != 0) goto out;
-    unsigned char be[32];
-    for (int i = 0; i < 32; i++) be[i] = priv[31 - i];
-    if (mbedtls_mpi_read_binary(&d, be, 32) != 0) goto out;
-    if (mbedtls_ecp_mul(&grp, &Q, &d, &grp.G, rng_cb, NULL) != 0) goto out;
-    if (mbedtls_mpi_write_binary_le(&Q.MBEDTLS_PRIVATE(X), pub, 32) != 0) goto out;
-    rc = 0;
-out:
-    mbedtls_ecp_group_free(&grp);
-    mbedtls_mpi_free(&d);
-    mbedtls_ecp_point_free(&Q);
-    return rc;
+    /* Неприжатый ключ из конфигурации слой прижимает сам (RFC 7748) — так же считают его
+     * wireguard-go и сторона xsteer на Go, поэтому публичная половина совпадает с их расчётом.
+     * mbedtls такой ключ отвергала, то есть прежде он давал отказ там, где Go давал ключ. */
+    return sc_x25519_base(pub, priv) == 0 ? 0 : -1;
 }

@@ -10,8 +10,14 @@
  * ключом, который мы же у него и взяли.
  *
  * ЧЕГО ЗДЕСЬ НЕТ. Ни OCSP, ни списков отзыва: на роутере их нечем и некогда качать, а
- * молчаливая имитация проверки хуже честного её отсутствия. Срок действия mbedtls проверяет
- * сам (MBEDTLS_HAVE_TIME), и это единственная временная проверка, на которую мы опираемся.
+ * молчаливая имитация проверки хуже честного её отсутствия. Срок действия каждого сертификата
+ * цепочки проверяет библиотека по текущему времени (sc_chain_verify), и это единственная
+ * временная проверка, на которую мы опираемся.
+ *
+ * Сама проверка — за слоем примитивов (src/lib/scrypto.h): путь до корня, признаки CA и имя
+ * строит и проверяет wolfSSL, подпись CertificateVerify — wolfCrypt. Здесь остаётся то, что
+ * относится к TLS 1.3, а не к X.509: разбор сообщений Certificate и CertificateVerify, строка
+ * с приставкой, которую подписывает сервер, и выбор алгоритма по коду из сообщения.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -19,10 +25,7 @@
 #include <string.h>
 #include <pthread.h>
 
-#include "mbedtls/x509_crt.h"
-#include "mbedtls/pk.h"
-#include "mbedtls/md.h"
-
+#include "scrypto.h"
 #include "certverify.h"
 
 /* ---- хранилище корней ---------------------------------------------------------------
@@ -36,14 +39,13 @@
  * Освобождения нет намеренно: хранилище живёт столько же, сколько процесс, и «освободить перед
  * выходом» здесь означало бы код, который исполняется ровно в момент, когда его результат уже
  * никому не нужен. */
-static mbedtls_x509_crt g_roots;
+static struct sc_roots *g_roots;
 static int g_roots_rc = CERTV_ENOROOTS;
 static pthread_once_t g_roots_once = PTHREAD_ONCE_INIT;
 static const char *g_roots_path;
 
 static void roots_load(void) {
     const char *path = (g_roots_path && g_roots_path[0]) ? g_roots_path : CERTV_DEFAULT_ROOTS;
-    mbedtls_x509_crt_init(&g_roots);
 
     FILE *f = fopen(path, "rb");
     if (!f) return;
@@ -55,21 +57,21 @@ static void roots_load(void) {
     if (sz <= 0 || sz > 8 * 1024 * 1024) { fclose(f); return; }
     rewind(f);
 
-    /* +1 байт под ноль: mbedtls_x509_crt_parse отличает PEM от DER по наличию терминатора и
-     * требует, чтобы он ВХОДИЛ в переданную длину. Без него разбор молча уходит в ветку DER
-     * и не находит ни одного корня — то есть хранилище выглядит пустым. */
+    /* +1 байт под ноль: разбору PEM он не нужен, но текст, который где-то дальше прочтут как
+     * строку, без терминатора — ловушка, и байт за неё — не цена. */
     unsigned char *buf = malloc((size_t)sz + 1);
     if (!buf) { fclose(f); return; }
     size_t got = fread(buf, 1, (size_t)sz, f);
     fclose(f);
     buf[got] = '\0';
 
-    /* Возврат больше нуля — «часть сертификатов не разобралась». Это НЕ отказ: в хранилище
-     * встречаются записи с алгоритмами, которых нет в нашей сборке mbedtls, и требовать
-     * идеального разбора значило бы остаться без корней целиком из-за одного экзотического. */
-    int rc = mbedtls_x509_crt_parse(&g_roots, buf, got + 1);
+    /* Записи, которые не разобрались, слой пропускает: в хранилище встречаются корни с
+     * алгоритмами, которых нет в нашей сборке wolfSSL (и истёкшие), и требовать идеального
+     * разбора значило бы остаться без корней целиком из-за одного экзотического. Отказ здесь —
+     * только когда не разобралось НИЧЕГО. */
+    int rc = sc_roots_load(&g_roots, buf, got);
     free(buf);
-    if (rc < 0 || g_roots.version == 0) return;
+    if (rc != 0) return;
     g_roots_rc = 0;
 }
 
@@ -79,7 +81,18 @@ static void roots_load(void) {
  * записи «3 байта длины + DER» с двухбайтовым хвостом расширений у каждой. Расширения не
  * читаются: в них бывает разве что signed_certificate_timestamp, на решение он не влияет.
  */
-static int parse_chain(const unsigned char *b, size_t n, mbedtls_x509_crt *chain) {
+/* Сколько сертификатов цепочки берётся в проверку. Настоящие цепочки — два-четыре; всё, что
+ * сверх шестнадцати, отбрасывается, а не роняет проверку: если нужный промежуточный оказался
+ * семнадцатым, путь до корня не построится, и это будет честный отказ цепочки. */
+#define CHAIN_MAX 16
+
+/* Разобрать сообщение на куски DER — сами сертификаты разбирает библиотека (sc_chain_verify):
+ * лист, который не разобрался, — отказ «сертификат не разобрался», промежуточный — пропуск
+ * (цепочка нередко приезжает с запасом, и незнакомый алгоритм в лишнем сертификате ничего не
+ * решает). */
+static int parse_chain(const unsigned char *b, size_t n, const unsigned char **der,
+                       size_t *der_n, size_t *count) {
+    *count = 0;
     if (n < 1) return CERTV_EPARSE;
     size_t p = 1 + b[0];                       /* certificate_request_context */
     if (p + 3 > n) return CERTV_EPARSE;
@@ -87,17 +100,16 @@ static int parse_chain(const unsigned char *b, size_t n, mbedtls_x509_crt *chain
     p += 3;
     if (p + list > n) return CERTV_EPARSE;
 
-    size_t end = p + list, seen = 0;
+    size_t end = p + list;
     while (p + 3 <= end) {
         size_t clen = ((size_t)b[p] << 16) | ((size_t)b[p + 1] << 8) | b[p + 2];
         p += 3;
         if (clen == 0 || p + clen > end) return CERTV_EPARSE;
-        /* Разбор ПРОДОЛЖАЕТСЯ при отказе на промежуточном сертификате, но не на первом:
-         * листовой нужен обязательно (им проверяется подпись), а промежуточный, который мы
-         * не поняли, может оказаться лишним — цепочка нередко приезжает с запасом. */
-        int rc = mbedtls_x509_crt_parse_der(chain, b + p, clen);
-        if (rc != 0 && seen == 0) return CERTV_EPARSE;
-        if (rc == 0) seen++;
+        if (*count < CHAIN_MAX) {
+            der[*count] = b + p;
+            der_n[*count] = clen;
+            (*count)++;
+        }
         p += clen;
         if (p + 2 > end) break;
         size_t elen = ((size_t)b[p] << 8) | b[p + 1];
@@ -105,7 +117,7 @@ static int parse_chain(const unsigned char *b, size_t n, mbedtls_x509_crt *chain
         if (p + elen > end) return CERTV_EPARSE;
         p += elen;
     }
-    return seen ? 0 : CERTV_EPARSE;
+    return *count ? 0 : CERTV_EPARSE;
 }
 
 /* ---- подпись CertificateVerify (RFC 8446 §4.4.3) ------------------------------------
@@ -121,36 +133,37 @@ static const char CV_LABEL[] = "TLS 1.3, server CertificateVerify";
  * CertificateVerify запрещено (RFC 8446 §4.4.3), они остаются только для подписей ВНУТРИ
  * сертификатов. Сервер, выбравший что-то ещё, нарушает наш же список — это отдельная
  * причина, а не «подпись не сошлась». */
-static int sig_alg(unsigned code, mbedtls_md_type_t *md, int *is_pss) {
+/* secp521r1 (0x0603) в списке есть, а в сборке wolfSSL кривой P-521 нет (build/wolfssl/
+ * user_settings.h): такую подпись мы не предлагаем (Chrome её не предлагает, reality.c тоже), и
+ * сервер, выбравший её, получит отказ «подпись неверна» — ключ из сертификата не разберётся. */
+static int sig_alg(unsigned code, enum sc_hash *md, enum sc_sig_alg *alg) {
     switch (code) {
-        case 0x0403: *md = MBEDTLS_MD_SHA256; *is_pss = 0; return 0;  /* ecdsa_secp256r1 */
-        case 0x0503: *md = MBEDTLS_MD_SHA384; *is_pss = 0; return 0;  /* ecdsa_secp384r1 */
-        case 0x0603: *md = MBEDTLS_MD_SHA512; *is_pss = 0; return 0;  /* ecdsa_secp521r1 */
-        case 0x0804: *md = MBEDTLS_MD_SHA256; *is_pss = 1; return 0;  /* rsa_pss_rsae */
-        case 0x0805: *md = MBEDTLS_MD_SHA384; *is_pss = 1; return 0;
-        case 0x0806: *md = MBEDTLS_MD_SHA512; *is_pss = 1; return 0;
-        case 0x0809: *md = MBEDTLS_MD_SHA256; *is_pss = 1; return 0;  /* rsa_pss_pss */
-        case 0x080A: *md = MBEDTLS_MD_SHA384; *is_pss = 1; return 0;
-        case 0x080B: *md = MBEDTLS_MD_SHA512; *is_pss = 1; return 0;
+        case 0x0403: *md = SC_SHA256; *alg = SC_SIG_ECDSA; return 0;  /* ecdsa_secp256r1 */
+        case 0x0503: *md = SC_SHA384; *alg = SC_SIG_ECDSA; return 0;  /* ecdsa_secp384r1 */
+        case 0x0603: *md = SC_SHA512; *alg = SC_SIG_ECDSA; return 0;  /* ecdsa_secp521r1 */
+        case 0x0804: *md = SC_SHA256; *alg = SC_SIG_RSA_PSS; return 0;  /* rsa_pss_rsae */
+        case 0x0805: *md = SC_SHA384; *alg = SC_SIG_RSA_PSS; return 0;
+        case 0x0806: *md = SC_SHA512; *alg = SC_SIG_RSA_PSS; return 0;
+        case 0x0809: *md = SC_SHA256; *alg = SC_SIG_RSA_PSS; return 0;  /* rsa_pss_pss */
+        case 0x080A: *md = SC_SHA384; *alg = SC_SIG_RSA_PSS; return 0;
+        case 0x080B: *md = SC_SHA512; *alg = SC_SIG_RSA_PSS; return 0;
         default: return CERTV_EALG;
     }
 }
 
-static int check_signature(mbedtls_pk_context *pk, const unsigned char *cv, size_t cv_n,
+static int check_signature(const unsigned char *leaf, size_t leaf_n,
+                           const unsigned char *cv, size_t cv_n,
                            const unsigned char *transcript, size_t thash_n) {
     if (cv_n < 4) return CERTV_EPARSE;
     unsigned code = ((unsigned)cv[0] << 8) | cv[1];
     size_t sig_n = ((size_t)cv[2] << 8) | cv[3];
     if (4 + sig_n != cv_n) return CERTV_EPARSE;
 
-    mbedtls_md_type_t mdt;
-    int is_pss;
-    int rc = sig_alg(code, &mdt, &is_pss);
+    enum sc_hash mdt;
+    enum sc_sig_alg alg;
+    int rc = sig_alg(code, &mdt, &alg);
     if (rc) return rc;
-
-    const mbedtls_md_info_t *mi = mbedtls_md_info_from_type(mdt);
-    if (!mi) return CERTV_EALG;
-    size_t hn = mbedtls_md_get_size(mi);
+    size_t hn = sc_hash_len(mdt);
 
     /* ДЛИНА ТРАНСКРИПТА И ДЛИНА ХЕША ПОДПИСИ — РАЗНЫЕ ВЕЛИЧИНЫ, и путать их нельзя.
      *
@@ -171,23 +184,14 @@ static int check_signature(mbedtls_pk_context *pk, const unsigned char *cv, size
     memcpy(content + cn, transcript, thash_n); cn += thash_n;
 
     unsigned char digest[64];
-    if (mbedtls_md(mi, content, cn, digest) != 0) return CERTV_ESIG;
+    if (sc_hash(mdt, content, cn, digest) != 0) return CERTV_ESIG;
 
-    if (is_pss) {
-        /* Соль ЛЮБОЙ длины. RFC 8446 требует, чтобы она равнялась длине хеша, но встречаются
-         * серверы (и посредники, переподписывающие поток), у которых она другая; отвергать
-         * их значило бы объявить узел неисправным там, где подпись верна. */
-        mbedtls_pk_rsassa_pss_options o = {
-            .mgf1_hash_id = mdt,
-            .expected_salt_len = MBEDTLS_RSA_SALT_LEN_ANY,
-        };
-        if (mbedtls_pk_verify_ext(MBEDTLS_PK_RSASSA_PSS, &o, pk, mdt, digest, hn,
-                                  cv + 4, sig_n) != 0)
-            return CERTV_ESIG;
-        return 0;
-    }
-    if (mbedtls_pk_verify(pk, mdt, digest, hn, cv + 4, sig_n) != 0) return CERTV_ESIG;
-    return 0;
+    /* У PSS соль ЛЮБОЙ длины (так слой и проверяет). RFC 8446 требует, чтобы она равнялась
+     * длине хеша, но встречаются серверы (и посредники, переподписывающие поток), у которых она
+     * другая; отвергать их значило бы объявить узел неисправным там, где подпись верна. Ключ
+     * не того вида (ECDSA-подпись на ключе RSA) — тоже «подпись неверна», как и прежде. */
+    return sc_cert_verify_sig(leaf, leaf_n, alg, mdt, digest, hn, cv + 4, sig_n) == 0
+               ? 0 : CERTV_ESIG;
 }
 
 int cert_verify_server(const unsigned char *cert_body, size_t cert_n,
@@ -200,35 +204,33 @@ int cert_verify_server(const unsigned char *cert_body, size_t cert_n,
     pthread_once(&g_roots_once, roots_load);
     if (g_roots_rc != 0) return CERTV_ENOROOTS;
 
-    mbedtls_x509_crt chain;
-    mbedtls_x509_crt_init(&chain);
-    int rc = parse_chain(cert_body, cert_n, &chain);
+    const unsigned char *der[CHAIN_MAX];
+    size_t der_n[CHAIN_MAX], count = 0;
+    int rc = parse_chain(cert_body, cert_n, der, der_n, &count);
     if (rc == 0) {
-        /* ИМЯ ПРОВЕРЯЕТСЯ ЗДЕСЬ ЖЕ, третьим доводом verify: отдельной проверкой оно
-         * оказалось бы вторым местом, где живёт разбор SAN, и разошлось бы с библиотечным.
-         * Флаги важнее кода возврата: verify возвращает отказ и на «имя не то», и на
-         * «корня нет», а различать их человеку нужно. */
-        uint32_t flags = 0;
-        int vr = mbedtls_x509_crt_verify(&chain, &g_roots, NULL, host, &flags, NULL, NULL);
-        if (vr != 0 || flags != 0) rc = CERTV_ECHAIN;
+        /* ИМЯ ПРОВЕРЯЕТСЯ ЗДЕСЬ ЖЕ, вместе с цепочкой: отдельной проверкой оно оказалось бы
+         * вторым местом, где живёт разбор SAN, и разошлось бы с библиотечным. */
+        int vr = sc_chain_verify(g_roots, der, der_n, count, host);
+        if (vr == SC_EPARSE) rc = CERTV_EPARSE;
+        else if (vr != 0) rc = CERTV_ECHAIN;
     }
-    if (rc == 0) rc = check_signature(&chain.pk, cv_body, cv_n, transcript, thash_n);
-    mbedtls_x509_crt_free(&chain);
+    if (rc == 0) rc = check_signature(der[0], der_n[0], cv_body, cv_n, transcript, thash_n);
     return rc;
 }
 
 /* ---- Reality: сервер доказывает подлинность нам ------------------------------------
  *
- * Механика описана в certverify.h. Здесь — разбор, и он намеренно СВОЙ, а не через
- * mbedtls_x509_crt_parse_der: сертификат Reality подписан ключом Ed25519, а mbedtls его не
- * знает вовсе (в 3.6 нет ни кривой, ни алгоритма) и отказывается разбирать такой сертификат
- * целиком. То есть библиотечный разбор здесь не «дороже», а невозможен.
+ * Механика описана в certverify.h. Здесь — разбор, и он намеренно СВОЙ, а не библиотечный:
+ * сертификат Reality подписан ключом Ed25519, а Ed25519 в нашей сборке wolfSSL нет (он не
+ * нужен ни для чего, кроме разбора этого сертификата, — см. build/wolfssl/user_settings.h), и
+ * mbedtls, которую wolfSSL сменила, его не знала вовсе. Разбор всего сертификата ради двух полей
+ * был бы и лишним кодом, и лишней зависимостью от того, что библиотека умеет Ed25519.
  *
  * Нужны ровно два поля, и оба лежат на предсказуемых местах DER.
  */
 
 /* Один шаг по DER: тег, длина, значение. Возвращает 0 и двигает *p за значение; длину и
- * начало значения кладёт в *val/*val_n. Длиннее четырёх байт длина не бывает у сертификата,
+ * начало значения кладёт в *val и *val_n. Длиннее четырёх байт длина не бывает у сертификата,
  * который влез в сообщение рукопожатия. */
 static int der_next(const unsigned char **p, const unsigned char *end,
                     unsigned char *tag, const unsigned char **val, size_t *val_n) {
@@ -316,10 +318,8 @@ int cert_reality_check(const unsigned char *cert_body, size_t cert_n,
     size_t sig_n;
     if (find_signature(der, clen, &sig, &sig_n) != 0) return CERTV_EPARSE;
 
-    const mbedtls_md_info_t *mi = mbedtls_md_info_from_type(MBEDTLS_MD_SHA512);
-    if (!mi) return CERTV_EALG;
     unsigned char want[64];
-    if (mbedtls_md_hmac(mi, authkey, 32, pub, 32, want) != 0) return CERTV_ESIG;
+    if (sc_hmac(SC_SHA512, authkey, 32, pub, 32, want) != 0) return CERTV_ESIG;
 
     /* Сравнение постоянного времени. Утечка здесь ничего не открывает — обе стороны байты
      * и так видят, — но сравнивать секретозависимое memcmp'ом это привычка, которую в этом

@@ -30,11 +30,19 @@
 # измерен (MIPS), а остальное по-прежнему zig. Решение о том, что выкладывать, остаётся за
 # человеком — здесь только воспроизводимый рецепт.
 #
-#     sh build/build-ext-sdk.sh <каталог SDK> <mbedtls-3.6.2> <router|server> <выход> [версия] [ревизия]
+# ЧИСЛА ВЫШЕ СНЯТЫ НА mbedtls 3.6.2, которую в выпуске 1.10 сменила wolfSSL (шаг 1,
+# docs/architecture.md). Рецепт переведён на неё — тот же список файлов и те же опции
+# (build/wolfssl/build.sh и user_settings.h), что у zig, — но НА SDK ЕЩЁ НЕ ПРОГОНЯЛСЯ: на машине,
+# где шёл переезд, SDK OpenWrt нет. Выигрыш gcc над LLVM на MIPS надо перемерить заново — он был
+# свойством кода ChaCha20 в mbedtls, а у wolfSSL этот код другой.
+#
+#     sh build/build-ext-sdk.sh <каталог SDK> <исходники wolfSSL> <router|server> <выход> [версия] [ревизия]
+#
+# Исходники wolfSSL — той же версии, что в образе: sh build/wolfssl/fetch.sh <каталог> (сверит сумму).
 set -eu
 
 SDK="${1:?нужен каталог распакованного OpenWrt SDK}"
-MBED="${2:?нужен каталог исходников mbedtls}"
+WSRC="${2:?нужен каталог исходников wolfSSL (sh build/wolfssl/fetch.sh <каталог>)}"
 ROLE="${3:?нужна роль: router или server}"
 OUT="${4:?нужен путь выходного файла}"
 VERSION="${5:-0.0.0}"
@@ -52,35 +60,15 @@ CC=$(ls "$TC"/bin/*-openwrt-linux-gcc | head -1)
 # -O2, а не -Os: см. таблицу в шапке. Флаги процессора берутся те же, что у OpenWrt для этой цели
 # (include/target.mk: CPU_CFLAGS_24kc).
 OPT="-O2 -mips32r2 -mtune=24kc -flto"
-CFG='-DMBEDTLS_CONFIG_FILE="steer_mbedtls_config.h"'
-WORK="/tmp/mb-sdk-$(basename "$TC")"
-mkdir -p "$WORK"
 
-# mbedtls компилируется ЦЕЛИКОМ: линковщик возьмёт только используемое. Причина та же, что в
-# build-ext.sh — ручной отбор модулей превращается в игру «кто кого тянет».
-# Ошибка компиляции модуля называется на месте, а не глушится, — см. пояснение в
-# build/build-ext.sh: молчаливый провал доезжал до компоновки неопределённой ссылкой.
-if [ ! -f "$WORK/.done" ]; then
-    echo "собираю mbedtls тулчейном SDK ($OPT)"
-    mb_failed=
-    for f in "$MBED"/library/*.c; do
-        m=$(basename "$f" .c)
-        case "$m" in net_sockets|debug|timing) continue ;; esac
-        # shellcheck disable=SC2086
-        if ! "$CC" $OPT -w -c -I"$MBED/include" -I"$SRC/src/proto/tls" $CFG "$f" -o "$WORK/$m.o" \
-                2>"$WORK/$m.err"; then
-            mb_failed="$mb_failed $m"
-            echo "mbedtls: сборка модуля $m не удалась (SDK):" >&2
-            sed 's/^/    /' "$WORK/$m.err" >&2
-        fi
-        rm -f "$WORK/$m.err"
-    done
-    if [ -n "$mb_failed" ]; then
-        echo "mbedtls: сборка не удалась у модулей:$mb_failed — компоновка ниже упрётся в неопределённые ссылки" >&2
-    else
-        touch "$WORK/.done"
-    fi
-fi
+# wolfSSL — тем же рецептом, что у zig (build/wolfssl/build.sh: список файлов, опции, отказ
+# компиляции файла называется словами «не удалась» — их читает барьер релиза), только компилятор
+# SDK. Архив — в каталоге сборки дерева, с отпечатком: пересобирается, когда меняются опции.
+WLIB="$SRC/build/wolfssl-obj/sdk-$(basename "$TC")/libwolfssl.a"
+CC="$CC" AR="$(ls "$TC"/bin/*-openwrt-linux-gcc-ar | head -1)" \
+    CFLAGS="$OPT -ffunction-sections -fdata-sections" \
+    sh "$SRC/build/wolfssl/build.sh" "$WSRC" "$WLIB" asm
+WCFLAGS=$(cat "$WLIB.cflags")
 
 # Списки файлов — из build/sources.mk, одни на все сборки. До этого здесь жила своя копия,
 # и она отстала от релизной на шесть файлов (hwid, ctl, awg, certverify, tgws, tlsprobe):
@@ -108,10 +96,10 @@ THIRD_DEFS="$(profile_var THIRD_DEFS)"
 # 574 552 (−31,7%) при +1,2% на пакете — но привязало бы бинарник к рантайму выпуска OpenWrt, а
 # проект носит один файл на несколько выпусков. Числа и оговорки — в docs/xsteer.md.
 # shellcheck disable=SC2086
-"$CC" $OPT -w -static -s \
-    -I"$MBED/include" -I"$SRC/src/proto/tls" $STEER_INC $THIRD_DEFS $CFG $ROLEDEF \
+"$CC" $OPT -w -static -s -Wl,--gc-sections \
+    $STEER_INC $THIRD_DEFS $WCFLAGS $ROLEDEF \
     -DSTEER_VERSION="\"$VERSION\"" -DSTEER_REV="\"$REV\"" \
     -o "$OUT" \
-    $FILES "$WORK"/*.o -lpthread
+    $FILES "$WLIB" -lpthread
 
 printf '%s: %s байт\n' "$OUT" "$(stat -c %s "$OUT")"

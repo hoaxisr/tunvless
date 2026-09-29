@@ -69,8 +69,7 @@
 #include <net/if.h>
 #include <linux/netfilter_ipv4.h>
 
-#include <mbedtls/aes.h>
-
+#include "scrypto.h"
 #include "tgws.h"
 #include "tls13.h"
 #include "reality.h"
@@ -92,35 +91,13 @@ static int tg_verbose(void) {
 }
 #define VLOG(...) do { if (tg_verbose()) fprintf(stderr, __VA_ARGS__); } while (0)
 
-/* КОНТЕКСТ AES ОБЯЗАН ЛЕЖАТЬ ПО АДРЕСУ, КРАТНОМУ ШЕСТНАДЦАТИ, и ни один заголовок mbedtls об
- * этом не предупреждает. Стоило это разбора с ядерным SIGSEGV по нулевому адресу, поэтому
- * объяснение целиком:
- *
- * mbedtls умеет AES тремя способами — таблицами, ассемблерной вставкой и интринсиками AES-NI.
- * Интринсики требуют, чтобы массив раундовых ключей был выровнен на шестнадцать байт (они
- * читают его как `__m128i`, то есть выровненной командой SSE), и mbedtls это учитывает: в
- * aes.c есть mbedtls_aes_rk_offset, который сдвигает ключи внутри контекста. НО включается он
- * по условию `MBEDTLS_AESNI_HAVE_CODE == 2`, а это значение выводится из макроса __AES__,
- * который ставит компилятор по ключу -maes.
- *
- * А ключ этот наша сборка даёт РОВНО ОДНОМУ файлу — aesni.c (см. AESNI_FLAGS в
- * build/build-ext.sh: иначе компилятор вставил бы команды AES-NI во весь остальной код и
- * бинарник перестал бы работать на процессорах без них). Получается расхождение ВНУТРИ
- * mbedtls: aesni.c собран на интринсиках и ждёт выровненный массив, а aes.c собран без -maes,
- * считает, что работает ассемблерная вставка, которой выравнивание не нужно, и не сдвигает
- * ничего. Контекст, оказавшийся на стеке по адресу, кратному четырём, а не шестнадцати, роняет
- * setkey на первой же выровненной загрузке — общей защитой памяти, то есть без осмысленного
- * адреса в отчёте.
- *
- * Ловушка молчаливая и старая: она есть у каждого нашего контекста AES с самого начала, просто
- * до сих пор все они случайно ложились куда надо. Поймана на прямой пробе дата-центра, где
- * кадр стека сложился иначе. Поэтому выравнивание объявляется ЗДЕСЬ, у типа, а не в том месте,
- * где повезло упасть: мест, где контекст живёт на стеке, три, и выбирать между ними по факту
- * падения — значит чинить по одному до конца времён.
- *
- * Контексты самого mbedtls (внутри GCM у TLS) от этого не страдают: их выделяет malloc, а он
- * на всех наших платформах возвращает адреса, кратные шестнадцати. */
-#define STEER_AES_ALIGN16 __attribute__((aligned(16)))
+/* КОНТЕКСТ AES ОБЯЗАН ЛЕЖАТЬ ПО АДРЕСУ, КРАТНОМУ ШЕСТНАДЦАТИ: раундовые ключи читают командами
+ * AES-NI и ARMv8 Crypto, а у mbedtls, которой мост шифровал прежде, это кончилось ядерным
+ * SIGSEGV — контекст на стеке по адресу, кратному четырём, ронял setkey (прежний
+ * STEER_AES_ALIGN16 здесь и его разбор — в истории файла). Теперь выравнивание — свойство
+ * самого типа struct sc_aesctr (SC_ALIGN в src/lib/scrypto.h), и объявлять его у каждого места,
+ * где контекст живёт на стеке, больше не нужно; стенд tests/dcmatch.c проверяет, что оно на месте
+ * и у struct obf. */
 
 #define HS_LEN        64        /* длина рукопожатия обфускации */
 #define TAG_POS       56        /* метка транспорта */
@@ -635,17 +612,14 @@ static short dc_of(uint32_t ip, short *media) {
  * Сырые, без SHA-256 и без секрета, — так делает клиент, идущий в дата-центр напрямую, и
  * так же ждёт точка apiws. */
 static int hs_keystream(const unsigned char hs[HS_LEN], unsigned char out[HS_LEN]) {
-    mbedtls_aes_context aes STEER_AES_ALIGN16;
-    unsigned char nonce[16], sb[16], zeros[HS_LEN];
-    size_t nc = 0;
+    struct sc_aesctr aes;
+    unsigned char zeros[HS_LEN];
     int rc;
 
-    mbedtls_aes_init(&aes);
-    memcpy(nonce, hs + 40, 16);
     memset(zeros, 0, sizeof(zeros));
-    rc = mbedtls_aes_setkey_enc(&aes, hs + 8, 256);
-    if (rc == 0) rc = mbedtls_aes_crypt_ctr(&aes, HS_LEN, &nc, nonce, sb, zeros, out);
-    mbedtls_aes_free(&aes);
+    rc = sc_aesctr_init(&aes, hs + 8, hs + 40);
+    if (rc == 0) rc = sc_aesctr_xor(&aes, zeros, out, HS_LEN);
+    sc_aesctr_free(&aes);
     return rc;
 }
 
@@ -1227,30 +1201,29 @@ static int tls_start(struct upstream *u, const char *sni) {
  *
  * Обе стороны в одном цикле poll: отдельный поток на направление стоил бы второго стека и
  * согласования закрытия ради ровно той же работы. */
+/* Гамма на направление: ключ, счётчик и позиция внутри блока живут в контексте слоя (прежде —
+ * отдельные поля рядом с контекстом AES: счётчик, блок гаммы и смещение на каждую сторону). */
 struct obf {
-    mbedtls_aes_context enc STEER_AES_ALIGN16, dec STEER_AES_ALIGN16;
-    unsigned char nce[16], ncd[16], sbe[16], sbd[16];
-    size_t oe, od;
+    struct sc_aesctr enc, dec;
 };
+
+static void obf_free(struct obf *o);   /* определён ниже, у пробы */
 
 static int obf_init(struct obf *o, const unsigned char hs[HS_LEN]) {
     unsigned char rev[HS_LEN];
     for (int i = 0; i < HS_LEN; i++) rev[i] = hs[HS_LEN - 1 - i];
-    mbedtls_aes_init(&o->enc);
-    mbedtls_aes_init(&o->dec);
-    memcpy(o->nce, hs + 40, 16);
-    memcpy(o->ncd, rev + 40, 16);
-    o->oe = o->od = 0;
-    if (mbedtls_aes_setkey_enc(&o->enc, hs + 8, 256) != 0) return -1;
-    if (mbedtls_aes_setkey_enc(&o->dec, rev + 8, 256) != 0) return -1;
+    /* Оба «не заведены» ДО первого init: отказ на первом оставил бы во втором мусор, и
+     * obf_free принял бы его за развёрнутый ключ. */
+    o->enc.ready = o->dec.ready = 0;
+    if (sc_aesctr_init(&o->enc, hs + 8, hs + 40) != 0 ||
+        sc_aesctr_init(&o->dec, rev + 8, rev + 40) != 0) { obf_free(o); return -1; }
     /* Промотать 64 байта гаммы надо ТОЛЬКО шифрующему направлению: их съел наш собственный
      * init, который ушёл в сеть. Поток сервера к нам начинается с нуля — он нам никакого
      * init не слал. Промотав оба, получаешь расшифровку со сдвигом: снято пробой против
      * настоящего Telegram — ответ приходил, но выглядел шумом. */
     unsigned char skip[HS_LEN], zero[HS_LEN];
     memset(zero, 0, sizeof(zero));
-    if (mbedtls_aes_crypt_ctr(&o->enc, HS_LEN, &o->oe, o->nce, o->sbe, zero, skip) != 0)
-        return -1;
+    if (sc_aesctr_xor(&o->enc, zero, skip, HS_LEN) != 0) { obf_free(o); return -1; }
     return 0;
 }
 
@@ -1285,8 +1258,6 @@ static int obf_init(struct obf *o, const unsigned char hs[HS_LEN]) {
  * выключается и остаток сессии переливается как раньше: испорченное соединение человека
  * хуже неоптимального.
  */
-static void obf_free(struct obf *o);   /* определён ниже, у пробы */
-
 #define MS_PKT_MAX (2u * 1024 * 1024)   /* больше настоящий пакет MTProto не бывает */
 
 struct msgsplit {
@@ -1409,8 +1380,7 @@ static int ms_feed(struct msgsplit *m, struct upstream *u,
          * потока и ровно по одному разу — иначе разбор длин уедет со сдвигом. */
         size_t slice = n - off;
         if (slice > sizeof(pt)) slice = sizeof(pt);
-        if (mbedtls_aes_crypt_ctr(&m->o.enc, slice, &m->o.oe, m->o.nce, m->o.sbe,
-                                  p + off, pt) != 0)
+        if (sc_aesctr_xor(&m->o.enc, p + off, pt, slice) != 0)
             goto give_up;
 
         while (i < slice) {
@@ -1581,8 +1551,7 @@ static void pump(int cfd, struct upstream *u, struct pump_stat *st, struct msgsp
                         unsigned char pk[8], dec[8];
                         size_t n = take < sizeof(pk) ? take : sizeof(pk);
                         memcpy(pk, rx.buf, n);
-                        if (mbedtls_aes_crypt_ctr(&st->dbg->dec, n, &st->dbg->od,
-                                                  st->dbg->ncd, st->dbg->sbd, pk, dec) == 0) {
+                        if (sc_aesctr_xor(&st->dbg->dec, pk, dec, n) == 0) {
                             /* Префикс длины: у сжатого (0xef) один байт, у обычного (0xee) и
                              * с набивкой (0xdd) — четыре. */
                             size_t off = (st->tag == 0xef) ? 1 : 4;
@@ -2600,8 +2569,8 @@ done:
 
 
 static void obf_free(struct obf *o) {
-    mbedtls_aes_free(&o->enc);
-    mbedtls_aes_free(&o->dec);
+    sc_aesctr_free(&o->enc);
+    sc_aesctr_free(&o->dec);
 }
 
 /* Транспорт intermediate (0xee): четыре байта длины, дальше тело. Взят он, а не padded, ровно
@@ -2615,7 +2584,7 @@ static int probe_send(struct upstream *u, struct obf *o,
     pkt[2] = (unsigned char)((n >> 16) & 0xff);
     pkt[3] = (unsigned char)((n >> 24) & 0xff);
     memcpy(pkt + 4, body, n);
-    if (mbedtls_aes_crypt_ctr(&o->enc, n + 4, &o->oe, o->nce, o->sbe, pkt, enc) != 0)
+    if (sc_aesctr_xor(&o->enc, pkt, enc, n + 4) != 0)
         return -1;
     return ws_send(u, enc, n + 4);
 }
@@ -2691,7 +2660,7 @@ static int probe_direct(int dc, int media, int timeout_s) {
     /* Транспорт intermediate: четыре байта длины, дальше тело — как и у пробы через мост. */
     pkt[0] = 40; pkt[1] = 0; pkt[2] = 0; pkt[3] = 0;
     memcpy(pkt + 4, body, 40);
-    if (mbedtls_aes_crypt_ctr(&o.enc, 44, &o.oe, o.nce, o.sbe, pkt, enc) != 0) goto out;
+    if (sc_aesctr_xor(&o.enc, pkt, enc, 44) != 0) goto out;
     if (send_all(fd, enc, 44) < 0) { printf("итог:       запрос не ушёл\n"); goto out; }
     printf("req_pq_multi: отправлен\n");
 
@@ -2708,8 +2677,7 @@ static int probe_direct(int dc, int media, int timeout_s) {
             if (r <= 0) break;
             /* Поток CTR расшифровывается ПО ПОРЯДКУ И ЦЕЛИКОМ: пропуск байтов сдвинул бы
              * гамму, и остаток ответа превратился бы в шум. */
-            if (mbedtls_aes_crypt_ctr(&o.dec, (size_t)r, &o.od, o.ncd, o.sbd, in,
-                                      dec + got) != 0)
+            if (sc_aesctr_xor(&o.dec, in, dec + got, (size_t)r) != 0)
                 break;
             got += (size_t)r;
         }
@@ -2805,6 +2773,9 @@ int cmd_tgws_probe(int dc, int media, int direct, int timeout_s) {
 
     unsigned char hs[HS_LEN];
     struct obf o;
+    /* «Не заведены» до hs_build: его отказ ведёт на bad мимо obf_init, а obf_free там смотрит
+     * на эти флаги. */
+    o.enc.ready = o.dec.ready = 0;
     if (hs_build(hs, 0xee, (short)dc, (short)media) != 0 || obf_init(&o, hs) != 0) {
         printf("итог:       не собрать рукопожатие\n");
         goto bad;
@@ -2852,7 +2823,7 @@ int cmd_tgws_probe(int dc, int media, int direct, int timeout_s) {
             if (op == 0x2 && len > 8) {
                 unsigned char dec[512];
                 size_t n = len > sizeof(dec) ? sizeof(dec) : len;
-                if (mbedtls_aes_crypt_ctr(&o.dec, n, &o.od, o.ncd, o.sbd, pl, dec) != 0) goto bad;
+                if (sc_aesctr_xor(&o.dec, pl, dec, n) != 0) goto bad;
                 /* resPQ#05162463 — первые четыре байта ТЕЛА, а тело начинается за заголовком:
                  * 4 байта длины транспорта + 8 auth_key_id + 8 message_id + 4 длины тела =
                  * 24. Смещение снято с живого ответа, а не выведено из документации. */

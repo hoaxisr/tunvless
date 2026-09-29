@@ -47,7 +47,9 @@ words() { tr ' ' '\n' | grep -v '^$'; }
 # Виды выхода расширенной части (KINDS_EXT_SRC) лежат в src/kinds рядом с базовыми, но в профиль
 # base не входят — их отсутствие и есть отказ «требует пакет steer-extended» (src/kinds/kind.c).
 # Поэтому с каталогами ядра сверяется base вместе с ними, а их место — ниже, отдельной проверкой.
-m_base="$( { profile_src base; echo; profile_var KINDS_EXT_SRC; } | words | names)"
+# Тот же расклад у слоя примитивов (CRYPTO_SRC, src/lib/scrypto.c): лежит в каталоге ядра, в base не
+# входит — базовой сборке криптография не нужна, и wolfSSL в ней нет.
+m_base="$( { profile_src base; echo; profile_var KINDS_EXT_SRC; echo; profile_var CRYPTO_SRC; } | words | names)"
 m_ext="$( { profile_src extended; echo; profile_src server; echo; profile_src tgws; } | words |
           grep -E "^($(profile_var EXT_DIRS | tr ' ' '|'))/" | names)"
 check "sources.mk: профиль base (с видами расширенной части) — это все каталоги ядра"  "$disk_base" "$m_base"
@@ -78,7 +80,7 @@ check "src/third_party/libyaml совпадает с суммами UPSTREAM" ""
 # без -DHAVE_CONFIG_H api.c не компилируется — громко, но только на той машине, где собирают этот
 # путь (релиз, SDK, образ). Android.bp держит их во флагах libsteer_yaml, а исходники библиотеки
 # там — ровно LIBYAML_SRC, и движок с ней компонуется (static_libs в steer_defaults).
-for f in Makefile build.sh build/build-ext.sh build/build-ext-sdk.sh build/build-ext-native.sh tests/ext-test.sh; do
+for f in Makefile build.sh build/build-ext.sh build/build-ext-sdk.sh tests/ext-test.sh; do
     check "$f передаёт THIRD_DEFS" "1" \
         "$([ "$(grep -v '^[[:space:]]*#' "$f" | grep -c 'THIRD_DEFS')" -ge 1 ] && echo 1 || echo 0)"
 done
@@ -149,13 +151,13 @@ done
 check "в src нет макросов профилей STEER_EXTENDED/SERVER/TGWS (правило 3)" "" "$profbad"
 check "пути сборки не передают ключей профилей -DSTEER_EXTENDED/SERVER/TGWS" "0" \
     "$(grep -hvE '^[[:space:]]*(#|//)' Makefile Android.bp build/sources.mk build.sh build/build-ext.sh \
-         build/build-ext-sdk.sh build/build-ext-native.sh tests/ext-test.sh |
+         build/build-ext-sdk.sh tests/ext-test.sh |
        grep -cE -- '-DSTEER_(EXTENDED|SERVER|TGWS)\>'; true)"
 
 # Сценарии сборки не перечисляют исходники сами: копия списка — ровно то, что расходилось
 # молча (у рецептов SDK и нативного к моменту перевода на манифест не хватало шести файлов).
 # Строки комментариев не считаются: в прозе пути упоминаются законно.
-for f in build.sh build/build-ext.sh build/build-ext-sdk.sh build/build-ext-native.sh; do
+for f in build.sh build/build-ext.sh build/build-ext-sdk.sh; do
     check "$f: исходники берёт из манифеста, а не перечисляет сам" "" \
         "$(grep -v '^[[:space:]]*#' "$f" | grep -oE 'src/[a-z0-9_/]+\.c' | tr '\n' ' ')"
 done
@@ -340,7 +342,7 @@ for field in Provides Replaces Conflicts; do
 done
 
 # ---- стенды расширенной части прогоняются в релизе --------------------------------------
-# `make test` в релизе стендов расширенной части не касается: mbedtls там нет по построению. Они идут
+# `make test` в релизе стендов расширенной части не касается: криптобиблиотеки там нет по построению. Они идут
 # отдельным шагом ВНУТРИ образа сборки, где библиотека та самая, которой собирается
 # расширенный пакет (R-063). Забыть этот шаг легко и тихо: релиз от этого не краснеет,
 # просто рукопожатие, освобождение ключей и арифметика хаба перестают кем-либо стеречься.
@@ -549,8 +551,9 @@ check "в профилях sources.mk только существующие фа
 # Проверяется не текст, а решения, каждое из которых уже стоило отдельного разбора.
 check "xs_install.sh исполняемый" "yes" \
     "$([ -x server/xs_install.sh ] && echo yes || echo no)"
-# Компилятора в нём нет НАМЕРЕННО: системный libmbedtls отменяет наш steer_mbedtls_config.h,
-# то есть собралась бы тихо не та криптография. Проверка ловит откат к «соберём на месте».
+# Компилятора в нём нет НАМЕРЕННО: системная wolfSSL собрана с чужими опциями, а раскладка её
+# структур от них зависит (build/wolfssl/user_settings.h), то есть собралась бы тихо не та
+# криптография. Проверка ловит откат к «соберём на месте».
 check "xs_install.sh не собирает хаб на месте" "0" \
     "$(grep -cE '^[^#]*\b(cc|gcc|clang|make)\b' server/xs_install.sh)"
 check "xs_install.sh берёт готовый бинарник, если он рядом" "1" \
@@ -674,7 +677,7 @@ check "каждый файл из files/ упакован в ОБА корня" 
 # отвечает ЧТЕНИЕМ ФАЙЛА. Проверять это стендом нужно потому, что ошибиться здесь можно
 # в обе стороны и обе молчат: недостающая зависимость — это половина движка, которая не
 # работает на стоковом роутере (conntrack, H-110), а лишняя — пакет, который менеджер
-# отказывается ставить там, где всё для него есть (libmbedtls у статической сборки).
+# отказывается ставить там, где всё для него есть (библиотека у статической сборки).
 #
 # Функция берётся из build.sh как есть: копия здесь разошлась бы с оригиналом, а стенд
 # на копии проверяет копию.
@@ -683,22 +686,22 @@ dtmp="$(mktemp -d)"
 printf 'static binary without any SONAME\n' > "$dtmp/static"
 # Строка ровно того вида, что пишет линковщик в DT_NEEDED. Нулевые байты вокруг — чтобы
 # файл не был текстовым: grep без -a такой файл пропускает, и проверка стояла бы на том,
-# что бинарник — это текст.
-printf 'x\000libmbedcrypto.so.16\000x\n' > "$dtmp/native"
+# что бинарник — это текст. Имя — будущего пакета libsteer-wolfssl (шаг 4 выпуска 1.10).
+printf 'x\000libsteer-wolfssl.so.1\000x\n' > "$dtmp/shared"
+# Системная libwolfssl OpenWrt (SONAME с хешем опций) пакетом движка НЕ считается: связываться
+# с ней нельзя (SONAME меняется с каждым обновлением), и зависимость на неё — ошибка.
+printf 'x\000libwolfssl.so.5.9.1.e624513f\000x\n' > "$dtmp/system"
 
 check "базовый пакет требует conntrack и kmod-nft-queue" \
     "nftables ip-full conntrack kmod-nft-queue" "$(pkg_deps "$dtmp/static" base)"
 check "расширенный добавляет kmod-tun" \
     "nftables ip-full conntrack kmod-nft-queue kmod-tun" "$(pkg_deps "$dtmp/static" ext)"
-check "статическая сборка НЕ требует libmbedtls" \
-    "" "$(pkg_deps "$dtmp/static" ext | grep -o libmbedtls)"
-check "нативная сборка требует libmbedtls" \
-    "nftables ip-full conntrack kmod-nft-queue kmod-tun libmbedtls" "$(pkg_deps "$dtmp/native" ext)"
-# Версия ABI в имени зависимости привязала бы пакет к одному выпуску OpenWrt: пакет
-# называется libmbedtls21 на 25.12 и libmbedtls12 на 23.05, а provides: libmbedtls
-# объявляют оба.
-check "имя зависимости без версии ABI" \
-    "" "$(pkg_deps "$dtmp/native" ext | grep -o 'libmbedtls[0-9][0-9]*')"
+check "статическая сборка НЕ требует пакета библиотеки" \
+    "" "$(pkg_deps "$dtmp/static" ext | grep -o 'libsteer-wolfssl\|libwolfssl')"
+check "связанная с libsteer-wolfssl сборка требует его" \
+    "nftables ip-full conntrack kmod-nft-queue kmod-tun libsteer-wolfssl" "$(pkg_deps "$dtmp/shared" ext)"
+check "системная libwolfssl зависимостью не становится" \
+    "nftables ip-full conntrack kmod-nft-queue kmod-tun" "$(pkg_deps "$dtmp/system" ext)"
 rm -rf "$dtmp"
 
 # Оба формата пакета обязаны получить ОДИН список, и это не педантизм: apk берёт его через
@@ -714,22 +717,59 @@ done
 check "литералов зависимостей в упаковке не осталось" "" \
     "$(grep -n "depends:'nftables\|mk_ipk .*\"nftables" build.sh)"
 
-# ---- цикл сборки mbedtls не глушит ошибки компиляции --------------------------
+# ---- сборка криптобиблиотеки не глушит ошибки компиляции ------------------------
 #
-# Все четыре сборочных сценария компилируют mbedtls одним и тем же скопированным циклом, и во
-# всех четырёх строка кончалась на `2>/dev/null || true`: провал модуля и его отсутствие в
-# наборе становились неразличимы, а компоновка ниже сообщала о нём неопределённой ссылкой на
-# символ — без строки, объясняющей причину, потому что её стёрли шагом раньше (I-034).
+# Сборочные сценарии прежде компилировали mbedtls скопированным циклом, и во всех строка
+# кончалась на `2>/dev/null || true`: провал модуля и его отсутствие в наборе становились
+# неразличимы, а компоновка ниже сообщала о нём неопределённой ссылкой на символ — без строки,
+# объясняющей причину, потому что её стёрли шагом раньше (I-034). Теперь цикл один на всех —
+# build/wolfssl/build.sh, — и сценарии обязаны звать его, а не заводить свою копию.
 #
 # Проверяется текстом по той же причине, что и списки исходников выше: docker, zig и тулчейна
 # SDK здесь нет, а форма строки — это текст. Заодно закреплено, что отказ назван словом,
 # которое читает барьер релиза: иначе релиз с недособранной криптографией уйдёт молча.
-for f in build/build-ext.sh build/build-ext-sdk.sh build/build-ext-native.sh build/bench.sh; do
-    check "$f: компиляция mbedtls не уходит в /dev/null" "0" \
-        "$(grep -c 'o "\$m\.o" 2>/dev/null\|o "\$WORK/\$m\.o" 2>/dev/null' "$f"; true)"
-    check "$f: отказ модуля назван словом барьера релиза" "1" \
-        "$([ "$(grep -c 'сборка модуля \$m не удалась' "$f"; true)" -ge 1 ] && echo 1 || echo 0)"
+W=build/wolfssl/build.sh
+check "$W: компиляция файла wolfSSL не уходит в /dev/null" "0" \
+    "$(grep -v '^[[:space:]]*#' "$W" | grep -c '\.o" 2>/dev/null'; true)"
+check "$W: отказ файла назван словом барьера релиза" "1" \
+    "$([ "$(grep -c 'сборка файла \$f не удалась' "$W"; true)" -ge 1 ] && echo 1 || echo 0)"
+check "$W: провал любого файла роняет сборку" "1" \
+    "$(grep -c 'сборка не удалась у файлов:\$failed" >&2; exit 1' "$W")"
+for f in build/build-ext.sh build/build-ext-sdk.sh build/bench.sh tests/ext-test.sh; do
+    check "$f: wolfSSL собирает общим рецептом build/wolfssl/build.sh" "1" \
+        "$([ "$(grep -v '^[[:space:]]*#' "$f" | grep -c 'build/wolfssl/build\.sh')" -ge 1 ] && echo 1 || echo 0)"
+    check "$f: своей копии списка файлов wolfSSL нет" "" \
+        "$(grep -v '^[[:space:]]*#' "$f" | grep -oE 'wolfcrypt/src/[a-z0-9_]+\.c' | tr '\n' ' ')"
 done
+
+# ---- список файлов wolfSSL и опции — одни на все сборки -------------------------
+#
+# Android.bp будущего форка (build/wolfssl/Android.bp) не умеет читать build.sh, поэтому список
+# там свой — и сверяется здесь. Файл, забытый в одном из двух, собрался бы на роутере и не
+# собрался на телефоне (или наоборот) неопределённой ссылкой.
+wl_sh="$(sh build/wolfssl/build.sh list | sort -u | tr '\n' ' ')"
+wl_bp="$(grep -oE '"(src|wolfcrypt)/[a-z0-9_/.-]+\.c"' build/wolfssl/Android.bp | tr -d '"' | sort -u | tr '\n' ' ')"
+check "build/wolfssl/Android.bp: те же файлы wolfSSL, что build/wolfssl/build.sh" "$wl_sh" "$wl_bp"
+bp_wolf="$(awk '/^cc_library_static \{/ { blk = "" } { blk = blk $0 "\n" } /^\}/ { if (blk ~ /name: "libsteer_wolfssl",/) print blk; blk = "" }' Android.bp)"
+# build/wolfssl — дважды: local_include_dirs (опции для самих .c wolfSSL) и export_include_dirs
+# (они же для src/lib/scrypto.c в steerd).
+check "Android.bp: libsteer_wolfssl — из filegroup форка, с опциями build/wolfssl" "1 2 1" \
+    "$(printf '%s' "$bp_wolf" | grep -c ':libwolfssl_der_srcs') $(printf '%s' "$bp_wolf" | grep -c '"build/wolfssl"') $(printf '%s' "$bp_wolf" | grep -c 'DWOLFSSL_USER_SETTINGS')"
+check "Android.bp: движок компонуется с libsteer_wolfssl" "1" \
+    "$(grep -c 'static_libs: \["libsteer_wolfssl"\]' Android.bp)"
+
+# ---- wolfSSL видит один файл движка --------------------------------------------
+#
+# Слой примитивов (src/lib/scrypto.h) обещает: код протоколов криптобиблиотеку не зовёт, её типов в
+# заголовках нет, и сменить её — правка одного файла. Обещание держится только проверкой: один
+# #include <wolfssl/...> в tls13.c вернул бы и зависимость стендов `make test` от библиотеки, и
+# второе место, где живёт её API.
+check "заголовки wolfSSL включает только src/lib/scrypto.c" "src/lib/scrypto.c " \
+    "$(grep -rlE '#include [<"]wolfssl/' src | sort | tr '\n' ' ')"
+check "в src не осталось вызовов mbedtls" "" \
+    "$(grep -rhoE '\<mbedtls_[a-z0-9_]+\(' src | sort -u | tr '\n' ' ')"
+check "в src не осталось заголовков mbedtls" "" \
+    "$(grep -rlE '#include [<"]mbedtls/' src tests | tr '\n' ' ')"
 
 # ---- каждый тарбол в образе сверяется по контрольной сумме ---------------------
 #
@@ -739,12 +779,18 @@ done
 # Reality, и подмена в ней не ломается заметно.
 #
 # Проверяется СООТНОШЕНИЕ, а не два известных имени: сколько в образе скачиваний тарбола,
-# столько и сверок. Новый источник, добавленный без суммы, стенд поймает здесь.
+# столько и сверок. Новый источник, добавленный без суммы, стенд поймает здесь. wolfSSL образ
+# берёт скриптом build/wolfssl/fetch.sh (версия и сумма — там, одни на образ, стенды и ndk-check):
+# образ обязан звать его, а скрипт — сверять сумму до распаковки.
 dl=$(grep -cE 'curl -fsSL -o /tmp/' build/Dockerfile; true)
 sums=$(grep -c 'sha256sum -c -' build/Dockerfile; true)
 check "у каждого тарбола образа есть сверка суммы" "$dl" "$sums"
-check "сумма mbedtls задана аргументом сборки" "1" \
-    "$(grep -c '^ARG MBEDTLS_SHA256=[0-9a-f]\{64\}$' build/Dockerfile; true)"
+check "образ берёт wolfSSL через build/wolfssl/fetch.sh" "2" \
+    "$(grep -v '^[[:space:]]*#' build/Dockerfile | grep -c 'wolfssl/fetch.sh\|steer-wolfssl-fetch.sh /opt/wolfssl'; true)"
+check "сумма wolfSSL задана в fetch.sh" "1" \
+    "$(grep -c '^WOLFSSL_SHA256=[0-9a-f]\{64\}$' build/wolfssl/fetch.sh; true)"
+check "fetch.sh сверяет сумму до распаковки" "1" \
+    "$(awk '/sha256sum -c/ { s = NR } /tar xzf/ { t = NR } END { print (s && t && s < t) ? 1 : 0 }' build/wolfssl/fetch.sh)"
 
 # ---- MTU из конфигурации нигде не берётся без потолка --------------------------
 #
