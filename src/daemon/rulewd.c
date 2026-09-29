@@ -16,7 +16,9 @@
  * снимает свои правила на каждой смене сети, и будить демон ради чужих добавлений незачем. Из
  * удалений повод — только наше правило: метка в поле меток движка с нашей маской
  * (STEER_MARK_MASK) или, где приоритет свой (телефон, rule_pref), правило с меткой на этом
- * приоритете. Правило пробы сторожа (from-правило без метки) поводом не бывает.
+ * приоритете. Правило пробы сторожа (from-правило без метки) поводом не бывает. Третий повод —
+ * снятый запасной запрет в таблице IPv6 выхода (группа RTNLGRP_IPV6_ROUTE, фильтр пропускает из
+ * снятых маршрутов только запреты; ниже, «ЗАПРЕТ IPv6 УХОДИТ ВМЕСТЕ С lo»).
  *
  * СРАЗУ, А НЕ ЧЕРЕЗ СЕКУНДУ (проверка на QEMU 04664a5). Прежде проверка шла через секунду
  * тишины после последнего события пачки (не позже двух после первого), а чинил ребёнок
@@ -63,6 +65,40 @@
  *   снимаются, только когда верная стоит. Чужое снятие таблицу не трогает — netd правил своих
  *   таблиц не касается, `ip rule flush` маршрутов не снимает. «Правила нет, а таблица занята» —
  *   значит, правило сняли не мы.
+ *
+ * IPv6 — ПО ТАБЛИЦЕ IPv4 (проверка на QEMU 98b7964, 2026-09-28, docs/architecture.md, раздел 5).
+ * Прежде у правила IPv6 признак был тот же, но по таблице IPv6: «правила нет, а таблица IPv6
+ * занята». На `/etc/init.d/network restart` он не сработал ни разу из восьми: netifd кладёт lo, и
+ * ядро вместе с ним снимает запасной запрет во всех таблицах IPv6 выходов (запрет в IPv6 висит на
+ * lo, см. ниже), а падение wg снимает `default dev wgX`. Таблицы IPv6 стояли пустыми с +1,4 по
+ * +6,5 с, netifd снимал правила на +4 с — и страж принимал «правила нет, таблица пуста» за своё
+ * снятие. Правила IPv6 возвращал reload (сверка по новому br-lan, «правила fwmark IPv6 нет —
+ * привязываю заново») за +1,2…+2,9 с, по одному выходу на ~0,4 с, и цепочка ingress_mark ждала
+ * его: 2,6–3,7 с вместо ~300 мс. Пустую таблицу IPv6 делает не только движок, но и ядро, поэтому
+ * судить по ней о «снято нами» нельзя. Судит таблица IPv4: каждое наше снятие правила IPv6 снимает
+ * и маршрутизацию IPv4 выхода вместе с таблицей (отказ direct у сторожа и apply_routing_one,
+ * `--drop` убранного выхода, `steer down`), а запрет IPv4 от lo не зависит. Правило IPv6 обязано
+ * стоять, если стоит правило IPv4 или занята таблица IPv4 (или всё ещё занята таблица IPv6 —
+ * прежний признак остаётся частным случаем). Своя «отметка о снятии» в памяти демона была бы
+ * вторым источником правды, который врёт, как только снимает не демон: подкоманда `steer apply`
+ * без сокета, init с `steer down`.
+ *
+ * ЗАПРЕТ IPv6 УХОДИТ ВМЕСТЕ С lo. В IPv6 запрет (blackhole, unreachable, prohibit) у ядра — маршрут
+ * на петлю: `ip -6 route add blackhole default table N` без устройства ядро принимает, но вешает на
+ * lo само (ip6_route_info_create: у запрета устройство — loopback), и `ip link set lo down`
+ * снимает его вместе с остальными маршрутами lo (проверено в netns на 6.8: и с метрикой, и без).
+ * Запрета «без устройства» в IPv6 нет, другого вида маршрута-запрета тоже; запрет правилом
+ * (`ip -6 rule … blackhole`) от lo не зависит, но снимается тем же flush, что и наше правило, и
+ * меняет раскладку правил на обеих платформах (приоритеты, сверка сторожа, снимки) — ради окна,
+ * которое страж закрывает и так. Поэтому запрет остаётся на lo, а снятым его возвращает страж:
+ * событие RTM_DELROUTE запрета с метрикой STEER_BACKSTOP_METRIC — та же проверка через 100 мс, и
+ * запрет — одним сообщением rtnetlink (rtnl_route6_blackhole). Ставится он и при лежащем lo (ядро
+ * принимает, и подъём lo его не трогает — проверено там же). Запрет обязан лежать у выхода, чья
+ * таблица IPv4 занята: table_bind6 кладёт его при любой привязке, а снимают его только вместе со
+ * всей маршрутизацией выхода (те же снятия, что выше). Маршрут `default dev wgX` страж не
+ * возвращает — какое устройство ведёт трафик, решает проход сторожа; до него IPv6 выхода стоит на
+ * запрете, а помеченный пакет не туда отбрасывает postrouting_guard.
+ *
  * Отказ сторожа (apply_failed: снять правило, сбросить таблицу) идёт в цикле демона одним
  * синхронным куском — событие своего снятия страж читает уже после сброса таблицы. `steer down`
  * снимает таблицы nftables раньше правил — проверка видит «таблицы движка нет» и молчит.
@@ -137,26 +173,34 @@ struct rulewd {
 
 /* ---- проверка ------------------------------------------------------------------------------ */
 
-/* Снято ли чужой рукой правило IPv6 выхода — тем же признаком, что у IPv4 (см. шапку): правила нет,
- * а таблица IPv6 занята. Ядро без IPv6 (дамп не прочитался) — не снято. */
-static int rule6_missing(const struct output *o) {
-    static char rules6[16384], routes6[8192];
-    if (!out_route6(o)) return 0;
-    if (rtnl_rules_text6(rules6, sizeof(rules6)) != 0 || !rules6[0]) return 0;
-    if (rtnl_routes_text6(o->table, routes6, sizeof(routes6)) != 0) return 0;
-    struct route_facts f = route_facts_of(rules6, routes6, o->mark, o->table);
-    return f.known && !f.rule && !(f.table == TBL_EMPTY && !f.backstop);
-}
+/* Чего не хватает у выхода (биты): правила IPv4, правила IPv6, запасного запрета в таблице IPv6. */
+enum { MISS_R4 = 1, MISS_R6 = 2, MISS_BS6 = 4 };
 
-/* Снято ли правило IPv4 выхода: 1 — снято, 0 — на месте или снято нами вместе с таблицей, -1 —
- * ядро не спросить. rules — дамп правил IPv4, уже прочитанный. */
-static int rule4_missing(const char *rules, const struct output *o) {
-    static char routes[8192];
+/* Чего у выхода не хватает — по признакам из шапки («СВОИ УДАЛЕНИЯ», «IPv6 — ПО ТАБЛИЦЕ IPv4»,
+ * «ЗАПРЕТ IPv6 УХОДИТ ВМЕСТЕ С lo»). rules и rules6 — дампы правил, уже прочитанные (rules6 пуст —
+ * ядро без IPv6, и половина IPv6 не сверяется). -1 — ядро не спросить. */
+static int out_missing(const char *rules, const char *rules6, const struct output *o) {
+    static char routes[8192], routes6[8192];
     if (rtnl_routes_text(o->table, routes, sizeof(routes)) != 0) return -1;
     struct route_facts f = route_facts_of(rules, routes, o->mark, o->table);
     if (!f.known) return -1;
-    /* Таблица пуста — правило снято вместе с ней, и это наше решение (см. шапку). */
-    return !(f.rule || (f.table == TBL_EMPTY && !f.backstop));
+    /* Таблица IPv4 занята — маршрут на устройство, запрет или запасной запрет. Пуста — правило
+     * снято вместе с ней, и это наше решение (см. шапку). */
+    int busy4 = !(f.table == TBL_EMPTY && !f.backstop);
+    int miss = !f.rule && busy4 ? MISS_R4 : 0;
+    /* С 1.9 у выхода с маршрутом IPv6 так же сверяется и его половина IPv6. */
+    if (!out_route6(o) || !rules6[0]) return miss;
+    if (rtnl_routes_text6(o->table, routes6, sizeof(routes6)) != 0) return miss;
+    struct route_facts f6 = route_facts_of(rules6, routes6, o->mark, o->table);
+    if (!f6.known) return miss;
+    int busy6 = !(f6.table == TBL_EMPTY && !f6.backstop);
+    /* Правило IPv6 обязано стоять, если выход ведёт трафик по IPv4 (правило IPv4 стоит или его
+     * таблица занята) — пустая таблица IPv6 здесь не довод: её опустошает и ядро. */
+    if (!f6.rule && (f.rule || busy4 || busy6)) miss |= MISS_R6;
+    /* Запасной запрет IPv6 лежит у каждого привязанного выхода; нет его только там, где снята
+     * вся маршрутизация выхода вместе с таблицей IPv4. */
+    if (busy4 && !f6.backstop) miss |= MISS_BS6;
+    return miss;
 }
 
 static void list_add(char *list, size_t n, size_t *k, int cnt, const char *name) {
@@ -164,20 +208,27 @@ static void list_add(char *list, size_t n, size_t *k, int cnt, const char *name)
     if (w > 0 && *k + (size_t)w < n) *k += (size_t)w;
 }
 
+/* Дампы правил обоих семейств для out_missing. -1 — правил IPv4 не прочитать; правил IPv6 нет
+ * (ядро без IPv6) — rules6 пуст. */
+static int rules_read(char *rules, size_t rn, char *rules6, size_t r6n) {
+    if (rtnl_rules_text(rules, rn) != 0 || !rules[0]) return -1;
+    if (rtnl_rules_text6(rules6, r6n) != 0) rules6[0] = '\0';
+    return 0;
+}
+
 int rulewd_missing(const struct spec *sp, char *list, size_t n) {
-    static char rules[16384];
+    static char rules[16384], rules6[16384];
     if (n) list[0] = '\0';
     if (!sp) return 0;
-    if (rtnl_rules_text(rules, sizeof(rules)) != 0 || !rules[0]) return -1;
+    if (rules_read(rules, sizeof(rules), rules6, sizeof(rules6)) != 0) return -1;
     int cnt = 0;
     size_t k = 0;
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
         if (!out_has_device(o) || !o->mark || !o->table) continue;
-        int m4 = rule4_missing(rules, o);
-        if (m4 < 0) return -1;
-        /* С 1.9 у выхода с маршрутом IPv6 так же сверяется и его правило IPv6. */
-        if (!m4 && !rule6_missing(o)) continue;
+        int m = out_missing(rules, rules6, o);
+        if (m < 0) return -1;
+        if (!m) continue;
         list_add(list, n, &k, cnt, o->name);
         cnt++;
     }
@@ -206,27 +257,32 @@ static void pref_note(struct rulewd *r, int fam, uint32_t mark, uint32_t prio) {
     r->pref[i].prio = prio;
 }
 
-/* Вернуть снятые правила сами, в процессе (см. шапку). Имена выходов, чьи правила ставились, — в
- * list. Возврат — сколько выходов тронуто, -1 — ядро не спросить или не приняло. */
-static int rulewd_restore(struct rulewd *r, const struct spec *sp, char *list, size_t n) {
-    static char rules[16384];
-    if (n) list[0] = '\0';
-    if (rtnl_rules_text(rules, sizeof(rules)) != 0 || !rules[0]) return -1;
-    int cnt = 0, bad = 0;
-    size_t k = 0;
+/* Вернуть снятое сами, в процессе (см. шапку). Имена выходов, у которых что-то ставилось, — в all;
+ * из них те, чьи правила ставились, — в rl, чей запасной запрет IPv6 — в bs (по n байт каждый).
+ * Возврат — сколько выходов тронуто, -1 — ядро не спросить или не приняло. */
+static int rulewd_restore(struct rulewd *r, const struct spec *sp, char *all, char *rl, char *bs,
+                          size_t n) {
+    static char rules[16384], rules6[16384];
+    if (n) all[0] = rl[0] = bs[0] = '\0';
+    if (rules_read(rules, sizeof(rules), rules6, sizeof(rules6)) != 0) return -1;
+    int cnt = 0, rcnt = 0, bcnt = 0, bad = 0;
+    size_t k = 0, rk = 0, bk = 0;
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
         if (!out_has_device(o) || !o->mark || !o->table) continue;
-        int m4 = rule4_missing(rules, o);
-        if (m4 < 0) return -1;
-        int m6 = rule6_missing(o);
-        if (!m4 && !m6) continue;
-        if (m4 && rtnl_rule_fwmark(4, o->mark, STEER_MARK_MASK, o->table,
-                                   (int)pref_of(r, 4, o->mark)) != 0) bad = 1;
-        if (m6 && rtnl_rule_fwmark(6, o->mark, STEER_MARK_MASK, o->table,
-                                   (int)pref_of(r, 6, o->mark)) != 0) bad = 1;
-        list_add(list, n, &k, cnt, o->name);
-        cnt++;
+        int m = out_missing(rules, rules6, o);
+        if (m < 0) return -1;
+        if (!m) continue;
+        if ((m & MISS_R4) && rtnl_rule_fwmark(4, o->mark, STEER_MARK_MASK, o->table,
+                                              (int)pref_of(r, 4, o->mark)) != 0) bad = 1;
+        /* Запрет — раньше правила IPv6: вернувшееся правило должно найти в таблице запрет, а не
+         * пустоту (тот же порядок, что у привязки: маршрут первым, правило вторым). */
+        if ((m & MISS_BS6) && rtnl_route6_blackhole(o->table, STEER_BACKSTOP_METRIC) != 0) bad = 1;
+        if ((m & MISS_R6) && rtnl_rule_fwmark(6, o->mark, STEER_MARK_MASK, o->table,
+                                              (int)pref_of(r, 6, o->mark)) != 0) bad = 1;
+        list_add(all, n, &k, cnt++, o->name);
+        if (m & (MISS_R4 | MISS_R6)) list_add(rl, n, &rk, rcnt++, o->name);
+        if (m & MISS_BS6) list_add(bs, n, &bk, bcnt++, o->name);
     }
     return bad ? -1 : cnt;
 }
@@ -249,13 +305,19 @@ static void rulewd_check(struct rulewd *r) {
     char list[512];
     if (rulewd_missing(d->sp, list, sizeof(list)) <= 0) return;
     if (!r->cf.restored) { r->cf.repair(r->cf.arg); return; }
-    long now = loop_now_ms();
-    r->back_at[r->back_i] = now;
-    r->back_i = (r->back_i + 1) % (RULEWD_STORM_N + 1);
-    int rc = rulewd_restore(r, d->sp, list, sizeof(list));
+    char rl[512], bs[512];
+    int rc = rulewd_restore(r, d->sp, list, rl, bs, sizeof(list));
+    /* В счёт шторма — возвраты правил (и неудачные попытки), но не одного запрета IPv6: его
+     * снимает ядро вместе с lo, а не тот, кто дерётся за `ip rule`, и на `network restart` он
+     * приходит вторым возвратом рядом с правилами — два перезапуска сети за минуту иначе уже
+     * были бы «штормом». */
+    if (rl[0] || rc < 0) {
+        r->back_at[r->back_i] = loop_now_ms();
+        r->back_i = (r->back_i + 1) % (RULEWD_STORM_N + 1);
+    }
     char left[512];
     if (rc > 0 && rulewd_missing(d->sp, left, sizeof(left)) == 0) {
-        r->cf.restored(r->cf.arg, list);
+        r->cf.restored(r->cf.arg, list, rl, bs);
         return;
     }
     /* Сами не смогли — прежняя починка ребёнком (правило и masquerade тем же кодом, что apply). */
@@ -302,6 +364,28 @@ static int rule_is_ours(const struct nlmsghdr *h, int *fam, uint32_t *markp, uin
     return STEER_RULE_PREF && prio == (uint32_t)STEER_RULE_PREF;
 }
 
+/* Снят ли запасной запрет IPv6 (см. шапку, «ЗАПРЕТ IPv6 УХОДИТ ВМЕСТЕ С lo»): маршрут IPv6
+ * `blackhole default` с метрикой STEER_BACKSTOP_METRIC. Чья это таблица, событие не решает — это
+ * сверка по спеке (out_missing): так чужой запрет с той же метрикой стоит лишь одной проверки. */
+static int route_is_backstop6(const struct nlmsghdr *h) {
+    const struct rtmsg *rt = NLMSG_DATA(h);
+    size_t hl = NLMSG_ALIGN(sizeof(*rt));
+    if (h->nlmsg_len < NLMSG_HDRLEN + hl) return 0;
+    if (rt->rtm_family != AF_INET6 || rt->rtm_type != RTN_BLACKHOLE || rt->rtm_dst_len) return 0;
+    const char *p = (const char *)rt + hl, *e = (const char *)h + h->nlmsg_len;
+    while (p + sizeof(struct rtattr) <= e) {
+        const struct rtattr *a = (const struct rtattr *)p;
+        if (a->rta_len < sizeof(*a) || p + a->rta_len > e) break;
+        if (a->rta_type == RTA_PRIORITY && RTA_PAYLOAD(a) >= 4) {
+            uint32_t v;
+            memcpy(&v, RTA_DATA(a), 4);
+            return v == (uint32_t)STEER_BACKSTOP_METRIC;
+        }
+        p += RTA_ALIGN(a->rta_len);
+    }
+    return 0;
+}
+
 static void rulewd_nl(struct loop *l, int fd, uint32_t ev, void *arg) {
     (void)l; (void)ev;
     struct rulewd *r = arg;
@@ -320,6 +404,8 @@ static void rulewd_nl(struct loop *l, int fd, uint32_t ev, void *arg) {
             if (h->nlmsg_type == RTM_DELRULE && rule_is_ours(h, &fam, &mark, &prio)) {
                 ours = 1;
                 pref_note(r, fam, mark, prio);
+            } else if (h->nlmsg_type == RTM_DELROUTE && route_is_backstop6(h)) {
+                ours = 1;
             }
         }
     }
@@ -339,28 +425,40 @@ static void rulewd_nl(struct loop *l, int fd, uint32_t ev, void *arg) {
     loop_timer_set(r->tm, left < quiet ? (left > 0 ? left : 0) : quiet);
 }
 
-/* Сокет на группы правил IPv4 и IPv6 с фильтром «только RTM_DELRULE». -1 — не открылся. */
+/* Сокет на группы правил IPv4 и IPv6 и маршрутов IPv6 с фильтром «только RTM_DELRULE и снятый
+ * запрет IPv6». -1 — не открылся. */
 static int rulewd_open(void) {
     int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_ROUTE);
     if (fd < 0) return -1;
-    /* Фильтр ядру: сообщение уведомления правил — одно на пакет, тип — u16 по смещению 4
+    /* Фильтр ядру: сообщение уведомления — одно на пакет, тип — u16 по смещению 4
      * (nlmsghdr.nlmsg_type, порядок байт хоста: BPF_H в сокетном фильтре читает сетевой, поэтому
-     * сравнение — с обоими видами). Не встал фильтр — живём без него: разбор ниже тот же. */
+     * сравнение — с обоими видами). Снятый маршрут пропускается, только если это запрет: байт
+     * rtm_type — по смещению 16 + 7 (заголовок nlmsghdr и седьмое поле struct rtmsg), байт от
+     * порядка не зависит. Так маршруты, которые netd и netifd снимают на каждой смене сети,
+     * демон не будят вовсе; из запретов разбор ниже оставит только наш (route_is_backstop6). Не
+     * встал фильтр — живём без него: разбор тот же. */
     uint16_t t = RTM_DELRULE;
     uint16_t sw = (uint16_t)((t >> 8) | (t << 8));
+    uint16_t tr = RTM_DELROUTE;
+    uint16_t swr = (uint16_t)((tr >> 8) | (tr << 8));
     struct sock_filter code[] = {
-        BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 4),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t, 2, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, sw, 1, 0),
-        BPF_STMT(BPF_RET | BPF_K, 0),
-        BPF_STMT(BPF_RET | BPF_K, 0xffff),
+        /* 0 */ BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 4),
+        /* 1 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t, 6, 0),       /* → 8 принять */
+        /* 2 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, sw, 5, 0),      /* → 8 */
+        /* 3 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, tr, 1, 0),      /* → 5 */
+        /* 4 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, swr, 0, 2),     /* → 5, иначе → 7 */
+        /* 5 */ BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 16 + 7),
+        /* 6 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, RTN_BLACKHOLE, 1, 0),
+        /* 7 */ BPF_STMT(BPF_RET | BPF_K, 0),
+        /* 8 */ BPF_STMT(BPF_RET | BPF_K, 0xffff),
     };
     struct sock_fprog prog = { (unsigned short)(sizeof(code) / sizeof(code[0])), code };
     setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof(prog));
     struct sockaddr_nl a;
     memset(&a, 0, sizeof(a));
     a.nl_family = AF_NETLINK;
-    a.nl_groups = (1u << (RTNLGRP_IPV4_RULE - 1)) | (1u << (RTNLGRP_IPV6_RULE - 1));
+    a.nl_groups = (1u << (RTNLGRP_IPV4_RULE - 1)) | (1u << (RTNLGRP_IPV6_RULE - 1)) |
+                  (1u << (RTNLGRP_IPV6_ROUTE - 1));
     if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0) { close(fd); return -1; }
     return fd;
 }

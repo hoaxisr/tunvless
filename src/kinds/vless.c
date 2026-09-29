@@ -1,5 +1,5 @@
 /* kind=vless — туннель VLESS по подписке, устройство которого создаёт наш процесс
- * (`steer vless <выход>`, src/tunnel/tunnel.c).
+ * (`steer vless <выход>`, src/proto/vless/vlmain.c; стек — src/tunnel/stack.c).
  *
  * vless — это тоже устройство: клиент поднимает TUN, и дальше всё остальное (метки,
  * таблицы, failover, каналы) работает с ним ровно как с wireguard. Отдельный вид нужен

@@ -45,6 +45,12 @@ int nft_concat_element6(int add, const char *set_name, const uint8_t addr[16],
                         const struct nftlk_box *box, uint32_t ttl);
 int nft_map_set_element6(const char *map_name, const uint8_t fake[16], const uint8_t real[16],
                          const uint8_t *known_real);
+/* Подмена fake → real по тому, что стоит в ядре, а не по памяти (после замены набора правил карта
+ * засеяна из файла, и память ей не свидетель — доводы у map_ensure в nftnl.c). 0 — в ядре
+ * желаемое значение, 1 — стояло другое и заменено, иначе отрицательный errno. */
+int nft_map_ensure_element(const char *map_name, uint32_t fake_host, uint32_t real_host);
+int nft_map_ensure_element6(const char *map_name, const uint8_t fake[16],
+                            const uint8_t real[16]);
 /* Снять адрес key (alen — 4 или 16, порядок сети) из интервального набора g_nft_table, где он
  * лежит внутри слитого отрезка (засев набора правил и auto-merge): отрезок заменяется его частями
  * без key одной транзакцией. Только отрезок без срока, целиком внутри [lo, hi] (пул fake-IP). 0 —

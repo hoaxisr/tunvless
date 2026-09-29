@@ -155,9 +155,9 @@ echo "ext-test: собираю и прогоняю spokematch (ASan: ${ASAN:-н�
 # xslink.c в списке ОБЯЗАТЕЛЕН: командная строка клиента принимает и ссылку xs://, и файл
 # одним xs_conf_load_any, и живёт эта функция там. Без неё сборка стенда падает на компоновке,
 # то есть весь ext-test не доходит даже до первой проверки — а именно в нём и живёт ASan.
-# src/lib/ctlcall.c — там же и по той же причине: xsclient.c зовёт сокет управления демона
-# (ctlcall_socket и ctlcall_forward в cmd_xsteer_peers), и без файла стенд не компоновался — до
-# шага 1 выпуска 1.10 ext-test был из-за этого красным ещё до первой проверки.
+# ctlcall.c — по той же причине: `steer xsteer-peers` под демоном отдаёт запрос в сокет
+# (cmd_xsteer_peers → ctlcall_forward), и с тех пор, как xsclient.c зовёт его, стенд без этого
+# файла не компоновался — ext-test падал здесь, не дойдя ни до одной проверки.
 $CC -O1 -g -w $STEER_INC $ASAN -o "$BUILD/spokematch" \
 	tests/spokematch.c \
 	src/proto/xsteer/xsconn.c src/proto/xsteer/xswire.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xsroute.c \
@@ -173,19 +173,24 @@ $CC -O1 -g -w $STEER_INC $ASAN -o "$BUILD/spokematch" \
 # санитайзера нет, стенд об этом ГОВОРИТ САМ (последние строки его вывода) — проверки кодов
 # возврата и дескрипторов прогонятся, куча нет.
 #
-# Список исходников повторяет devupmatch без client.c: сам client.c стенд ВКЛЮЧАЕТ (шов
-# установления TCP статический, см. заголовок стенда), и вторая его копия при компоновке
-# дала бы дубли символов. Выпуск сертификатов (R-118) — tests/certgen.c, он есть всегда, поэтому
-# STEER_HAVE_X509WRITE задаётся безусловно (прежде — пробой mbedtls на MBEDTLS_X509_CRT_WRITE_C).
+# Транспорт (TRANSPORT_SRC, build/sources.mk) — без двух файлов: trdial.c и roots.c стенд
+# ВКЛЮЧАЕТ (швы установления TCP и корней статические, см. заголовок стенда), и вторая их копия
+# при компоновке дала бы дубли символов. Клиент VLESS (client.c) — отдельным объектом.
+# Выпуск сертификатов для случаев security=tls (R-118) — tests/certgen.c на wolfSSL стендов, он
+# есть всегда, поэтому STEER_HAVE_X509WRITE задаётся безусловно (прежде — пробой mbedtls на
+# MBEDTLS_X509_CRT_WRITE_C, которого в урезанной конфигурации роутера не было).
 echo "ext-test: собираю и прогоняю vlessmatch (ASan: ${ASAN:-нет})..."
 $CC -O1 -g -w $STEER_INC -Itests $ASAN -DSTEER_HAVE_X509WRITE -o "$BUILD/vlessmatch" tests/vlessmatch.c \
+	src/proto/vless/client.c src/proto/transport/transport.c src/proto/transport/trsec.c \
+	src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
 	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
 	$MODEL_SRC $KINDS_SRC $CERTGEN $CRYPTO -lpthread
 "$BUILD/vlessmatch"
 
 # androidroots — склейка каталога корней Android в файл для certverify (cert_roots в
-# client.c на платформе с системным хранилищем корней). Платформа — телефон (умолчание сборки),
+# src/proto/tls/roots.c — стенд его включает — на платформе с системным хранилищем корней;
+# до шага 2 выпуска 1.10 склейка жила в client.c). Платформа — телефон (умолчание сборки),
 # каталоги хранилища — свои, во временном месте (ключ STEER_ANDROID_CA_DIRS читает
 # src/platform/android.c): стенд не трогает ни /data, ни /apex.
 echo "ext-test: собираю и прогоняю androidroots..."
@@ -207,11 +212,20 @@ $CC -O2 -w $STEER_INC -o "$BUILD/hubmatch" tests/hubmatch.c \
 	$MODEL_SRC $KINDS_SRC $CRYPTO -lpthread
 "$BUILD/hubmatch"
 
-# devupmatch — подъём устройства туннеля называет свои отказы (I-114).
+# devupmatch — подъём устройства туннеля называет свои отказы (I-114), и переселение связи из
+# запасной сессии чинит оба самоуказателя. Стенд компонуется со стеком (STACK_SRC), дайлером
+# VLESS (VLESS_MOD_SRC без точки входа vlmain.c) и транспортом (TRANSPORT_SRC), а не включает
+# tunnel.c, как до шага 2 выпуска 1.10. Пути — явно, а не из манифеста: по явным путям
+# tests/buildmatch.sh сверяет, что стенды компонуют всё, что включают.
 echo "ext-test: собираю и прогоняю devupmatch..."
 $CC -O2 -w $STEER_INC -o "$BUILD/devupmatch" tests/devupmatch.c \
-	src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
-	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c src/lib/jsonw.c src/lib/evline.c \
+	src/tunnel/stack.c src/tunnel/rtx.c src/tunnel/tun.c \
+	src/proto/vless/vldial.c src/proto/vless/vlwatch.c src/proto/vless/client.c \
+	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/vless/sub.c \
+	src/proto/transport/transport.c src/proto/transport/trdial.c src/proto/transport/trsec.c \
+	src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c src/proto/tls/roots.c \
+	src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c src/proto/tls/h2.c \
+	src/lib/jsonw.c src/lib/evline.c \
 	$MODEL_SRC $KINDS_SRC $CRYPTO -lpthread
 "$BUILD/devupmatch"
 

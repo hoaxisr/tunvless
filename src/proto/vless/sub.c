@@ -1077,7 +1077,7 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
  *
  * Раньше это решение жило в tunnel.c одной строкой `if (!strstr(raw, "://"))`, и на конфиге
  * Xray оно срабатывало ПО СЛУЧАЙНОСТИ: «://» там есть внутри настроек DNS. Здесь оно потому,
- * что здесь его можно проверить стендом — tunnel.c требует и сети, и TUN, и криптобиблиотеки.
+ * что здесь его можно проверить стендом — туннель требует и сети, и TUN, и TLS.
  *
  * Возвращает raw или dec; ни то, ни другое не освобождается — буферы вызывающего. */
 const char *vless_sub_text(const char *raw, size_t raw_n, char *dec, size_t dec_n) {

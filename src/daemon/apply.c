@@ -556,9 +556,19 @@ static void apply_prepare(const char *spec, struct spec *cfg, struct groups *gr,
  * утечка, которую засев закрывает: подмена стоит, метки нет, пакет к поддельному адресу
  * разворачивается в настоящий и уходит в WAN. Без засева карты пакет к поддельному адресу до
  * прихода таблицы к резолверу подмены не находит и не уходит никуда (правило за dnat,
- * generate.c, build_fakeip): соединение ждёт резолвера, а не идёт мимо выхода. */
-static void seed_begin(const struct spec *cfg, const struct groups *gr) {
+ * generate.c, build_fakeip): соединение ждёт резолвера, а не идёт мимо выхода.
+ *
+ * ФАЙЛ — СВЕЖИЙ (проверка на QEMU 98b7964, docs/architecture.md, раздел 5). Резолвер переписывает
+ * файл состояния не чаще раза в минуту, и засев из него отставал от памяти резолвера: новое имя —
+ * без подмены (клиент с поддельным адресом в кэше: «без подмены — никуда», 3 запроса из 40 на три
+ * замены), сменившийся адрес — прежним (и EEXIST резолвера его не исправлял). flush = 1 (загрузка,
+ * не --dry-run): перед засевом резолвер этого каталога состояния по просьбе «flush» записывает файл
+ * и отвечает уже после записи (supd_dnsd_flush). Резолвера нет — просить некого: файл последний,
+ * какой он записал (при выходе он дописывает его сам). --dry-run резолвер не трогает: печать
+ * вправе отстать от памяти, ядро она не меняет. */
+static void seed_begin(const struct spec *cfg, const struct groups *gr, int flush) {
     if (!g_print_state_seed || !has_fakeip(gr)) return;
+    if (flush) supd_dnsd_flush();
     char path[512];
     if (snprintf(path, sizeof(path), "%s/fakeip.state", steer_state_dir()) >= (int)sizeof(path))
         return;
@@ -651,7 +661,7 @@ static int ruleset_load(const struct spec *cfg, const struct groups *gr) {
                 fprintf(f, "delete table %s %s\n", fams[k], nft_table());
         }
     }
-    seed_begin(cfg, gr);
+    seed_begin(cfg, gr, 1);
     if (generate(cfg, gr, f, &e) < 0) err_die(&e);
     seed_end();
     fclose(f);
@@ -751,7 +761,7 @@ int cmd_apply(const char *spec, int dry) {
     if (dry) {
         awg_check_all(&cfg);
         /* Засев — и в --dry-run: интерфейс и стенды сверяют именно то, что встанет в ядро. */
-        seed_begin(&cfg, &gr);
+        seed_begin(&cfg, &gr, 0);
         if (generate(&cfg, &gr, stdout, &e) < 0) err_die(&e);
         seed_end();
         return 0;

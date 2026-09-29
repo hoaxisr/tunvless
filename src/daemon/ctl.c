@@ -2581,11 +2581,16 @@ static void repair_done(struct conn *c, int code) {
 
 /* Обратный вызов стража: правила он вернул сам, в процессе демона (rulewd.c, «СРАЗУ, А НЕ ЧЕРЕЗ
  * СЕКУНДУ»). Очередь изменяющих команд не нужна: одно сообщение rtnetlink на правило, таблицы не
- * тронуты. masquerade (телефон) вернёт проход сторожа, который repaired_emit зовёт. */
-static void srv_restored(void *arg, const char *list) {
+ * тронуты. masquerade (телефон) вернёт проход сторожа, который repaired_emit зовёт. Запасной запрет
+ * IPv6 (его ядро снимает вместе с lo — rulewd.c, «ЗАПРЕТ IPv6 УХОДИТ ВМЕСТЕ С lo») — своей строкой:
+ * правил в этом случае никто не снимал, и строка о них была бы неправдой. */
+static void srv_restored(void *arg, const char *all, const char *rules, const char *bs6) {
     struct ctl_srv *s = arg;
-    fprintf(stderr, LOG_I "правила выходов сняты снаружи — возвращены: %s\n", list);
-    repaired_emit(s, list, 0);
+    if (rules[0]) fprintf(stderr, LOG_I "правила выходов сняты снаружи — возвращены: %s\n", rules);
+    if (bs6[0])
+        fprintf(stderr, LOG_I "запрет IPv6 в таблице выхода снят (вместе с lo или снаружи) — "
+                        "возвращён: %s\n", bs6);
+    repaired_emit(s, all, 0);
 }
 
 static void st_repair(struct conn *c) {

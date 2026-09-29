@@ -21,10 +21,12 @@
  * быть осведомляющий, иначе на системах без txqueuelen штатный запуск превратится в поток
  * предупреждений, и это научит не смотреть в журнал вовсе.
  *
- * Стенд включает src/tunnel/tunnel.c целиком: tun_bring_up статическая, и дотянуться до неё
- * иначе значило бы завести в движке подкоманду ради теста. Отсюда и криптобиблиотека — цикл туннеля
- * тянет за собой TLS 1.3 и reality (поэтому стенд живёт в tests/ext-test.sh, а не в
- * `make test`). Ни сети, ни прав, ни устройства ему не нужно: вызывается ровно одна
+ * Стенд КОМПОНУЕТСЯ со стеком туннеля (src/tunnel/stack.c) и дайлером VLESS, а не включает их:
+ * с шага 2 выпуска 1.10 tun_bring_up — часть интерфейса стека (stack.h), а переселение связи из
+ * запасной сессии — часть таблицы дайлера (vless_dialer.take). Прежде стенд включал tunnel.c
+ * целиком ради одной статической функции. Криптобиблиотека нужна по-прежнему — дайлер тянет за
+ * собой транспорт, TLS 1.3 и reality (поэтому стенд живёт в tests/ext-test.sh, а не в
+ * `make test`). Ни сети, ни прав, ни устройства ему не нужно: подъём устройства — это ровно одна
  * функция, и все её сайд-эффекты проходят через подменённый run_quiet.
  */
 #define _GNU_SOURCE
@@ -57,8 +59,8 @@ int run_quiet(const char *const argv[]) {
 /* Привязку таблицы делает failover.c; сюда он не входит — на этом стенде его не зовут. */
 void bind_device(struct output *o, const char *dev) { (void)o; (void)dev; }
 
-#include "jsonw.h"
-#include "../src/tunnel/tunnel.c"
+#include "stack.h"
+#include "vldial.h"
 
 /* ---- перехват журнала --------------------------------------------------------- */
 
@@ -164,28 +166,34 @@ int main(void) {
 
     /* ---- пул запасных: указатели после переезда структуры -----------------------
      *
-     * spare_checkout копирует сессию из слота пула в таблицу соединений (memcpy) и чинит один
+     * Взятие запасной копирует связь из слота пула в сессию соединения (memcpy) и чинит
      * самоуказатель — h2.io.ctx. Второй такой же живёт у выгрузки xhttp: up_request ставит
-     * up.h2.io.ctx = &c->up, и для stream-up это происходит ЕЩЁ В СЛОТЕ (up_open внутри
-     * vless_connect). После переезда он указывал в брошенный слот, который тут же
-     * переиспользовала следующая запасная — выгрузка одного соединения уезжала в сокет чужого. */
+     * xh.up.h2.io.ctx = &t->xh.up, и для stream-up это происходит ЕЩЁ В СЛОТЕ (up_open внутри
+     * открытия связи). После переезда он указывал в брошенный слот, который тут же
+     * переиспользовала следующая запасная — выгрузка одного соединения уезжала в сокет чужого.
+     *
+     * С шага 2 выпуска 1.10 переселение — у дайлера (vless_dialer.take), а чинит указатели
+     * транспорт (xhttp_moved); слот пула освобождает стек, и это проверяет tests/tunnelmatch.c.
+     * Здесь — оба самоуказателя на настоящем транспорте и то, что поток соединения (UUID и
+     * Vision, заведённые до взятия) переселение не затирает. */
     printf("\n== пул запасных: оба самоуказателя чинятся после переезда ==\n");
     {
-        memset(&g_spares[0], 0, sizeof(g_spares[0]));
-        g_spares[0].state = SPARE_READY;
-        g_spares[0].born_ns = now_ns();
-        g_spares[0].v.fd = -1;
-        g_spares[0].v.tr = VT_XHTTP;
-        g_spares[0].v.h2.io.ctx = &g_spares[0].v;
-        g_spares[0].v.up.started = 1;
-        g_spares[0].v.up.h2.io.ctx = &g_spares[0].v.up;
-        struct vless_conn out;
+        static struct vl_sess spare, out;
+        memset(&spare, 0, sizeof(spare));
+        spare.t.link.fd = -1;
+        spare.t.fr = &tr_xhttp;
+        spare.t.h2.io.ctx = &spare.t.link;
+        spare.t.xh.up.started = 1;
+        spare.t.xh.up.h2.io.ctx = &spare.t.xh.up;
         memset(&out, 0, sizeof(out));
-        check("запасная взята", 0, spare_checkout(&out));
-        check("h2.io.ctx указывает на новую структуру", 1, out.h2.io.ctx == &out);
+        out.uuid[0] = 0x5a;
+        out.vis.need_uuid = 1;
+        vless_dialer.take(&out, &spare);
+        check("связь переселена", 1, out.t.fr == &tr_xhttp && out.t.xh.up.started == 1);
+        check("h2.io.ctx указывает на новую структуру", 1, out.t.h2.io.ctx == &out.t.link);
         check("up.h2.io.ctx указывает на новую структуру, а не в слот", 1,
-              out.up.h2.io.ctx == &out.up);
-        check("слот освобождён", SPARE_EMPTY, g_spares[0].state);
+              out.t.xh.up.h2.io.ctx == &out.t.xh.up);
+        check("поток соединения не затёрт", 1, out.uuid[0] == 0x5a && out.vis.need_uuid == 1);
     }
 
     printf(fails ? "\nПРОВАЛОВ: %d\n" : "\nвсе проверки прошли\n", fails);

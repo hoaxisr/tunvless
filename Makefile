@@ -388,11 +388,14 @@ $(BUILD)/h2match: tests/h2match.c src/proto/tls/h2.c src/proto/tls/h2.h src/prot
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/h2match.c
 
-# Отказ сервера на выгрузку xhttp (stream-up, packet-up) обязан дойти до vless_send (I-219):
-# client.c включается целиком (up_drain статическая), h2.c настоящий, TLS и Reality
-# подменены — связь выгрузки голая, на сокетной паре. Подробности — в шапке стенда.
-XHUPMATCH_SRC = src/proto/tls/h2.c src/proto/vless/vless_proto.c src/proto/vless/vision.c
-$(BUILD)/xhupmatch: tests/xhupmatch.c src/proto/vless/client.c src/proto/vless/client.h src/proto/tls/h2.h $(XHUPMATCH_SRC)
+# Отказ сервера на выгрузку xhttp (stream-up, packet-up) обязан дойти до отправки (I-219):
+# транспорт xhttp (trxhttp.c) включается целиком (up_drain статическая), остальные ярусы
+# транспорта и h2.c настоящие и компонуются отдельно, TLS и Reality подменены — связь
+# выгрузки голая, на сокетной паре. Подробности — в шапке стенда.
+XHUPMATCH_SRC = src/proto/tls/h2.c src/proto/transport/transport.c src/proto/transport/trsec.c \
+                src/proto/transport/trdial.c src/proto/transport/trgrpc.c src/proto/tls/roots.c
+$(BUILD)/xhupmatch: tests/xhupmatch.c src/proto/transport/trxhttp.c src/proto/transport/transport.h \
+                    src/proto/tls/h2.h $(XHUPMATCH_SRC)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/xhupmatch.c \
 		$(XHUPMATCH_SRC) $(PLATFORM_SRC) -lpthread
@@ -405,7 +408,7 @@ $(BUILD)/xhupmatch: tests/xhupmatch.c src/proto/vless/client.c src/proto/vless/c
 # разбор подписки; остальная расширенная часть доходит только до ext-syntax.
 $(BUILD)/visionmatch: tests/visionmatch.c src/proto/vless/vision.c src/proto/vless/vision.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/visionmatch.c
+	$(CC) $(CFLAGS) -o $@ tests/visionmatch.c src/proto/vless/vision.c
 
 # vless_proto.c — в предпосылках и в стенде: разбор подписки решает, ПРИГОДЕН ли
 # идентификатор, а превращает его в 16 байт vless_proto.c, и правило у них одно (правило
@@ -460,12 +463,14 @@ $(BUILD)/tungromatch: tests/tungromatch.c src/tunnel/tun.c src/tunnel/tun.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/tungromatch.c $(PLATFORM_SRC)
 
-# Разбор пакетов туннеля VLESS на подменённом клиенте (I-320, I-321, I-322): tunnel.c
-# включается целиком, client.c подменён, поэтому криптобиблиотека не нужна — её типов в
-# заголовках нет (src/lib/scrypto.h), как у ext-syntax. Подробности — в шапке стенда.
+# Разбор пакетов туннеля VLESS на подменённом транспорте (I-320, I-321, I-322): стек
+# (stack.c) включается целиком, дайлер VLESS (vldial.c) настоящий и компонуется отдельно, а
+# соединение с узлом (vless_connect и transport_*) подменено, поэтому криптобиблиотека не нужна —
+# её типов в заголовках нет (src/lib/scrypto.h), как у ext-syntax. Подробности — в шапке стенда.
 TUNNELMATCH_SRC = src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/vless_proto.c src/proto/vless/vision.c \
-                  src/proto/vless/sub.c src/lib/jsonw.c src/lib/evline.c $(MODEL_KINDS) $(KINDS_EXT_SRC)
-$(BUILD)/tunnelmatch: tests/tunnelmatch.c src/tunnel/tunnel.c $(TUNNELMATCH_SRC)
+                  src/proto/vless/vldial.c src/proto/vless/vlwatch.c \
+                  src/lib/jsonw.c src/lib/evline.c $(MODEL_KINDS) $(KINDS_EXT_SRC)
+$(BUILD)/tunnelmatch: tests/tunnelmatch.c src/tunnel/stack.c src/tunnel/dialer.h $(TUNNELMATCH_SRC)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/tunnelmatch.c \
 		$(TUNNELMATCH_SRC) -lpthread -ldl
@@ -478,7 +483,7 @@ $(BUILD)/tunnelmatch: tests/tunnelmatch.c src/tunnel/tunnel.c $(TUNNELMATCH_SRC)
 # всё равно входит: стенд, который надо позвать руками, не запускается никогда.
 $(BUILD)/tunnamematch: tests/tunnamematch.c src/tunnel/tun.c src/tunnel/tun.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/tunnamematch.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) -o $@ tests/tunnamematch.c src/tunnel/tun.c $(PLATFORM_SRC)
 
 # Разбор конфигурации xsteer — единственное место, куда в движок попадает текст, который
 # человек написал руками, поэтому разбор строгий, а стенд перечисляет каждый отказ.

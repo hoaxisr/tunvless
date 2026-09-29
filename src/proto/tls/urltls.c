@@ -14,8 +14,9 @@
  * с plain: облик браузера живёт в одном месте), ALPN — http/1.1: запрос обычный HTTP/1.1, и
  * сервер, согласившийся на h2, ответил бы кадрами, которые здесь читать нечем. Подлинность
  * сервера проверяется по цепочке до корня (auth.host): страница плена провайдера с чужим
- * сертификатом — это не «быстрый член», а отказ. Корни — те же, что у клиента VLESS
- * (vless_cert_roots: на телефоне склейка системного каталога, на роутере умолчание certverify).
+ * сертификатом — это не «быстрый член», а отказ. Корни — те же, что у транспорта security=tls
+ * (tls_cert_roots в roots.c: на телефоне склейка системного каталога, на роутере умолчание
+ * certverify).
  *
  * ВРЕМЯ — от начала соединения до первого прикладного байта ответа, по CLOCK_MONOTONIC: как у
  * HTTP в urltest.c плюс рукопожатие TLS — два оборота того же пути, что и сам запрос. Годен ответ
@@ -39,7 +40,7 @@
 #include "loop.h"
 #include "reality.h"
 #include "tls13.h"
-#include "client.h"
+#include "roots.h"
 #include "urltls.h"
 
 #ifndef STEER_VERSION
@@ -137,7 +138,7 @@ static int measure(const struct urltls_work *w) {
 
     struct tls13 *t = calloc(1, sizeof(*t));
     if (!t) goto fail;
-    struct tls13_auth auth = { .host = w->host, .roots = vless_cert_roots() };
+    struct tls13_auth auth = { .host = w->host, .roots = tls_cert_roots() };
     int res = -1;
     if (tls13_handshake_auth(t, fd, hello, hello_n, rst.priv, &auth) != 0) goto done;
     if (t->alpn[0] && strcmp(t->alpn, "http/1.1") != 0) goto done;

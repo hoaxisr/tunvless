@@ -64,7 +64,7 @@
 #define TUN "/dev/tun"
 #endif
 
-/* Системное хранилище корней для узлов security=tls (src/proto/vless/client.c, cert_roots):
+/* Системное хранилище корней для узлов security=tls (src/proto/tls/roots.c, cert_roots):
  * каталоги по порядку предпочтения, первый, где нашёлся хоть один файл, и есть хранилище.
  * Ключом сборки — чтобы стенд (tests/androidroots.c, сборка в tests/ext-test.sh) подставил
  * свои. */

@@ -2,8 +2,8 @@
  *
  * ЗАЧЕМ. На телефоне нет файла ca-bundle, который certverify.c читает на роутере: корни лежат
  * каталогом, по сертификату на файл, и каждый файл — это текст `openssl x509 -text`, за
- * которым идёт PEM. client.c на телефоне склеивает первый найденный каталог в файл
- * состояния и отдаёт его certverify швом auth.roots (см. cert_roots в client.c). Если склейка
+ * которым идёт PEM. Движок на телефоне склеивает первый найденный каталог в файл
+ * состояния и отдаёт его certverify швом auth.roots (см. cert_roots в src/proto/tls/roots.c). Если склейка
  * молча не работает, проверка security=tls на телефоне отвергает КАЖДЫЙ узел как «хранилище
  * корней не прочиталось», а на роутере этого не видно никогда — там путь другой.
  *
@@ -26,8 +26,11 @@
 
 /* Платформа — телефон, каталоги корней — свои, во временном месте: и то и другое задаёт сборка
  * в tests/ext-test.sh (-DSTEER_DEFAULT_PLATFORM=android и STEER_ANDROID_CA_DIRS, их читает
- * src/platform/android.c). Каталог состояния стенд задаёт сам, ниже, тем же швом, что --state-dir. */
-#include "../src/proto/vless/client.c"
+ * src/platform/android.c). Каталог состояния стенд задаёт сам, ниже, тем же швом, что --state-dir.
+ * Склейка и шов g_cert_roots живут в src/proto/tls/roots.c (до шага 2 выпуска 1.10 — в
+ * client.c), и включается ровно он: cert_roots статическая. */
+#include "../src/proto/tls/roots.c"
+#include <sys/random.h>
 
 #include "scrypto.h"
 

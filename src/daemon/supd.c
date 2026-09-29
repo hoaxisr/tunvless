@@ -507,11 +507,12 @@ int supd_orphan_down(void) {
  * резолвер ответил; 0 — резолвера нет (сокета нет: без демона и без пережившего его резолвера)
  * или ответ не пришёл вовремя; -1 — резолвер прежней версии, просьбы не знает (закрыл
  * соединение молча): тогда элементы вернёт таблица от демона, как прежде. */
-int supd_dnsd_reassert(void) {
+static int dnsd_ask(const char *req, int ms) {
     pid_t pid;
     int fd = dnsd_connect(&pid);
     if (fd < 0) return 0;
-    if (send(fd, "reassert\n", 9, MSG_NOSIGNAL) != 9) {
+    size_t l = strlen(req);
+    if (send(fd, req, l, MSG_NOSIGNAL) != (ssize_t)l) {
         close(fd);
         return 0;
     }
@@ -519,11 +520,27 @@ int supd_dnsd_reassert(void) {
     ssize_t m = -1;
     struct pollfd p = { fd, POLLIN, 0 };
     int r;
-    while ((r = poll(&p, 1, 500)) < 0 && errno == EINTR) {}
+    while ((r = poll(&p, 1, ms)) < 0 && errno == EINTR) {}
     if (r > 0) m = recv(fd, b, sizeof(b), MSG_DONTWAIT);
     close(fd);
     if (m >= 3 && !memcmp(b, "ok\n", 3)) return 1;
     return m == 0 ? -1 : 0;
+}
+
+int supd_dnsd_reassert(void) {
+    return dnsd_ask("reassert\n", 500);
+}
+
+/* Прямо перед засевом карты и наборов fake-IP — попросить резолвер записать файл состояния
+ * (просьба «flush», src/dnsd/adopt.c; зачем — у fakeip_state_flush в src/dnsd/fakeip.c). Зовёт
+ * тот же загрузчик, что и reassert. Ответ «ok» приходит после записи, и ждётся дольше (1 с):
+ * засев из отставшего файла — это новые имена без подмены и прежние адреса в новой таблице, а
+ * запись на tmpfs — доли миллисекунды, так что долго ждать приходится, только если резолвер занят
+ * (перечитывает списки). Не дождались — засев из того, что лежит: расхождение карты с памятью
+ * исправит проход резолвера после таблицы (nft_map_ensure_element), новые имена — он же. Возврат —
+ * как у supd_dnsd_reassert. */
+int supd_dnsd_flush(void) {
+    return dnsd_ask("flush\n", 1000);
 }
 
 static void dn_conn_close(struct supd *s) {
@@ -732,7 +749,7 @@ static void child_cb(struct loop *l, pid_t pid, int status, void *arg) {
         h->st.running = 0;
         h->st.up = 0;
         /* down клиента, следившего за узлом, говорил об узле этого процесса (он и выходит, найдя
-         * другой узел, — tunnel.c, «слежка за узлом»). Новый процесс выберет узел заново, и
+         * другой узел, — proto/vless/vlwatch.c, «слежка за узлом»). Новый процесс выберет узел заново, и
          * «ни один узел не ответил» (probe_of) до его подъёма было бы неправдой. */
         if (h->st.watch) h->st.said_down = 0;
         h->st.watch = 0;
@@ -929,7 +946,7 @@ int supd_restart(struct supd *s, const char *out, const char *cmd) {
 
 /* ---- ход перебора узлов vless из памяти (probe.h) ---------------------------------------- */
 
-/* То же, что записал бы клиент (probe_report в src/tunnel/tunnel.c), — по его событиям:
+/* То же, что записал бы клиент (probe_report в src/proto/vless/vlmain.c), — по его событиям:
  * nonode — номер вне подписки (живёт до следующего запуска, как запись — пока свежа); node без
  * up и down у живого процесса — перебор идёт; down самого клиента — ни один узел не ответил (total
  * — из последнего node, 0 — узлов в подписке не было). Остальное — сказать нечего. */

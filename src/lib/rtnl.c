@@ -400,6 +400,26 @@ int rtnl_route_default_dev(int table, int ifindex) {
     return rtnl_talk(buf, msg_end(&b, nh), NULL, NULL);
 }
 
+int rtnl_route6_blackhole(int table, int metric) {
+    uint8_t buf[128];
+    struct nlbuf b;
+    struct rtmsg rt;
+    memset(&rt, 0, sizeof(rt));
+    rt.rtm_family = AF_INET6;
+    rt.rtm_table = table < 256 ? (uint8_t)table : RT_TABLE_UNSPEC;
+    rt.rtm_protocol = RTPROT_BOOT;
+    rt.rtm_scope = RT_SCOPE_UNIVERSE;
+    rt.rtm_type = RTN_BLACKHOLE;
+    /* Замена, как у `ip -6 route replace` в backstop_set_fam (failover.c): стоящий такой же запрет
+     * она не дублирует. Устройства в сообщении нет — ядро само вешает запрет на lo. */
+    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_NEWROUTE,
+                                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+                                    &rt, sizeof(rt));
+    nlbuf_put_u32(&b, RTA_TABLE, (uint32_t)table);
+    nlbuf_put_u32(&b, RTA_PRIORITY, (uint32_t)metric);
+    return rtnl_talk(buf, msg_end(&b, nh), NULL, NULL);
+}
+
 /* ---- вопросы diag ------------------------------------------------------------------------ */
 
 static void default6_cb(const struct nlmsghdr *h, void *ctx) {

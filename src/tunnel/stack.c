@@ -1,9 +1,18 @@
-/* Цикл туннеля: пакеты из TUN — в потоки VLESS и обратно.
+/* Стек туннеля: пакеты из TUN — в потоки к узлу и обратно.
  *
- * Ядро отдаёт нам IP-пакеты, а сервер VLESS принимает соединения. Разрыв между этими двумя
+ * Ядро отдаёт нам IP-пакеты, а узел принимает соединения. Разрыв между этими двумя
  * представлениями и есть содержание этого файла: на каждое TCP-соединение из TUN мы
- * открываем свой поток VLESS и дальше переносим байты, подтверждая клиенту приём так, как
+ * открываем свой поток к узлу и дальше переносим байты, подтверждая клиенту приём так, как
  * это сделал бы настоящий стек.
+ *
+ * ПРОТОКОЛА ЗДЕСЬ НЕТ. До шага 2 выпуска 1.10 этот файл назывался tunnel.c и был сварен с
+ * VLESS: толстая половина соединения держала `struct vless_conn`, отправка клеила заголовок
+ * VLESS и кадры Vision, приём разбирал ответ VLESS, а в конце файла жили подкоманды
+ * `steer vless`, `vless-nodes` и `vless-probe`. Теперь всё, что знает про узел, — у дайлера
+ * (dialer.h): сессия соединения для стека непрозрачна, а VLESS — один из дайлеров
+ * (proto/vless/vldial.c), и его точка входа — в модуле протокола (proto/vless/vlmain.c).
+ * Поведение при этом не менялось ни в чём, вплоть до порядка строк журнала: разделение
+ * проведено по швам, которые в файле уже были (upstream_send, downstream_pump, установщик).
  *
  * Почему это НЕ полный стек TCP и почему так можно. Алгоритмов перегрузки здесь нет — их
  * делает клиент на своей стороне и сервер на своей. Наша задача уже: подтвердить SYN,
@@ -35,18 +44,13 @@
 #include <time.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <sys/mman.h>
 
-#include "vless.h"
-#include "client.h"
-#include "vless_proto.h"
-#include "vision.h"
-#include "tls13.h"
 #include "tun.h"
 #include "rtx.h"
-#include "tunnel.h"
+#include "dialer.h"
+#include "stack.h"
 #include "spec.h"
-#include "evline.h"
-#include "jsonw.h"
 #include "run.h"
 
 /* ---- журнал с уровнем --------------------------------------------------------
@@ -66,9 +70,6 @@
  */
 #define LOG_W  "steer[warn] tunnel: "
 #define LOG_I  "steer[info] tunnel: "
-/* Без слова tunnel: подъём выхода и разбор подписки — это ещё не туннель. */
-#define LOG_W2 "steer[warn]: "
-#define LOG_I2 "steer[info]: "
 
 /* Сколько соединений держим одновременно. Каждое — это сокет к серверу плюс TLS-состояние,
  * то есть около 3 КБ; 64 соединения это ~200 КБ, что для роутера с 15 МБ приемлемо, а для
@@ -129,7 +130,7 @@
  *
  * Отсюда три решения, и они держатся друг за друга:
  *
- *   1. толстая половина живёт в ОТДЕЛЬНОМ массиве (struct sess). Проход цикла её не
+ *   1. толстая половина живёт в ОТДЕЛЬНОМ массиве (сессии дайлера). Проход цикла её не
  *      касается вовсе, а страницы под неё берутся только теми соединениями, по которым
  *      реально идёт ввод-вывод — простаивающий слот больше не стоит двух резидентных
  *      страниц;
@@ -141,34 +142,12 @@
  * Порядок важен: сам по себе список живых не помог бы, пока запись занимает 19 КБ, — при
  * 320 живых соединениях обход всё равно упирался бы в память. И наоборот. */
 
-/* Толстая половина: нужна только тому соединению, по которому идёт ввод-вывод. */
-struct sess {
-    struct vless_conn v;
-    struct vision vis;
-    /* Разобранный UUID узла: нужен один раз на соединение — в заголовке запроса VLESS и
-     * при заводе Vision. В горячей половине ему делать нечего. */
-    unsigned char uuid[16];
-    /* ---- сборка датаграммы UDP (только у потоков UDP) ----
-     *
-     * VLESS несёт датаграммы потоком: [длина(2)][данные] и снова. Записи TLS про эти
-     * границы не знают ничего — датаграмма может приехать двумя записями, а одна запись
-     * принести полторы, — поэтому недособранное приходится держать между чтениями.
-     *
-     * Здесь, а не в горячей половине: проход цикла про сборку не знает и знать не должен.
-     * Место занимают только те соединения, по которым реально идёт UDP, — страницы под
-     * struct sess берутся по факту обращения, ровно как у буферов TLS рядом.
-     *
-     * dg_want == 0 означает «ждём длину». lenb хранит первый байт длины, если запись
-     * кончилась ровно между двумя байтами длины: случай редкий, но молча теряющий
-     * синхронизацию потока навсегда.
-     *
-     * dg_skip — сколько байт слишком большой датаграммы осталось выбросить. Выбросить её
-     * НАДО ЦЕЛИКОМ и точно: оборвав отсчёт, мы приняли бы её хвост за длину следующей. */
-    unsigned char dg[UDP_DGRAM_MAX];
-    uint16_t dg_want, dg_have;
-    uint32_t dg_skip;
-    unsigned char lenb, lenb_n;
-};
+/* Толстая половина — сессия дайлера (dialer.h): связь с узлом и состояние протокола на этом
+ * потоке. Для стека она непрозрачна, и размер её называет дайлер (sess_size); у VLESS это
+ * около 40 КБ — буферы записей TLS обеих связей, контексты шифров, HTTP/2, Vision, сборка
+ * датаграммы (struct vl_sess в proto/vless/vldial.c). Лежат сессии отдельным массивом в куче
+ * потока, рядом с горячей таблицей (см. «таблицы потока» ниже), и страницы под них берутся
+ * только теми соединениями, по которым реально идёт ввод-вывод. */
 
 struct conn {
     /* Первая строка кэша — ровно то, что читает проход цикла. Порядок полей здесь не
@@ -211,8 +190,8 @@ struct conn {
      * идут потоком и следующее чтение всё разгребало, а вот ХВОСТ ответа мог простоять до
      * таймаута повтора у клиента. */
     uint8_t rx_ready;
-    uint8_t header_sent;      /* заголовок VLESS уже ушёл серверу */
-    uint8_t established;
+    /* Здесь стояли header_sent («заголовок VLESS уже ушёл») и established («ответ VLESS
+     * разобран»): это состояние протокола, и оно переехало в сессию дайлера. */
     /* Клиенту причитается подтверждение, но мы его отложили до конца разбора порции из
      * TUN. Подтверждать каждый пакет отдельно — это лишняя запись в устройство на каждый
      * пакет выгрузки, притом что все они подтверждаются одним ACK с последним номером. */
@@ -257,7 +236,7 @@ struct conn {
     struct flow_key key;
     int fd;                   /* копия сокета сессии: нужна при снятии с epoll */
     int done;                 /* установщик закончил: читать только с ACQUIRE */
-    int rc;                   /* его результат: 0 или код ошибки vless_* */
+    int rc;                   /* его результат: 0 или код ошибки дайлера */
     /* Когда сервер закрылся: предел ожидания подтверждений.
      *
      * Закрывать соединение в этот момент НЕЛЬЗЯ, и это ровно та ошибка, из-за которой
@@ -510,23 +489,42 @@ static int client_can_take_record(struct conn *c) {
  * байтах в пути, второй тянул всё; сквозная скорость 12 Мбит, и коробка вставала намертво
  * (сброс по сторожевому таймеру mtk-wdt). При одной очереди тот же тест дал 292 Мбит и
  * коробку, которая жива. Двадцать четыре раза — это не потеря второго ядра, это отказ
- * пути данных. */
-static __thread struct conn g_conns[MAX_CONNS];
-static __thread struct sess g_sess[MAX_CONNS];
+ * пути данных.
+ *
+ * ТАБЛИЦЫ ПОТОКА — В КУЧЕ, А НЕ В __thread (шаг 2 выпуска 1.10). Прежде g_conns и сессии были
+ * массивами `static __thread` — около 14 МБ статического TLS. В статическом бинарнике это
+ * обходилось даром: musl отдаёт TLS потока свежими страницами, и память занимали только
+ * тронутые. В разделяемой libsteer (шаг 4) — нет: статический TLS библиотеки, загруженной при
+ * запуске, заводится КАЖДОМУ потоку КАЖДОГО процесса, который с ней слинкован, то есть и
+ * steerd, и всем модулям, а glibc к тому же зануляет его memset'ом — 14 МБ резидентной
+ * памяти на поток. Решение владельца было «таблицам не место в .so»; куча выполняет его, не
+ * требуя от модуля нести свою копию стека: у потока цикла одно отображение (mmap) под
+ * горячую таблицу, списки, корзины и сессии, и страницы в нём, как и прежде в TLS, берутся
+ * только по факту обращения. Установщикам и слежке за узлом таблицы теперь не достаются
+ * вовсе — прежде у каждого из них было по 14 МБ адресного пространства TLS, которые они не
+ * трогали.
+ *
+ * Указатели на таблицы остались __thread — это восемь байт на поток, а обращение к ним в пути
+ * пакета то же, что было к массивам. */
+static __thread struct conn *g_conns;
+/* Сессии дайлера, по одной на слот, шагом g_sess_stride. Шаг общий на процесс: он задаётся из
+ * dialer_ops.sess_size в stack_run до запуска потоков и дальше только читается. */
+static __thread unsigned char *g_sess;
+static size_t g_sess_stride;
 /* Сессия соединения. Считается по индексу, а НЕ хранится указателем: указатель это восемь
  * байт в горячей записи, которых ей взять негде.
  *
- * Годится только внутри потока-владельца: g_conns и g_sess — __thread, и у другого потока
- * своя база. Установщик поэтому получает указатель на сессию в самой заявке, а не считает
- * его сам — иначе он адресовал бы чужую таблицу по индексу из нашей. */
-#define SESS(c) (&g_sess[(size_t)((c) - g_conns)])
+ * Годится только внутри потока-владельца: g_conns и g_sess у каждого потока свои. Установщик
+ * поэтому получает указатель на сессию в самой заявке, а не считает его сам — иначе он
+ * адресовал бы чужую таблицу по индексу из нашей. */
+#define SESS(c) ((void *)(g_sess + (size_t)((c) - g_conns) * g_sess_stride))
 
 /* Занятые слоты, плотно. Все проходы цикла идут ТОЛЬКО по этому массиву — зачем, написано
  * выше у struct conn. */
-static __thread uint16_t g_live[MAX_CONNS];
+static __thread uint16_t *g_live;
 static __thread int g_live_n;
 /* Свободные слоты. Без него поиск места был бы перебором таблицы на каждый SYN. */
-static __thread uint16_t g_freelist[MAX_CONNS];
+static __thread uint16_t *g_freelist;
 static __thread int g_free_n;
 
 /* Хэш потока -> слот. Открытых цепочек, а не проб: удаление из цепочки не оставляет
@@ -540,7 +538,23 @@ static __thread int g_free_n;
  * Перебором это 320 сравнений по записи в 19 КБ — то есть 320 промахов кэша на пакет,
  * 2,2 миллиона в секунду. Хэш даёт одно обращение. */
 #define CONN_BUCKETS 512
-static __thread int16_t g_bucket[CONN_BUCKETS];
+static __thread int16_t *g_bucket;
+
+/* Дайлер процесса: таблица протокола и узел. Задаётся в stack_run до запуска потоков и дальше
+ * только читается — потому и не __thread: установщикам он нужен тот же, что циклу. */
+static const struct dialer *g_dl;
+
+/* Одно отображение на поток цикла: горячая таблица, списки и корзины, за ними — сессии. */
+struct conn_tables {
+    struct conn conns[MAX_CONNS];
+    uint16_t live[MAX_CONNS];
+    uint16_t freelist[MAX_CONNS];
+    int16_t bucket[CONN_BUCKETS];
+};
+/* Начало сессий — с границы строки кэша, как и шаг между ними. */
+#define SESS_ALIGN 64
+#define TABLES_HEAD (((sizeof(struct conn_tables)) + SESS_ALIGN - 1) & ~(size_t)(SESS_ALIGN - 1))
+static __thread size_t g_tables_len;
 
 static inline unsigned flow_hash(const struct flow_key *k) {
     /* Порты вместе с адресами: соединения к одному узлу отличаются только исходным портом,
@@ -668,218 +682,16 @@ static void stats_dump(uint64_t window_ns) {
 static int g_trace;
 #define TR(...) do { if (g_trace) fprintf(stderr, "tun: " __VA_ARGS__); } while (0)
 
-/* ---- слежка за узлом: клиент под демоном сам говорит, жив ли узел -----------------------
- *
- * ЗАЧЕМ. Клиент сообщал демону `up` при выборе узла и больше ничего, а умерший потом узел сторож
- * будто бы замечал пробой TCP через устройство. Не замечал: SYN-ACK на SYN клиент отдаёт сам и
- * сразу, ДО рукопожатия с узлом (handle_packet, «SYN-ACK — СРАЗУ»), поэтому connect пробы
- * сторожа удавался и на мёртвом узле. Рукопожатие, которое эта проба заводила у установщика, не
- * мерил никто: проба к тому времени уже закрыла сокет. Жив ли узел, знает только клиент, — и
- * сказать это должен он сам, событием в трубу (evline.h): `down` с причиной, когда узел
- * перестал отвечать, и снова `up`, когда ответил. Сторож такого клиента пробой не спрашивает
- * (fostate.h, watch), а принимает его слово.
- *
- * МЕРА — vless_probe: та же проверка, по которой узел выбирается при подъёме (соединение,
- * TLS/Reality, запрос через узел и первый байт ответа). Одна мера на «выбран», «потерян» и
- * «нашёлся», иначе down и up мерились бы разными линейками, и выход мигал бы там, где одна
- * говорит «жив», а другая — нет. Исходы соединений живого трафика приговором НЕ служат, они
- * только зовут проверку раньше срока: NW_STREAK отказов vless_connect подряд (без удачи между
- * ними) — проверить сейчас. Приговором их не сделать потому, что пачка SYN при открытии
- * страницы отказывает вся разом на одной потере пакетов, а удачное рукопожатие не говорит, что
- * узел пропускает трафик дальше себя.
- *
- * РИТМ. Пока узел жив — проверка раз в NW_PERIOD_S: это период сторожа по умолчанию, то есть
- * частота той самой пробы, которую слежка заменяет, и фонового трафика не прибавляется: прежде
- * за период шли проба TCP, рукопожатие её соединения с узлом и пополнение запасных сессий
- * (spare_refill на её SYN), теперь — одна проверка. Неудачная проверка
- * повторяется через NW_CONFIRM_S, и `down` — только после двух неудач подряд: одна потеря на
- * радиоканале не должна переключать группу туда и обратно. Узел назван номером — при подъёме
- * его не проверяли (перебора нет, out_node_named), и первая проверка идёт сразу.
- *
- * УЗЕЛ ПОТЕРЯН. Круг проверок: сперва свой узел (короткий сбой проходит на месте, с тем же
- * устройством), потом остальные кандидаты в порядке предпочтения (out_node_list — тот же, что у
- * подъёма). Свой ответил — `up`. Ответил другой — процесс выходит: сменить узел на ходу нельзя,
- * каждое соединение несёт параметры своего узла (UUID, flow и транспорт берутся у узла на каждой
- * отправке), а подъём заново — тот же перебор, что при старте, и выберет первого отвечающего по
- * порядку. Поднимет процесс супервизор демона. Не ответил никто — следующий круг через
- * NW_RETRY_S, с каждым пустым кругом вдвое дольше, до NW_RETRY_MAX_S: подписку, где мертвы все,
- * незачем перебирать без передышки.
- *
- * ТОЛЬКО ПОД ДЕМОНОМ (evline_enabled): кроме демона, `down` услышать некому. Под procd и при
- * ручном запуске потока нет и проверок нет — поведение прежнее, и сторож там пробует устройство,
- * как пробовал.
- *
- * ПОТОК свой, с одной задачей: спит на условной переменной до срока (CLOCK_MONOTONIC — во сне
- * телефона эти часы стоят, и слежка его не будит), установщик будит его раньше по серии отказов.
- * В тишине — одно пробуждение в минуту. */
-#define NW_PERIOD_S    60
-#define NW_CONFIRM_S   3
-#define NW_RETRY_S     15
-#define NW_RETRY_MAX_S 300
-#define NW_STREAK      3
-#define NW_TIMEOUT_S   8
-
-static struct {
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
-    int on;                         /* поток слежки завёлся: только тогда ему докладывают */
-    int streak;                     /* отказов vless_connect подряд */
-    int kick;                       /* серия набралась — проверить сейчас */
-    const struct vless_node *nodes;
-    const int *sel;                 /* кандидаты в порядке предпочтения (индексы в nodes) */
-    size_t sel_n;
-    int cur;                        /* узел, которым идёт трафик */
-    int checked;                    /* узел проверен при подъёме (перебор) */
-} g_nw = { .mu = PTHREAD_MUTEX_INITIALIZER };
-
-/* Исход рукопожатия с узлом — от установщика (и живого соединения, и запасной сессии). */
-static void nw_seen(int rc) {
-    if (!__atomic_load_n(&g_nw.on, __ATOMIC_ACQUIRE)) return;
-    pthread_mutex_lock(&g_nw.mu);
-    if (rc == 0) g_nw.streak = 0;
-    else if (++g_nw.streak >= NW_STREAK) {
-        g_nw.kick = 1;
-        pthread_cond_signal(&g_nw.cv);
-    }
-    pthread_mutex_unlock(&g_nw.mu);
-}
-
-static uint64_t nw_now_ms(void) { return now_ns() / 1000000ull; }
-
-/* Ждать срока due (мс CLOCK_MONOTONIC) или, пока узел жив, серии отказов. Под замком. */
-static void nw_wait(uint64_t due, int up) {
-    struct timespec ts = { .tv_sec = (time_t)(due / 1000), .tv_nsec = (long)(due % 1000) * 1000000L };
-    while (!(up && g_nw.kick) && nw_now_ms() < due)
-        pthread_cond_timedwait(&g_nw.cv, &g_nw.mu, &ts);
-    g_nw.kick = 0;
-}
-
-/* down с причиной проверки (vless_probe: «TCP не соединился», «ответа нет: …»). Причина — как
- * есть, без приставки «узел не отвечает»: это и так значит down после up, а место в событии
- * дорого. Событие пишется одной записью не длиннее EVLINE_WRITE_MAX (480 байт, evline.c), и
- * каждый байт вне ASCII идёт в ней шестью знаками \u00XX — то есть кириллицы влезает меньше
- * восьмидесяти байт. Длиннее — событие потерялось бы целиком, поэтому причина обрезается здесь,
- * по границе знака UTF-8: не больше NW_WHY_ESC знаков в записи. */
-#define NW_WHY_ESC 440
-static void nw_down(const char *why) {
-    char w[160];
-    size_t n = 0, esc = 0;
-    for (const unsigned char *s = (const unsigned char *)why; *s && n + 1 < sizeof(w); ) {
-        /* Знак целиком: ведущий байт и его продолжения. */
-        size_t len = *s >= 0xF0 ? 4 : *s >= 0xE0 ? 3 : *s >= 0xC0 ? 2 : 1;
-        size_t cost = 0, k;
-        for (k = 0; k < len && s[k]; k++)
-            cost += s[k] >= 0x80 || s[k] < 0x20 ? 6 : (s[k] == '"' || s[k] == '\\') ? 2 : 1;
-        if (k < len || n + len + 1 > sizeof(w) || esc + cost > NW_WHY_ESC) break;
-        memcpy(w + n, s, len);
-        n += len;
-        esc += cost;
-        s += len;
-    }
-    w[n] = '\0';
-    evline_emit("down", "why", EVLINE_STR, w[0] ? w : "узел не отвечает", (const char *)NULL);
-}
-
-static void *nw_thread(void *arg) {
-    (void)arg;
-    const struct vless_node *cur = &g_nw.nodes[g_nw.cur];
-    int up = 1, fails = 0;
-    uint64_t retry = NW_RETRY_S;
-    uint64_t due = nw_now_ms() + (g_nw.checked ? NW_PERIOD_S * 1000ull : 0);
-    char why[256];
-    for (;;) {
-        pthread_mutex_lock(&g_nw.mu);
-        nw_wait(due, up);
-        pthread_mutex_unlock(&g_nw.mu);
-        if (up) {
-            if (vless_probe(cur, NW_TIMEOUT_S, why, sizeof(why)) == 0) {
-                fails = 0;
-                pthread_mutex_lock(&g_nw.mu);
-                g_nw.streak = 0;
-                pthread_mutex_unlock(&g_nw.mu);
-                due = nw_now_ms() + NW_PERIOD_S * 1000ull;
-                continue;
-            }
-            if (++fails < 2) { due = nw_now_ms() + NW_CONFIRM_S * 1000ull; continue; }
-            up = 0;
-            fails = 0;
-            retry = NW_RETRY_S;
-            nw_down(why);
-            fprintf(stderr, LOG_W2 "узел %s не отвечает: %s — проверяю узлы\n", cur->name, why);
-            due = nw_now_ms() + retry * 1000ull;
-            continue;
-        }
-        /* Круг: сперва свой, потом остальные кандидаты по порядку (см. шапку). */
-        if (vless_probe(cur, NW_TIMEOUT_S, why, sizeof(why)) == 0) {
-            up = 1;
-            pthread_mutex_lock(&g_nw.mu);
-            g_nw.streak = 0;
-            g_nw.kick = 0;
-            pthread_mutex_unlock(&g_nw.mu);
-            evline_emit("up", "watch", EVLINE_INT, 1L, (const char *)NULL);
-            fprintf(stderr, LOG_I2 "узел %s снова отвечает\n", cur->name);
-            due = nw_now_ms() + NW_PERIOD_S * 1000ull;
-            continue;
-        }
-        for (size_t k = 0; k < g_nw.sel_n; k++) {
-            const struct vless_node *n = &g_nw.nodes[g_nw.sel[k]];
-            if (g_nw.sel[k] == g_nw.cur || vless_probe(n, NW_TIMEOUT_S, why, sizeof(why)) != 0)
-                continue;
-            fprintf(stderr, LOG_W2 "узел %s не отвечает, а %s отвечает — выхожу, чтобы выбрать "
-                            "узел заново\n", cur->name, n->name);
-            exit(0);
-        }
-        retry = retry * 2 > NW_RETRY_MAX_S ? NW_RETRY_MAX_S : retry * 2;
-        due = nw_now_ms() + retry * 1000ull;
-    }
-    return NULL;
-}
-
-/* Узел выбран: сказать демону up и, если он слушает, завести слежку (шапка выше). Замок держится
- * от создания потока до записи up: первая проверка названного узла идёт сразу, и её down не
- * должен обогнать up в трубе. */
-static void nw_start(const struct vless_node *nodes, const int *sel, size_t sel_n, int cur,
-                     int checked) {
-    if (!evline_enabled()) { evline_emit("up", (const char *)NULL); return; }
-    pthread_condattr_t ca;
-    pthread_condattr_init(&ca);
-    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
-    pthread_cond_init(&g_nw.cv, &ca);
-    pthread_condattr_destroy(&ca);
-    g_nw.nodes = nodes;
-    g_nw.sel = sel;
-    g_nw.sel_n = sel_n;
-    g_nw.cur = cur;
-    g_nw.checked = checked;
-    pthread_attr_t a;
-    pthread_attr_init(&a);
-    /* Проверка держит соединение (struct vless_conn) на своём стеке — с запасом против 128 КБ
-     * потока по умолчанию у musl. */
-    pthread_attr_setstacksize(&a, 512 * 1024);
-    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-    pthread_t t;
-    pthread_mutex_lock(&g_nw.mu);
-    int err = pthread_create(&t, &a, nw_thread, NULL);
-    pthread_attr_destroy(&a);
-    if (err) {
-        pthread_mutex_unlock(&g_nw.mu);
-        /* Без слежки up — прежний, без watch: сторож тогда пробует устройство сам, как раньше
-         * (и так же не видит узла за ним — см. шапку). */
-        fprintf(stderr, LOG_W2 "поток слежки за узлом не создался (%s) — потерю узла клиент "
-                        "не заметит\n", strerror(err));
-        evline_emit("up", (const char *)NULL);
-        return;
-    }
-    __atomic_store_n(&g_nw.on, 1, __ATOMIC_RELEASE);
-    evline_emit("up", "watch", EVLINE_INT, 1L, (const char *)NULL);
-    pthread_mutex_unlock(&g_nw.mu);
-}
+/* Слежка за узлом (клиент под демоном сам говорит, жив ли узел) жила здесь и переехала в модуль
+ * протокола — proto/vless/vlwatch.c: её мера — проверка VLESS, кандидаты — узлы подписки. Исходы
+ * рукопожатий установщика доходят до неё через дайлер (connect в vldial.c). */
 
 /* ---- пул установщиков ------------------------------------------------------
  *
  * Рукопожатие вынесено из цикла в отдельные потоки. Пул, а не поток на соединение, по двум
  * причинам: поток на каждое соединение это сотни потоков на пачке запросов страницы, и —
- * важнее — адрес узла, сработавший в прошлый раз, кэшируется в client.c как __thread. Живя
+ * важнее — адрес узла, сработавший в прошлый раз, кэшируется в транспорте как __thread
+ * (proto/transport/trdial.c). Живя
  * в потоке-однодневке, этот кэш терялся бы на каждом соединении, и перебор мёртвых адресов
  * начинался бы заново.
  *
@@ -893,6 +705,10 @@ static void nw_start(const struct vless_node *nodes, const int *sel, size_t sel_
  * Держать вдвое больше потоков за тот же результат незачем. */
 #define CONNECTORS 4
 #define CONNQ 32
+/* Сколько установщик ждёт связи с узлом. Восемь секунд — прежнее число: его же берёт проверка
+ * узла при подъёме, и соединение, которое проверка сочла бы живым, не должно отваливаться здесь
+ * по более короткому сроку. */
+#define CONNECT_TIMEOUT_S 8
 
 /* ---- запасные сессии -------------------------------------------------------
  *
@@ -901,7 +717,8 @@ static void nw_start(const struct vless_node *nodes, const int *sel, size_t sel_
  * уезжает в туннель. Уравнять пути можно только одним способом: сделать рукопожатие
  * ЗАРАНЕЕ. Это возможно, потому что адрес назначения в VLESS едет не при установлении, а
  * в заголовке запроса — вместе с первыми данными (см. upstream_send): TLS-сессия к узлу
- * до этого момента ничья, и её можно приготовить впрок.
+ * до этого момента ничья, и её можно приготовить впрок. Для стека это свойство дайлера —
+ * DC_PRECONNECT (dialer.h): у протокола, где адрес нужен уже при установлении, пула нет.
  *
  * Пул пополняется ТОЛЬКО по приходу SYN — на тихом роутере фоновых рукопожатий нет
  * совсем. Браузер же открывает соединения пачками: первый SYN пачки берёт запасную
@@ -913,7 +730,7 @@ static void nw_start(const struct vless_node *nodes, const int *sel, size_t sel_
  * мёртвым сами, не проверяя: проверка стоила бы круга до сервера, а протухшую сессию
  * дешевле выбросить и открыть новую.
  *
- * Память: жилая часть vless_conn — это ~19 КБ буферов TLS; при четырёх запасных — до
+ * Память: жилая часть связи — это ~19 КБ буферов TLS; при четырёх запасных — до
  * 76 КБ, и то лишь у выхода, через который реально ходят. Плата сопоставима с одним
  * лишним живым соединением. */
 #define SPARE_MAX 8
@@ -921,15 +738,19 @@ static void nw_start(const struct vless_node *nodes, const int *sel, size_t sel_
 #define SPARE_EMPTY   0
 #define SPARE_FILLING 1
 #define SPARE_READY   2
+/* Запасная — это целая сессия дайлера, а берётся из неё только связь (dialer_ops.take).
+ * Сессии лежат одним блоком в куче (stack_run), по SPARE_MAX штук шагом g_sess_stride: прежде
+ * это был статический массив внутри таблицы, но размер сессии теперь называет дайлер. */
 struct spare {
-    struct vless_conn v;
+    void *sess;
     uint64_t born_ns;
     uint8_t state;
 };
 static struct spare g_spares[SPARE_MAX];
 static pthread_mutex_t g_spare_mu = PTHREAD_MUTEX_INITIALIZER;
 /* Сколько держать. Задаётся STEER_TUN_SPARES (0 выключает), читается один раз в
- * tunnel_run — до запуска потоков, поэтому дальше поле только читают. */
+ * stack_run — до запуска потоков, поэтому дальше поле только читают. Ноль и у дайлера без
+ * DC_PRECONNECT: связь, которой нужен адрес назначения, впрок не приготовить. */
 static int g_spare_want;
 /* Последний отказ установления запасной: пока узел не отвечает, пополнять пул — значит
  * занимать установщиков заведомо мёртвыми попытками наперегонки с живыми заявками. */
@@ -939,11 +760,12 @@ static uint64_t g_spare_fail_ns;
  * потока своя, и SESS() в чужом потоке адресовал бы чужую таблицу. Ошибка была бы из тех,
  * что проявляются перепутанными кусками чужого соединения раз в сутки.
  *
- * c == NULL означает пополнение пула запасных: v указывает в g_spares, и результат
- * останется там же — забирать его некому, его найдёт следующий SYN. efd — eventfd
+ * c == NULL означает пополнение пула запасных: sp — слот g_spares, sess — его сессия, и
+ * результат останется там же — забирать его некому, его найдёт следующий SYN. efd — eventfd
  * потока-заказчика: по готовности установщик будит его цикл, чтобы SYN-ACK... уже не
- * SYN-ACK (он ушёл сразу), а ранние данные не ждали до 20 мс опроса. */
-struct connjob { struct conn *c; struct vless_conn *v; const struct vless_node *node; int efd; };
+ * SYN-ACK (он ушёл сразу), а ранние данные не ждали до 20 мс опроса. Узла в заявке нет: он
+ * один на процесс и лежит в дайлере (g_dl). */
+struct connjob { struct conn *c; void *sess; struct spare *sp; int efd; };
 static struct {
     struct connjob q[CONNQ];
     unsigned head, n;
@@ -964,10 +786,10 @@ static void *connector(void *arg) {
 
         if (!j.c) {
             /* Пополнение пула: сессия остаётся в своём слоте g_spares, будить некого —
-             * её заберёт следующий SYN. Слот наш (FILLING), пока не отдадим. */
-            struct spare *sp = (struct spare *)((char *)j.v - offsetof(struct spare, v));
-            int rc = vless_connect(j.node, j.v, 8);
-            nw_seen(rc);
+             * её заберёт следующий SYN. Слот наш (FILLING), пока не отдадим. Исход слежке
+             * за узлом докладывает сам дайлер — внутри connect. */
+            struct spare *sp = j.sp;
+            int rc = g_dl->ops->connect(g_dl->ctx, j.sess, CONNECT_TIMEOUT_S);
             pthread_mutex_lock(&g_spare_mu);
             if (rc == 0) {
                 sp->born_ns = now_ns();
@@ -980,9 +802,9 @@ static void *connector(void *arg) {
             continue;
         }
 
-        int rc = vless_connect(j.node, j.v, 8);
-        /* Исход — и слежке за узлом (под демоном): серия отказов зовёт её проверку раньше срока. */
-        nw_seen(rc);
+        /* Исход — и слежке за узлом (под демоном): серия отказов зовёт её проверку раньше
+         * срока. Докладывает дайлер, потому что мера «жив ли узел» — его. */
+        int rc = g_dl->ops->connect(g_dl->ctx, j.sess, CONNECT_TIMEOUT_S);
         j.c->rc = rc;
         /* RELEASE: цикл читает done с ACQUIRE, и всё, что записано в сессию выше, обязано
          * быть видно ему к этому моменту. Без барьера это ровно та ошибка, которая
@@ -1049,7 +871,8 @@ static int connq_push(const struct connjob *j) {
  * Берётся САМАЯ СТАРАЯ из годных: свежие переживут ещё один SYN, а старую иначе всё
  * равно выбросил бы срок. Протухшие закрываются прямо здесь — это не горячий путь,
  * SYN приходят десятками в секунду, не тысячами. */
-static int spare_checkout(struct vless_conn *out) {
+static int spare_checkout(void *out) {
+    const struct dialer_ops *d = g_dl->ops;
     uint64_t now = now_ns();
     struct spare *best = NULL;
     pthread_mutex_lock(&g_spare_mu);
@@ -1057,37 +880,29 @@ static int spare_checkout(struct vless_conn *out) {
         struct spare *sp = &g_spares[i];
         if (sp->state != SPARE_READY) continue;
         if ((now - sp->born_ns) / 1000000 >= SPARE_TTL_MS) {
-            vless_close(&sp->v);
+            d->close(sp->sess);
             sp->state = SPARE_EMPTY;
             continue;
         }
         /* Сервер мог успеть закрыть парковку — это видно без чтения. POLLIN сам по
          * себе не приговор: там может лежать NewSessionTicket, чтение его пропустит. */
-        struct pollfd pd = { .fd = sp->v.fd, .events = POLLIN | POLLRDHUP };
+        struct pollfd pd = { .fd = d->fd(sp->sess), .events = POLLIN | POLLRDHUP };
         if (poll(&pd, 1, 0) > 0 && (pd.revents & (POLLERR | POLLHUP | POLLRDHUP))) {
-            vless_close(&sp->v);
+            d->close(sp->sess);
             sp->state = SPARE_EMPTY;
             continue;
         }
         if (!best || sp->born_ns < best->born_ns) best = sp;
     }
+    /* Переселение связи — у дайлера: что в сессии связь, а что состояние потока, и какие в
+     * связи указатели на саму себя (у HTTP/2 их два, см. xhttp_moved в trxhttp.c), знает он, а
+     * не стек. Под замком, как прежде копия: слот станет пустым только после неё. */
     if (best) {
-        memcpy(out, &best->v, sizeof(*out));
+        d->take(out, best->sess);
         best->state = SPARE_EMPTY;
     }
     pthread_mutex_unlock(&g_spare_mu);
-    if (!best) return -1;
-    /* h2 держит указатель на своё же соединение (io.ctx) — после переезда структуры
-     * он указывает в брошенный слот пула. Для tcp-транспорта h2 не используется вовсе.
-     * Таких самоуказателей ДВА: второй — у выгрузки xhttp (up_request ставит
-     * up.h2.io.ctx = &c->up), и для stream-up он ставится ещё в слоте, внутри vless_connect.
-     * Пока чинился только первый, выгрузка соединения уезжала через up чужой запасной
-     * сессии, которая тут же заводилась в том же слоте. */
-    if (out->tr != VT_RAW) {
-        out->h2.io.ctx = out;
-        out->up.h2.io.ctx = &out->up;
-    }
-    return 0;
+    return best ? 0 : -1;
 }
 
 /* Закрыть протухшие запасные сессии.
@@ -1108,7 +923,7 @@ static void spare_sweep(void) {
         struct spare *sp = &g_spares[i];
         if (sp->state != SPARE_READY) continue;
         if ((now - sp->born_ns) / 1000000 < SPARE_TTL_MS) continue;
-        vless_close(&sp->v);
+        g_dl->ops->close(sp->sess);
         sp->state = SPARE_EMPTY;
     }
     pthread_mutex_unlock(&g_spare_mu);
@@ -1117,7 +932,7 @@ static void spare_sweep(void) {
 /* Пополнить пул до want. Вызывается на каждый SYN — то есть ровно тогда, когда
  * соединения действительно открывают. Слоты резервируются под замком, заявки уходят
  * без него: connq_push берёт свой мьютекс, и держать два вложенными незачем. */
-static void spare_refill(const struct vless_node *node) {
+static void spare_refill(void) {
     if (g_spare_want <= 0) return;
     int fill[SPARE_MAX];
     int nfill = 0;
@@ -1137,7 +952,8 @@ static void spare_refill(const struct vless_node *node) {
     pthread_mutex_unlock(&g_spare_mu);
 
     for (int k = 0; k < nfill; k++) {
-        struct connjob j = { .c = NULL, .v = &g_spares[fill[k]].v, .node = node, .efd = -1 };
+        struct connjob j = { .c = NULL, .sess = g_spares[fill[k]].sess, .sp = &g_spares[fill[k]],
+                             .efd = -1 };
         if (connq_push(&j) != 0) {
             /* Очередь полна — живые заявки важнее. Вернуть ВСЕ оставшиеся резервы:
              * слот в состоянии FILLING без заявки не заполнит никто и никогда. */
@@ -1155,11 +971,12 @@ static void spare_refill(const struct vless_node *node) {
  * закрывал сессию, с которой в тот момент работает установщик, и дальше происходили сразу две
  * разные беды:
  *
- *   - vless_close отдавал ядру дескриптор, которым установщик ещё пользуется. Номер тут же
- *     достаётся другому потоку, и куски чужого соединения уезжают не туда — ровно тот класс
+ *   - закрытие сессии отдавало ядру дескриптор, которым установщик ещё пользуется. Номер тут
+ *     же достаётся другому потоку, и куски чужого соединения уезжают не туда — ровно тот класс
  *     ошибок, ради которого заявка и несёт указатель на сессию, а не индекс;
- *   - g_conns и g_sess живут в TLS потока-владельца. Он возвращается из worker_loop, TLS
- *     освобождается, а установщик продолжает писать по прежнему адресу.
+ *   - таблицы и сессии принадлежат потоку-владельцу. Он возвращается из worker_loop и
+ *     освобождает их (прежде — вместе с TLS, теперь — munmap), а установщик продолжает писать
+ *     по прежнему адресу.
  *
  * Необслуженные заявки просто выбрасываем: установщик их ещё не брал, ждать нечего. Ждать
  * приходится только взятых, их не больше CONNECTORS, и каждая ограничена таймаутом connect.
@@ -1207,23 +1024,54 @@ static int connq_release(struct conn *base) {
 static __thread int g_conn_efd = -1;
 
 /* Поставить заявку. 0 — принята, -1 — очередь полна. */
-static int conn_submit(struct conn *c, const struct vless_node *node) {
-    struct connjob j = { .c = c, .v = &SESS(c)->v, .node = node, .efd = g_conn_efd };
+static int conn_submit(struct conn *c) {
+    struct connjob j = { .c = c, .sess = SESS(c), .sp = NULL, .efd = g_conn_efd };
     return connq_push(&j);
 }
 
-/* Таблица заводится один раз на поток: свободны все слоты, корзины пусты. */
-static void conn_table_init(void) {
+/* Таблица заводится один раз на поток: свободны все слоты, корзины пусты. 0 — готово, -1 —
+ * памяти под неё нет.
+ *
+ * Одно отображение (mmap), а не malloc: размер — десяток мегабайт, и нужны свежие нулевые
+ * страницы, которые ядро выдаёт по факту обращения, — ровно то, что прежде давал TLS потока.
+ * Трогаются здесь только горячая таблица и первые байты каждой сессии (dialer_ops.clear), то
+ * есть одна страница на слот — столько же, сколько трогала прежняя запись `v.fd = -1`. */
+static int conn_table_init(void) {
+    if (!g_conns) {
+        size_t len = TABLES_HEAD + (size_t)MAX_CONNS * g_sess_stride;
+        void *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m == MAP_FAILED) return -1;
+        struct conn_tables *t = m;
+        g_conns = t->conns;
+        g_live = t->live;
+        g_freelist = t->freelist;
+        g_bucket = t->bucket;
+        g_sess = (unsigned char *)m + TABLES_HEAD;
+        g_tables_len = len;
+    }
     g_live_n = 0;
     g_free_n = 0;
     for (int i = MAX_CONNS - 1; i >= 0; i--) {
         g_conns[i].livepos = -1;
         g_conns[i].hnext = -1;
         g_conns[i].fd = -1;
-        SESS(&g_conns[i])->v.fd = -1;
+        g_dl->ops->clear(SESS(&g_conns[i]));
         g_freelist[g_free_n++] = (uint16_t)i;
     }
     for (int i = 0; i < CONN_BUCKETS; i++) g_bucket[i] = -1;
+    return 0;
+}
+
+/* Вернуть таблицы потока системе. Только когда установщики отпущены (connq_release вернул 0):
+ * иначе они писали бы в снятое отображение. */
+static void conn_table_free(void) {
+    if (!g_conns) return;
+    munmap(g_conns, g_tables_len);
+    g_conns = NULL;
+    g_live = g_freelist = NULL;
+    g_bucket = NULL;
+    g_sess = NULL;
+    g_tables_len = 0;
 }
 
 static struct conn *conn_find(const struct flow_key *k) {
@@ -1369,131 +1217,26 @@ static struct conn *conn_new(const struct tun_dev *tun) {
 static void conn_drop(struct conn *c) {
     TR("закрываю conn#%ld fd=%d\n", (long)(c - g_conns), c->fd);
     if (c->used) {
-        vless_close(&SESS(c)->v);
+        g_dl->ops->close(SESS(c));
         conn_unlink(c);
         g_freelist[g_free_n++] = (uint16_t)(c - g_conns);
     }
     rtx_done(&c->rtx);
     free(c->early);
-    /* Толстую половину НЕ трём целиком: 18,8 КБ memset на каждое закрытие это 18,8 КБ,
-     * прогнанных через кэш ради нулей, которые всё равно перепишет vless_connect (он
-     * начинается с memset своей структуры). Здесь достаточно обнулить то, что читаем сами. */
+    /* Толстую половину НЕ трём целиком: десятки килобайт memset на каждое закрытие — это
+     * десятки килобайт, прогнанных через кэш ради нулей, которые всё равно перепишет открытие
+     * связи. Сессию к новому соединению готовит дайлер (clear), трогая только её начало. */
     memset(c, 0, sizeof(*c));
     c->fd = -1;
-    SESS(c)->v.fd = -1;
     c->livepos = -1;
     c->hnext = -1;
-    memset(&SESS(c)->vis, 0, sizeof(SESS(c)->vis));
-    /* Счётчики сборки датаграммы — но НЕ сам буфер: 4 КБ нулей на каждое закрытие это те
-     * же 4 КБ через кэш ради данных, которые всё равно перепишет следующая датаграмма.
-     * Читаем мы только счётчики, и обнулить достаточно их — ровно то же правило, по
-     * которому целиком не трётся и толстая половина. */
-    SESS(c)->dg_want = SESS(c)->dg_have = 0;
-    SESS(c)->dg_skip = 0;
-    SESS(c)->lenb_n = 0;
+    g_dl->ops->clear(SESS(c));
 }
 
-/* Отправить серверу данные в правильной форме: с заголовком VLESS на первом кадре и в
- * обёртке Vision, если узел её требует.
- *
- * Три исхода, а не два: «ушло», «сейчас нельзя, повторите» и «всё сломалось». Средний
- * появился вместе с HTTP/2, где закрытое окно — нормальное состояние, а не сбой, и
- * путать его с отказом значит разрывать рабочее соединение. */
-#define SEND_OK    0
-#define SEND_AGAIN 1
-#define SEND_FATAL (-1)
-
-static int upstream_send(struct conn *c, const struct vless_node *node,
-                         const unsigned char *data, size_t n) {
-    struct sess *s = SESS(c);
-    /* Буфер нужен ТОЛЬКО чтобы приклеить заголовок или кадр Vision к данным одной записью.
-     * Когда клеить нечего — а это обычный случай, потому что заголовок уходит один раз на
-     * соединение, а Vision заканчивает набивку первым же кадром, — данные отдаются прямо из
-     * пакета, без копии вовсе. */
-    static __thread unsigned char out[TUNNEL_BUF];
-    const unsigned char *body = data;
-    size_t len = 0;
-
-    if (!c->header_sent) {
-        /* Адрес назначения берём из пакета: имени у нас нет, клиент уже разрешил его сам
-         * (или через наш резолвер, который вернул fake-IP и подменит адрес в DNAT). */
-        unsigned char ip4[4];
-        memcpy(ip4, &c->key.dst, 4);
-        /* Поток UDP объявляется командой 2 и БЕЗ flow.
-         *
-         * Vision (xtls-rprx-vision) — это про TCP: он подменяет копирование потока после
-         * рукопожатия, а у датаграмм такого потока нет. Xray это и требует: аккаунту с
-         * flow=xtls-rprx-vision он запрещает vision на TCP-запросе без flow, но UDP-запрос
-         * с пустым flow принимает — именно так ходит UDP у самого Xray. Прислать здесь flow
-         * значило бы получить закрытый поток без внятной причины.
-         *
-         * dport уже в хостовом порядке — см. комментарий в tun.h. */
-        len = vless_build_request(s->uuid, c->is_udp ? VLESS_CMD_UDP : VLESS_CMD_TCP,
-                                  NULL, ip4, c->key.dport,
-                                  c->is_udp ? NULL : node->flow, out, sizeof(out));
-        if (!len) return SEND_FATAL;
-    }
-
-    /* Оборачивать нужно только пока Vision не закончил набивку. После кадра end vision_wrap
-     * сводится к копированию данных на месте — а копию мы делали ДВАЖДЫ: сначала в framed,
-     * потом из него в out. То есть каждый байт выгрузки проходил по памяти трижды (третий
-     * раз — внутри tls13_write, где он обязателен: шифрование идёт на месте в записи).
-     * Теперь до шифрования копий ноль или одна. */
-    /* Состояние Vision снимается ДО обёртки и возвращается, если отправка не удалась.
-     *
-     * Иначе первый кадр терялся безвозвратно при закрытом окне HTTP/2: vision_wrap уже
-     * пометил бы UUID отправленным и набивку законченной, а h2_write не отправил НИЧЕГО
-     * (он либо всё, либо ничего). Клиент повторяет тот же пакет, мы отправляем его уже без
-     * кадра и без UUID — сервер такого не ждёт и закрывает поток. Снаружи это выглядело бы
-     * как «узел с vision и grpc иногда не работает», причём «иногда» означало бы «когда
-     * сервер не успел принять», то есть на быстром канале чаще.
-     *
-     * Шестьдесят четыре байта копии против невоспроизводимой поломки протокола. */
-    struct vision vis_before = s->vis;
-    if (node->flow[0] && !c->is_udp && !s->vis.sent_end) {
-        size_t fn = vision_wrap(&s->vis, data, n, out + len, sizeof(out) - len);
-        if (!fn) return SEND_FATAL;
-        len += fn;
-        body = out;
-    } else if (len) {
-        /* Заголовок уже лежит в out — данные приклеиваем к нему. */
-        if (len + n > sizeof(out)) return SEND_FATAL;
-        memcpy(out + len, data, n);
-        len += n;
-        body = out;
-    } else {
-        len = n;
-    }
-
-    /* Через vless_send: упаковку транспорта знает клиент, а не туннель. */
-    int rc = vless_send(&s->v, body, len);
-    if (rc == H2_EWINDOW) {
-        /* Окно HTTP/2 закрыто: сервер не успевает принимать. Это НЕ отказ — это то, для
-         * чего управление потоком и существует. Ничего не ушло (h2_write либо отправляет
-         * всё, либо ничего), поэтому достаточно не подтверждать пакет: клиент повторит
-         * его сам, как при потере, и повторит уже тогда, когда окно откроется.
-         *
-         * Первая версия считала это ошибкой и разрывала соединение. Выглядело как
-         * «выгрузка обрывается на случайном месте» — месте, где сервер впервые не успел. */
-        s->vis = vis_before;                /* кадр не ушёл — обёртка как бы не делалась */
-        return SEND_AGAIN;
-    }
-    if (rc == H2_ESTATUS) {
-        /* Сервер xhttp ответил отказом на выгрузку (stream-up, packet-up): кусок не принят, и
-         * поток за ним цел не будет. Закрываем, как любую неудачу отправки, но причину
-         * называем — иначе узел, отказывающий каждому куску, выглядит живым (I-219). */
-        static __thread time_t said;
-        if (g_now_s - said >= 5) {
-            said = g_now_s;
-            fprintf(stderr, LOG_W "узел %s не принял данные: %s — соединение закрыто; "
-                            "проверьте настройки xhttp узла\n", node->name, vless_strerror(rc));
-        }
-    }
-    if (rc) return SEND_FATAL;
-    /* Заголовок отмечаем отправленным только теперь: пометить раньше значило бы, что
-     * повторная попытка уйдёт без него, и сервер не поймёт, куда соединять. */
-    c->header_sent = 1;
-    return SEND_OK;
+/* Отправить узлу данные клиента. Форма — заголовок запроса, обёртки, упаковка транспорта —
+ * дело дайлера (dialer_ops.send); итог — SEND_* (dialer.h). */
+static int upstream_send(struct conn *c, const unsigned char *data, size_t n) {
+    return g_dl->ops->send(g_dl->ctx, SESS(c), &c->key, c->is_udp, data, n);
 }
 
 /* SYN-ACK клиенту. ISN всегда 1 и в our_seq не хранится: our_seq заводится сразу как 2
@@ -1531,13 +1274,13 @@ static void conn_reset(struct conn *c, const struct tun_dev *tun) {
  * h2 закрыто, дошлём позже); -1 — поток сломан, соединению конец. Пока хвост не ушёл,
  * никакие свежие данные клиента серверу не отправляются — иначе байты поменяются
  * местами, а TCP-поток этого не прощает. */
-static int early_flush(struct conn *c, const struct vless_node *node) {
+static int early_flush(struct conn *c) {
     while (c->early_off < c->early_n) {
         size_t chunk = c->early_n - c->early_off;
-        /* Запас под заголовок VLESS и кадр Vision: upstream_send клеит их в один буфер
-         * TUNNEL_BUF, и порция впритык не влезла бы вместе с ними. */
+        /* Запас под заголовок запроса и обёртку (у VLESS — кадр Vision): дайлер клеит их в
+         * один буфер TUNNEL_BUF, и порция впритык не влезла бы вместе с ними. */
         if (chunk > TUNNEL_BUF - 2048) chunk = TUNNEL_BUF - 2048;
-        int sr = upstream_send(c, node, c->early + c->early_off, chunk);
+        int sr = upstream_send(c, c->early + c->early_off, chunk);
         if (sr == SEND_AGAIN) return 1;
         if (sr != SEND_OK) return -1;
         c->early_off += (uint32_t)chunk;
@@ -1551,9 +1294,9 @@ static int early_flush(struct conn *c, const struct vless_node *node) {
 /* Придержать данные до готовности потока. 0 — взяли, -1 — не поместилось или нет памяти.
  *
  * Одна функция на TCP и UDP, потому что придерживается в обоих случаях РОВНО ТО, что уйдёт
- * серверу: у TCP это поток байт как есть, у UDP — уже обрамлённые датаграммы. Границы
- * датаграмм при этом сохраняются сами, без второго счётчика: длина каждой лежит в её же
- * первых двух байтах. */
+ * серверу: у TCP это поток байт как есть, у UDP — уже обрамлённые дайлером датаграммы
+ * (dgram_frame). Границы датаграмм при этом сохраняются сами, без второго счётчика: их несёт
+ * само обрамление — у VLESS это длина в первых двух байтах каждой. */
 static int early_hold(struct conn *c, const unsigned char *d, size_t n) {
     if (n > EARLY_CAP - c->early_n) return -1;
     if (!c->early) {
@@ -1572,97 +1315,48 @@ static int early_hold(struct conn *c, const unsigned char *d, size_t n) {
  * никому не важно, кроме сборщика фрагментов. */
 static __thread uint16_t g_ip_id;
 
-/* Датаграмма серверу: двухбайтовая длина и данные ОДНИМ куском.
+/* Датаграмма серверу: обрамление дайлера и данные ОДНИМ куском.
  *
  * Одним обязательно: h2_write отправляет либо всё, либо ничего, и датаграмма, разрезанная
  * на два вызова, при закрытом окне уехала бы половиной — сервер прочитал бы длину и стал
- * ждать хвост, которого нет, а следующая датаграмма приехала бы внутрь предыдущей. */
-static int udp_send_dgram(struct conn *c, const struct vless_node *node,
-                          const unsigned char *p, size_t n) {
-    static __thread unsigned char fr[2 + UDP_DGRAM_MAX];
+ * ждать хвост, которого нет, а следующая датаграмма приехала бы внутрь предыдущей.
+ *
+ * Запас в 64 байта под обрамление: у VLESS оно два байта длины, но буфер стека не должен
+ * знать, чьё именно. */
+static int udp_send_dgram(struct conn *c, const unsigned char *p, size_t n) {
+    static __thread unsigned char fr[UDP_DGRAM_MAX + 64];
     if (n > UDP_DGRAM_MAX) return SEND_FATAL;
-    fr[0] = (unsigned char)(n >> 8);
-    fr[1] = (unsigned char)n;
-    memcpy(fr + 2, p, n);
+    size_t fn = g_dl->ops->dgram_frame(p, n, fr, sizeof(fr));
+    if (!fn) return SEND_FATAL;
     /* Сессия ещё устанавливается: писать в неё нельзя — в ней работает установщик, — а
      * датаграмму придержать можно. Проверка стоит ЗДЕСЬ, в единственном месте, которое
      * знает про обрамление: разложенная по вызывающим, она была бы вторым правилом «кто
      * имеет право трогать сессию», и второе однажды разошлось бы с первым. */
     if (c->pending)
-        return early_hold(c, fr, 2 + n) == 0 ? SEND_OK : SEND_AGAIN;
-    return upstream_send(c, node, fr, 2 + n);
+        return early_hold(c, fr, fn) == 0 ? SEND_OK : SEND_AGAIN;
+    return upstream_send(c, fr, fn);
 }
 
-/* Разобрать поток датаграмм от узла и отдать их клиенту.
- *
- * Состояние сборки живёт в сессии между вызовами: границы датаграммы, кадра HTTP/2 и записи
- * TLS не совпадают ни в одном месте, и «дочитать до конца датаграммы» здесь нельзя — чтение
- * заблокировалось бы и остановило весь цикл. Возвращает 0 или -1. */
-static int udp_downstream(struct conn *c, const struct tun_dev *tun,
-                          const unsigned char *d, size_t n) {
-    struct sess *s = SESS(c);
-    while (n) {
-        /* Слишком крупная датаграмма выбрасывается РОВНО ПО ДЛИНЕ. Оборвать отсчёт нельзя:
-         * её хвост тут же был бы прочитан как длина следующей, и поток разъехался бы
-         * навсегда — то есть одна такая датаграмма убивала бы соединение. */
-        if (s->dg_skip) {
-            uint32_t take = s->dg_skip < n ? s->dg_skip : (uint32_t)n;
-            d += take;
-            n -= take;
-            s->dg_skip -= take;
-            continue;
-        }
-        if (!s->dg_want) {
-            if (s->lenb_n) {                        /* первый байт длины приехал раньше */
-                s->dg_want = (uint16_t)((s->lenb << 8) | d[0]);
-                s->lenb_n = 0;
-                d++;
-                n--;
-            } else if (n == 1) {
-                /* Запись кончилась ровно между двумя байтами длины. Случай редкий, и
-                 * именно поэтому его надо обработать: потерянный байт длины — это не
-                 * потерянная датаграмма, а сдвиг всего потока после неё. */
-                s->lenb = d[0];
-                s->lenb_n = 1;
-                return 0;
-            } else {
-                s->dg_want = (uint16_t)((d[0] << 8) | d[1]);
-                d += 2;
-                n -= 2;
-            }
-            if (!s->dg_want) continue;              /* длина 0: отдавать нечего */
-            if (s->dg_want > UDP_DGRAM_MAX) {
-                static __thread time_t said;
-                if (g_now_s - said >= 10) {
-                    said = g_now_s;
-                    fprintf(stderr, LOG_W "tunnel: датаграмма %u байт больше предела %d — "
-                            "выброшена\n", s->dg_want, UDP_DGRAM_MAX);
-                }
-                s->dg_skip = s->dg_want;
-                s->dg_want = 0;
-                continue;
-            }
-            s->dg_have = 0;
-        }
-        size_t need = (size_t)s->dg_want - s->dg_have;
-        size_t take = n < need ? n : need;
-        memcpy(s->dg + s->dg_have, d, take);
-        s->dg_have = (uint16_t)(s->dg_have + take);
-        d += take;
-        n -= take;
-        if (s->dg_have < s->dg_want) return 0;      /* хвост приедет следующей записью */
+/* Куда дайлер отдаёт нагрузку (dialer_ops.deliver): соединение и его устройство, плюс счёт
+ * отданного — ради строки трассировки после разбора. */
+struct emit_ctx {
+    struct conn *c;
+    const struct tun_dev *tun;
+    size_t total;
+};
 
-        if (udp_write_to_client(tun, c->key.dst, c->key.src, c->key.dport, c->key.sport,
-                                s->dg, s->dg_want, ++g_ip_id) != 0)
-            return -1;
-        TR("клиенту датаграмма %u байт\n", s->dg_want);
-        s->dg_want = 0;
-        s->dg_have = 0;
-        /* Метка времени двигается на КАЖДОЙ датаграмме, а не только на пакетах клиента:
-         * поток, по которому идёт только приём (а таких у UDP полно — те же обновления от
-         * игрового сервера), иначе убрали бы по простою прямо во время работы. */
-        c->last = g_now_s;
-    }
+/* Целая датаграмма от узла — клиенту. */
+static int emit_dgram(void *arg, const unsigned char *p, size_t n) {
+    struct emit_ctx *e = arg;
+    struct conn *c = e->c;
+    if (udp_write_to_client(e->tun, c->key.dst, c->key.src, c->key.dport, c->key.sport,
+                            p, n, ++g_ip_id) != 0)
+        return -1;
+    TR("клиенту датаграмма %zu байт\n", n);
+    /* Метка времени двигается на КАЖДОЙ датаграмме, а не только на пакетах клиента:
+     * поток, по которому идёт только приём (а таких у UDP полно — те же обновления от
+     * игрового сервера), иначе убрали бы по простою прямо во время работы. */
+    c->last = g_now_s;
     return 0;
 }
 
@@ -1746,26 +1440,30 @@ static void rtx_resend(struct conn *c, const struct tun_dev *tun, const char *wh
     c->rto_ms = c->rto_ms * 2 > RTO_MAX_MS ? RTO_MAX_MS : c->rto_ms * 2;
 }
 
-/* Прочитать у сервера и отдать клиенту как TCP-пакет. */
-static int downstream_pump(struct conn *c, const struct vless_node *node,
-                           const struct tun_dev *tun) {
+/* Кусок потока от узла — клиенту как TCP. */
+static int emit_stream(void *arg, const unsigned char *p, size_t n) {
+    struct emit_ctx *e = arg;
+    if (emit_to_client(e->c, e->tun, p, n) != 0) return -1;
+    e->total += n;
+    return 0;
+}
+
+/* Прочитать у сервера и отдать клиенту как TCP-пакет (или датаграммы UDP).
+ *
+ * Два шага дайлера, а не один: чтение (read) и разбор (deliver). Между ними стек считает то,
+ * что считал всегда, — сколько байт пришло от узла за порцию (DRAIN_MAX_BYTES) и сколько
+ * времени ушло на само чтение (STEER_TUN_STATS), — и эти числа не должны зависеть от того,
+ * сколько стоит разбор протокола. */
+static int downstream_pump(struct conn *c, const struct tun_dev *tun) {
     /* Статический, а не на стеке: буфер размером с запись TLS — это шестнадцать килобайт
      * стека на каждый вызов, а поток обработки здесь один. */
     static __thread unsigned char buf[TUNNEL_BUF];
     size_t got = 0;
-    /* Через клиента, а не tls13_read напрямую: у grpc и xhttp между TLS и VLESS лежит
-     * HTTP/2, и чтение мимо него отдавало бы кадры вместо данных. Прямой вызов работал,
-     * пока транспорт был единственный, и это ровно тот случай, когда «работает» и
-     * «правильно» разошлись молча.
-     *
-     * Вариант _zc отдаёт указатель на расшифрованную запись там, где копия не нужна: на
-     * голом tcp данные так и остаются в буфере соединения. Буфер buf при этом всё равно
-     * нужен — под транспорты поверх HTTP/2, где кадр собирается из нескольких записей. */
-    struct sess *s = SESS(c);
+    void *s = SESS(c);
     TR("чтение conn#%ld fd=%d\n", (long)(c - g_conns), c->fd);
     uint64_t r0 = g_stats ? now_ns() : 0;
     const unsigned char *rx = buf;
-    int rc = vless_recv_zc(&s->v, buf, sizeof(buf), &rx, &got);
+    int rc = g_dl->ops->read(s, buf, sizeof(buf), &rx, &got);
     if (g_stats) g_st.recv_ns += now_ns() - r0;
     g_rx_total += got;
     if (g_stats) { g_st.recs++; g_st.rec_bytes += got; }
@@ -1775,94 +1473,17 @@ static int downstream_pump(struct conn *c, const struct vless_node *node,
     if (!got) { TR("служебный кадр, данных нет\n"); return 0; }
     TR("от сервера %zu байт\n", got);
 
-    /* Порядок разбора: сначала заголовок ОТВЕТА VLESS, потом кадры Vision.
-     *
-     * Сервер отвечает так: [версия|длина_доп|доп] и только ДАЛЬШЕ поток в кадрах Vision.
-     * Заголовок ответа обёрткой не покрыт, и первая версия пыталась развернуть его как
-     * кадр: получала «00 00 96 67 ad» (версия 0, длина 0, начало данных), длины кадра
-     * выходили бессмысленные, unwrap возвращал EAGAIN, и ответ терялся целиком.
-     *
-     * Это зеркало ошибки на отправке: там заголовок ЗАПРОСА тоже идёт до кадра, а не
-     * внутри него. Один и тот же принцип, который я дважды прочитал наоборот. */
-    const unsigned char *cur = rx;
-    size_t left = got;
+    /* Разбор — заголовок ответа, обёртки, сборка датаграмм — у дайлера. Нагрузку он отдаёт
+     * сразу, кусок за куском, а не складывает в общий буфер: складывать было незачем — всё
+     * равно потом нарезали, — а стоило это копии всего трафика и предела «не влезло». */
+    struct emit_ctx e = { .c = c, .tun = tun, .total = 0 };
+    if (g_dl->ops->deliver(g_dl->ctx, s, c->is_udp, rx, got,
+                           c->is_udp ? emit_dgram : emit_stream, &e) != 0)
+        return -1;
+    if (c->is_udp) return 0;
 
-    if (!c->established) {
-        size_t skip = 0;
-        if (vless_parse_response(cur, left, &skip) != 0) {
-            TR("ответ VLESS не разобран (%zu байт)\n", left);
-            return -1;
-        }
-        cur += skip;
-        left -= skip;
-        c->established = 1;
-        TR("заголовок ответа снят (%zu байт), осталось %zu\n", skip, left);
-    }
-
-    /* Дальше пути расходятся: у TCP это поток в кадрах Vision, у UDP — датаграммы с
-     * двухбайтовой длиной и без всякого Vision (его в запросе UDP мы не объявляли). */
-    if (c->is_udp)
-        return left ? udp_downstream(c, tun, cur, left) : 0;
-
-    size_t total = 0;
-
-    while (left) {
-        const unsigned char *p = cur;
-        size_t pn = left;
-
-        if (node->flow[0]) {
-            size_t used = 0;
-            const unsigned char *pl = NULL;
-            size_t pl_n = 0;
-            int ur = vision_unwrap(&s->vis, cur, left, &used, &pl, &pl_n);
-            /* Недопустимая команда в кадре — это КОНЕЦ соединения, а не пауза.
-             *
-             * Разбор возвращает EPROTO, не сбросив накопленный заголовок, поэтому каждый
-             * следующий вызов перечитывает тот же испорченный кадр и потребляет ноль
-             * байт. Прежний `break` при этом отдавал неотрицательный итог, то есть
-             * соединение считалось живым: одного байта команды 3 от сервера хватало,
-             * чтобы туннель до бесконечности читал записи, расшифровывал их (самая
-             * дорогая работа на этом железе) и выбрасывал целиком, а клиент ждал ответа,
-             * которого не будет, пока слот не уберут по простою в 120 секунд. */
-            if (ur == VISION_EPROTO) {
-                TR("недопустимый кадр Vision: рвём соединение, осталось %zu\n", left);
-                return -1;
-            }
-            if (ur != 0 || (!used && !pl_n)) {
-                /* Нехватка данных ошибкой больше не считается: разбор потоковый и копит
-                 * начало потока сам (см. rx_pre в vision.h). Ноль потреблённых байт при
-                 * нулевой выдаче означает, что двигаться некуда. */
-                TR("кадр не разобран: ur=%d осталось %zu\n", ur, left);
-                break;
-            }
-            p = pl;
-            pn = pl_n;
-            cur += used;
-            left -= used;
-
-        } else {
-            cur += left;
-            left = 0;
-        }
-
-        /* Отдаём кадр сразу, а не складываем в общий буфер: складывать было незачем — всё
-         * равно потом нарезали, — а стоило это копии всего трафика и предела «не влезло». */
-        if (pn) {
-            if (emit_to_client(c, tun, p, pn) != 0) return -1;
-            total += pn;
-        }
-    }
-
-    /* Сервер объявил прямое копирование — сообщаем об этом соединению, чтобы следующее
-     * чтение шло мимо расшифровки. Ставится ЗДЕСЬ, потому что команда живёт в кадрах
-     * Vision, а про них знает только этот код. */
-    if (s->vis.recv_direct && !s->v.rx_direct) {
-        s->v.rx_direct = 1;
-        TR("сервер перешёл на прямое копирование — читаем сокет как есть\n");
-    }
-
-    if (!total) { TR("после разбора данных нет\n"); return 0; }
-    TR("клиенту %zu байт (seq до %u)\n", total, c->our_seq);
+    if (!e.total) { TR("после разбора данных нет\n"); return 0; }
+    TR("клиенту %zu байт (seq до %u)\n", e.total, c->our_seq);
     return 0;
 }
 
@@ -1971,21 +1592,7 @@ static size_t udp_defrag(const unsigned char *pkt, size_t n, unsigned char *out,
     return asm_total;
 }
 
-/* Идентификатор узла не разобрался, и соединение закрывается. Причина известна здесь и
- * обязана быть сказана: молчаливый conn_drop снаружи выглядит как «трафика нет», и ровно так
- * выглядел бы следующий похожий случай (I-097). Сегодня сюда не попасть — узел с негодным
- * UUID отсеивается при разборе подписки, а tunnel_run проверяет его до подъёма устройства, —
- * поэтому строка через ограничитель, а не на каждый пакет. Сам UUID не печатается: это
- * ключ доступа к узлу. */
-static void node_id_refused(const struct vless_node *node, const char *what) {
-    static __thread time_t said;
-    if (g_now_s - said < 5) return;
-    said = g_now_s;
-    fprintf(stderr, LOG_W "у узла %s не разбирается UUID — %s отклонено; "
-                    "проверьте ссылку узла\n", node->name, what);
-}
-
-/* Датаграмма из TUN: своя сессия VLESS на каждый поток «адрес-порт → адрес-порт».
+/* Датаграмма из TUN: своя сессия на каждый поток «адрес-порт → адрес-порт».
  *
  * Почему сессия на поток, а не одна на всё. Адрес назначения в VLESS едет в заголовке
  * запроса, то есть задаётся ОДИН РАЗ и на весь поток. Нести в одном потоке нескольких
@@ -1998,9 +1605,12 @@ static void node_id_refused(const struct vless_node *node, const char *what) {
  * Рукопожатие на поток теперь недорого: первая датаграмма ждёт его в буфере ранних данных,
  * а пул запасных сессий отдаёт готовый поток сразу — то же, что и у SYN. Ровно поэтому
  * поддержка UDP появилась именно после той работы, а не до: без неё каждая новая
- * QUIC-сессия стоила бы 100-400 мс на пустом месте. */
-static void udp_packet(const struct tun_dev *tun, const struct vless_node *node,
-                       struct conn *c, const struct flow_key *k,
+ * QUIC-сессия стоила бы 100-400 мс на пустом месте.
+ *
+ * Правило «сессия на поток» — стека, а не только VLESS: дайлер получает поток целиком и один,
+ * поэтому протокол с мультиплексированием понадобился бы стеку как другая модель, а не как
+ * ещё одна таблица (см. «чего здесь нет» в dialer.h). */
+static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct flow_key *k,
                        const unsigned char *pkt, size_t n, size_t off) {
     size_t dn = n - off;
     /* Сюда попадают только целые датаграммы: фрагменты собирает udp_defrag ещё до разбора
@@ -2018,19 +1628,17 @@ static void udp_packet(const struct tun_dev *tun, const struct vless_node *node,
         c->fd = -1;
         conn_link(c);                               /* после ключа: хэш считается по нему */
         c->last = g_now_s;
-        if (vless_uuid_parse(node->uuid, SESS(c)->uuid) != 0) {
-            node_id_refused(node, "соединение UDP");
+        /* Отказ дайлер называет сам (у VLESS — негодный UUID узла, I-097). */
+        if (g_dl->ops->flow_open(g_dl->ctx, SESS(c), k, 1) != 0) {
             conn_drop(c);
             return;
         }
-        /* Vision не заводим вовсе: в запросе UDP flow не объявлен, значит кадров не будет
-         * ни в ту, ни в другую сторону. */
 
         int qr;
-        if (g_spare_want > 0 && spare_checkout(&SESS(c)->v) == 0) {
-            c->fd = SESS(c)->v.fd;
+        if (g_spare_want > 0 && spare_checkout(SESS(c)) == 0) {
+            c->fd = g_dl->ops->fd(SESS(c));
             TR("UDP: взята запасная сессия\n");
-        } else if ((qr = conn_submit(c, node)) == 0) {
+        } else if ((qr = conn_submit(c)) == 0) {
             c->pending = 1;
             TR("UDP: заявка установщику\n");
         } else {
@@ -2046,7 +1654,7 @@ static void udp_packet(const struct tun_dev *tun, const struct vless_node *node,
             conn_drop(c);
             return;
         }
-        spare_refill(node);
+        spare_refill();
     }
 
     c->last = g_now_s;
@@ -2058,7 +1666,7 @@ static void udp_packet(const struct tun_dev *tun, const struct vless_node *node,
      * НАВСЕГДА. На голом tcp такого не бывает (там отправка либо целиком, либо ошибка), а
      * на grpc и xhttp окно закрывается штатно. */
     if (!c->pending && c->early) {
-        int fr = early_flush(c, node);
+        int fr = early_flush(c);
         if (fr < 0) { conn_drop(c); return; }
         if (fr > 0) {
             if (g_stats) g_st.udp_drops++;
@@ -2067,7 +1675,7 @@ static void udp_packet(const struct tun_dev *tun, const struct vless_node *node,
         }
     }
 
-    int sr = udp_send_dgram(c, node, pkt + off, dn);
+    int sr = udp_send_dgram(c, pkt + off, dn);
     if (sr == SEND_OK) {
         TR("датаграмма клиента %zu байт -> серверу\n", dn);
         return;
@@ -2087,11 +1695,9 @@ static void udp_packet(const struct tun_dev *tun, const struct vless_node *node,
 }
 
 /* Один пакет из TUN. */
-static void drain_conn(struct conn *c, const struct vless_node *node,
-                       const struct tun_dev *tun);
+static void drain_conn(struct conn *c, const struct tun_dev *tun);
 
-static void handle_packet(const struct tun_dev *tun, const struct vless_node *node,
-                          const unsigned char *pkt, size_t n) {
+static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, size_t n) {
     struct flow_key k;
     size_t off = 0;
 
@@ -2115,7 +1721,7 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
        k.proto, k.tcp_flags, n - off);
 
     /* Всё, что не TCP и не UDP, туннель нести не умеет: это ICMP, ESP и прочее, для чего
-     * у VLESS команды нет вовсе.
+     * у VLESS (и у любого дайлера потоков) команды нет вовсе.
      *
      * И НЕ МОЛЧИМ. Прежде такой пакет просто выбрасывался, и это стоило целых сайтов —
      * тогда в этой ветке был ещё и UDP: браузер идёт к Cloudflare по QUIC, то есть UDP на
@@ -2136,7 +1742,7 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
 
     struct conn *c = conn_find(&k);
 
-    if (k.proto == 17) { udp_packet(tun, node, c, &k, pkt, n, off); return; }
+    if (k.proto == 17) { udp_packet(tun, c, &k, pkt, n, off); return; }
 
     if (k.tcp_flags & TCP_SYN) {
         if (c) {
@@ -2185,12 +1791,12 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
          * Зачем так: браузер держит десятки соединений живыми, ничего по ним не передавая
          * (HTTP/2 keep-alive), и за каждое платилось 32 КБ, которых потом не хватало на новые.
          * Теперь простаивающее соединение стоит только своей записи в таблице. */
-        if (vless_uuid_parse(node->uuid, SESS(c)->uuid) != 0) {
-            node_id_refused(node, "соединение TCP");
+        /* Состояние протокола на потоке (у VLESS — UUID и Vision). Отказ дайлер называет сам
+         * (негодный UUID узла, I-097). */
+        if (g_dl->ops->flow_open(g_dl->ctx, SESS(c), &k, 0) != 0) {
             conn_drop(c);
             return;
         }
-        vision_init(&SESS(c)->vis, SESS(c)->uuid);
 
         /* SYN-ACK — СРАЗУ, не дожидаясь рукопожатия с узлом. Рукопожатие стоит
          * 100-400 мс, и прежде всё это время клиент сидел без ответа: свой TLS к сайту
@@ -2201,16 +1807,16 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
          * клиент узнаёт RST'ом после рукопожатия — ровно как раньше. */
 
         /* Запасная сессия: рукопожатие сделано заранее, поток готов уже сейчас. */
-        if (g_spare_want > 0 && spare_checkout(&SESS(c)->v) == 0) {
-            c->fd = SESS(c)->v.fd;
+        if (g_spare_want > 0 && spare_checkout(SESS(c)) == 0) {
+            c->fd = g_dl->ops->fd(SESS(c));
             send_synack(c, tun);
-            spare_refill(node);
+            spare_refill();
             TR("SYN: взята запасная сессия\n");
             return;
         }
 
         TR("SYN: заявка установщику\n");
-        int qr = conn_submit(c, node);
+        int qr = conn_submit(c);
         if (qr != 0) {
             /* Очередь полна: столько рукопожатий разом процессор не переварит. Молча
              * отбрасывать SYN нельзя — за это уже пришлось расплатиться однажды, — поэтому
@@ -2228,7 +1834,7 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
         }
         c->pending = 1;
         send_synack(c, tun);
-        spare_refill(node);
+        spare_refill();
         return;
     }
 
@@ -2339,13 +1945,13 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
      * свежие данные вперёд него отправлять нельзя — байты поменяются местами. Не
      * подтверждаем, клиент повторит; это тот же приём, что у SEND_AGAIN ниже. */
     if (c->early) {
-        int fr = early_flush(c, node);
+        int fr = early_flush(c);
         if (fr < 0) { conn_reset(c, tun); return; }
         if (fr > 0) return;
     }
 
     TR("данные клиента %zu байт -> серверу%s\n", data_n, fin ? " (и FIN)" : "");
-    int sr = data_n ? upstream_send(c, node, pkt + off, data_n) : SEND_OK;
+    int sr = data_n ? upstream_send(c, pkt + off, data_n) : SEND_OK;
     if (sr == SEND_AGAIN) {
         /* Окно закрыто. Прежде чем перекладывать задержку на клиента, разберём то, что уже
          * лежит в сокете: WINDOW_UPDATE приходит именно оттуда и обычно УЖЕ там — сервер
@@ -2372,9 +1978,9 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
         struct pollfd sp = { .fd = c->fd, .events = POLLIN };
         if (client_can_take_record(c) &&
             poll(&sp, 1, 5) > 0 && (sp.revents & POLLIN)) {
-            drain_conn(c, node, tun);
+            drain_conn(c, tun);
             if (c->srv_closed) return;          /* пакет не ушёл и уже не уйдёт */
-            sr = upstream_send(c, node, pkt + off, data_n);
+            sr = upstream_send(c, pkt + off, data_n);
         }
     }
     if (sr == SEND_AGAIN) {
@@ -2433,7 +2039,7 @@ static void flush_acks(const struct tun_dev *tun) {
  * Номер адреса берётся из таблицы маршрутизации выхода: она уже уникальна и уже лежит в
  * реестре, то есть переживает перезагрузку. Выдумывать для этого второй счётчик значило
  * бы завести второе место, где номера могут разъехаться. */
-static void tun_bring_up(const char *dev, int table) {
+void tun_bring_up(const char *dev, int table) {
     char addr[40];
     /* Без знака: таблица приходит из файла реестра, и отрицательное число оттуда давало
      * адрес 198.51.100.-N, который ip не примет (I-322). */
@@ -2494,14 +2100,14 @@ static void tun_bring_up(const char *dev, int table) {
  * Отдельной функцией, потому что вызывается из двух мест: по событию epoll и по флагу
  * rx_ready. Копия этой логики в двух местах означала бы, что предел порции соблюдается в
  * одном из них и не соблюдается в другом. */
-static void drain_conn(struct conn *c, const struct vless_node *node,
-                       const struct tun_dev *tun) {
-    struct sess *s = SESS(c);
+static void drain_conn(struct conn *c, const struct tun_dev *tun) {
+    const struct dialer_ops *d = g_dl->ops;
+    void *s = SESS(c);
     int reads = 0;
     uint64_t drained_from = g_rx_total;
     c->rx_ready = 0;
     for (;;) {
-        if (downstream_pump(c, node, tun) != 0) {
+        if (downstream_pump(c, tun) != 0) {
             /* Сервер закрыл. Соединение НЕ закрываем, пока клиент не подтвердит всё
              * отправленное: пока в кольце есть неподтверждённое, его надо повторять, а
              * закрыв соединение, мы уничтожим и кольцо. FIN уйдёт из общего прохода. */
@@ -2515,15 +2121,15 @@ static void drain_conn(struct conn *c, const struct vless_node *node,
             if (g_stats) g_st.drain_full++;
             /* Прервались на своём пределе, а данные, может быть, ещё в буфере: отметим, что
              * ждать события на сокете для них не нужно. */
-            c->rx_ready = (uint8_t)(vless_has_data(&s->v) != 0);
+            c->rx_ready = (uint8_t)(d->has_data(s) != 0);
             return;
         }
         if (!c->is_udp && !client_can_take_record(c)) {
-            c->rx_ready = (uint8_t)(vless_has_data(&s->v) != 0);
+            c->rx_ready = (uint8_t)(d->has_data(s) != 0);
             return;
         }
         /* Целая запись уже прочитана у сокета — спрашивать ядро незачем. */
-        if (vless_has_data(&s->v)) continue;
+        if (d->has_data(s)) continue;
         /* Есть ли ещё что читать. Без этой проверки следующее чтение заблокируется на
          * таймауте сокета (восемь секунд) и остановит весь цикл. */
         struct pollfd sp = { .fd = c->fd, .events = POLLIN };
@@ -2531,11 +2137,10 @@ static void drain_conn(struct conn *c, const struct vless_node *node,
     }
 }
 
-/* Что нужно потоку, чтобы работать: своя очередь устройства, узел и свой номер. Больше
- * ничего — остальное состояние у него собственное (__thread). */
+/* Что нужно потоку, чтобы работать: своя очередь устройства и свой номер. Больше ничего —
+ * дайлер общий (g_dl), а остальное состояние у потока собственное (__thread и его таблицы). */
 struct worker {
     struct tun_dev tun;
-    const struct vless_node *node;
     int id;
     /* Дошёл ли поток до цикла, то есть нёс ли эта очередь трафик хоть секунду. Нужно
      * ровно для одного: различить в журнале «туннель не поднялся» и «туннель работал и
@@ -2546,7 +2151,7 @@ struct worker {
 static void *worker_loop(void *arg) {
     struct worker *w = arg;
     struct tun_dev tun = w->tun;
-    const struct vless_node *node = w->node;
+    const struct dialer_ops *dops = g_dl->ops;
     int tun_fd = tun.fd;
     g_worker = w->id;
 
@@ -2554,7 +2159,15 @@ static void *worker_loop(void *arg) {
     uint64_t stats_at = g_stats ? now_ns() : 0;
     uint64_t loop_at = 0;   /* когда вернулось прошлое ожидание — для оценки периода витка */
     uint64_t spare_at = 0;  /* когда последний раз выбрасывали протухший запас */
-    conn_table_init();
+    /* Таблицы потока — в куче (см. «таблицы потока» у g_conns). Прежде они были в TLS и
+     * отказать не могли: не дали бы памяти — не создался бы сам поток. Теперь отказ свой, и
+     * он такой же, как отказ epoll ниже: поток не запускается, очередь отдаётся остальным. */
+    if (conn_table_init() != 0) {
+        fprintf(stderr, LOG_W "нет памяти под таблицу соединений (%s) — поток не запущен, "
+                        "очередь отдана остальным\n", strerror(errno));
+        close(tun_fd);
+        return NULL;
+    }
     unsigned char pkt[TUNNEL_BUF];
 
     /* epoll, а не poll, и это не вкусовщина.
@@ -2583,6 +2196,7 @@ static void *worker_loop(void *arg) {
     if (ep < 0) {
         fprintf(stderr, LOG_W "epoll недоступен (%s) — поток не запущен, "
                         "очередь отдана остальным\n", strerror(errno));
+        conn_table_free();
         close(tun_fd);
         return NULL;
     }
@@ -2596,6 +2210,7 @@ static void *worker_loop(void *arg) {
             fprintf(stderr, LOG_W "TUN не встал в epoll (%s) — поток не запущен, "
                             "очередь отдана остальным\n", strerror(errno));
             close(ep);
+            conn_table_free();
             close(tun_fd);
             return NULL;
         }
@@ -2742,7 +2357,7 @@ static void *worker_loop(void *arg) {
             if (!c->pending || !__atomic_load_n(&c->done, __ATOMIC_ACQUIRE)) { li++; continue; }
             c->pending = 0;
             pend--;
-            c->fd = SESS(c)->v.fd;
+            c->fd = dops->fd(SESS(c));
             if (c->client_gone) {
                 /* Клиент передумал, пока шло рукопожатие. Отвечать некому — просто
                  * закрываем и поток к узлу, и запись. */
@@ -2753,7 +2368,7 @@ static void *worker_loop(void *arg) {
                 /* С причиной, а не «не открылся»: код различает «TCP не соединился»,
                  * «сервер не признал ключ» и «сервер не согласился на HTTP/2». */
                 fprintf(stderr, LOG_W "поток к %s не открылся: %s (rc=%d)\n",
-                        node->host, vless_strerror(c->rc), c->rc);
+                        dops->peer(g_dl->ctx), dops->strerror(c->rc), c->rc);
                 /* RST, а не молчание: клиент иначе ждёт до таймаута. Молчать я пробовал —
                  * страница с видео перестала открываться вовсе, потому что браузер
                  * использует быстрый отказ лучше, чем ожидание. */
@@ -2762,7 +2377,7 @@ static void *worker_loop(void *arg) {
             }
             /* Ранние данные, которые клиент успел прислать за время рукопожатия, —
              * серверу, первым делом и до любых свежих пакетов. */
-            if (c->early && early_flush(c, node) < 0) {
+            if (c->early && early_flush(c) < 0) {
                 conn_reset(c, &tun);
                 continue;
             }
@@ -2802,7 +2417,7 @@ static void *worker_loop(void *arg) {
                 uint64_t t1 = g_stats ? now_ns() : 0;
                 if (rn <= 0) break;
                 if (g_stats) { g_st.tun_reads++; g_st.tun_read_ns += t1 - t0; }
-                handle_packet(&tun, node, pkt, (size_t)rn);
+                handle_packet(&tun, pkt, (size_t)rn);
                 if (g_stats) g_st.pkt_ns += now_ns() - t1;
             }
             flush_acks(&tun);
@@ -2828,7 +2443,7 @@ static void *worker_loop(void *arg) {
              * работал в первой версии: датаграмма уходила серверу, ответ лежал в сокете, а
              * читать его никто не приходил. */
             if (c->srv_closed || (!c->is_udp && !client_can_take_record(c))) continue;
-            drain_conn(c, node, &tun);
+            drain_conn(c, &tun);
         }
 
         /* Соединения, у которых данные уже лежат в буфере: ядро о них не сообщит, и без
@@ -2838,7 +2453,7 @@ static void *worker_loop(void *arg) {
             struct conn *c = &g_conns[g_live[li]];
             if (!c->rx_ready || c->pending) continue;
             forced--;
-            drain_conn(c, node, &tun);
+            drain_conn(c, &tun);
         }
 
         /* Один проход на все сроки: повтор, закрытие после сервера, уборка задержавшихся.
@@ -2862,7 +2477,7 @@ static void *worker_loop(void *arg) {
 
             /* Хвост ранних данных, не поместившийся в окно h2 на готовности потока:
              * дослать. Новых данных клиента может и не быть — досылать больше некому. */
-            if (c->early && early_flush(c, node) < 0) {
+            if (c->early && early_flush(c) < 0) {
                 conn_reset(c, &tun);
                 continue;
             }
@@ -2942,8 +2557,10 @@ static void *worker_loop(void *arg) {
      * с чем они работают. Почему это важно — у connq_release. eventfd — тоже только
      * после: установщик пишет в него по готовности, и закрытый раньше времени номер
      * ядро успело бы отдать кому-то другому. */
-    if (connq_release(g_conns) == 0)
+    if (connq_release(g_conns) == 0) {
         while (g_live_n) conn_drop(&g_conns[g_live[0]]);
+        conn_table_free();
+    }
     if (efd >= 0) close(efd);
     g_conn_efd = -1;
     close(ep);
@@ -2983,7 +2600,29 @@ static int worker_count(void) {
     return 1;
 }
 
-int tunnel_run(struct output *o, const struct vless_node *node) {
+time_t stack_now_s(void) { return g_now_s; }
+
+/* Шаг сессий и пул запасных — по размеру сессии дайлера. До запуска любых потоков: дальше
+ * g_dl, g_sess_stride и g_spares[].sess только читают. */
+static void stack_setup(const struct dialer *d) {
+    g_dl = d;
+    g_sess_stride = (d->ops->sess_size + SESS_ALIGN - 1) & ~(size_t)(SESS_ALIGN - 1);
+    if (!(d->ops->caps & DC_PRECONNECT)) g_spare_want = 0;
+    if (g_spare_want <= 0) return;
+    /* Весь пул одним блоком: SPARE_MAX сессий, а не g_spare_want, — слоты g_spares не
+     * меняются от числа запасных, и так проще, чем помнить, какие из них с памятью. Страницы
+     * под слоты, которые не заполнятся никогда, calloc большого размера не трогает. */
+    unsigned char *m = calloc(SPARE_MAX, g_sess_stride);
+    if (!m) {
+        fprintf(stderr, LOG_W "нет памяти под запасные сессии — каждый SYN платит "
+                        "рукопожатие\n");
+        g_spare_want = 0;
+        return;
+    }
+    for (int i = 0; i < SPARE_MAX; i++) g_spares[i].sess = m + (size_t)i * g_sess_stride;
+}
+
+int stack_run(struct output *o, const struct dialer *d) {
     const char *dev = o->device;
     g_trace = getenv("STEER_TUN_TRACE") != NULL;
     g_stats = getenv("STEER_TUN_STATS") != NULL;
@@ -2995,16 +2634,10 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
     g_spare_want = sp ? atoi(sp) : 4;
     if (g_spare_want < 0) g_spare_want = 0;
     if (g_spare_want > SPARE_MAX) g_spare_want = SPARE_MAX;
+    stack_setup(d);
 
-    /* Идентификатор узла — ДО устройства и потоков, пока узел ещё можно назвать. Ниже он
-     * разбирается заново на каждое соединение, и отказ там означал бы туннель, который
-     * поднят, но закрывает всё подряд (I-097). */
-    unsigned char id[16];
-    if (vless_uuid_parse(node->uuid, id) != 0) {
-        fprintf(stderr, LOG_W2 "у узла %s не разбирается UUID — туннель %s не поднят; "
-                        "проверьте ссылку узла\n", node->name, dev);
-        return 1;
-    }
+    /* Узел, который заведомо не годится (у VLESS — негодный UUID, I-097), модуль протокола
+     * отвергает ДО этой функции, пока узел ещё можно назвать: здесь устройство уже поднимется. */
 
     static struct worker workers[MAX_WORKERS];
     struct tun_dev queues[MAX_WORKERS];
@@ -3022,7 +2655,6 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
         int fl = fcntl(queues[i].fd, F_GETFL, 0);
         if (fl >= 0) fcntl(queues[i].fd, F_SETFL, fl | O_NONBLOCK);
         workers[i].tun = queues[i];
-        workers[i].node = node;
         workers[i].id = i;
     }
     tun_bring_up(dev, o->table);
@@ -3036,8 +2668,9 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
      * момент готовности, — а это мы. */
     bind_device(o, dev);
     fprintf(stderr, LOG_I "%s привязан к таблице %d\n", dev, o->table);
-    fprintf(stderr, LOG_I "%s -> %s (%s:%u %s%s)\n", dev, node->name,
-            node->host, node->port, node->type, node->flow[0] ? " +vision" : "");
+    char desc[512];
+    d->ops->describe(d->ctx, desc, sizeof(desc));
+    fprintf(stderr, LOG_I "%s -> %s\n", dev, desc);
     /* Печатается всегда: без разгрузки и без второй очереди скорость падает в разы, и знать,
      * что именно досталось, надо до замеров, а не после. */
     fprintf(stderr, LOG_I "разгрузка записи в %s %s; потоков %d из %d запрошенных\n",
@@ -3084,360 +2717,6 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
     return 1;
 }
 
-/* ---- подкоманда steer vless -------------------------------------------------
- *
- * Поднимает TUN для выхода kind=vless из спеки. Отдельный процесс, а не поток внутри
- * apply: apply должен завершаться, а туннель — жить. Init-скрипт держит по экземпляру
- * procd на каждый такой выход, поэтому падение одного не уносит остальные.
- */
-#define MAX_NODES 128
-static struct vless_node g_nodes[MAX_NODES];
-/* Спека — значение, а не глобалы (правило 6, docs/architecture.md, раздел 2): экземпляр
- * заводит каждая точка входа (cmd_vless, cmd_vless_nodes, cmd_vless_probe) и передаёт его
- * параметром в load_nodes и underlay_setup. Выделяется по требованию, а не static в каждой из
- * трёх: struct spec — под 300 КБ, и три статических экземпляра заняли бы в bss втрое больше
- * того одного, что был общим на файл, хотя на процесс команда всегда одна. Не освобождается:
- * живёт до конца процесса, как и прежний static. */
-static struct spec *spec_new(void) {
-    struct spec *sp = calloc(1, sizeof(*sp));
-    if (!sp) die("нет памяти под спеку", NULL);
-    return sp;
-}
-
-/* Найти выход и разобрать его подписку. Одно место на все три команды: иначе «как
- * читается подписка» разошлось бы между подъёмом, списком и проверкой — а расхождение
- * здесь означало бы, что человек выбирает в интерфейсе не тот узел, который поднимется. */
-/* Узлы подписки из ФАЙЛА, без выхода. Вынесено отдельно ради `vless-nodes /путь`: управляющему
- * слою нужно показать локации подписки ДО того, как на неё заведён хоть один выход — иначе
- * человек собирает выход из подписки, локаций которой не видит. */
-static int load_nodes_file(const char *path, size_t *cnt, struct vless_sub_stats *st) {
-    /* Подписка читается с диска: скачивание — дело управляющего слоя. */
-    FILE *f = fopen(path, "r");
-    if (!f) { fprintf(stderr, LOG_W2 "%s не читается\n", path); return 2; }
-    static char raw[262144], dec[262144];
-    size_t n = fread(raw, 1, sizeof(raw) - 1, f);
-    raw[n] = '\0';
-    fclose(f);
-    /* Какой это формат — решает sub.c: там же, где формат и разбирается, и там же, где это
-     * можно проверить стендом. */
-    const char *text = vless_sub_text(raw, n, dec, sizeof(dec));
-
-    *cnt = vless_parse_sub(text, g_nodes, MAX_NODES, st);
-    return 0;
-}
-
-static int load_nodes(struct spec *sp, const char *spec_path, const char *out_name,
-                      struct output **out, size_t *cnt, struct vless_sub_stats *st) {
-    /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
-     * die() изнутри load_spec. */
-    struct err e = {0};
-    if (load_spec(spec_path, sp, &e) < 0) err_die(&e);
-    struct output *o = out_by_name(sp, out_name);
-    if (!o) { fprintf(stderr, LOG_W2 "выхода %s нет в спеке\n", out_name); return 2; }
-    /* Настройку своего выхода спрашиваем у вида: не vless — не наш. */
-    const struct vless_cfg *vc = out_vless(o);
-    if (!vc) {
-        fprintf(stderr, LOG_W2 "выход %s не vless (kind другой)\n", out_name);
-        return 2;
-    }
-    *out = o;
-    return load_nodes_file(vc->sub_file, cnt, st);
-}
-
-/* Метка сокетов к узлам — до первого соединения, то есть и до перебора узлов: проверка узла
- * при подъёме и `vless-probe` обязаны идти тем же путём, что и сам туннель, иначе при `via`
- * проба стучалась бы напрямую и объявляла мёртвым узел, который через выход-цель жив (или
- * наоборот). Смысл метки — «вложенные выходы» в spec.h.
- *
- * Реестр — только при via: у цели метка появляется там, а без via этот процесс реестра до
- * подъёма не трогал, и трогать его ради метки «мимо каналов» незачем. Без выхода (проба
- * файла подписки) метка — обычная «мимо каналов»: её отдаёт та же функция для выхода без via. */
-static void underlay_setup(struct spec *sp, const struct output *o) {
-    static const struct output none;
-    if (o && o->over[0]) {
-        struct err e = {0};
-        if (registry_assign(sp, &e) < 0) err_die(&e);
-    }
-    vless_set_sock_mark(out_underlay_mark(sp, o ? o : &none), o && o->over[0]);
-}
-
-static void node_json(const struct vless_node *n, int index) {
-    printf("{\"index\":%d,", index);
-    printf("\"name\":"); jsonw_str(stdout, n->name);
-    printf(",\"host\":"); jsonw_str(stdout, n->host);
-    printf(",\"port\":%u,\"type\":", n->port);
-    jsonw_str(stdout, n->type);
-    printf(",\"security\":"); jsonw_str(stdout, n->security);
-    printf(",\"vision\":%s", n->flow[0] ? "true" : "false");
-    if (n->mode[0]) { printf(",\"mode\":"); jsonw_str(stdout, n->mode); }
-    printf("}");
-}
-
-/* Причины, по которым узлы не попали в список. Массив, а не одна строка: причин у
- * одной подписки бывает несколько, и «поддержки ws нет» рядом с «reality без pbk» —
- * это два разных действия для владельца подписки. Печатается всегда, в том числе
- * пустым: потребитель, который проверяет наличие поля, не должен отличать «причин нет»
- * от «движок старый». */
-static void skipped_json(const struct vless_sub_stats *st) {
-    printf(",\"skipped_reasons\":[");
-    for (size_t i = 0; i < st->reasons_n; i++) {
-        if (i) putchar(',');
-        printf("{\"reason\":");
-        jsonw_str(stdout, st->reasons[i].reason);
-        printf(",\"count\":%zu,\"example\":", st->reasons[i].count);
-        jsonw_str(stdout, st->reasons[i].example);
-        printf("}");
-    }
-    printf("]");
-    /* Причин больше, чем влезло в VLESS_SKIP_REASONS. Печатается только когда есть, но
-     * молчать об этом нельзя: иначе сумма count разойдётся со skipped, и читающий
-     * решит, что часть узлов пропала. */
-    if (st->reasons_dropped) printf(",\"skipped_other\":%zu", st->reasons_dropped);
-}
-
-/* Перечислить узлы подписки.
- *
- * Индекс здесь — это индекс среди ПРИГОДНЫХ узлов, и он же понимается движком в поле
- * `node` спеки. Одно значение слова «номер узла» на весь проект: если бы список включал
- * непригодные, человек выбрал бы номер 5, а поднялся бы другой узел — и понять это было
- * бы невозможно, потому что оба списка выглядят правдоподобно. Непригодные считаются
- * отдельно и объясняются причиной, но номеров не занимают. */
-int cmd_vless_nodes(const char *spec_path, const char *out_name) {
-    struct output *o = NULL;
-    size_t cnt = 0;
-    struct vless_sub_stats st;
-    /* Аргумент с косой чертой — путь к файлу подписки, а не имя выхода: имена выходов
-     * состоят из [A-Za-z0-9_.-] (см. name_ok), и косая черта в них невозможна, так что
-     * спутать нечего. Тогда спека не нужна вовсе, а `chosen` пуст: выбора ещё не было. */
-    int by_file = out_name && out_name[0] == '/';
-    int rc = by_file ? load_nodes_file(out_name, &cnt, &st)
-                     : load_nodes(spec_new(), spec_path, out_name, &o, &cnt, &st);
-    if (rc) return rc;
-
-    printf("{\"output\":");
-    jsonw_str(stdout, by_file ? "" : out_name);
-    printf(",\"sub_file\":");
-    jsonw_str(stdout, by_file ? out_name : o->vless.sub_file);
-    /* `node` — прежнее поле: один выбранный номер либо -1. Выбор из нескольких узлов оно
-     * выразить не может, поэтому при нём печатается -1, а сам выбор лежит в `chosen`. Старый
-     * потребитель этого поля читает то же, что читал: «узел не назначен, ищем рабочий». */
-    size_t chosen_n = o ? o->vless.nodes_n : 0;
-    printf(",\"node\":%d,\"chosen\":[", chosen_n == 1 ? o->vless.nodes[0] : -1);
-    for (size_t i = 0; i < chosen_n; i++) printf("%s%d", i ? "," : "", o->vless.nodes[i]);
-    printf("],\"usable\":%zu,\"skipped\":%zu,\"foreign\":%zu,\"nodes\":[",
-           cnt, st.skipped, st.foreign);
-    for (size_t i = 0; i < cnt; i++) {
-        if (i) putchar(',');
-        node_json(&g_nodes[i], (int)i);
-    }
-    printf("]");
-    skipped_json(&st);
-    printf("}\n");
-    return 0;
-}
-
-/* Проверить узел и измерить задержку.
- *
- * node >= 0 — только этот узел. node < 0 — по порядку до первого рабочего, то есть ровно
- * то, что сделает движок при подъёме выхода.
- *
- * По одному узлу за вызов не случайно: проверка узла упирается в таймаут, и «проверить
- * все» на подписке из двадцати шести узлов заняло бы минуты — дольше, чем живёт вызов
- * ubus. Интерфейс спрашивает по одному и заполняет таблицу постепенно. */
-int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int timeout_s) {
-    struct output *o = NULL;
-    size_t cnt = 0;
-    struct vless_sub_stats st;
-    /* Вместо имени выхода — путь к файлу подписки, как у vless-nodes и по той же причине:
-     * узлы выбирают там, где выход собирают, и подписке, на которую ещё не заведён ни один
-     * выход, иначе нечем было бы ответить «какой из этих узлов живой». Без выхода нет и
-     * порядка предпочтения, поэтому `--node -1` здесь значит «все по порядку подписки», а
-     * не «как поднимется выход». */
-    int by_file = out_name && out_name[0] == '/';
-    /* Спека нужна и пробе файла: метку «мимо каналов» underlay_setup спрашивает у неё же. */
-    struct spec *sp = spec_new();
-    int rc = by_file ? load_nodes_file(out_name, &cnt, &st)
-                     : load_nodes(sp, spec_path, out_name, &o, &cnt, &st);
-    if (rc) return rc;
-    underlay_setup(sp, o);
-    if (!cnt) {
-        printf("{\"ok\":false,\"error\":\"в подписке нет пригодных узлов\","
-               "\"skipped\":%zu,\"foreign\":%zu", st.skipped, st.foreign);
-        skipped_json(&st);
-        printf("}\n");
-        return 1;
-    }
-    if (node >= (int)cnt) {
-        printf("{\"ok\":false,\"error\":\"узла %d нет, всего %zu\"}\n", node, cnt);
-        return 1;
-    }
-
-    /* node < 0 — «как поднимется выход», а поднимется он по кандидатам из спеки: при
-     * выбранном подмножестве перебор идёт по нему и в его порядке. Той же функцией, что и
-     * подъём, — иначе диагностика показывала бы порядок, которого не будет. */
-    static int sel[MAX_NODES];
-    size_t sel_n = 0;
-    if (node >= 0) { sel[0] = node; sel_n = 1; }
-    else if (by_file) {
-        for (size_t i = 0; i < cnt && i < MAX_NODES; i++) sel[sel_n++] = (int)i;
-    } else {
-        sel_n = out_node_list(o, cnt, sel, MAX_NODES);
-        if (!sel_n) {
-            printf("{\"ok\":false,\"error\":\"выбранных узлов нет в подписке, "
-                   "пригодных всего %zu\"}\n", cnt);
-            return 1;
-        }
-    }
-    int found = -1;
-    printf("{\"output\":");
-    jsonw_str(stdout, by_file ? "" : out_name);
-    printf(",\"sub_file\":");
-    jsonw_str(stdout, by_file ? out_name : o->vless.sub_file);
-    printf(",\"results\":[");
-    for (size_t k = 0; k < sel_n; k++) {
-        size_t i = (size_t)sel[k];
-        char why[256] = "";
-        int hs = -1, ttfb = -1;
-        int pr = vless_probe_timed(&g_nodes[i], timeout_s, why, sizeof(why), &hs, &ttfb);
-        if (k) putchar(',');
-        printf("{\"index\":%zu,\"name\":", i);
-        jsonw_str(stdout, g_nodes[i].name);
-        printf(",\"type\":");
-        jsonw_str(stdout, g_nodes[i].type);
-        printf(",\"ok\":%s,\"handshake_ms\":%d,\"ttfb_ms\":%d,\"why\":",
-               pr == 0 ? "true" : "false", hs, ttfb);
-        jsonw_str(stdout, why);
-        printf("}");
-        if (pr == 0) { found = (int)i; if (node < 0) break; }
-    }
-    printf("],\"working\":%d}\n", found);
-    return found >= 0 ? 0 : 1;
-}
-
-/* Ход перебора — в файл probe-<выход> (probe_report), только если о нём некому сказать иначе:
- * у ребёнка демона с --supervise есть труба событий (evline_enabled), и демон знает то же из
- * node/nonode/down — файл там не нужен никому, а флеш телефона изнашивает (probe.h). Снимается
- * запись (probe_clear) в любом режиме: удалить отсутствующий файл ничего не пишет, а оставшийся
- * от прежнего запуска под procd рассказывал бы про перебор, которого больше нет. */
-static void vl_probe_report(const char *out_name, enum probe_state st, int node, int total) {
-    if (!evline_enabled()) probe_report(out_name, st, node, total);
-}
-
-int cmd_vless(const char *spec_path, const char *out_name) {
-    evline_open();
-    struct output *o = NULL;
-    size_t cnt = 0;
-    struct vless_sub_stats st;
-    struct spec *sp = spec_new();
-    int rc = load_nodes(sp, spec_path, out_name, &o, &cnt, &st);
-    if (rc) return rc;
-    underlay_setup(sp, o);
-    struct vless_node *nodes = g_nodes;
-    if (!cnt) {
-        /* Приговор — не только в журнал. Диагностика без него говорила «устройства нет,
-         * смотрите журнал движка», то есть отправляла человека искать то, что уже известно
-         * здесь (I-100). total=0 отличает «узлов в подписке нет» от «ни один не ответил». */
-        vl_probe_report(out_name, PROBE_FAILED, 0, 0);
-        evline_emit("down", "why", EVLINE_STR, "в подписке нет пригодных узлов",
-                     (const char *)NULL);
-        fprintf(stderr, LOG_W2 "в подписке нет пригодных узлов "
-                        "(пропущено %zu, чужих протоколов %zu)\n", st.skipped, st.foreign);
-        /* Причины — в журнал тоже, а не только в ubus: подъём выхода идёт из procd, и
-         * человек, который смотрит logread, иначе видит ровно то же «пропущено 26» без
-         * объяснения, из-за которого и завёлся splicicd#16. */
-        for (size_t i = 0; i < st.reasons_n; i++)
-            fprintf(stderr, LOG_W2 "  %s — узлов %zu%s%s\n", st.reasons[i].reason,
-                    st.reasons[i].count, st.reasons[i].example[0] ? ", например " : "",
-                    st.reasons[i].example);
-        return 1;
-    }
-    fprintf(stderr, LOG_I2 "узлов %zu (пропущено %zu, чужих %zu)\n", cnt, st.skipped, st.foreign);
-
-    /* Кандидаты в порядке предпочтения. Пустой `nodes` (и прежнее `node: -1`) означает «вся
-     * подписка», выбранное подмножество — только его узлы и только в написанном порядке. Одна
-     * функция на подъём и на `vless-probe`: покажи диагностика другой порядок, она объясняла
-     * бы не тот перебор, который случится (см. out_node_list в kinds/vless.c). */
-    static int sel[MAX_NODES];
-    size_t sel_n = out_node_list(o, cnt, sel, MAX_NODES);
-    if (!sel_n) {
-        /* Сюда попадают только выборы, целиком уехавшие за пределы подписки: она обновилась,
-         * узлов стало меньше. Перебирать вместо выбранного что попало нельзя — это увело бы
-         * трафик в локацию, которую человек не выбирал, и молча.
-         *
-         * Приговор — СВОЙ, а не общий `failed` с total=0. Раньше здесь стояло ровно то же,
-         * что при пустой подписке, и диагностика говорила «в подписке нет пригодных узлов»
-         * на подписке из двадцати девяти живых узлов, где человек написал `node: 31`. Снято
-         * с роутера; в запись теперь едет и номер, который он написал, и настоящее число
-         * пригодных — по ним приговор читается без journal. */
-        vl_probe_report(out_name, PROBE_NO_SUCH_NODE, o->vless.nodes_n ? o->vless.nodes[0] : -1, (int)cnt);
-        evline_emit("nonode",
-                     "node", EVLINE_INT, (long)(o->vless.nodes_n ? o->vless.nodes[0] : -1),
-                     "total", EVLINE_INT, (long)cnt, (const char *)NULL);
-        fprintf(stderr, LOG_W2 "выбранных узлов нет в подписке (пригодных всего %zu) — "
-                        "проверьте nodes\n", cnt);
-        return 1;
-    }
-    if (sel_n < o->vless.nodes_n)
-        fprintf(stderr, LOG_W2 "узлов выбрано %zu, в подписке есть %zu — остальные номера "
-                        "вне подписки\n", o->vless.nodes_n, sel_n);
-
-    int chosen = -1;
-    if (out_node_named(o)) {
-        chosen = sel[0];
-        /* Узел назван номером — перебора нет, и объяснять нечего. Прежняя запись снимается:
-         * она осталась бы от предыдущей настройки и рассказывала бы про перебор, которого
-         * больше не будет.
-         *
-         * Спрашивается именно «назван ли», а не «остался ли один кандидат»: кандидат
-         * остаётся один и в подписке из единственного узла, и когда из трёх выбранных
-         * уцелел один. По длине списка проверка там пропускалась вовсе — туннель поднимался
-         * на молчащем узле, и вместо приговора возвращалось «устройства нет» (I-100). */
-        probe_clear(out_name);
-    } else {
-        /* Перебор — то самое состояние, у которого не было имени. Устройство появится только
-         * после выбора, а до тех пор его нет, и раньше это выглядело как отказ: одинаково с
-         * «ни один узел не ответил» и с «выход не настроен» (I-100). Номер проверяемого узла
-         * пишется ПЕРЕД проверкой: она длится до восьми секунд, и всё это время строка
-         * состояния обязана называть то, что происходит сейчас.
-         *
-         * Счёт идёт по КАНДИДАТАМ, а не по подписке: при `nodes: [6,7,12]` человек ждёт «2 из
-         * 3», а не «2 из 26» — перебираться будут три, и обещать двадцать шесть значило бы
-         * назвать чужое ожидание. */
-        for (size_t i = 0; i < sel_n; i++) {
-            char why[256];
-            vl_probe_report(out_name, PROBE_RUNNING, (int)i + 1, (int)sel_n);
-            evline_emit("node", "n", EVLINE_INT, (long)(i + 1), "total", EVLINE_INT, (long)sel_n,
-                        (const char *)NULL);
-            if (vless_probe(&nodes[sel[i]], 8, why, sizeof(why)) == 0) {
-                fprintf(stderr, LOG_I2 "выбран %s (%s)\n", nodes[sel[i]].name, why);
-                chosen = sel[i];
-                break;
-            }
-            fprintf(stderr, LOG_I2 "%s — %s\n", nodes[sel[i]].name, why);
-        }
-    }
-    if (chosen < 0) {
-        vl_probe_report(out_name, PROBE_FAILED, 0, (int)sel_n);
-        evline_emit("down", "why", EVLINE_STR, "ни один узел подписки не отвечает",
-                     (const char *)NULL);
-        fprintf(stderr, LOG_W2 "ни один узел подписки не отвечает\n");
-        return 1;
-    }
-    /* Узел выбран — устройство сейчас появится, и дальше о состоянии выхода говорит само
-     * устройство. Запись снимается здесь, а не в tunnel_run: снять её обязан тот, кто её
-     * поставил, иначе на каждом пути выхода из tunnel_run про неё придётся помнить.
-     *
-     * Под демоном об узле за устройством дальше говорит слежка (nw_start, «слежка за узлом»):
-     * up с watch, down, когда узел перестал отвечать, и снова up. Без демона — прежний up,
-     * которого никто не читает. */
-    probe_clear(out_name);
-    nw_start(nodes, sel, sel_n, chosen, !out_node_named(o));
-
-    /* Реестр — чтобы узнать таблицу выхода: из неё берётся адрес устройства. Вызов
-     * идемпотентен и с apply не спорит: тот же файл, те же номера. Правило 5,
-     * docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал die()
-     * изнутри registry_assign. */
-    struct err e = {0};
-    if (registry_assign(sp, &e) < 0) err_die(&e);
-    return tunnel_run(o, &nodes[chosen]);
-}
+/* Подкоманды `steer vless`, `vless-nodes` и `vless-probe` жили здесь и переехали в модуль
+ * протокола — proto/vless/vlmain.c; туда же и проверка узла перед подъёмом (vless_tunnel_run в
+ * vldial.c). */
