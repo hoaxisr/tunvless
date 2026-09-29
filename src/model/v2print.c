@@ -77,6 +77,24 @@ static void fseq(struct flow *w, const char *key, const char *const *v, size_t n
     fputc(']', w->f);
 }
 
+/* Апстрим DNS одним отображением `{ url: …, out: …, ips: […], bootstrap: […] }`. */
+static void dns_up_flow(FILE *f, const struct spec_dns_up *u, const char (*oname)[32]) {
+    struct flow w = { f, 0 };
+    const char *b[MAX_DNS_IPS];
+    fputs("{ ", f);
+    fs(&w, "url", u->url);
+    if (u->out >= 0) fs(&w, "out", oname[u->out]);
+    if (u->ips_n) {
+        for (size_t k = 0; k < u->ips_n; k++) b[k] = u->ips[k];
+        fseq(&w, "ips", b, u->ips_n);
+    }
+    if (u->boot_n) {
+        for (size_t k = 0; k < u->boot_n; k++) b[k] = u->boot[k];
+        fseq(&w, "bootstrap", b, u->boot_n);
+    }
+    fputs(" }", f);
+}
+
 /* ---- имена ----------------------------------------------------------------------------------- */
 
 #define NAMES_MAX (MAX_OUTPUTS + MAX_ANON + MAX_LISTS + MAX_CLIENTS)
@@ -407,21 +425,36 @@ int spec_print_v2(FILE *f, const struct spec *s, struct err *e) {
         }
     }
 
-    if (s->traceroute_hops || s->dns.cache || s->dns.up_n) {
+    size_t named_up = 0;
+    for (size_t i = 0; i < s->dns.up_n; i++) named_up += !s->dns.up[i].inl;
+    if (s->traceroute_hops || s->dns.cache || named_up || s->dns.boot_n) {
         fputs("\ndns:\n", f);
         if (s->traceroute_hops) fputs("  traceroute_hops: true\n", f);
-        if (s->dns.cache) fprintf(f, "  cache: %ld\n", s->dns.cache);
-        if (s->dns.up_n) {
+        if (s->dns.cache) {
+            fprintf(f, "  cache: %ld\n", s->dns.cache);
+            if (s->dns.ttl_min != 10 || s->dns.ttl_max != 3600 || s->dns.ttl_neg != 30)
+                fprintf(f, "  cache_ttl: { min: %ld, max: %ld, negative: %ld }\n", s->dns.ttl_min,
+                        s->dns.ttl_max, s->dns.ttl_neg);
+        }
+        if (s->dns.boot_n) {
+            struct flow w = { f, 0 };
+            const char *b[MAX_DNS_IPS];
+            for (size_t k = 0; k < s->dns.boot_n; k++) b[k] = s->dns.boot[k];
+            fputs("  ", f);
+            fseq(&w, "bootstrap", b, s->dns.boot_n);
+            fputc('\n', f);
+        }
+        if (s->dns.general && s->dns.general <= s->dns.up_n)
+            fprintf(f, "  upstream: %s\n", s->dns.up[s->dns.general - 1].name);
+        if (named_up) {
             fputs("  upstreams:\n", f);
             for (size_t i = 0; i < s->dns.up_n; i++) {
-                const struct spec_dns_up *u = &s->dns.up[i];
-                struct flow w = { f, 0 };
+                if (s->dns.up[i].inl) continue;
                 fputs("    ", f);
-                yq(f, u->name);
-                fputs(": { ", f);
-                fs(&w, "url", u->url);
-                if (u->out >= 0) fs(&w, "out", oname[u->out]);
-                fputs(" }\n", f);
+                yq(f, s->dns.up[i].name);
+                fputs(": ", f);
+                dns_up_flow(f, &s->dns.up[i], oname);
+                fputc('\n', f);
             }
         }
     }
@@ -445,7 +478,15 @@ int spec_print_v2(FILE *f, const struct spec *s, struct err *e) {
             else fs(&w, "to", "all");
             fs(&w, "out", oname[ru->out]);
             if (ru->realip) fs(&w, "resolve", "realip");
-            if (ru->dns && ru->dns <= s->dns.up_n) fs(&w, "dns", s->dns.up[ru->dns - 1].name);
+            if (ru->dns && ru->dns <= s->dns.up_n) {
+                const struct spec_dns_up *du = &s->dns.up[ru->dns - 1];
+                if (du->inl) {
+                    fk(&w, "dns");
+                    dns_up_flow(f, du, oname);
+                } else {
+                    fs(&w, "dns", du->name);
+                }
+            }
             if (ru->dev_scope) fs(&w, "scope", "device");
             if (ru->disabled) { fk(&w, "enabled"); fputs("false", f); }
             fputs(" }\n", f);

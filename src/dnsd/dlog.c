@@ -126,7 +126,14 @@ static char *dlog_render(size_t *len) {
         fprintf(f, ",\"count\":%u,\"last\":%lld,\"ago\":%ld}", e->count,
                 (long long)(wall - ago), ago);
     }
-    fputs("]}\n", f);
+    /* Апстримы со своим транспортом и кэш (1.11): состояние, счётчики, последняя ошибка. Ключи
+     * добавлены в конец — читатель схемы 1 их не знает и не спотыкается. */
+    fputs("],\"upstreams\":[", f);
+    dup_render(f);
+    fputs("],\"cache\":", f);
+    if (dcache_on()) dcache_render(f);
+    else fputs("null", f);
+    fputs("}\n", f);
     if (fclose(f) != 0) { free(mem); return NULL; }
     *len = n;
     return mem;

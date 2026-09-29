@@ -379,7 +379,20 @@ dns:
   mode: fakeip
   cache: 2048
 EOF
-refused "dns.cache — ещё не поддерживается" "ещё не поддерживается в этой версии движка: dns.cache" 4:10
+accepted "dns.cache (с 1.11)"
+
+y <<'EOF'
+version: 2
+outputs:
+  vpn: { kind: interface, device: wg0 }
+dns:
+  bootstrap: [1.1.1.1]
+  upstream: doh
+  upstreams:
+    doh: { url: https://dns.google/dns-query, out: vpn }
+    dot: { url: "tls://1.1.1.1" }
+EOF
+accepted "dns.upstreams, bootstrap и общий upstream (с 1.11)"
 
 y <<'EOF'
 version: 2
@@ -387,9 +400,17 @@ outputs:
   vpn: { kind: interface, device: wg0 }
 dns:
   upstreams:
-    doh: { url: https://1.1.1.1/dns-query, out: vpn }
+    doh: { url: https://dns.google/dns-query, out: vpn }
 EOF
-refused "dns.upstreams — ещё не поддерживается" "dns.upstreams" 6
+refused "имя сервера DoH без ips и bootstrap — отказ" "нечем разрешить" 6
+
+y <<'EOF'
+version: 2
+dns:
+  upstreams:
+    doq: { url: "quic://1.1.1.1" }
+EOF
+refused "DoQ пока отказ" "DoQ (quic://) ещё не поддерживается" 4
 
 # Адреса IPv6 клиентов и lan законны с 1.9 (docs/architecture.md, «4б»): правило получает
 # v6-двойник, convert печатает адреса как есть.

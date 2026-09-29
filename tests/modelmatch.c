@@ -291,13 +291,13 @@ static void t_v2(void) {
     check("v2: to: all — весь трафик, без списка", 1, r->lists_n == 0 && rule_list(&g_spec, r)->all);
     check("v2: for: lan — клиенты по умолчанию", 1, r->clients_n == 0 && rule_who(&g_spec, r) == &g_spec.lan);
 
-    /* Хранится в модели и тогда, когда спека отвергнута «ещё не поддерживается». */
-    check("v2: dns.upstreams — отказ", -1, load(
+    /* Апстримы и кэш (с 1.11) читаются и хранятся в модели. */
+    check("v2: dns.upstreams — принято", 0, load(
         "version: 2\n"
         "outputs: { vpn: { kind: interface, device: wg0 } }\n"
         "dns: { cache: 512, upstreams: { doh: { url: \"https://1.1.1.1/dns-query\", out: vpn } } }\n"
         "rules: [ { to: all, out: vpn, dns: doh } ]\n"));
-    check("… «ещё не поддерживается»", 1, has("ещё не поддерживается в этой версии движка: dns.cache"));
+    check("… протокол DoH, порт 443", 1, g_spec.dns.up[0].proto == DNSP_DOH && g_spec.dns.up[0].port == 443);
     check("… апстрим в модели", 1, g_spec.dns.up_n == 1 && g_spec.dns.up[0].out == 0 &&
           !strcmp(g_spec.dns.up[0].name, "doh"));
     check("… кэш в модели", 512, g_spec.dns.cache);

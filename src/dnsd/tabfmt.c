@@ -10,9 +10,21 @@
 
 /* ---- сборка: демон и `steer dnsd-table --spec` ------------------------------------------- */
 
+static void join_list(FILE *out, const char (*v)[46], size_t n) {
+    if (!n) { fputc('-', out); return; }
+    for (size_t i = 0; i < n; i++) fprintf(out, "%s%s", i ? "," : "", v[i]);
+}
+
 void tabfmt_build(const struct spec *sp, FILE *out) {
     dch_build(sp);
-    fprintf(out, "%zu\n", g_dch_n);
+    /* Без апстримов и кэша таблица остаётся такой, какой была до 1.11, — байт в байт: заголовок
+     * «N», без строк апстримов. Иначе заголовок «N U кэш min max neg» и U строк после каналов. */
+    int ext = g_dup_cfg_n || g_dcache_cfg.entries;
+    if (!ext)
+        fprintf(out, "%zu\n", g_dch_n);
+    else
+        fprintf(out, "%zu %zu %ld %ld %ld %ld\n", g_dch_n, g_dup_cfg_n, g_dcache_cfg.entries,
+                g_dcache_cfg.ttl_min, g_dcache_cfg.ttl_max, g_dcache_cfg.ttl_neg);
     for (size_t i = 0; i < g_dch_n; i++) {
         const struct dchan *c = &g_dch[i];
         /* family — по факту (1.9, IPv6): «46», когда у доменной группы есть половина IPv6
@@ -22,6 +34,16 @@ void tabfmt_build(const struct spec *sp, FILE *out) {
                 (c->fam & DCH_V6) ? ((c->fam & DCH_V4) ? "46" : "6") : "4", c->chan);
         for (size_t k = 0; k < c->rules_n; k++)
             fprintf(out, "|%s", c->rules_path[k]);
+        if (c->up) fprintf(out, "|dns:%d", c->up);
+        fputc('\n', out);
+    }
+    /* Апстрим: имя|адрес|выход|метка|адреса сервера|серверы bootstrap. «-» — пусто. */
+    for (size_t i = 0; i < g_dup_cfg_n; i++) {
+        const struct dup_cfg *u = &g_dup_cfg[i];
+        fprintf(out, "%s|%s|%s|%u|", u->u.name, u->u.url, u->via[0] ? u->via : "-", u->mark);
+        join_list(out, u->u.ips, u->u.ips_n);
+        fputc('|', out);
+        join_list(out, u->u.boot, u->u.boot_n);
         fputc('\n', out);
     }
 }
@@ -85,6 +107,13 @@ static int parse_chan_line(const char *buf, size_t from, size_t line_end, struct
             case 3: field_copy(family, family_cap, buf + pos, flen); break;
             case 4: field_copy(c->chan, sizeof(c->chan), buf + pos, flen); break;
             default:
+                /* Поле «dns:N» — апстрим канала (1.11); остальное — пути списков. */
+                if (flen > 4 && !memcmp(buf + pos, "dns:", 4)) {
+                    char num[8];
+                    field_copy(num, sizeof(num), buf + pos + 4, flen - 4);
+                    c->up = atoi(num);
+                    break;
+                }
                 if (c->rules_n < MAX_FILES) {
                     char *p = malloc(flen + 1);
                     if (!p) return -1;
@@ -105,16 +134,99 @@ static int parse_chan_line(const char *buf, size_t from, size_t line_end, struct
     return field >= 5 ? 0 : -1;
 }
 
+/* Первая строка: «N» (до 1.11) или «N U кэш min max neg». */
+static int parse_header(const char *buf, size_t nl, long *want, long *upn, struct dcache_cfg *cc) {
+    char h[96];
+    field_copy(h, sizeof(h), buf, nl);
+    char *end = NULL;
+    long n = strtol(h, &end, 10);
+    *upn = 0;
+    memset(cc, 0, sizeof(*cc));
+    if (end == h || n < 0 || (size_t)n > MAX_RULES) return -1;
+    *want = n;
+    if (*end == '\0') return 0;
+    if (*end != ' ') return -1;
+    long u, e, mn, mx, ng;
+    int used = 0;
+    if (sscanf(end + 1, "%ld %ld %ld %ld %ld%n", &u, &e, &mn, &mx, &ng, &used) != 5 ||
+        end[1 + used] != '\0')
+        return -1;
+    if (u < 0 || u > MAX_DNS_UP || e < 0 || e > 1000000 || mn < 0 || mx < 0 || ng < 0) return -1;
+    *upn = u;
+    cc->entries = e; cc->ttl_min = mn; cc->ttl_max = mx; cc->ttl_neg = ng;
+    return 0;
+}
+
+/* Разбить строку по '|' на поля (до max); возвращает их число. */
+static size_t split_fields(const char *buf, size_t from, size_t end, size_t (*f)[2], size_t max) {
+    size_t n = 0, pos = from;
+    while (n < max) {
+        size_t e = pos;
+        while (e < end && buf[e] != '|') e++;
+        f[n][0] = pos; f[n][1] = e - pos;
+        n++;
+        if (e >= end) break;
+        pos = e + 1;
+    }
+    return n;
+}
+
+static void list_into(const char *s, size_t n, char (*dst)[46], unsigned char *cnt) {
+    *cnt = 0;
+    if (n == 1 && s[0] == '-') return;
+    size_t pos = 0;
+    while (pos <= n && *cnt < MAX_DNS_IPS) {
+        size_t e = pos;
+        while (e < n && s[e] != ',') e++;
+        if (e > pos) {
+            field_copy(dst[*cnt], 46, s + pos, e - pos);
+            (*cnt)++;
+        }
+        pos = e + 1;
+    }
+}
+
+/* Строка апстрима «имя|адрес|выход|метка|адреса|bootstrap». Адрес, который не разбирается (таблицу
+ * прислал демон другой версии), не роняет резолвер: апстрим остаётся с proto == DNSP_NONE и не
+ * используется, а каналы на него отвечают прежним путём наверх. */
+static int parse_up_line(const char *buf, size_t from, size_t end, struct dup_cfg *c) {
+    size_t f[6][2];
+    if (split_fields(buf, from, end, f, 6) != 6) return -1;
+    memset(c, 0, sizeof(*c));
+    field_copy(c->u.name, sizeof(c->u.name), buf + f[0][0], f[0][1]);
+    field_copy(c->u.url, sizeof(c->u.url), buf + f[1][0], f[1][1]);
+    if (!(f[2][1] == 1 && buf[f[2][0]] == '-')) {
+        field_copy(c->via, sizeof(c->via), buf + f[2][0], f[2][1]);
+        c->need_mark = 1;
+    }
+    char num[16];
+    field_copy(num, sizeof(num), buf + f[3][0], f[3][1]);
+    c->mark = (unsigned)strtoul(num, NULL, 10);
+    list_into(buf + f[4][0], f[4][1], c->u.ips, &c->u.ips_n);
+    list_into(buf + f[5][0], f[5][1], c->u.boot, &c->u.boot_n);
+    char why[96];
+    struct spec_dns_up p;
+    memset(&p, 0, sizeof(p));
+    if (dnsurl_parse(c->u.url, &p, why, sizeof(why)) == 0) {
+        c->u.proto = p.proto;
+        c->u.port = p.port;
+        snprintf(c->u.host, sizeof(c->u.host), "%s", p.host);
+        snprintf(c->u.path, sizeof(c->u.path), "%s", p.path);
+    }
+    return 0;
+}
+
 int tabfmt_parse(const char *buf, size_t len) {
     size_t nl = find_nl(buf, len, 0);
     if (nl >= len) return -1; /* нет даже строки-счётчика */
-    char digits[16];
-    field_copy(digits, sizeof(digits), buf, nl);
-    char *end = NULL;
-    long want = strtol(digits, &end, 10);
-    if (end == digits || *end != '\0' || want < 0 || (size_t)want > MAX_RULES) return -1;
+    long want, upn;
+    struct dcache_cfg cc;
+    if (parse_header(buf, nl, &want, &upn, &cc) != 0) return -1;
 
     tabfmt_release_current();
+    memset(g_dup_cfg, 0, sizeof(g_dup_cfg));
+    g_dup_cfg_n = 0;
+    g_dcache_cfg = cc;
 
     size_t out_n = 0;
     size_t pos = nl + 1;
@@ -136,6 +248,16 @@ int tabfmt_parse(const char *buf, size_t len) {
         pos = line_end + 1;
     }
     g_dch_n = out_n;
+    for (long i = 0; i < upn; i++) {
+        size_t line_end = find_nl(buf, len, pos);
+        if (line_end >= len) return -1;
+        if (parse_up_line(buf, pos, line_end, &g_dup_cfg[g_dup_cfg_n]) != 0) return -1;
+        g_dup_cfg_n++;
+        pos = line_end + 1;
+    }
+    /* Канал, чей апстрим в таблице не назван, спрашивает прежним путём. */
+    for (size_t i = 0; i < g_dch_n; i++)
+        if (g_dch[i].up < 0 || (size_t)g_dch[i].up > g_dup_cfg_n) g_dch[i].up = 0;
     return 0;
 }
 
@@ -150,11 +272,10 @@ int tabfmt_feed(struct tabfmt_feed *st, const char *data, size_t n) {
 
     size_t nl = find_nl(st->buf, st->len, 0);
     if (nl >= st->len) return 0; /* строка-счётчик ещё не дописана */
-    char digits[16];
-    field_copy(digits, sizeof(digits), st->buf, nl);
-    char *end = NULL;
-    long want = strtol(digits, &end, 10);
-    if (end == digits || *end != '\0' || want < 0 || (size_t)want > MAX_RULES) return -1;
+    long want, upn;
+    struct dcache_cfg cc;
+    if (parse_header(st->buf, nl, &want, &upn, &cc) != 0) return -1;
+    want += upn;                 /* строки каналов и строки апстримов идут подряд */
 
     size_t pos = nl + 1;
     for (long i = 0; i < want; i++) {

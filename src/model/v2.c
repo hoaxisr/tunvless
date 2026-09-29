@@ -33,6 +33,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 
 #include "spec.h"
 #include "ynode.h"
@@ -957,12 +958,86 @@ static int reaches_balance(const struct spec *s, const struct output *o, int dep
 
 /* ---- dns ---------------------------------------------------------------------------------- */
 
+/* Список адресов IP (`ips`, `bootstrap`): не больше MAX_DNS_IPS, каждый — адрес IPv4 или IPv6. */
+static int ips_of(struct v2 *x, const struct ynode *n, const char *where,
+                  char (*dst)[46], unsigned char *cnt) {
+    if (items_ok(x, n, where, MAX_DNS_IPS)) return -1;
+    size_t k = n_items(n);
+    for (size_t i = 0; i < k; i++) {
+        const struct ynode *it = item(n, i);
+        struct in6_addr a;
+        if (inet_pton(AF_INET, it->str, &a) != 1 && inet_pton(AF_INET6, it->str, &a) != 1)
+            return fail(x, it, "%s: «%s» — нужен адрес IPv4 или IPv6", where, it->str);
+        if (strlen(it->str) >= 46) return fail(x, it, "%s: адрес слишком длинный", where);
+        snprintf(dst[i], 46, "%s", it->str);
+    }
+    *cnt = (unsigned char)k;
+    return 0;
+}
+
+/* Один апстрим: `url` обязателен; `out` — выход, через который уходит запрос (нет или выход без
+ * устройства, kind=direct, — напрямую); `ips` — адреса сервера, чтобы имя не разрешалось;
+ * `bootstrap` — серверы, которые разрешают имя сервера (иначе общие из dns.bootstrap). */
+static int p_dns_up(struct v2 *x, const struct ynode *val, const char *where, const char *name,
+                    struct spec_dns_up *u) {
+    struct spec *s = x->s;
+    static const char *const U[] = { "url", "out", "ips", "bootstrap", NULL };
+    char w[96];
+    const char *sv;
+    memset(u, 0, sizeof(*u));
+    u->out = -1;
+    snprintf(u->name, sizeof(u->name), "%s", name);
+    if (want_map(x, val, where) || keys_known(x, val, where, U)) return -1;
+    const struct ynode *un = ynode_get(val, "url"), *on = ynode_get(val, "out");
+    snprintf(w, sizeof(w), "%s.url", where);
+    if (!un) return fail(x, val, "%s: нет url", where);
+    if (str_of(x, un, w, &sv) || copy_to(x, un, w, sv, u->url, sizeof(u->url))) return -1;
+    char why[160];
+    if (dnsurl_parse(sv, u, why, sizeof(why)) != 0) return fail(x, un, "%s: «%s» — %s", w, sv, why);
+    if (on) {
+        snprintf(w, sizeof(w), "%s.out", where);
+        if (str_of(x, on, w, &sv)) return -1;
+        int oi = out_idx(s, sv);
+        if (oi < 0 && strcmp(sv, "direct") != 0)
+            return fail(x, on, "%s: выхода «%s» нет в outputs (или слово direct — напрямую)", w, sv);
+        if (oi >= 0 && !out_over_target_ok(&s->out[oi])) {
+            /* Выход без устройства (kind=direct) — то же «напрямую»; прочие без устройства
+             * (zapret, tgws, группа) метке некуда вести. */
+            if (strcmp(out_kind_name(&s->out[oi]), "direct") != 0)
+                return fail(x, on, "%s: выход «%s» (kind=%s) без своего устройства — запрос "
+                            "к DNS нельзя направить через него; нужен interface, awg, vless или "
+                            "xsteer, либо direct", w, sv, out_kind_name(&s->out[oi]));
+            oi = -1;
+        }
+        u->out = oi;
+    }
+    const struct ynode *in = ynode_get(val, "ips"), *bn = ynode_get(val, "bootstrap");
+    snprintf(w, sizeof(w), "%s.ips", where);
+    if (in && ips_of(x, in, w, u->ips, &u->ips_n)) return -1;
+    snprintf(w, sizeof(w), "%s.bootstrap", where);
+    if (bn && ips_of(x, bn, w, u->boot, &u->boot_n)) return -1;
+    return 0;
+}
+
+/* Имя сервера DoT и DoH, не записанное адресом, нужно откуда-то разрешить: `ips` апстрима или
+ * bootstrap (его или общий). Без них апстрим при первом же запросе не нашёл бы сервер. */
+static int up_has_way(const struct spec *s, const struct spec_dns_up *u) {
+    struct in6_addr a;
+    if (u->proto != DNSP_DOT && u->proto != DNSP_DOH) return 1;
+    if (inet_pton(AF_INET, u->host, &a) == 1 || inet_pton(AF_INET6, u->host, &a) == 1) return 1;
+    return u->ips_n || u->boot_n || s->dns.boot_n;
+}
+
 static int p_dns(struct v2 *x, const struct ynode *n) {
     struct spec *s = x->s;
-    static const char *const K[] = { "mode", "cache", "upstreams", "traceroute_hops", NULL };
+    static const char *const K[] = { "mode", "cache", "cache_ttl", "upstream", "upstreams",
+                                     "bootstrap", "traceroute_hops", NULL };
     if (want_map(x, n, "dns") || keys_known(x, n, "dns", K)) return -1;
     const struct ynode *v;
     const char *sv;
+    s->dns.ttl_min = 10;
+    s->dns.ttl_max = 3600;
+    s->dns.ttl_neg = 30;
     if ((v = ynode_get(n, "mode"))) {
         if (str_of(x, v, "dns.mode", &sv)) return -1;
         if (!strcmp(sv, "realip")) x->realip_default = 1;
@@ -970,40 +1045,46 @@ static int p_dns(struct v2 *x, const struct ynode *n) {
     }
     if ((v = ynode_get(n, "traceroute_hops")) && bool_of(x, v, "dns.traceroute_hops", &s->traceroute_hops))
         return -1;
-    if ((v = ynode_get(n, "cache"))) {
-        if (long_of(x, v, "dns.cache", 0, 1000000, &s->dns.cache)) return -1;
-        if (s->dns.cache) unsup(x, v, "dns.cache — кэш ответов резолвера, выпуск 1.11");
+    if ((v = ynode_get(n, "cache")) && long_of(x, v, "dns.cache", 0, 100000, &s->dns.cache)) return -1;
+    if ((v = ynode_get(n, "cache_ttl"))) {
+        static const char *const T[] = { "min", "max", "negative", NULL };
+        if (want_map(x, v, "dns.cache_ttl") || keys_known(x, v, "dns.cache_ttl", T)) return -1;
+        const struct ynode *t;
+        if ((t = ynode_get(v, "min")) && long_of(x, t, "dns.cache_ttl.min", 0, 86400, &s->dns.ttl_min)) return -1;
+        if ((t = ynode_get(v, "max")) && long_of(x, t, "dns.cache_ttl.max", 1, 604800, &s->dns.ttl_max)) return -1;
+        if ((t = ynode_get(v, "negative")) &&
+            long_of(x, t, "dns.cache_ttl.negative", 0, 86400, &s->dns.ttl_neg)) return -1;
+        if (s->dns.ttl_min > s->dns.ttl_max)
+            return fail(x, v, "dns.cache_ttl: min (%ld) больше max (%ld)", s->dns.ttl_min, s->dns.ttl_max);
     }
+    if ((v = ynode_get(n, "bootstrap")) && ips_of(x, v, "dns.bootstrap", s->dns.boot, &s->dns.boot_n))
+        return -1;
     if ((v = ynode_get(n, "upstreams"))) {
         if (want_map(x, v, "dns.upstreams")) return -1;
-        static const char *const U[] = { "url", "out", NULL };
         for (size_t i = 0; i < ynode_len(v); i++) {
             const struct ynode *key = ynode_key_at(v, i), *val = ynode_val_at(v, i);
             if (s->dns.up_n >= MAX_DNS_UP)
                 return fail(x, key, "dns.upstreams: больше %d апстримов", MAX_DNS_UP);
+            char nm[32], where[64];
+            if (name_of(x, key, "dns.upstreams", nm)) return -1;
+            for (size_t k = 0; k < s->dns.up_n; k++)
+                if (!strcmp(s->dns.up[k].name, nm))
+                    return fail(x, key, "dns.upstreams: имя «%s» повторяется", nm);
+            snprintf(where, sizeof(where), "dns.upstreams.%s", nm);
             struct spec_dns_up *u = &s->dns.up[s->dns.up_n];
-            memset(u, 0, sizeof(*u));
-            u->out = -1;
-            if (name_of(x, key, "dns.upstreams", u->name)) return -1;
-            char where[64], w[80];
-            snprintf(where, sizeof(where), "dns.upstreams.%s", u->name);
-            if (want_map(x, val, where) || keys_known(x, val, where, U)) return -1;
-            const struct ynode *un = ynode_get(val, "url"), *on = ynode_get(val, "out");
-            snprintf(w, sizeof(w), "%s.url", where);
-            if (!un) return fail(x, val, "%s: нет url", where);
-            if (str_of(x, un, w, &sv) || copy_to(x, un, w, sv, u->url, sizeof(u->url))) return -1;
-            if (strncmp(sv, "https://", 8) != 0 && strncmp(sv, "tls://", 6) != 0)
-                return fail(x, un, "%s: «%s» — нужен https://… (DoH) или tls://… (DoT)", w, sv);
-            if (on) {
-                snprintf(w, sizeof(w), "%s.out", where);
-                if (str_of(x, on, w, &sv)) return -1;
-                if ((u->out = out_idx(s, sv)) < 0)
-                    return fail(x, on, "%s: выхода «%s» нет в outputs", w, sv);
-            }
+            if (p_dns_up(x, val, where, nm, u)) return -1;
+            if (!up_has_way(s, u))
+                return fail(x, val, "%s: имя «%s» нечем разрешить — задайте ips (адреса сервера) или "
+                            "bootstrap", where, u->host);
             s->dns.up_n++;
         }
-        if (s->dns.up_n)
-            unsup(x, v, "dns.upstreams — свой DNS у правил через выход, выпуск 1.11");
+    }
+    if ((v = ynode_get(n, "upstream"))) {
+        if (str_of(x, v, "dns.upstream", &sv)) return -1;
+        size_t u = 0;
+        while (u < s->dns.up_n && strcmp(s->dns.up[u].name, sv)) u++;
+        if (u == s->dns.up_n) return fail(x, v, "dns.upstream: апстрима «%s» нет в dns.upstreams", sv);
+        s->dns.general = (unsigned char)(u + 1);
     }
     return 0;
 }
@@ -1176,11 +1257,24 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
     }
     if ((v = ynode_get(n, "dns"))) {
         snprintf(w, sizeof(w), "правило %s: dns", rn);
-        if (str_of(x, v, w, &sv)) return -1;
-        size_t u = 0;
-        while (u < s->dns.up_n && strcmp(s->dns.up[u].name, sv)) u++;
-        if (u == s->dns.up_n) return fail(x, v, "правило %s: апстрима «%s» нет в dns.upstreams", rn, sv);
-        r->dns = (unsigned char)(u + 1);
+        if (v->kind == YN_MAP) {
+            /* Свой сервер прямо в правиле: тот же набор ключей, что у dns.upstreams. Имя ему
+             * даёт правило (для status и журнала). */
+            if (s->dns.up_n >= MAX_DNS_UP)
+                return fail(x, v, "%s: больше %d апстримов вместе с dns.upstreams", w, MAX_DNS_UP);
+            struct spec_dns_up *u = &s->dns.up[s->dns.up_n];
+            if (p_dns_up(x, v, w, rn, u)) return -1;
+            u->inl = 1;
+            if (!up_has_way(s, u))
+                return fail(x, v, "%s: имя «%s» нечем разрешить — задайте ips или bootstrap", w, u->host);
+            r->dns = (unsigned char)(++s->dns.up_n);
+        } else {
+            if (str_of(x, v, w, &sv)) return -1;
+            size_t u = 0;
+            while (u < s->dns.up_n && strcmp(s->dns.up[u].name, sv)) u++;
+            if (u == s->dns.up_n) return fail(x, v, "правило %s: апстрима «%s» нет в dns.upstreams", rn, sv);
+            r->dns = (unsigned char)(u + 1);
+        }
     }
     if ((v = ynode_get(n, "enabled"))) {
         int on = 1;

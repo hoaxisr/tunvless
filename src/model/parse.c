@@ -635,3 +635,99 @@ int spec_is_mac(const char *s) {
     }
     return groups == 6;
 }
+
+/* ---- адрес апстрима DNS (dns.upstreams, docs/spec-v2.md) ---------------------------------------
+ *
+ * Схема выбирает транспорт, и только она: `https://` — DoH (RFC 8484), `tls://` — DoT (RFC 7858),
+ * `udp://` и `tcp://` — обычный DNS, `quic://` — DoQ (RFC 9250). DoQ схема принимает как слово, но
+ * разбор её отвергает: клиента QUIC в резолвере ещё нет, и спека с ним не должна молча превратиться
+ * в спеку без апстрима.
+ *
+ * Имя или адрес сервера — до первого `:` или `/`; адрес IPv6 пишется в скобках, как в любом URL.
+ * Для udp:// и tcp:// нужен адрес, а не имя: обычный DNS на имя потребовал бы разрешить его тем же
+ * обычным DNS, то есть тем самым системным резолвером, от которого bootstrap и отвязывает
+ * апстрим. Путь есть только у DoH (умолчание /dns-query, как у dns.google и cloudflare-dns.com).
+ * Порт по умолчанию — у протокола: 53, 853, 443. Разбор один и тот же у спеки (demon) и у
+ * резолвера: последнему демон передаёт адрес строкой, и разойтись им нечем. */
+int dnsurl_parse(const char *url, struct spec_dns_up *u, char *why, size_t why_n) {
+    static const struct { const char *scheme; int proto; unsigned short port; } S[] = {
+        { "udp://", DNSP_UDP, 53 }, { "tcp://", DNSP_TCP, 53 }, { "tls://", DNSP_DOT, 853 },
+        { "https://", DNSP_DOH, 443 }, { "quic://", DNSP_QUIC, 853 },
+    };
+    u->proto = DNSP_NONE;
+    size_t k = 0;
+    for (; k < sizeof(S) / sizeof(S[0]); k++)
+        if (!strncmp(url, S[k].scheme, strlen(S[k].scheme))) break;
+    if (k == sizeof(S) / sizeof(S[0])) {
+        snprintf(why, why_n, "нужен адрес вида https://… (DoH), tls://… (DoT), udp://… или tcp://…");
+        return -1;
+    }
+    if (S[k].proto == DNSP_QUIC) {
+        snprintf(why, why_n, "DoQ (quic://) ещё не поддерживается");
+        return -1;
+    }
+    const char *p = url + strlen(S[k].scheme);
+    char host[128];
+    size_t hn = 0;
+    if (*p == '[') {
+        const char *e = strchr(p, ']');
+        if (!e || e == p + 1 || (size_t)(e - p) > sizeof(host)) {
+            snprintf(why, why_n, "адрес IPv6 в скобках не разобрался");
+            return -1;
+        }
+        hn = (size_t)(e - p - 1);
+        memcpy(host, p + 1, hn);
+        p = e + 1;
+    } else {
+        while (p[hn] && p[hn] != ':' && p[hn] != '/') hn++;
+        if (!hn || hn >= sizeof(host)) {
+            snprintf(why, why_n, "нет имени сервера");
+            return -1;
+        }
+        memcpy(host, p, hn);
+        p += hn;
+    }
+    host[hn] = '\0';
+    long port = S[k].port;
+    if (*p == ':') {
+        char *end;
+        port = strtol(p + 1, &end, 10);
+        if (end == p + 1 || port < 1 || port > 65535 || (*end && *end != '/')) {
+            snprintf(why, why_n, "порт — число от 1 до 65535");
+            return -1;
+        }
+        p = end;
+    }
+    const char *path = "/dns-query";
+    if (*p == '/') {
+        if (S[k].proto != DNSP_DOH) {
+            snprintf(why, why_n, "путь есть только у https://");
+            return -1;
+        }
+        path = p;
+    } else if (*p) {
+        snprintf(why, why_n, "лишнее после адреса: «%s»", p);
+        return -1;
+    }
+    if (strlen(path) >= sizeof(u->path)) {
+        snprintf(why, why_n, "путь длиннее %zu байт", sizeof(u->path) - 1);
+        return -1;
+    }
+    for (const char *c = host; *c; c++)
+        if ((unsigned char)*c <= ' ' || *c == '|' || *c == ',' || *c == '"') {
+            snprintf(why, why_n, "недопустимый символ в имени сервера");
+            return -1;
+        }
+    struct in6_addr a;
+    int lit = inet_pton(AF_INET, host, &a) == 1 || inet_pton(AF_INET6, host, &a) == 1;
+    if ((S[k].proto == DNSP_UDP || S[k].proto == DNSP_TCP) && !lit) {
+        snprintf(why, why_n, "для %s нужен адрес, а не имя: обычный DNS не может сам разрешить имя своего "
+                 "сервера", S[k].scheme);
+        return -1;
+    }
+    u->proto = (unsigned char)S[k].proto;
+    u->port = (unsigned short)port;
+    snprintf(u->host, sizeof(u->host), "%s", host);
+    snprintf(u->path, sizeof(u->path), "%s", S[k].proto == DNSP_DOH ? path : "");
+    return 0;
+}
