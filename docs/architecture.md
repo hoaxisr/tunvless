@@ -213,34 +213,56 @@ steer-tools <команда>    ссылка на steerd: отвечает то�
 
 ### Слои и каталоги
 
+Раскладка дерева, как она есть после шага 2 выпуска 1.10 (каталоги слоёв — `INC_DIRS` в
+`build/sources.mk`, их же ровно перечисляет `Android.bp`; сверяет `tests/buildmatch.sh`):
+
 ```
 src/
   lib/        общие кирпичи, о спеке не знают
-              sys.c (run, моно-время, атомарная запись), jsonw.c, jsonr.c, yaml.c (обёртка libyaml),
-              nlbuf.h, nftnl.c (nf_tables по netlink), ctnl.c (conntrack), sindex.c,
-              ir.c (дерево ruleset: его строят и compile, и виды через emit)
+              run.c (run, run_quiet), err.c, tmpfile.c (шаблон временного файла), jsonw.c, jsonr.c,
+              ynode.c (обёртка libyaml), nlbuf.h, nftnl.c (nf_tables по netlink), nftdump.c,
+              nftvmap.c, ctnl.c (conntrack), rtnl.c, procscan.c, sindex.c, puff.c,
+              ir.c (дерево ruleset: его строят и compile, и виды через emit),
+              evline.c (линия событий помощник → демон), ctlcall.c (вызов сокета демона)
   model/      spec.h (struct spec, struct output с union видов, rule, client, list),
-              v2.c (чтение YAML/JSON v2), v1.c (перевод legacy v1 в ту же модель),
-              check.c (сквозные проверки), registry.c, marks.c
-  kinds/      kind.h (struct kind_ops, биты свойств, реестр),
-              direct.c interface.c awg.c tunnel.c xsteer.c zapret.c tgws.c group.c
-  platform/   platform.h, openwrt.c, android.c
+              parse.c (выбор формата), v2.c и v2print.c (спека v2), v1.c (перевод legacy v1),
+              check.c (сквозные проверки), registry.c, marks.h, probe.c, srs.c, srsplan.c
+  kinds/      kind.h и kind.c (struct kind_ops, биты свойств, реестр),
+              direct.c interface.c awg.c vless.c xsteer.c zapret.c tgws.c group.c grpurl.c
+  platform/   platform.h, platform.c, openwrt.c, android.c
   profile/    profile.h, profile.c (умолчания), extended.c, server.c, tgws.c — данные профиля
-  compile/    groups.c, generate.c, print.c (текущая раскладка), legacy.c (ядра 4.9),
+  compile/    groups.c, balance.c, generate.c, print.c (текущая раскладка), legacy.c (ядра 4.9),
               nftcompat.c
-  daemon/     main.c, ctl.c (сокет, протокол), apply.c (сверка), watch.c (сторож),
-              supervise.c, events.c, status.c, diag.c, explain.c, fwcheck.c
-  dnsd/       main.c, proxy.c, wire.c, rules.c, fakeip.c, table.c, upstream.c (DoH/DoT, метка
-              выхода), cache.c, dlog.c
+  daemon/     main.c, ctl.c (сокет, протокол), apply.c (сверка), watch.c и watchd.c (сторож),
+              supervise.c и supd.c (супервизор), status.c, diag.c, explain.c, fwcheck.c,
+              failover.c, fogroup.c, folat.c, foprobe.c, urltest.c, conns.c, loop.c, state.c,
+              recon.c, rulewd.c, gaiw.c, helpers.c, nftquery.c
+  dnsd/       main.c, proxy.c, wire.c, rules.c, fakeip.c, realip.c, origdst.c, table.c, tabfmt.c,
+              fpseed.c, adopt.c, dlog.c
   client/     main.c — steer, клиент сокета
-  tunnel/     main.c, stack (tcp/udp, rtx, tun), dialer.h, transport.h
-  proto/      tls/ (tls13, certverify, reality, chello, h2)
-              vless/ (vless_proto, vision, sub, subfetch)   transport/ (tcp, tls, reality, grpc,
-              xhttp, ws, httpupgrade)   xsteer/ (xswire, xshake, xsepoch, xsconf, xslink, xsconn,
-              xsroute, xsstream, xsclient, xshub, xsadmin)   tgws/   obfs/ (WG поверх
-              поддельного TCP: помощник и obfs-server)
-  tools/      steer-tools: fit (aggregate.c), srs + puff, hwid, tls-probe, xsteer-admin
+  cli/        cli.c — разбор командной строки
+  tools/      steer-tools: aggregate.c (fit), srsread.c, hwid.c
+  tunnel/     стек туннеля, без протокола: tun.c (TUN: очереди, разгрузка, запись пакетов),
+              rtx.c (кольцо повтора), stack.c и stack.h (TCP/UDP ↔ потоки к узлу, таблица
+              соединений, пул установщиков, запасные сессии), dialer.h (struct dialer_ops)
+  proto/      tls/ (tls13, certverify, reality, chello, h2, roots — корни проверки сертификата,
+              tlsprobe, urltls)
+              transport/ (transport.h — struct transport_ops и security_ops; transport.c —
+              сборка ярусов и транспорт tcp; trdial.c — сокет до узла; trsec.c — none, tls,
+              reality; trgrpc.c; trxhttp.c)
+              vless/ (vlmain.c — подкоманды vless*, vldial.c — дайлер стека, vlwatch.c — слежка
+              за узлом, client.c — vless_connect и проверка узла, vless_proto, vision, sub,
+              subfetch)
+              xsteer/ (xswire, xshake, xsepoch, xsconf, xslink, xsconn, xsroute, xsstream,
+              xsclient, xshub, xsadmin)   tgws/   obfs/ (WG поверх поддельного TCP: помощник и
+              obfs-server)
+  third_party/libyaml (разбор YAML; файлы не правятся — см. UPSTREAM)
 ```
+
+Ещё не заведено то, что в плане названо дальше: транспорты `ws` и `httpupgrade` (шаг 5 выпуска
+1.10, файлы рядом с `trgrpc.c`), апстримы и кэш резолвера (`dnsd/upstream.c`, `dnsd/cache.c` —
+1.11). Отдельного `tunnel/main.c` нет и не будет: точка входа туннеля — у модуля протокола
+(`proto/vless/vlmain.c`), а стек — библиотека, которую модуль зовёт (`stack_run`).
 
 Переносятся все файлы, включая защищённые пути `reality.c`, `tls13.c`, `vision.c`,
 `vless_proto.c`, `xswire.c`, `xshake.c`, `xsepoch.c`, `certverify.c`: владелец решил трогать
@@ -290,10 +312,137 @@ struct kind_ops {
 
 ### Туннели: стек, дайлер, транспорт
 
-Нынешний `ext/tunnel.c` (TUN, стек TCP/UDP, потоки) становится общей библиотекой (в `libsteer`),
-а протокол — дайлером в своём модуле (`steer-vless`, `steer-xsteer`, позже `steer-hysteria2`):
+Стек туннеля (TUN, TCP/UDP ↔ потоки) — общая библиотека (в `libsteer`), а протокол — дайлер в
+своём модуле (`steer-vless`, позже `steer-hysteria2`; `steer-xsteer` — свой цикл, см. ниже):
 модуль — отдельный бинарник, линкуется с `libsteer` и запускается демоном ребёнком, как сейчас
-помощник. **Криптобэкенд — один на всё: wolfSSL, QUIC — ngtcp2 на нём** (решение владельца 2026-09-28).
+помощник. С шага 2 выпуска 1.10 стек, дайлер и транспорт разведены в коде; сами `.so` и модули —
+шаг 4.
+
+Три слоя (раскладка по файлам — «Слои и каталоги»):
+
+- **стек** (`src/tunnel`): TUN ↔ потоки TCP/UDP клиента — SYN-ACK сразу, окно и кольцо повтора,
+  ранние данные, сборка фрагментов, таблица соединений, пул установщиков, запасные сессии. Про
+  протокол он не знает ничего: на каждое соединение у него непрозрачная сессия дайлера
+  (`struct dialer_ops`, `dialer.h`); вход — `stack_run(выход, дайлер)` (`stack.h`);
+- **дайлер** — протокол поверх транспорта: заголовок запроса, обёртки, разбор ответа,
+  обрамление датаграмм. Первый и пока единственный — VLESS (`proto/vless/vldial.c`: заголовок
+  VLESS, Vision, UDP командой 2). Подкоманды `steer vless*`, выбор узла и слежка за ним — там же,
+  в модуле протокола (`vlmain.c`, `vlwatch.c`);
+- **транспорт** (`proto/transport`): как поток дайлера едет до узла — сокет по всем адресам
+  имени с меткой `over` (`trdial.c`), безопасность `security=` — none, tls, reality (`trsec.c`) —
+  и транспорт `type=` — tcp, grpc, xhttp (`transport.c`, `trgrpc.c`, `trxhttp.c`); ws и
+  httpupgrade — шаг 5, ещё две таблицы `transport_ops`.
+
+Интерфейсы — сокращённо, полностью с доводами в заголовках:
+
+```c
+struct dialer_ops {              /* src/tunnel/dialer.h — vless; позже trojan, ss… */
+    const char *name;
+    unsigned caps;               /* DC_PRECONNECT: связь открывается до адреса — пул запасных */
+    size_t sess_size;            /* сессия на соединение клиента; память выделяет стек */
+    int  (*connect)(const void *ctx, void *sess, int timeout_s);   /* в потоке установщика */
+    void (*take)(void *dst, void *src);      /* связь из запасной сессии — в сессию соединения */
+    int  (*flow_open)(const void *ctx, void *sess, const struct flow_key *k, int udp);
+    int  (*send)(const void *ctx, void *sess, const struct flow_key *k, int udp,
+                 const unsigned char *d, size_t n);                   /* SEND_OK/AGAIN/FATAL */
+    size_t (*dgram_frame)(const unsigned char *p, size_t n, unsigned char *out, size_t cap);
+    int  (*read)(void *sess, unsigned char *buf, size_t cap,
+                 const unsigned char **data, size_t *got);
+    int  (*deliver)(const void *ctx, void *sess, int udp, const unsigned char *d, size_t n,
+                    dialer_emit_fn emit, void *arg);   /* кусками потока или датаграммами */
+    /* служебные: peer, describe, strerror, close, clear, fd, has_data */
+};
+
+struct transport_ops {           /* src/proto/transport/transport.h — tcp, grpc, xhttp (ws, httpupgrade) */
+    const char *name;
+    const char *alpn;            /* что просить в ALPN; NULL у tcp */
+    int zc;                      /* данные лежат в записях TLS как есть — чтение без копии */
+    int  (*open)(struct transport *, const struct tr_node *, int timeout_s);
+    int  (*write)(struct transport *, const unsigned char *, size_t);
+    int  (*read)(struct transport *, unsigned char *, size_t cap, size_t *got);
+    void (*moved)(struct transport *);       /* структура переехала — поправить самоуказатели */
+    void (*close)(struct transport *);       /* своё сверх основной связи: вторая связь xhttp */
+};
+struct security_ops {            /* none, tls, reality */
+    const char *name;
+    int (*handshake)(struct tr_link *, const struct tr_node *, const char *alpn);
+};
+```
+
+От прежнего проекта в этом разделе (один список `transport_ops` на «tcp, tls, reality, grpc,
+xhttp, ws, httpupgrade» и `open_tcp`/`open_udp` у дайлера) сделанное отличается в трёх местах:
+
+- **безопасность и транспорт — две таблицы, а не одна цепочка.** В ссылке узла это два
+  независимых поля, `security=` и `type=`, и сочетаются они любые; одна цепочка слоёв одного типа
+  потребовала бы правил, какой слой над каким вправе стоять. Слои безопасности различаются только
+  рукопожатием — после него у tls и reality одни и те же записи TLS 1.3, — поэтому у
+  `security_ops` одна функция, а поток после рукопожатия общий. Вторая связь xhttp (stream-up,
+  packet-up) поднимается тем же `tr_link_open`, что и основная: прежде рукопожатие было
+  скопировано в неё отдельной функцией;
+- **у дайлера нет `open_tcp`/`open_udp`.** Узел один на процесс, связь — одна на поток клиента,
+  и открывает её установщик стека (`connect`); TCP и UDP различаются флагом в `flow_open`, `send`
+  и `deliver` — у VLESS это одна связь с другой командой в заголовке. Датаграммы едут байтами
+  потока (`dgram_frame`). Протоколу с собственными датаграммами (hysteria2 — датаграммы QUIC)
+  понадобятся `send_dgram` и развилка в стеке; они добавятся вместе с ним, а не угадываются
+  заранее;
+- **сессия одна на соединение клиента — и связь, и состояние потока.** Граница между ними — дело
+  дайлера: `take` переселяет из запасной сессии только связь, не затирая UUID и Vision потока.
+
+Поведение при разделении не менялось: байты на проводе, строки журнала и их порядок, коды выхода
+прежние. Держат это стенды `tunnelmatch` (стек на настоящем дайлере VLESS и подменённом
+транспорте), `xhupmatch`, ext-test (`vlessmatch`, `devupmatch`, `androidroots` на настоящей
+библиотеке) и снимок генератора.
+
+**Таблицы потока — в куче, а не в `__thread`.** До шага 2 горячая таблица соединений и сессии
+(`g_conns`, `g_sess[320]`) были статическим TLS цикла — 13 МБ (замер `size -A` объекта
+`tunnel.c`). В статическом бинарнике это обходилось даром: musl отдаёт TLS потока свежими
+страницами, и память занимали только тронутые. В разделяемой `libsteer` — нет: статический TLS
+библиотеки, загруженной при запуске, заводится каждому потоку каждого процесса, слинкованного с
+ней (`steerd`, модули), а glibc ещё и зануляет его — мегабайты резидентной памяти на поток.
+Решение владельца «таблицам не место в .so» выполнено кучей, а не переносом в бинарник модуля: у
+потока цикла одно отображение (`mmap`) под таблицу, списки, корзины и сессии, страницы берутся
+по факту обращения, как прежде в TLS, а установщики и поток слежки своих 13 МБ адресного
+пространства больше не получают. Перенос в модуль потребовал бы, чтобы стек в .so адресовал TLS
+исполняемого файла или получал таблицы от модуля обратным вызовом, — сложнее, а выигрыша против
+кучи нет. Если владелец всё же захочет таблицы именно в бинарнике модуля, это место пересматривается.
+
+**Статический TLS, который остаётся** (буферы на поток; замер `size -A` объектов при сборке с
+mbedtls 3.6 на x86_64): в будущей `libsteer` — стек 30 КБ (буфер чтения, датаграмма, сборка
+фрагментов), `tun.c` 4 КБ, транспорт 52 КБ (grpc, выгрузка xhttp), `h2.c` 44 КБ, `reality.c`
+6 КБ, `tls13.c` 136 КБ; в модуле VLESS — дайлер 18 КБ и проверка узла 33 КБ. Пока бинарник
+статический, это тот же TLS, что и был. На шаге 4 выбор — оставить (около 270 КБ статического
+TLS на каждый поток каждого процесса с `libsteer`) или перенести буферы стека и транспорта в
+таблицы потока и в связь; `tls13.c` — за шагом 1 (переезд на wolfSSL). Замечено при проверке
+шага 2: на glibc (сборка на хосте) стенд `tests/run-tunnel.sh` не проходит ни до шага, ни после —
+glibc кладёт статический TLS в стек потока, а установщикам дан стек 128 КБ (`connq_push`), и
+`pthread_create` отказывает (EINVAL): прежде TLS был 13 МБ, теперь около 300 КБ, но всё ещё
+больше 128 КБ. На musl роутера TLS живёт отдельно и отказа нет. С подменой размера стека
+(`LD_PRELOAD`, как в `tests/tunnelmatch.c`) стенд проходит на обоих бинарниках одинаково.
+Для `libsteer` на телефоне (bionic) это надо проверить на шаге 4 вместе с решением о буферах.
+
+**Что куда при шаге 4** (списки `STACK_SRC`, `TRANSPORT_SRC` и `VLESS_MOD_SRC` в
+`build/sources.mk` заведены уже сейчас):
+
+| Файлы | Куда |
+|---|---|
+| `tunnel/stack.c`, `rtx.c`, `tun.c` | `libsteer.so` (`tun.c` нужен и xsteer) |
+| `proto/transport/*`, `proto/tls/*` с `roots.c` | `libsteer.so`, криптография — `libsteer-wolfssl.so` |
+| `proto/vless/vlmain.c` (main модуля), `vldial.c`, `vlwatch.c`, `client.c`, `vless_proto.c`, `vision.c` | бинарник `steer-vless` |
+| `proto/vless/sub.c`, `subfetch.c` | `libsteer.so`: подписку разбирает и `steer-tools sub-fetch` |
+| `proto/xsteer/xsclient.c` | бинарник `steer-xsteer`; общее с хабом и `steer-tools` (`xswire`, `xshake`, `xsconn`, `xsstream`, `xsepoch`, `xsconf`, `xslink`, `xsroute`, `xsadmin`) — в `libsteer.so`, решается там же |
+
+В `steerd` от VLESS остаётся вид `kinds/vless.c` (разбор выхода, правила) и слабая ссылка на
+подкоманды в `daemon/main.c` — на её месте отказ «нужен пакет steer-vless».
+
+**xsteer** на этот стек не ложится и в шаге 2 не переделывался. Он везёт IP-пакеты, а не потоки:
+TUN ↔ записи своего протокола (Noise IK в облике TLS, `xshake.c`) поверх UDP или своего TCP
+(`xsstream.c`) — без терминатора TCP/UDP, окон и повтора, то есть отдавать дайлеру ему нечего.
+Транспорты `proto/transport` ему тоже ни к чему: его рукопожатие — не TLS-клиент к серверу, а
+своё. Общее со стеком у него — слой TUN (`tun.c`: очереди, чтение, склейка сегментов при записи);
+подъём устройства свой (адрес из конфигурации, MTU из накладных, режим netifd), потоки свои — по
+соединению на поток. Граница для него — общий `tun.c` в `libsteer` и свой цикл в модуле.
+
+**Криптобэкенд — один на всё: wolfSSL, QUIC — ngtcp2 на нём** (решение владельца 2026-09-28).
 mbedtls уходит: QUIC в нём нет, и распространённые библиотеки QUIC его не поддерживают, а
 второго криптостека на флеше владелец не хочет. wolfSSL закрывает TLS 1.3 (DoH, DoT, VLESS,
 xsteer), примитивы wolfCrypt для своих REALITY и TLS 1.3 в `proto/tls` (x25519, AES-GCM,
@@ -302,25 +451,10 @@ ChaCha20-Poly1305, HKDF, ed25519) и служит криптобэкендом n
 `proto/tls` и модулей — через свой тонкий слой примитивов, чтобы код протоколов не звал
 wolfSSL напрямую. Что проверить при переезде, прежде чем полагаться: пакет libwolfssl в
 OpenWrt собран с нужными возможностями (TLS 1.3, QUIC, x25519/ed25519, ChaCha), размер на
-флеше против нынешнего mbedtls, сборка на телефоне (Android.bp, ndk-check):
-
-```c
-struct dialer_ops {                          /* vless, позже trojan, ss… */
-    const char *name;
-    int (*open_tcp)(struct flow *, const struct node *, struct transport *);
-    int (*open_udp)(struct flow *, const struct node *, struct transport *);
-    ...
-};
-struct transport_ops {                       /* tcp, tls, reality, grpc, xhttp, ws, httpupgrade */
-    const char *name;
-    int (*connect)(struct transport *, const struct node *);
-    ...
-};
-```
+флеше против нынешнего mbedtls, сборка на телефоне (Android.bp, ndk-check).
 
 Новый протокол — это файл дайлера, а стек не трогается. Первая очередь после пересборки —
-транспорт WebSocket/HTTPUpgrade. *Предложение:* xsteer в эту схему не входит. Он везёт
-IP-пакеты, а не потоки, поэтому остаётся своим видом со своим помощником.
+транспорт WebSocket/HTTPUpgrade (шаг 5): две таблицы `transport_ops`, дайлер и стек не меняются.
 
 ### DNS
 
@@ -473,7 +607,8 @@ rules:                                # сверху вниз, выше — си
   есть только RENO, CUBIC и BBR;
 - wolfSSL с 5.8.2 распространяется под GPLv3;
 - стека TUN отдельно от VLESS в коде нет: `struct sess` в `src/tunnel/tunnel.c` держит `vless_conn`;
-  у туннеля ~14 МБ thread-local (`g_conns`/`g_sess`), им не место в разделяемой библиотеке.
+  у туннеля ~14 МБ thread-local (`g_conns`/`g_sess`), им не место в разделяемой библиотеке
+  (так было до шага 2 ниже; теперь — «Туннели: стек, дайлер, транспорт» в разделе 2).
 
 Решения:
 
@@ -501,6 +636,21 @@ rules:                                # сверху вниз, выше — си
    замер размера и скорости шифров на mipsel против нынешней сборки.
 2. Стек отдельно от протокола: `dialer_ops`/`transport_ops`, `struct sess` без `vless_conn`,
    диалер VLESS — в `proto/vless`.
+   *Сделано* (устройство — «Туннели: стек, дайлер, транспорт» в разделе 2). `src/tunnel/tunnel.c`
+   разделён: стек — `src/tunnel/stack.c` (`stack_run`, `dialer.h`), дайлер VLESS —
+   `proto/vless/vldial.c`, подкоманды `vless*` и слежка за узлом — `vlmain.c` и `vlwatch.c`;
+   установление связи из `client.c` — в `proto/transport` (`transport_ops` для tcp/grpc/xhttp и
+   отдельные `security_ops` для none/tls/reality — почему две таблицы, сказано там же), корни
+   проверки сертификата — `proto/tls/roots.c`. Сессия соединения для стека непрозрачна.
+   Thread-local таблицы туннеля ушли не в бинарник модуля, как записано в таблице решений выше, а
+   в кучу потока цикла (одно `mmap` на поток): цель решения — «не в .so» — выполнена без того,
+   чтобы стек в библиотеке зависел от памяти модуля; довод и оценка — там же. Поведение не
+   менялось: снимок генератора совпадает (128 снимков), стенды туннеля и ext-test зелёные без
+   правки ожиданий. Стенды переведены на линковку новых единиц: `devupmatch` больше не включает
+   `tunnel.c`, заодно `visionmatch` и `tunnamematch` — свои `.c`; храповик `tests/buildmatch.sh`
+   на включение `.c` из `src` — 27 вместо 30 (`tunnelmatch` включает `stack.c`: ему нужны
+   статические функции разбора пакета). Попутно ext-test снова доходит до конца: стенд
+   `spokematch` не компоновался без `src/lib/ctlcall.c`.
 3. Маршрут модуля ставит демон по `up`; модули не зовут `bind_device`. Проверка на QEMU.
 4. `libsteer.so` (`-fPIC`, скрытые символы, version-script, SONAME по версии движка) и
    `libsteer-wolfssl.so`; модули `steer-vless`, `steer-xsteer`, `steer-obfs`, `steer-tgws` —
@@ -1060,7 +1210,8 @@ procd держит один `steerd daemon --watch --supervise --apply`; на т
 - ~~**Здоровье помощников в демоне (1.8, шаг 4).** Клиент vless сообщает `up` при выборе узла и
   больше ничего: умерший потом узел сторож замечает по-прежнему пробой TCP. Событие `down` на
   потерю узла у самого клиента сняло бы и эту пробу.~~ — закрыто: клиент vless под демоном следит
-  за узлом сам (`src/tunnel/tunnel.c`, «слежка за узлом») — той же проверкой, что выбирает узел
+  за узлом сам (тогда `src/tunnel/tunnel.c`, с шага 2 выпуска 1.10 — `src/proto/vless/vlwatch.c`,
+  «слежка за узлом») — той же проверкой, что выбирает узел
   при подъёме, раз в минуту и сразу после трёх несостоявшихся подряд соединений с узлом. Две
   неудачи подряд — `down` с причиной; свой узел снова ответил — `up`; ответил другой кандидат —
   клиент выходит, и демон поднимает его заново тем же перебором. `up` приходит с `watch`, и сторож
