@@ -65,6 +65,11 @@ struct recon_diff {
     int ruleset;
     char route[MAX_OUTPUTS][32];
     size_t route_n;
+    /* route_kern[i] — выход route[i] привязывается заново только потому, что ядро разошлось с
+     * ожидаемым, а подпись его маршрутизации в спеке не менялась: такая привязка ничего не снимает
+     * нарочно, и страж правил вправе возвращать правила этого выхода, пока она идёт (rulewd.c).
+     * Выход с изменившейся подписью, новый и полный apply — 0: спека могла отнять у него IPv6. */
+    unsigned char route_kern[MAX_OUTPUTS];
     struct { unsigned mark; int table; } drop[2 * MAX_OUTPUTS];
     size_t drop_n;
     int awg, masq;
