@@ -29,7 +29,7 @@ CORE_DIRS := src/lib src/model src/platform src/compile src/daemon src/kinds src
 # PLATFORM_SRC); остальные — по одному на профиль, у base своего файла нет. Отдельно от ядра и
 # от расширенной части, потому что файл профиля не входит ни в одну сборку, кроме своей.
 PROFILE_DIRS := src/profile
-EXT_DIRS  := src/tunnel src/proto/tls src/proto/transport src/proto/vless src/proto/xsteer src/proto/tgws
+EXT_DIRS  := src/tunnel src/proto/tls src/proto/transport src/proto/vless src/proto/xsteer src/proto/tgws src/modules
 # Клиент сокета `steer` (src/client) — отдельный бинарник, не профиль движка: CLIENT_SRC ниже.
 CLIENT_DIRS := src/client
 # Сторонний код (src/third_party) — не слой движка: файлы в нём не правятся (см. UPSTREAM в
@@ -82,7 +82,11 @@ YAML_SRC := src/lib/ynode.c $(LIBYAML_SRC)
 # lib/ir.c — дерево набора правил (lib/ir.h) — здесь по той же причине: его строят не только
 # компилятор (src/compile), но и виды (kind_ops.emit у zapret и tgws), а о спеке и видах дерево
 # не знает ничего (только libc), то есть это кирпич lib, а не часть компилятора.
-MODEL_SRC := $(PLATFORM_SRC) src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/lib/ir.c src/model/parse.c src/model/v1.c \
+#
+# lib/module.c — какая команда чья и установлен ли модуль (шаг 4 выпуска 1.10, src/lib/module.h):
+# его зовут реестр видов (kinds/kind.c, kinds/tgws.c) и справка (cli/cli.c), а они идут со всякой
+# моделью, поэтому файл здесь же.
+MODEL_SRC := $(PLATFORM_SRC) src/lib/module.c src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/lib/ir.c src/model/parse.c src/model/v1.c \
              src/model/check.c src/model/v2.c src/model/v2print.c src/model/registry.c \
              src/model/probe.c src/compile/nftcompat.c src/lib/puff.c src/model/srs.c src/model/srsplan.c \
              src/lib/nftdump.c src/lib/rtnl.c src/lib/procscan.c $(YAML_SRC)
@@ -126,15 +130,34 @@ KINDS_EXT_SRC  := src/kinds/vless.c src/kinds/xsteer.c
 # src/daemon/steer.c нарезан на модули (docs/architecture.md, раздел 2, «Слои и каталоги»):
 # компиляция спеки в правила — в src/compile, остальное ядро — в src/daemon, порядок ниже
 # такой же, как был в steer.c (lib/run.c раньше всех — на него ссылаются и compile, и daemon).
-CORE_SRC := src/lib/run.c src/lib/jsonw.c src/lib/evline.c src/compile/groups.c src/compile/generate.c src/compile/balance.c src/compile/print.c src/compile/legacy.c src/daemon/fwcheck.c \
-            src/daemon/apply.c src/daemon/status.c src/daemon/nftquery.c src/daemon/diag.c \
-            src/daemon/explain.c src/daemon/helpers.c src/daemon/supervise.c src/daemon/supd.c src/daemon/watch.c src/daemon/main.c \
-            $(MODEL_SRC) $(DNSD_SRC) src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
-            src/cli/cli.c src/tools/srsread.c src/tools/hwid.c src/daemon/ctl.c \
-            src/daemon/conns.c src/daemon/loop.c src/daemon/state.c src/daemon/watchd.c src/daemon/recon.c src/daemon/rulewd.c \
-            src/daemon/foprobe.c src/daemon/gaiw.c src/daemon/urltest.c src/daemon/fogroup.c src/lib/nftvmap.c \
-            src/daemon/folat.c src/lib/ctlcall.c \
-            $(KINDS_BASE_SRC)
+#
+# С ВЫПУСКА 1.10 (ШАГ 4) ЯДРО РАЗРЕЗАНО НА ТРИ СПИСКА, а CORE_SRC — их сумма:
+#   DAEMON_SRC        то, что остаётся в бинарнике steerd, когда он линкуется с libsteer.so:
+#                     компилятор правил, apply, сторож, супервизор, демон, резолвер, точка входа;
+#   LIBSTEER_BASE_SRC то, что нужно и демону, и модулям: модель спеки (с libyaml), платформа,
+#                     реестр и файлы видов, разбор командной строки, линия событий, обфускатор,
+#                     идентификатор роутера. Уходит в libsteer.so (LIBSTEER_SRC ниже);
+#   OBFS_MOD_SRC      точка входа обфускатора (`steer obfs`, `steer obfs-server`) — в пакете
+#                     модуль steer-obfs, а в статических сборках часть ядра, как была.
+# Статические сборки (телефон, стенды, мини-сборка tgws, хаб) по-прежнему берут CORE_SRC целиком:
+# один бинарник без разделяемых библиотек, и снимок генератора, стенды и телефон проверяют ровно
+# ту логику, что едет в пакет; отличается только компоновка. Что список DAEMON + LIBSTEER_BASE +
+# OBFS_MOD даёт то же множество файлов, что прежний CORE_SRC, сверяет tests/buildmatch.sh.
+# cli/modcmd.c — команды модулей (заглушки steerd и настоящие ветки модулей) и main модуля;
+# входит и в steerd, и в каждый бинарник модуля.
+MODCMD_SRC := src/cli/modcmd.c
+DAEMON_SRC := src/compile/groups.c src/compile/generate.c src/compile/balance.c src/compile/print.c src/compile/legacy.c src/daemon/fwcheck.c \
+              src/daemon/apply.c src/daemon/status.c src/daemon/nftquery.c src/daemon/diag.c \
+              src/daemon/explain.c src/daemon/helpers.c src/daemon/supervise.c src/daemon/supd.c src/daemon/watch.c src/daemon/main.c \
+              $(DNSD_SRC) src/daemon/failover.c src/tools/aggregate.c \
+              src/tools/srsread.c src/daemon/ctl.c \
+              src/daemon/conns.c src/daemon/loop.c src/daemon/state.c src/daemon/watchd.c src/daemon/recon.c src/daemon/rulewd.c \
+              src/daemon/foprobe.c src/daemon/gaiw.c src/daemon/urltest.c src/daemon/fogroup.c src/lib/nftvmap.c \
+              src/daemon/folat.c $(MODCMD_SRC)
+LIBSTEER_BASE_SRC := src/lib/run.c src/lib/jsonw.c src/lib/evline.c $(MODEL_SRC) src/proto/obfs/obfs.c \
+                     src/cli/cli.c src/tools/hwid.c src/lib/ctlcall.c $(KINDS_BASE_SRC)
+OBFS_MOD_SRC := src/proto/obfs/obfsmain.c
+CORE_SRC := $(DAEMON_SRC) $(LIBSTEER_BASE_SRC) $(OBFS_MOD_SRC)
 
 # Слой криптографических примитивов (src/lib/scrypto.h, docs/architecture.md, «Криптография»):
 # единственный файл движка, который видит wolfSSL. Лежит в src/lib, потому
@@ -196,6 +219,53 @@ PROFILE_server   := $(CORE_SRC) $(XS_COMMON_SRC) $(EXT_SERVER_SRC) src/profile/s
 PROFILE_tgws     := $(CORE_SRC) $(EXT_TGWS_SRC) src/profile/tgws.c
 # Телефон: тот же состав, что расширенный роутерный (Android.bp, цель steer).
 PROFILE_android  := $(PROFILE_extended)
+
+# ---- РАЗДЕЛЯЕМАЯ СБОРКА РОУТЕРА (шаг 4 выпуска 1.10, docs/architecture.md, «Сборки») ----------
+#
+# Пакет роутера — не один статический бинарник, а steerd, четыре модуля и две разделяемые
+# библиотеки. Списки ниже — то, что линкуется в каждый из этих файлов; статические профили выше
+# остаются для телефона (шаг 6), стендов и микропакетов и собирают то же самое одним файлом.
+#
+#   libsteer.so         LIBSTEER_SRC: модель, платформа, виды, разбор команд, линия событий, слой
+#                       криптографии, TLS и REALITY, транспорты, стек TUN — всё, что нужно и
+#                       steerd, и модулям. Собирается -fPIC -fvisibility=hidden с version-script
+#                       build/libsteer.map (наружу — только нужное), SONAME libsteer.so.<версия>;
+#                       ABI между версиями не обещается, модуль той же версии, что движок.
+#   libsteer-wolfssl.so наша сборка wolfSSL (build/wolfssl): список файлов — build/wolfssl/
+#                       build.sh, не здесь.
+#   steerd              PROFILE_steerd = DAEMON_SRC + urltls.c (замер групп по HTTPS — ему нужен
+#                       TLS из libsteer; вслед за ним в 1.11 dnsd для DoH/DoT). Поэтому ядро
+#                       зависит от обеих библиотек.
+#   steer-vless         клиент VLESS: дайлер, слежка за узлом, проверка узла, Vision, разбор
+#                       подписки, скачивание подписки, проба TLS. Свой main — modmain.c.
+#   steer-xsteer        клиент звезды xsteer: рукопожатие, конфигурация, маршрутизация, поток,
+#                       служебные команды (ключ, проверка, ссылка).
+#   steer-obfs          помощник обфускатора; сам код obfs.c — в libsteer (его зовёт и xsteer).
+#   steer-tgws          мост Telegram; правила перехвата пишет ядро (kinds/tgws.c в libsteer).
+#
+# modcmd.c входит и в steerd (заглушки команд модулей), и в каждый модуль (настоящие ветки): один
+# разбор команд, тот же вывод и код выхода, `steer vless-nodes` для splify2 не меняется.
+# Состав двух бинарных половин сверяет tests/buildmatch.sh: в модуле нет failover.c и модели —
+# они в libsteer/steerd; маршрут выхода ставит демон по up (шаг 3).
+LIBSTEER_SRC := $(LIBSTEER_BASE_SRC) $(KINDS_EXT_SRC) $(STACK_SRC) $(TRANSPORT_SRC) \
+                src/tunnel/tun.c src/proto/tls/chello.c src/proto/tls/tls13.c \
+                src/proto/tls/certverify.c src/proto/tls/reality.c src/proto/tls/h2.c $(CRYPTO_SRC)
+STEERD_DYN_SRC := $(DAEMON_SRC) src/proto/tls/urltls.c
+VLESS_MODULE_SRC := $(VLESS_MOD_SRC) src/proto/vless/sub.c src/proto/vless/subfetch.c \
+                    src/proto/tls/tlsprobe.c $(MODCMD_SRC) src/modules/main_vless.c
+XSTEER_MODULE_SRC := src/proto/xsteer/xsclient.c src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c \
+                     src/proto/xsteer/xslink.c src/proto/xsteer/xsroute.c src/proto/xsteer/xsconn.c \
+                     src/proto/xsteer/xsstream.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xshake.c \
+                     src/proto/xsteer/xsadmin.c $(MODCMD_SRC) src/modules/main_xsteer.c
+OBFS_MODULE_SRC := $(OBFS_MOD_SRC) $(MODCMD_SRC) src/modules/main_obfs.c
+TGWS_MODULE_SRC := src/proto/tgws/tgws.c $(MODCMD_SRC) src/modules/main_tgws.c
+
+PROFILE_libsteer   := $(LIBSTEER_SRC)
+PROFILE_steerd     := $(STEERD_DYN_SRC)
+PROFILE_mod_vless  := $(VLESS_MODULE_SRC)
+PROFILE_mod_xsteer := $(XSTEER_MODULE_SRC)
+PROFILE_mod_obfs   := $(OBFS_MODULE_SRC)
+PROFILE_mod_tgws   := $(TGWS_MODULE_SRC)
 
 # Два бинарника на пакет (docs/architecture.md, раздел 4а, «Бинарники»): профиль — это движок
 # steerd (демон, компилятор, apply, помощники, инструменты; ссылка steer-tools на него же), а

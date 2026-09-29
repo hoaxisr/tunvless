@@ -123,6 +123,7 @@
 #include "state.h"
 #include "watchd.h"
 #include "helpers.h"
+#include "module.h"
 
 #define LOG_SW "steer[warn] supervise: "
 /* Таблицы, не забранные резолвером: одна — десятки килобайт; больше мегабайта в очереди —
@@ -276,11 +277,63 @@ static void ev_health(struct supd *s, struct helper *h, const struct evline *e) 
     steerd_emit(s->d, "health", f);
 }
 
+/* ОТВЕРГНУТЬ МОДУЛЬ (шаг 4 выпуска 1.10, evline.h: hello). Модуль — отдельный бинарник со своим
+ * пакетом, и на роутере он легко оказывается другой версии, чем движок: пакеты обновили не
+ * все. Формат событий между выпусками не обещан, поэтому чужой версии демон не верит ни в чём —
+ * ни в up, ни в устройство, к которому пришлось бы привязывать маршрут. Процесс гасится
+ * (SIGTERM), причина остаётся в журнале и в status (last_down, поле rejected) до нового запуска:
+ * человек видит не «помощник упал», а «поставьте модуль той же версии». Перезапуск идёт по
+ * обычной паузе — обновили пакет, и следующий запуск пройдёт. */
+static void mod_reject(struct supd *s, struct helper *h, const char *why) {
+    struct helper_state *st = &h->st;
+    char reason[200];
+    snprintf(reason, sizeof(reason), "модуль %s %s", h->prog, why);
+    fprintf(stderr, LOG_SW "%s %s — %s: отвергнут\n", h->cmd, h->name, reason);
+    h->rejected = 1;
+    st->up = 0;
+    st->known = 1;
+    st->said_down = 1;
+    st->since = (long)time(NULL);
+    snprintf(st->why, sizeof(st->why), "%s", reason);
+    emit_state(s, h, "helper-down", st->why);
+    wake_watch(s, h);
+    if (h->pid > 0) kill(h->pid, SIGTERM);
+}
+
+/* Первое сообщение модуля обязано быть hello с версией движка. */
+static void mod_hello(struct supd *s, struct helper *h, const struct evline *e) {
+    const char *ver = evline_str(e, "ver");
+    if (!ver) {
+        mod_reject(s, h, "прислал hello без версии");
+        return;
+    }
+    if (strcmp(ver, steer_engine_version()) != 0) {
+        char why[160];
+        snprintf(why, sizeof(why), "версии %.16s, а движок %.16s — обновите пакеты steer вместе",
+                 ver, steer_engine_version());
+        mod_reject(s, h, why);
+        return;
+    }
+    h->hello = 1;
+    snprintf(h->mver, sizeof(h->mver), "%s", ver);
+}
+
 static void ev_line(struct supd *s, struct helper *h, const char *line) {
     struct evline e;
     if (evline_parse(line, &e) != 0) return;
     struct helper_state *st = &h->st;
     long v, t;
+    /* Шов стенда (STEER_SUPERVISE_EXE) подменяет модуль заглушкой движка: она про hello не знает. */
+    if (h->module && !s->seam) {
+        if (h->rejected) return;         /* процесс уже приговорён, его словам не верим */
+        if (!h->hello) {
+            if (!strcmp(e.ev, "hello")) mod_hello(s, h, &e);
+            else mod_reject(s, h, "не назвал версию (первое сообщение — не hello): "
+                                  "нужен модуль того же выпуска, что движок");
+            return;
+        }
+        if (!strcmp(e.ev, "hello")) return;
+    }
     if (!strcmp(e.ev, "up")) {
         st->up = 1;
         st->known = 1;
@@ -953,6 +1006,26 @@ static int start_one(struct helper *h, void *arg) {
         if (rc < 0) return -1;
         if (rc == 1) return 0;          /* забран живой: о его выходе скажет dn_conn */
     } else {
+        /* Бинарника модуля нет (пакет не поставлен или удалён): не запускать вслепую, а сказать
+         * прямо — один раз в журнал, дальше в status (last_down), — и повторять по обычной паузе:
+         * поставят пакет, следующая попытка запустит. */
+        if (h->module && !s->seam) {
+            char mp[PATH_MAX + 64];
+            if (steer_module_path(h->prog, mp, sizeof(mp)) != 0) {
+                snprintf(h->st.why, sizeof(h->st.why), "нужен пакет %s", h->prog);
+                h->st.known = 1;
+                h->st.said_down = 1;
+                if (!h->nomod_logged) {
+                    fprintf(stderr, LOG_SW "%s %s — модуля нет: нужен пакет %s (входит в "
+                                    "steer-extended)\n", h->cmd, h->name, h->prog);
+                    h->nomod_logged = 1;
+                }
+                return -1;
+            }
+            h->nomod_logged = 0;
+        }
+        h->hello = h->rejected = 0;
+        h->mver[0] = '\0';
         int p[2];
         if (pipe2(p, O_CLOEXEC) != 0) return -1;
         const char *av[12];
@@ -1022,7 +1095,9 @@ static void child_cb(struct loop *l, pid_t pid, int status, void *arg) {
         if (h->st.watch) h->st.said_down = 0;
         h->st.watch = 0;
         /* Погашен нами — причина наша, а не код выхода, который это «вышел по SIGTERM». */
-        if (h->gone)
+        if (h->rejected) {
+            /* причина уже записана приговором модулю (mod_reject), а не «убит SIGTERM» */
+        } else if (h->gone)
             snprintf(h->st.why, sizeof(h->st.why), "выход убран из спеки");
         else if (h->restart && h->revive)
             snprintf(h->st.why, sizeof(h->st.why), "перезапуск: выход не отвечает");
@@ -1306,6 +1381,16 @@ int supd_helper_json(const struct supd *s, const char *name, FILE *out) {
         if (st->why[0]) {
             steerd_json_str(wj, sizeof(wj), st->why);
             fprintf(out, ",\"last_down\":%s", wj);
+        }
+        /* Модуль (отдельный бинарник): чей и какой версии, если он представился; отвергнутый за
+         * чужую версию помечен — причина в last_down. */
+        if (h->module) {
+            fprintf(out, ",\"module\":\"%s\"", h->prog);
+            if (h->hello) {
+                steerd_json_str(wj, sizeof(wj), h->mver);
+                fprintf(out, ",\"module_ver\":%s", wj);
+            }
+            if (h->rejected) fputs(",\"rejected\":true", out);
         }
         if (!strcmp(h->cmd, "vless") && (st->node || st->nonode))
             fprintf(out, ",\"node\":%ld,\"total\":%ld", st->nonode ? st->nonode : st->node,

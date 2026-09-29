@@ -22,7 +22,9 @@ DEFS    := -DSTEER_VERSION='"$(VERSION)"' $(if $(REV),-DSTEER_REV='"$(REV)"',)
 # список файлов сборки они не меняют, а пересобрать движок при их правке нужно всегда.
 include build/sources.mk
 CORE_HDR := $(wildcard $(addsuffix /*.h,$(CORE_DIRS) $(PROFILE_DIRS) $(THIRD_DIRS)))
-EXT_ALL_SRC := $(sort $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(EXT_SERVER_SRC) $(EXT_TGWS_SRC))
+# Точки входа модулей (src/modules, шаг 4 выпуска 1.10) — тоже расширенная часть: их main живёт
+# только в разделяемой раскладке, и ни один статический профиль их не компилирует.
+EXT_ALL_SRC := $(sort $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(EXT_SERVER_SRC) $(EXT_TGWS_SRC) $(wildcard src/modules/*.c))
 # Модель для стендов, которые компонуют её отдельным списком: разбор спрашивает вид у реестра, поэтому
 # вместе с моделью идут виды (src/kinds). Без awg.c: он тянет run_quiet из lib/run.c, а стенды
 # подменяют run_quiet своим — awg.c берут только те, кому нужен сам вид awg (specmatch, awgmatch).
@@ -40,7 +42,7 @@ MODEL_KINDS := $(MODEL_SRC) $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC))
 # новой версии компилятора — глушить его здесь флагами для LIBYAML_SRC, а не правкой upstream.
 override CFLAGS += $(addprefix -I,$(INC_DIRS)) $(THIRD_DEFS)
 
-.PHONY: all test clean ext-syntax ext-test snapshot-record print-inc ndk-check
+.PHONY: all test clean ext-syntax ext-test libs-test libs-exports snapshot-record print-inc ndk-check
 all: $(BUILD)/steerd $(BUILD)/steer
 
 # Два бинарника, как в пакете (docs/architecture.md, раздел 4а, «Бинарники»): build/steerd — весь
@@ -98,6 +100,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@sh tests/supervisematch.sh
 	@sh tests/ctlmatch.sh
 	@sh tests/supdmatch.sh
+	@sh tests/modhello.sh
 	@sh tests/reconmatch.sh
 	@sh tests/swapmatch.sh
 	@sh tests/netrestart.sh
@@ -233,6 +236,19 @@ ext-syntax:
 ext-test:
 	@BUILD=$(BUILD) CC="$(CC)" sh tests/ext-test.sh
 
+# Разделяемая раскладка роутера (шаг 4 выпуска 1.10: libsteer.so, libsteer-wolfssl.so, steerd и
+# модули) на хосте — тем же build/build-libs.sh, что кладёт файлы в пакеты, и с теми же исходниками
+# wolfSSL, что ext-test. В `make test` не входит по той же причине, что ext-test (нужна
+# библиотека); ext-test зовёт этот стенд последним шагом. Вся логика — в tests/libs-test.sh.
+libs-test: all $(BUILD)/steer-android $(BUILD)/tgwssim
+	@BUILD=$(BUILD) CC="$(CC)" sh tests/libs-test.sh
+
+# Переписать списки экспорта libsteer.so и libsteer-wolfssl.so по коду (build/libs-exports.sh).
+# Нужен, когда модуль или steerd начал брать из libsteer новый символ: сборка раскладки скажет
+# неопределённой ссылкой, `sh build/libs-exports.sh check` (его зовёт libs-test) — словами.
+libs-exports:
+	@BUILD=$(BUILD) CC="$(CC)" sh build/libs-exports.sh gen
+
 # Подбор доменного правила проверяется отдельной программой, а не через движок: подбор
 # сам — публичная функция резолвера (ruleset_match), а дотянуться до него иначе значило бы
 # добавить в движок подкоманду ради теста. Резолвер (DNSD_SRC) линкуется отдельными
@@ -323,8 +339,9 @@ $(BUILD)/awgmatch-android: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/
 
 # Виды — объектами (без awg.c и без парсера: стенд подменяет load_spec своей спекой). С
 # src/lib/ir.c — тем же доводом, что у MODEL_KINDS: zapret_emit/tgws_emit зовут ir_* на
-# компоновке, даже когда стенд их не вызывает (модели стенд не компонует, поэтому отдельно).
-FAILOVERMATCH_KINDS := $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC)) $(KINDS_EXT_SRC) src/lib/ir.c
+# компоновке, даже когда стенд их не вызывает (модели стенд не компонует, поэтому отдельно). И с
+# src/lib/module.c: kinds/tgws.c спрашивает, установлен ли модуль моста (шаг 4 выпуска 1.10).
+FAILOVERMATCH_KINDS := $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC)) $(KINDS_EXT_SRC) src/lib/ir.c src/lib/module.c
 
 # Модель v2 и перевод спеки v1 (src/model/v1.c, src/kinds/group.c): каналы → правила, списки,
 # клиенты; пул devices → группа — модулями модели, без движка: см. шапку tests/modelmatch.c. С

@@ -120,6 +120,10 @@ void evline_emit(const char *ev, ...) {
     free(mem);
 }
 
+void evline_hello(const char *module, const char *version) {
+    evline_emit("hello", "ver", EVLINE_STR, version, "mod", EVLINE_STR, module, (const char *)NULL);
+}
+
 /* ---- разбор ------------------------------------------------------------------------- */
 
 /* Строка в кавычках, курсор *p стоит на открывающей. Разворачивает ТЕ escape-последовательности,

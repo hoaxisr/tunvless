@@ -50,8 +50,11 @@ words() { tr ' ' '\n' | grep -v '^$'; }
 # Тот же расклад у слоя примитивов (CRYPTO_SRC, src/lib/scrypto.c): лежит в каталоге ядра, в base не
 # входит — базовой сборке криптография не нужна, и wolfSSL в ней нет.
 m_base="$( { profile_src base; echo; profile_var KINDS_EXT_SRC; echo; profile_var CRYPTO_SRC; } | words | names)"
-m_ext="$( { profile_src extended; echo; profile_src server; echo; profile_src tgws; } | words |
-          grep -E "^($(profile_var EXT_DIRS | tr ' ' '|'))/" | names)"
+# Профили разделяемой раскладки (шаг 4 выпуска 1.10: libsteer, steerd, четыре модуля) — тоже
+# профили: точки входа модулей (src/modules/main_*.c) существуют только в них.
+m_ext="$( { profile_src extended; echo; profile_src server; echo; profile_src tgws; echo
+            for p in libsteer steerd mod_vless mod_xsteer mod_obfs mod_tgws; do profile_src "$p"; echo; done; } |
+          words | grep -E "^($(profile_var EXT_DIRS | tr ' ' '|'))/" | names)"
 check "sources.mk: профиль base (с видами расширенной части) — это все каталоги ядра"  "$disk_base" "$m_base"
 check "sources.mk: профили покрывают всю расширенную часть" "$disk_ext" "$m_ext"
 
@@ -204,17 +207,21 @@ done
 # Голое «steer: » законно ровно в двух случаях: die() — отказ вызывающему, и разбор
 # аргументов. Оба заканчиваются кодом 2 и до журнала не доходят, о чём сказано в контракте.
 bare=""
-for f in src/daemon/main.c src/daemon/failover.c src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c src/dnsd/rules.c src/dnsd/wire.c src/dnsd/origdst.c src/dnsd/fakeip.c src/dnsd/table.c src/dnsd/dlog.c src/dnsd/realip.c src/dnsd/adopt.c src/dnsd/proxy.c src/dnsd/main.c src/proto/obfs/obfs.c src/tools/srsread.c src/model/srs.c src/model/srsplan.c; do
+for f in src/daemon/main.c src/cli/modcmd.c src/daemon/failover.c src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c src/dnsd/rules.c src/dnsd/wire.c src/dnsd/origdst.c src/dnsd/fakeip.c src/dnsd/table.c src/dnsd/dlog.c src/dnsd/realip.c src/dnsd/adopt.c src/dnsd/proxy.c src/dnsd/main.c src/proto/obfs/obfs.c src/tools/srsread.c src/model/srs.c src/model/srsplan.c; do
     # grep -c печатает 0 и выходит с кодом 1, когда совпадений нет, — поэтому «|| echo 0»
     # добавлял бы вторую строку и ломал сравнение числа.
     n=$(grep -c 'fprintf(stderr, "steer: ' "$f" 2>/dev/null); [ -n "$n" ] || n=0
     [ "$n" -gt 0 ] && bare="$bare$f:$n "
 done
-# main.c: девять законных строк — четыре отказа «этого нет в этой сборке» (VLESS, клиент
-# xsteer, хаб xsteer, служебные команды xsteer), «флаги идут после команды», неизвестное
-# слово у tgws-probe (I-316), два отказа флага --platform (без значения, нет такой
-# платформы) — эти четыре суть разбор аргументов — и отказ reload/subscribe движком (их
-# исполняет демон, а посылает клиент steer). Все они
+# main.c: три законные строки — отказ «хаб xsteer этой сборки нет» (хаб — архив для VPS, а не
+# модуль), «флаги идут после команды» и отказ reload/subscribe движком (их исполняет демон, а
+# посылает клиент steer). Остальные шесть строк, что были здесь до 1.10, переехали вместе с
+# командами модулей в cli/modcmd.c.
+#
+# modcmd.c: пять законных строк — «команды модуля нет в этой сборке, нужен пакет» (одна, общая
+# для всех модулей: текст с контрактной подстрокой steer-extended живёт в одном месте), «не
+# удалось запустить модуль», неизвестное слово у tgws-probe (I-316) и два отказа флага
+# --platform (без значения, нет такой платформы) — разбор аргументов. Все они
 # заканчиваются кодом 2 и до журнала не доходят, о чём сказано в контракте §5. Больше ни в
 # одном файле голых быть не должно.
 #
@@ -226,7 +233,7 @@ done
 # (src/model/srs.c, srsplan.c) в stderr не пишет вовсе — он возвращает отказ и текст снятого.
 # Две строки srsread.c печатаются при УДАВШЕМСЯ разборе — снятые правила и пропущенные подсети
 # IPv6, — и у них уровень есть; проверка ниже сторожит именно это различие.
-check "голых «steer: » ровно столько, сколько отказов вызывающему" "src/daemon/main.c:9 src/tools/srsread.c:10 " "$bare"
+check "голых «steer: » ровно столько, сколько отказов вызывающему" "src/daemon/main.c:3 src/cli/modcmd.c:5 src/tools/srsread.c:10 " "$bare"
 # Строки, которые печатаются при успехе, обязаны иметь уровень: разбор удался, значит это
 # журнал во время работы, а не отказ вызывающему.
 check "предупреждения srs-read при удавшемся разборе идут с уровнем" "2" \
@@ -327,19 +334,26 @@ check "барьер релиза считает архитектуры тем ж
 # их никто не обновит. Пакет собирается в обоих форматах из одного дерева файлов, и
 # забыть один формат легко — он ничего не ломает в сборке, просто половина устройств
 # остаётся без пакета. Поэтому оба вида упаковки сверяются здесь по составу.
-for pkg in steer steer-extended; do
-    check "build.sh упаковывает $pkg в apk" "1" "$(grep -c "info name:$pkg " build.sh)"
-    check "build.sh упаковывает $pkg в ipk" "1" "$(grep -c "mk_ipk .* $pkg " build.sh)"
+# С шага 4 выпуска 1.10 пакетов на архитектуру восемь (libsteer-wolfssl, libsteer, steer, четыре
+# модуля и мета-пакет steer-extended), и обе упаковки для всех идут через ОДНУ функцию pack
+# в build.sh (apk mkpkg и mk_ipk из одного дерева): забыть формат у одного пакета из восьми
+# нельзя, не забыв его у всех. Поэтому сверяется, что каждый пакет упаковывается и что функция
+# зовёт оба формата.
+for pkg in libsteer-wolfssl libsteer steer steer-extended; do
+    check "build.sh упаковывает $pkg" "1" "$(grep -c "^ *pack $pkg " build.sh)"
 done
-
-# Расширенный пакет обязан объявлять себя заменой базового в ОБОИХ форматах: иначе на
-# одном из них два пакета уживутся в базе и будут спорить за /usr/sbin/steer.
-check "extended объявляет provides в apk" "1" "$(grep -c 'info provides:steer' build.sh)"
-# Без якоря ^: первое поле стоит на той же строке, что и открывающая кавычка переменной.
-# Важно наличие всех трёх, а не разметка.
-for field in Provides Replaces Conflicts; do
-    check "extended объявляет $field в ipk" "1" "$(grep -c "$field: steer" build.sh)"
-done
+check "build.sh упаковывает модули по кругу vless xsteer obfs tgws" "1 1" \
+    "$(grep -c '^ *pack "steer-\$m" ' build.sh) $(grep -c '^    for m in vless xsteer obfs tgws; do' build.sh)"
+check "pack зовёт apk mkpkg и mk_ipk из одного дерева" "1 1" \
+    "$(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c 'apk mkpkg') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c 'mk_ipk ')"
+# Мета-пакет steer-extended ставит ядро и ВСЕ модули (имя ждёт splify2), а модули зависят от ядра.
+check "steer-extended зависит от ядра и четырёх модулей" "1" \
+    "$(grep -c 'pack steer-extended "\$xroot" "steer steer-vless steer-xsteer steer-obfs steer-tgws"' build.sh)"
+check "модули зависят от steer" "1" "$(grep -c 'mdeps="steer \$(pkg_deps' build.sh)"
+# Зависимости между нашими пакетами — точной версии (формат линии событий и ABI libsteer между
+# выпусками не обещаны).
+check "наши пакеты зависят друг от друга точной версией (apk и opkg)" "1 1" \
+    "$(grep -c '%s=%s-r1' build.sh) $(grep -c '(= %s-1)' build.sh)"
 
 # ---- стенды расширенной части прогоняются в релизе --------------------------------------
 # `make test` в релизе стендов расширенной части не касается: криптобиблиотеки там нет по построению. Они идут
@@ -522,7 +536,7 @@ check "и не тащит его файлы поимённо" "0" \
     "$(grep -c '^/etc/steer/lists/[^c]' "$KEEP")"
 check "но свои списки объявлены" "1" \
     "$(grep -cx '/etc/steer/lists/custom' "$KEEP")"
-check "build.sh кладёт keep.d в оба дерева пакета" "2" \
+check "build.sh кладёт keep.d в пакет ядра" "1" \
     "$(grep -c 'cp files/lib/upgrade/keep.d/steer' build.sh)"
 
 # Серверная половина. Установщик обязан уметь работать БЕЗ компилятора — ради этого архив
@@ -658,22 +672,23 @@ fi
 
 # ---- files/ против упаковки ---------------------------------------------------
 # Тот же класс, что списки файлов выше, и та же цена. Файлы системной обвязки
-# (init-скрипт, keep.d, hotplug) build.sh копирует ПОИМЁННО, и делает это ДВА раза —
-# в базовый корень пакета и в расширенный. Новый файл в files/ поэтому существует в
-# репозитории, приезжает в git, проходит все стенды и просто не попадает в пакет: на
-# роутере его нет, а в дереве он есть. Молчаливее не бывает — ни ошибки сборки, ни
-# предупреждения. Поэтому: каждый файл из files/ обязан быть упомянут в build.sh не
-# меньше двух раз.
+# (init-скрипт, keep.d, hotplug) build.sh копирует ПОИМЁННО — раньше в два корня (базовый и
+# расширенный пакеты), с шага 4 выпуска 1.10 в один: ядро, у которого теперь единственный
+# владелец файлов. Новый файл в files/ поэтому существует в репозитории, приезжает в git,
+# проходит все стенды и просто не попадает в пакет: на роутере его нет, а в дереве он есть.
+# Молчаливее не бывает — ни ошибки сборки, ни предупреждения. Поэтому: каждый файл из files/
+# обязан быть упомянут в build.sh — ровно один раз, в пакете ядра (второе упоминание
+# означало бы, что файл едет в два пакета и менеджер откажет второму: конфликт владельцев).
 missing=""
-once=""
+twice=""
 for f in $(find files -type f | sort); do
     n=$(grep -c -- "$f" build.sh)
     if [ "$n" -eq 0 ]; then missing="$missing$f "
-    elif [ "$n" -lt 2 ]; then once="$once$f "
+    elif [ "$n" -gt 1 ]; then twice="$twice$f "
     fi
 done
 check "каждый файл из files/ упакован" "" "$missing"
-check "каждый файл из files/ упакован в ОБА корня" "" "$once"
+check "и ровно в один пакет (ядро)" "" "$twice"
 
 # ---- зависимости пакета: считаются по файлу, а не по памяти -------------------
 #
@@ -690,34 +705,33 @@ dtmp="$(mktemp -d)"
 printf 'static binary without any SONAME\n' > "$dtmp/static"
 # Строка ровно того вида, что пишет линковщик в DT_NEEDED. Нулевые байты вокруг — чтобы
 # файл не был текстовым: grep без -a такой файл пропускает, и проверка стояла бы на том,
-# что бинарник — это текст. Имя — будущего пакета libsteer-wolfssl (шаг 4 выпуска 1.10).
-printf 'x\000libsteer-wolfssl.so.1\000x\n' > "$dtmp/shared"
+# что бинарник — это текст. Имя — пакета libsteer (шаг 4 выпуска 1.10).
+printf 'x\000libsteer.so.1.10.0\000x\n' > "$dtmp/shared"
 # Системная libwolfssl OpenWrt (SONAME с хешем опций) пакетом движка НЕ считается: связываться
 # с ней нельзя (SONAME меняется с каждым обновлением), и зависимость на неё — ошибка.
 printf 'x\000libwolfssl.so.5.9.1.e624513f\000x\n' > "$dtmp/system"
 
-check "базовый пакет требует conntrack и kmod-nft-queue" \
-    "nftables ip-full conntrack kmod-nft-queue" "$(pkg_deps "$dtmp/static" base)"
-check "расширенный добавляет kmod-tun" \
-    "nftables ip-full conntrack kmod-nft-queue kmod-tun" "$(pkg_deps "$dtmp/static" ext)"
+check "ядро требует conntrack и kmod-nft-queue" \
+    "nftables ip-full conntrack kmod-nft-queue" "$(pkg_deps "$dtmp/static" core)"
+check "модуль с TUN добавляет kmod-tun" "kmod-tun" "$(pkg_deps "$dtmp/static" tun)"
+check "обычный модуль системных зависимостей не имеет" "" "$(pkg_deps "$dtmp/static" mod)"
 check "статическая сборка НЕ требует пакета библиотеки" \
-    "" "$(pkg_deps "$dtmp/static" ext | grep -o 'libsteer-wolfssl\|libwolfssl')"
-check "связанная с libsteer-wolfssl сборка требует его" \
-    "nftables ip-full conntrack kmod-nft-queue kmod-tun libsteer-wolfssl" "$(pkg_deps "$dtmp/shared" ext)"
+    "" "$(pkg_deps "$dtmp/static" tun | grep -o 'libsteer\|libwolfssl')"
+check "связанная с libsteer сборка требует её" \
+    "nftables ip-full conntrack kmod-nft-queue libsteer" "$(pkg_deps "$dtmp/shared" core)"
+check "  и модуль с TUN — тоже" "kmod-tun libsteer" "$(pkg_deps "$dtmp/shared" tun)"
 check "системная libwolfssl зависимостью не становится" \
-    "nftables ip-full conntrack kmod-nft-queue kmod-tun" "$(pkg_deps "$dtmp/system" ext)"
+    "nftables ip-full conntrack kmod-nft-queue" "$(pkg_deps "$dtmp/system" core)"
 rm -rf "$dtmp"
 
 # Оба формата пакета обязаны получить ОДИН список, и это не педантизм: apk берёт его через
 # пробел, opkg через запятую, и разойтись они могут молча — .ipk с прежним списком выглядит
 # собранным ровно так же, как .apk с новым. Поэтому проверяется, что и там и там подставлена
-# ОДНА переменная, посчитанная pkg_deps, а не литерал.
-for v in deps edeps; do
-    check "apk берёт зависимости из \$$v" "1" \
-        "$(grep -c "depends:'\$$v'" build.sh)"
-    check "opkg берёт зависимости из \$$v" "1" \
-        "$(grep -c "mk_ipk .*\$(echo \"\$$v\"" build.sh)"
-done
+# ОДНА переменная (`$_dp` в pack), которую преобразуют dep_apk и dep_ipk, а не литерал.
+check "apk берёт зависимости через dep_apk из одной переменной" "1" \
+    "$(grep -c 'depends:.\$(dep_apk "\$_dp")' build.sh)"
+check "opkg берёт зависимости через dep_ipk из той же переменной" "1" \
+    "$(grep -c 'mk_ipk "\$_r" "\$_n" "\$arch" "\$(dep_ipk "\$_dp")"' build.sh)"
 check "литералов зависимостей в упаковке не осталось" "" \
     "$(grep -n "depends:'nftables\|mk_ipk .*\"nftables" build.sh)"
 
@@ -789,6 +803,76 @@ for f in $(find src/tunnel src/proto \( -name '*.c' -o -name '*.h' \)); do
     [ -n "$hit" ] && modroute="$modroute$f: $hit"
 done
 check "src/tunnel и src/proto не зовут маршрутизацию демона (шаг 3 выпуска 1.10)" "" "$modroute"
+
+# ---- разделяемая раскладка роутера (1.10, шаг 4) -------------------------------
+#
+# libsteer.so, steerd и четыре модуля собираются из непересекающихся списков (build/sources.mk),
+# и вместе они дают те же файлы, что статический расширенный профиль: файл, выпавший из всех, не
+# соберётся только в релизе, а файл в двух местах дал бы два экземпляра одного кода в разных
+# процессах (глобальные таблицы модели, реестр меток) и молчаливое расхождение. Общее у steerd и
+# модулей одно — cli/modcmd.c: он входит в каждый бинарник, потому что слабые ссылки на cmd_*
+# решаются компоновкой, а не загрузчиком.
+sd="$(mktemp -d)"
+for p in libsteer steerd mod_vless mod_xsteer mod_obfs mod_tgws extended; do
+    profile_src "$p" | words | sort -u > "$sd/$p"
+done
+modcmd="$(profile_var MODCMD_SRC)"
+for a in steerd mod_vless mod_xsteer mod_obfs mod_tgws; do
+    check "раскладка: в libsteer и $a нет общих файлов" "" \
+        "$(comm -12 "$sd/libsteer" "$sd/$a" | tr '\n' ' ')"
+done
+for a in mod_vless mod_xsteer mod_obfs mod_tgws; do
+    check "раскладка: у steerd и $a общий один файл — modcmd.c" "$modcmd " \
+        "$(comm -12 "$sd/steerd" "$sd/$a" | tr '\n' ' ')"
+done
+set -- mod_vless mod_xsteer mod_obfs mod_tgws
+while [ $# -gt 1 ]; do
+    a="$1"; shift
+    for b in "$@"; do
+        check "раскладка: у модулей $a и $b общий один файл — modcmd.c" "$modcmd " \
+            "$(comm -12 "$sd/$a" "$sd/$b" | tr '\n' ' ')"
+    done
+done
+# Модуль не несёт ни демона, ни модели: демон (failover.c, supd.c, dnsd…) — в steerd, модель и виды —
+# в libsteer. В списках модулей нет ничего из каталогов демона, резолвера, компилятора и моделей.
+for a in mod_vless mod_xsteer mod_obfs mod_tgws; do
+    check "раскладка: в $a нет файлов демона, компилятора, резолвера и модели" "" \
+        "$(grep -E '^src/(daemon|dnsd|compile|model|kinds|platform)/' "$sd/$a" | tr '\n' ' ')"
+done
+# (compile/nftcompat.c — раскладка по ядру, часть модели, а не компилятора: его зовёт реестр видов.)
+check "раскладка: libsteer не несёт демона, компилятора и резолвера" "" \
+    "$(grep -E '^src/(daemon|dnsd|compile)/' "$sd/libsteer" | grep -v 'src/compile/nftcompat.c' | tr '\n' ' ')"
+# Всё, что было в статическом расширенном профиле, есть в раскладке (кроме файла профиля), а лишнее —
+# только четыре точки входа модулей.
+cat "$sd/libsteer" "$sd/steerd" "$sd/mod_vless" "$sd/mod_xsteer" "$sd/mod_obfs" "$sd/mod_tgws" | sort -u > "$sd/all"
+check "раскладка покрывает расширенный профиль (кроме файла профиля)" "src/profile/extended.c " \
+    "$(comm -23 "$sd/extended" "$sd/all" | tr '\n' ' ')"
+check "  и добавляет только точки входа модулей" "src/modules/main_obfs.c src/modules/main_tgws.c src/modules/main_vless.c src/modules/main_xsteer.c " \
+    "$(comm -13 "$sd/extended" "$sd/all" | tr '\n' ' ')"
+# Точка входа — единственный main() модуля; steerd свой main держит в daemon/main.c.
+for a in vless xsteer obfs tgws; do
+    check "src/modules/main_$a.c зовёт steer_module_main с именем модуля" "1" \
+        "$(grep -c "steer_module_main(argc, argv, \"$a\", STEER_VERSION)" src/modules/main_$a.c)"
+done
+rm -rf "$sd"
+# Экспорт libsteer — version-script (не «всё видимое»): список порождён из кода, сверяет его
+# build/libs-exports.sh check (в tests/libs-test.sh), а здесь сторожится форма и то, что сборка его
+# читает. То же для libsteer-wolfssl.
+check "libsteer.map: экспорт списком, остальное локально" "1" \
+    "$(grep -c '^  local:$' build/libsteer.map)"
+check "libsteer-wolfssl.map: экспорт списком, остальное локально" "1" \
+    "$(grep -c '^  local:$' build/wolfssl/libsteer-wolfssl.map)"
+check "build-libs.sh линкует libsteer с version-script и SONAME по версии движка" "1 1" \
+    "$(grep -v '^[[:space:]]*#' build/build-libs.sh | grep -c 'version-script=build/libsteer.map') \
+$(grep -v '^[[:space:]]*#' build/build-libs.sh | grep -c -- '-soname,"libsteer.so.$VERSION"')"
+check "build-libs.sh берёт списки файлов из манифеста, а не перечисляет сам" "" \
+    "$(grep -v '^[[:space:]]*#' build/build-libs.sh | grep -oE 'src/[a-z0-9_/]+\.c' | tr '\n' ' ')"
+# Размеры хранилищ слоя — ABI между libsteer и libsteer-wolfssl: и в сборке (abi.c), и при загрузке
+# (scrypto.c, sc_abi_check) они сверяются с настоящими sizeof.
+check "abi.c сверяет хранилища слоя со структурами wolfSSL при сборке библиотеки" "6" \
+    "$(grep -c '^_Static_assert' build/wolfssl/abi.c)"
+check "отпечаток библиотеки и его сверка при загрузке — одного размера" "1" \
+    "$([ "$(grep -c '^#define SC_ABI_N' src/lib/scrypto.h)" = 1 ] && grep -q 'steer_wolfssl_abi\[SC_ABI_N\]' src/lib/scrypto.c build/wolfssl/abi.c && echo 1 || echo 0)"
 
 # ---- каждый тарбол в образе сверяется по контрольной сумме ---------------------
 #

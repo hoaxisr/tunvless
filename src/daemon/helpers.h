@@ -73,6 +73,16 @@ struct helper {
     char prog[16];
     char arg[2][256];
     char env[32];
+    /* prog — бинарник модуля (steer-vless и остальные, src/lib/module.h), а не своя программа
+     * вроде steer-nfqws: ему передаются те же слова, что подкоманде (`<cmd> <выход> --spec …`),
+     * он присылает hello с версией (evline.h), и демон сверяет её со своей. Ставится
+     * helpers_plan, когда команда помощника — команда модуля, а в самом steerd её нет
+     * (статические сборки несут модули в себе, и там помощник — по-прежнему подкоманда). */
+    int module;
+    /* Только у модуля (supd.c, ev_line): пришло ли hello и принято ли, не отвергнут ли процесс за
+     * чужую версию, версия из hello (для status) и записано ли в журнал, что бинарника нет. */
+    int hello, rejected, nomod_logged;
+    char mver[32];
     unsigned long long sig;   /* подпись параметров, которые помощник читает при старте */
     /* Не помощник выхода, а резолвер на таблице (демон; name пуст): его запуск и труба — свои
      * (supd.c), а пауза, сверка и остановка — общие. */
@@ -130,11 +140,13 @@ void helper_started(struct helper *h, pid_t pid);
 void helper_argv(const struct helper *h, const char *exe, const char *self, int seam,
                  const char *spec, char *progbuf, size_t pbn, const char **av);
 
-/* argv[0] ребёнка, которого запускают файлом exe: «<каталог>/steer», если exe — steerd, иначе сам
- * exe. Процесс помощника в списке процессов выглядит так же, как до раздельных бинарников
- * («/usr/sbin/steer vless out»): по этой строке его ищут pgrep -f 'steer dnsd' в diag,
- * 'steer obfs <выход>' у вида interface и скрипты splify2. Запускается при этом steerd —
- * /proc/<pid>/exe указывает на него, и ctl_find демона сверяет именно exe. */
+/* argv[0] ребёнка, которого запускают файлом exe: «<каталог>/steer», если exe — steerd или
+ * бинарник модуля (steer-vless и остальные), иначе сам exe. Процесс помощника в списке процессов
+ * выглядит так же, как до раздельных бинарников («/usr/sbin/steer vless out»): по этой строке
+ * его ищут pgrep -f 'steer dnsd' в diag, 'steer obfs <выход>' у вида interface и скрипты
+ * splify2. Запускается при этом steerd или модуль — /proc/<pid>/exe указывает на файл, который
+ * исполняется, и ctl_find демона сверяет именно exe (ищет только dnsd и supervise, то есть
+ * steerd; модули он не ищет). */
 const char *helper_argv0(const char *exe, char *buf, size_t n);
 
 /* Погасить всех: ordered=0 — SIGTERM всем сразу (supervise); 1 — по одному в обратном порядке

@@ -15,6 +15,7 @@
 
 #include "spec.h"
 #include "ir.h"
+#include "module.h"
 
 const struct tgws_cfg *out_tgws(const struct output *o) {
     return kind_of(o) == &kind_tgws ? &o->tg : NULL;
@@ -63,7 +64,9 @@ static int tgws_check(const struct spec *sp, const struct output *o, struct err 
  * stgws его поднимает свой init-скрипт. -1 — помощник не нужен (kind_ops.helper). */
 static int tgws_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
     (void)sp;
-    if (!prof()->extended) return -1;
+    /* Полный пакет — статическая сборка с профилем extended, либо модуль steer-tgws рядом с
+     * движком (1.10, шаг 4): без обоих моста нет, и помощник не называется. */
+    if (!prof()->extended && !steer_module_present("steer-tgws")) return -1;
     snprintf(h->cmd, sizeof(h->cmd), "tgws");
     kind_sig_mix(&h->sig, o->tg.domain, strlen(o->tg.domain));
     return 0;

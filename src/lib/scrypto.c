@@ -12,13 +12,16 @@
  * Код библиотеки ничего не говорит вызывающему, а смена библиотеки не должна менять ни одной
  * ветки у него. */
 #define _GNU_SOURCE
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <arpa/inet.h>
 
 #include <wolfssl/wolfcrypt/settings.h>
+#include <wolfssl/version.h>
 #include <wolfssl/ssl.h>
 #include <wolfssl/wolfcrypt/sha256.h>
 #include <wolfssl/wolfcrypt/sha512.h>
@@ -487,6 +490,39 @@ struct sc_roots {
     WOLFSSL_X509_STORE *store;
     pthread_mutex_t mu;
 };
+
+/* ---- сверка с загруженной libsteer-wolfssl.so ---------------------------------------------
+ *
+ * steer_wolfssl_abi определён в libsteer-wolfssl.so (build/wolfssl/abi.c — порядок полей там тот
+ * же, см. комментарий у него). В статической сборке символа нет — слабая ссылка нулевая, и сверять
+ * нечего: библиотека там собрана в тот же бинарник теми же опциями. В libsteer.so ссылка обязана
+ * быть видна за пределы библиотеки (visibility default), иначе компоновщик разрешил бы её нулём.
+ *
+ * Расхождение — не ошибка, которую можно вернуть: хранилища контекстов слоя уже расставлены по
+ * структурам вызывающих. Поэтому процесс гасится сразу, при загрузке (конструктор), строкой,
+ * которая называет причину и лечение, а не падает позже в чужом поле. */
+extern const unsigned long steer_wolfssl_abi[SC_ABI_N] __attribute__((weak, visibility("default")));
+
+struct chachapoly_sz { ChaCha c; Poly1305 p; };
+
+__attribute__((constructor)) static void sc_abi_check(void) {
+    if (!steer_wolfssl_abi) return;
+    const unsigned long want[SC_ABI_N] = {
+        LIBWOLFSSL_VERSION_HEX,
+        sizeof(wc_Sha256), sizeof(wc_Sha512), sizeof(wc_Sha384),
+        sizeof(Aes), sizeof(struct chachapoly_sz),
+        SC_HASH_CTX_SIZE, SC_AEAD_CTX_SIZE, SC_AESCTR_CTX_SIZE,
+        sizeof(WOLFSSL_X509_STORE), offsetof(WOLFSSL_X509_STORE, cm),
+    };
+    for (int i = 0; i < SC_ABI_N; i++) {
+        if (steer_wolfssl_abi[i] == want[i]) continue;
+        static const char msg[] =
+            "steer: libsteer-wolfssl.so другой сборки, чем libsteer.so (версия wolfSSL или размеры "
+            "структур не совпали) — обновите пакеты libsteer и libsteer-wolfssl вместе\n";
+        (void)!write(2, msg, sizeof(msg) - 1);
+        _exit(3);
+    }
+}
 
 static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 static int g_init_rc = -1;

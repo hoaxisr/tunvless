@@ -16,13 +16,60 @@ xsteer — [docs/xsteer.md](xsteer.md).
 | Профиль | Состав | Что в сборке |
 |---|---|---|
 | `base` | `CORE_SRC` | ядро: модель спеки, компилятор, демон, резолвер, виды `direct`, `interface`, `zapret`, `tgws` (правила перехвата), `awg` и группы, обфускатор; криптографии нет |
-| `extended` | ядро, `XS_COMMON_SRC`, `EXT_ROUTER_SRC`, `KINDS_EXT_SRC` | полный пакет роутера: ещё клиент VLESS/Reality со стеком туннеля, клиент xsteer, мост tgws, подписка, TLS на wolfSSL |
+| `extended` | ядро, `XS_COMMON_SRC`, `EXT_ROUTER_SRC`, `KINDS_EXT_SRC` | статическая полная сборка (телефон, стенды): ещё клиент VLESS/Reality со стеком туннеля, клиент xsteer, мост tgws, подписка, TLS на wolfSSL; на роутере те же файлы разложены по пакетам (ниже) |
 | `server` | ядро, `XS_COMMON_SRC`, `EXT_SERVER_SRC` | хаб xsteer |
 | `tgws` | ядро, `EXT_TGWS_SRC` | мини-сборка моста Telegram: своё поле метки, свой ряд таблиц и портов моста (docs/contract-v1.md, §7), без резолвера |
 | `android` | как `extended` | та же сборка с умолчанием платформы «телефон» (`-DSTEER_DEFAULT_PLATFORM=android`) |
 
 Код обеих платформ, роутера и телефона, есть в каждой сборке: платформа выбирается при запуске
 (раздел 2, правило 2).
+
+**Пакет роутера — разделяемая раскладка**, а не один статический файл. Профили выше остаются для
+статических сборок (телефон, стенды, микропакет tgws, хаб на VPS); роутер получает те же файлы,
+разложенные по бинарникам и библиотекам (списки — те же `build/sources.mk`, рецепт —
+`build/build-libs.sh`):
+
+| Файл | Список | Что в нём |
+|---|---|---|
+| `libsteer-wolfssl.so.<версия wolfSSL>` | `build/wolfssl/build.sh` | наша сборка wolfSSL (`build/wolfssl/user_settings.h`, QUIC включён) — только достижимое от экспорта |
+| `libsteer.so.<версия движка>` | `LIBSTEER_SRC` | модель спеки с libyaml, платформа, реестр и файлы видов, разбор командной строки, линия событий, обфускатор (`obfs.c`), слой примитивов, TLS 1.3, REALITY, h2, транспорты, стек TUN и `tun.c` |
+| `steerd` | `STEERD_DYN_SRC` = `DAEMON_SRC` + `urltls.c` | демон, компилятор правил, apply, сторож, супервизор, резолвер, заглушки команд модулей (`src/cli/modcmd.c`) |
+| `steer-vless` | `VLESS_MODULE_SRC` | клиент VLESS: `vlmain`, `vldial`, `vlwatch`, `client`, `vless_proto`, `vision`, разбор и скачивание подписки, проба TLS |
+| `steer-xsteer` | `XSTEER_MODULE_SRC` | клиент звезды: `xsclient` и общая часть формата (`xswire`, `xsconf`, `xslink`, `xsroute`, `xsconn`, `xsstream`, `xsepoch`, `xshake`), служебные команды `xsadmin` |
+| `steer-obfs` | `OBFS_MODULE_SRC` | точка входа обфускатора (`obfsmain.c`); сам `obfs.c` — в `libsteer`, его зовёт и xsteer |
+| `steer-tgws` | `TGWS_MODULE_SRC` | мост Telegram (`tgws.c`); правила перехвата пишет ядро (`kinds/tgws.c`) |
+
+Каждый модуль — свой `main` (`src/modules/main_<имя>.c`) и `src/cli/modcmd.c`; линкуется он с
+`libsteer.so`, thread-local таблицы туннеля живут в куче потока (раздел «Туннели»). В модуле нет
+`failover.c` и модели: маршрут выхода ставит демон по событию `up` (раздел 4а). Списки
+непересекающиеся, `modcmd.c` — общий; это сверяет `tests/buildmatch.sh`.
+
+Экспорт `libsteer.so` — version-script `build/libsteer.map` (только то, что берут `steerd` и
+модули; порождён из кода `build/libs-exports.sh`, проверка — `make libs-test`), SONAME
+`libsteer.so.<версия движка>`; ABI между версиями не обещается, поэтому модуль той же версии, что
+движок (зависимость пакета `steer (= версия)`; демон дополнительно проверяет версию из `hello`
+модуля, `docs/ctl.md`). Экспорт `libsteer-wolfssl.so` — `build/wolfssl/libsteer-wolfssl.map`:
+символы wolfSSL, которые зовёт слой примитивов, и отпечаток сборки. Библиотеки собираются `-fPIC` и
+`-ftls-model=initial-exec`; видимость задаёт version-script, а не `-fvisibility=hidden` (пометка
+`visibility("default")` на каждом экспортируемом определении — второй список в исходниках рядом с
+первым). Загрузчик musl задаётся на каждую архитектуру (`-Wl,--dynamic-linker`, `interp_of` в
+`build.sh`): `ld-musl-mipsel-sf.so.1`, `ld-musl-mips-sf.so.1`, `ld-musl-aarch64.so.1`,
+`ld-musl-armhf.so.1`, `ld-musl-arm.so.1`, `ld-musl-x86_64.so.1`; RPATH нет — библиотеки в
+`/usr/lib`.
+
+Пакеты: `libsteer-wolfssl`, `libsteer` (зависит от предыдущего), `steer` (ядро: `steerd`, `steer`,
+`steer-tools`, `steer-nfqws`, init-скрипт, hotplug, `keep.d`; зависит от `libsteer`),
+`steer-vless`, `steer-xsteer`, `steer-obfs`, `steer-tgws` (по бинарнику; зависят от `steer` и
+`libsteer` той же версии) и мета-пакет `steer-extended` (ядро и все четыре модуля). Ядро зависит
+от обеих библиотек, потому что `steerd` сам ходит по HTTPS (замер групп, `urltls.c`).
+
+Модуль, которого нет в системе, — не отсутствие команды. Вид выхода `vless` или `xsteer` при
+разборе спеки отвечает «kind vless требует пакет steer-vless (входит в steer-extended)» —
+единственное место текста, `src/kinds/kind.c`; команда модуля (`steer vless …`, `sub-fetch`,
+`tls-probe`, `xsteer-key`…) без модуля отвечает так же, с кодом 2, а при установленном модуле
+`steerd` запускает его с той же командной строкой (`src/cli/modcmd.c`). Есть ли модуль, решает
+файл `steer-<имя>` рядом с исполняемым файлом (`src/lib/module.c`; каталог подменяет
+`STEER_MODULE_DIR`).
 
 ## 2. Устройство
 
@@ -98,7 +145,9 @@ procd
        ├─ сторож                                   на цикле событий, без fork на проход
        ├─ супервизор детей
        ├─ steer dnsd --table-fd 3                  ребёнок: файл steerd, argv[0] «…/steer»
-       ├─ steer vless|xsteer|obfs|tgws <выход>     ребёнок: файл steerd, argv[0] «…/steer»
+       ├─ steer vless|xsteer|obfs|tgws <выход>     ребёнок: бинарник модуля (steer-vless,
+       │                                            steer-xsteer, steer-obfs, steer-tgws),
+       │                                            argv[0] «…/steer»
        └─ steer-nfqws <очередь> <файл ключей>      ребёнок: обёртка nfqws
 steer <команда>          клиент: команды демона — в сокет; остальное и всё без демона — execv steerd
 steer-tools <команда>    ссылка на steerd: отвечает только на инструменты
@@ -108,10 +157,21 @@ steer-tools <команда>    ссылка на steerd: отвечает то�
   выходов, резолвер, инструменты; `steerd <подкоманда>` — то же, что подкоманда движка. `steer` —
   отдельный маленький клиент сокета (`src/client/main.c`). `steer-tools` — ссылка на `steerd`, под
   этим именем движок отвечает только на инструменты (раздел 4а, «Бинарники»).
-- **Помощники — подкоманды `steerd`.** Демон запускает их тем же файлом `steerd`, но с argv[0]
-  «…/steer» (`helper_argv0`, `src/daemon/helpers.c`): в списке процессов они выглядят как
-  `steer dnsd`, `steer vless <выход>`, и поиск по командной строке (diag — обходом /proc) их
-  находит. Обработчик zapret — своя программа рядом с движком (`files/usr/sbin/steer-nfqws`).
+- **Помощники: резолвер — подкоманда `steerd`, туннели, обфускатор и мост — модули.** Резолвер
+  демон запускает тем же файлом `steerd`, помощников выходов — бинарником модуля из каталога
+  движка (`kind_helper.prog`, `helpers_plan` в `src/daemon/helpers.c`): `steer-vless`,
+  `steer-xsteer`, `steer-obfs`, `steer-tgws`. Слова у них те же, что у подкоманды
+  (`<команда> <выход> --spec … [--state-dir …]`), окружение — `STEER_EVENT_FD` и `STEER_SUPD`, как
+  у прежних помощников. argv[0] у всех «…/steer» (`helper_argv0`): в списке процессов они
+  выглядят как `steer dnsd`, `steer vless <выход>`, и поиск по командной строке (diag — обходом
+  /proc) их находит. В статической сборке (телефон, стенды) модули слинкованы в `steerd`
+  (`modcmd_builtin`), и помощник — подкоманда, как раньше. Обработчик zapret — своя программа рядом
+  с движком (`files/usr/sbin/steer-nfqws`).
+- **Первое сообщение модуля — `hello`** с версией его сборки (`docs/ctl.md`). Демон сверяет её со
+  своей: модуль другой версии, как и модуль, начавший не с `hello`, он гасит (SIGTERM) и не верит
+  ни одному его событию; причина — в журнале и в `last_down` ответа `helper` (поле `rejected`).
+  Бинарника модуля нет — в журнале один раз «модуля нет: нужен пакет steer-<имя>», в `last_down` то
+  же, повтор запуска по обычной паузе.
 - **Службу держит `/etc/init.d/steer`:** один экземпляр procd с respawn. `reload`, `reload_dnsd`,
   `reload_zapret` и `reapply` — запрос `reload` демону клиентом; `stop` ждёт выхода демона и зовёт
   `steerd down`; hotplug (`files/etc/hotplug.d/iface/95-steer`) шлёт экземпляру SIGHUP. На телефоне
@@ -129,7 +189,8 @@ src/
               jsonw.c, jsonr.c, ynode.c (обёртка libyaml), nlbuf.h, nftnl.c (nf_tables по
               netlink), nftdump.c, nftvmap.c, ctnl.c (conntrack), rtnl.c, procscan.c, sindex.c,
               puff.c, ir.c (дерево набора правил: его строят и compile, и виды через emit),
-              evline.c (линия событий помощник → демон), ctlcall.c (вызов сокета демона),
+              evline.c (линия событий помощник → демон, hello), ctlcall.c (вызов сокета демона),
+              module.c (какая команда чья, установлен ли модуль),
               scrypto.c (слой криптографических примитивов — только в сборках с TLS)
   model/      spec.h (struct spec, struct output с union видов, правила, клиенты, списки),
               parse.c (выбор формата), v2.c и v2print.c (спека v2), v1.c (перевод спеки v1),
@@ -148,7 +209,10 @@ src/
   dnsd/       main.c, proxy.c, wire.c, rules.c, fakeip.c, realip.c, origdst.c, table.c, tabfmt.c,
               fpseed.c, adopt.c, dlog.c
   client/     main.c — steer, клиент сокета
-  cli/        cli.c — таблица команд и разбор командной строки
+  cli/        cli.c — таблица команд и разбор командной строки; modcmd.c — команды модулей
+              (заглушки в steerd, настоящие ветки в модуле) и main модуля (steer_module_main)
+  modules/    main_vless.c, main_xsteer.c, main_obfs.c, main_tgws.c — main бинарников модулей
+              (только разделяемая раскладка)
   tools/      aggregate.c (fit), srsread.c, hwid.c
   tunnel/     стек туннеля без протокола: tun.c (TUN: очереди, разгрузка, запись пакетов),
               rtx.c (кольцо повтора), stack.c и stack.h (TCP/UDP ↔ потоки к узлу, таблица
@@ -170,6 +234,13 @@ src/
 
 Отдельной точки входа туннеля в `src/tunnel` нет: она у модуля протокола
 (`src/proto/vless/vlmain.c`), а стек — библиотека, которую модуль зовёт (`stack_run`).
+
+Куда файлы уходят в разделяемой раскладке (раздел 1): `src/tunnel`, `src/proto/tls` (кроме
+`tlsprobe.c` и `urltls.c`), `src/proto/transport`, `src/proto/obfs/obfs.c`, `src/lib`, `src/model`,
+`src/kinds`, `src/platform`, `cli/cli.c`, `tools/hwid.c` — в `libsteer.so`; `src/daemon`, `src/dnsd`,
+`src/compile`, `tools/aggregate.c`, `tools/srsread.c`, `tls/urltls.c` — в `steerd`; `proto/vless`
+(с `tls/tlsprobe.c`), `proto/xsteer` (без `xshub.c`), `proto/tgws`, `proto/obfs/obfsmain.c` —
+в модули; `xshub.c` — только в хаб на VPS.
 
 Файлы `reality.c`, `tls13.c`, `vision.c`, `vless_proto.c`, `xswire.c`, `xshake.c`, `xsepoch.c`,
 `certverify.c` держат байты на проводе: ошибка в них не ломается явно, поэтому их правка
@@ -338,6 +409,14 @@ struct security_ops {            /* none, tls, reality */
   таблицу соединений, списки, корзины и сессии; страницы берутся по факту обращения, а установщики
   и поток слежки этого адресного пространства не получают. Статический TLS разделяемой библиотеки
   заводился бы каждому потоку каждого слинкованного с ней процесса.
+- **Буферы на поток в `libsteer.so` остаются `__thread`.** `.tbss` объектов библиотеки (mipsel,
+  `size -A`): `tls13.c` — три по 40 КБ (рукопожатие, сертификаты) и 16 КБ записей, `stack.c` — 18 КБ
+  и три по 4 КБ, `trgrpc.c` и `trxhttp.c` — по 16–32 КБ, `h2.c` — около 40 КБ, `tun.c` и
+  `reality.c` — по 4 КБ; в заголовке TLS-сегмента `libsteer.so` итого около 282 КБ, у `steerd` —
+  16 КБ (`urltls.c`), у `steer-vless` — около 52 КБ (дайлер, проверка узла). Библиотека загружается
+  при запуске процесса (DT_NEEDED, не `dlopen`) и собирается с `-ftls-model=initial-exec`, поэтому
+  обращение — одна загрузка из GOT. На musl TLS потока лежит в его же отображении, нулевые страницы
+  не трогаются, пока буфер не использован; резидентной остаётся только используемая часть.
 
 Новый протокол поверх потоков — это файл дайлера, стек не трогается. Новый транспорт — таблица
 `transport_ops` без правки дайлера и стека (так устроены `ws` и `httpupgrade`: `tr_ws` в `trws.c`,
@@ -358,7 +437,21 @@ struct security_ops {            /* none, tls, reality */
 AES-GCM, ChaCha20-Poly1305, AES-CTR, X25519, проверка подписей и цепочки X.509. В заголовке слоя нет
 ни одного типа wolfSSL, контексты — непрозрачные буферы фиксированного размера, а заголовки
 wolfSSL включает один `src/lib/scrypto.c` (buildmatch). Свои TLS 1.3 и REALITY (`src/proto/tls`),
-рукопожатие и ратчет xsteer и мост tgws стоят на этом слое. В базовой сборке криптографии нет.
+рукопожатие и ратчет xsteer и мост tgws стоят на этом слое. В статической базовой сборке
+криптографии нет.
+
+**В пакете роутера** библиотека — `libsteer-wolfssl.so.<версия wolfSSL>`, слой `scrypto.c` — в
+`libsteer.so`, и `libsteer.so` зависит от неё (DT_NEEDED). Наружу из `libsteer-wolfssl.so` выходят
+символы `wc_*` и `wolfSSL_*`, которые зовёт слой (`build/wolfssl/libsteer-wolfssl.map`), и
+`steer_wolfssl_abi`; остальное код wolfSSL — включая TLS-стек и QUIC, включённые опциями, — в
+файл попадает, только если достижим от экспорта (`--gc-sections`). Размеры `SC_HASH_CTX_SIZE`,
+`SC_AEAD_CTX_SIZE`, `SC_AESCTR_CTX_SIZE` слоя — часть ABI между двумя файлами: контексты
+размещает `libsteer`, а заполняет `libsteer-wolfssl`. Их держат две проверки: при сборке библиотеки
+(`build/wolfssl/abi.c`: те же `_Static_assert`, что в `scrypto.c`) и при загрузке (`sc_abi_check`
+в `scrypto.c` сверяет версию wolfSSL, размеры структур и смещение поля `cm` хранилища корней с
+массивом `steer_wolfssl_abi` загруженной библиотеки; расхождение — строка в stderr и выход с кодом
+3). На роутере wolfSSL пакета `libwolfssl` не используется: в нём нет QUIC, а его SONAME несёт
+хеш опций.
 
 ### DNS
 
