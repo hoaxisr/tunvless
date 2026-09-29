@@ -45,6 +45,48 @@
  * loop_child, и о нём говорит закрытие того же соединения (dn_conn). Резолвер не нужен (спеки нет,
  * движок выключен) — найденный гасится (orphan_stop).
  *
+ * ПОМОЩНИКИ ДЕМОНА НЕ ПЕРЕЖИВАЮТ. В отличие от резолвера, пережить демона помощнику незачем и
+ * вредно: у резолвера есть что отдать новому демону (последняя таблица, порт 5300 без перерыва
+ * DNS), у помощника — нет, зато он держит то, что нужно новому экземпляру: устройство TUN
+ * клиента vless или xsteer (новый падает «устройство vr не создалось: Resource busy, отказал
+ * TUNSETIFF» с паузой 5→10→…→80 с, и выход лежит, пока сироту не убьют руками — проверка на
+ * QEMU 4192267), порт listen обфускатора, очередь NFQUEUE обработчика zapret. Прежде после
+ * kill -9 демона такого сироту не гасил никто: новый демон подхватывал только резолвер
+ * (adopt_dnsd), а сам помощник смерти родителя не замечал — события он пишет лишь при смене
+ * состояния, и закрытая труба в тишине ничем себя не выдаёт. Теперь признаков три, и каждый
+ * закрывает окно, которое оставляют другие:
+ *
+ *   1) PR_SET_PDEATHSIG(SIGTERM) в ребёнке до exec (child_arm) — ядро само шлёт помощнику
+ *      SIGTERM, когда умирает поток, сделавший fork. Потоки у демона есть (gaiw.c — getaddrinfo,
+ *      urltls.c — проверка urltest), но fork делает только главный: supd_kick зовётся из
+ *      обратных вызовов цикла (loop.c однопоточный), а потоки те — рабочие, без fork и exec, и
+ *      выходят сами, не забирая с собой детей. Главный же поток кончается только вместе с
+ *      процессом. Признак переживает exec (кроме set-uid и файлов с capabilities — таких
+ *      помощников нет) и не требует от помощника ничего: так гаснет и steer-nfqws, в код которого
+ *      мы не лезем. Окно между fork и prctl (демон умер раньше, чем ребёнок взвёл признак)
+ *      закрывает проверка getppid() сразу после prctl — обычная пара.
+ *   2) Переменная STEER_SUPD=<pid>:<время старта>:<каталог состояния> — метка «чей я». По ней
+ *      evline_open (src/lib/evline.c) в самом помощнике после exec проверяет, жив ли ещё его
+ *      демон, и взводит признак заново; по ней же новый демон находит сирот прежнего (ниже).
+ *      EPIPE на трубе событий (помощник с SIGPIPE, выключенным ради сокетов, — tgws) — тоже
+ *      «демона нет», и evline_emit гасит процесс тем же SIGTERM; с SIGPIPE по умолчанию запись
+ *      в закрытую трубу помощника убивает и так.
+ *   3) Новый демон при старте (supd_start) и `steerd down` (supd_orphan_down) гасят помощников,
+ *      чей демон мёртв, — orphans_stop: по /proc, процессы с STEER_EVENT_FD и STEER_SUPD этого
+ *      каталога состояния, чьего демона с тем pid и тем временем старта больше нет. Нужно это
+ *      не на случай, что PDEATHSIG не сработал, а потому что SIGTERM помощник исполняет не
+ *      мгновенно: клиент vless закрывает соединения, обфускатор — сокеты, и новый демон,
+ *      поднятый procd через секунду, иначе ещё мог бы застать устройство занятым. Сирот
+ *      прежней версии (без STEER_SUPD) узнаём по STEER_EVENT_FD, родителю init и --state-dir в
+ *      командной строке — их после обновления поверх упавшего демона тоже некому гасить.
+ *      Чужих не трогает: без STEER_EVENT_FD (помощники под procd, `steer supervise`) процесс не
+ *      наш, с меткой другого каталога состояния — чужой демон, с меткой живого демона —
+ *      помощник живого демона (второй демон на том же каталоге — не наш случай, и гасить у
+ *      него помощников этот демон не берётся).
+ *
+ * Резолвер ни одного из трёх не получает: у него нет STEER_EVENT_FD и STEER_SUPD, и PDEATHSIG
+ * ему не ставится — он переживает демона нарочно (выше).
+ *
  * ВЫКЛЮЧАТЕЛЬ. Движок выключен (телефон) — состав пустой: ни помощников, ни резолвера, и
  * поднятые гаснут при очередной сверке (apply, reload, SIGHUP — то, после чего демон перечитывает
  * спеку и спрашивает выключатель).
@@ -68,7 +110,9 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/prctl.h>
 #include <poll.h>
+#include <dirent.h>
 
 #include "platform.h"
 #include "spec.h"
@@ -110,6 +154,10 @@ struct supd {
     /* Резолвер забран у прежнего демона (adopt_dnsd): соединение с его управляющим сокетом —
      * его закрытие и есть выход резолвера; -1 — резолвер свой ребёнок (или его нет). */
     int dn_conn;
+    /* Метка помощников «чей я» (шапка, «Помощники демона не переживают»): «STEER_SUPD=…» для
+     * putenv в ребёнке, и pid демона — для проверки getppid() там же. */
+    char tag[PATH_MAX + 64];
+    pid_t me;
 };
 
 static void supd_kick(struct supd *s);
@@ -436,6 +484,175 @@ static void child_fd3(int fd) {
     else if (dup2(fd, 3) == 3) close(fd);
 }
 
+/* В ребёнке-помощнике до exec: признак смерти родителя и метка «чей я» (шапка, «Помощники демона
+ * не переживают»). getppid() — сразу ПОСЛЕ prctl: демон, умерший между fork и prctl, сигнала уже
+ * не пришлёт, и ребёнок остался бы тем самым сиротой. Выход с кодом 0: пожинать его некому, а
+ * запускать помощника без демона — незачем. */
+static void child_arm(struct supd *s) {
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+    if (getppid() != s->me) _exit(0);
+    putenv(s->tag);
+}
+
+/* ---- помощники, пережившие прежний демон --------------------------------------------------- */
+
+/* Время старта процесса (поле 22 /proc/<pid>/stat, тики от загрузки) и его родитель. 0 — процесса
+ * нет или он зомби: вышел и ждёт только, пока его приберут, — для нас это «вышел». Пара «pid и
+ * время старта» и есть имя процесса: pid, занятый заново, даст другое время. */
+static unsigned long long proc_start(pid_t pid, pid_t *ppid) {
+    char path[64], b[1024];
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, b, sizeof(b) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    b[n] = '\0';
+    /* Имя процесса в скобках может содержать и пробелы, и скобки: поля считаются от последней. */
+    char *p = strrchr(b, ')');
+    if (!p || p[1] != ' ') return 0;
+    p += 2;
+    char st = 0;
+    int pp = 0;
+    if (sscanf(p, "%c %d", &st, &pp) != 2 || st == 'Z' || st == 'X') return 0;
+    for (int f = 3; f < 22; f++) {
+        p = strchr(p, ' ');
+        if (!p) return 0;
+        p++;
+    }
+    unsigned long long t = strtoull(p, NULL, 10);
+    if (ppid) *ppid = (pid_t)pp;
+    return t ? t : 1;
+}
+
+/* Файл /proc/<pid>/<what> целиком (environ, cmdline — строки через NUL) до n-1 байт; длина. */
+static size_t proc_read(pid_t pid, const char *what, char *b, size_t n) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/%s", (int)pid, what);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    size_t got = 0;
+    while (got < n - 1) {
+        ssize_t m = read(fd, b + got, n - 1 - got);
+        if (m < 0 && errno == EINTR) continue;
+        if (m <= 0) break;
+        got += (size_t)m;
+    }
+    close(fd);
+    b[got] = '\0';
+    return got;
+}
+
+/* Значение KEY в блоке строк через NUL (environ); NULL — нет. */
+static const char *nul_env(const char *b, size_t n, const char *key) {
+    size_t kl = strlen(key);
+    for (size_t i = 0; i < n;) {
+        const char *e = b + i;
+        size_t l = strnlen(e, n - i);
+        if (l > kl && !memcmp(e, key, kl) && e[kl] == '=') return e + kl + 1;
+        i += l + 1;
+    }
+    return NULL;
+}
+
+/* Помощник ли pid демона этого каталога состояния, оставшийся без демона (шапка, признак 3). В
+ * what — «команда выход» из командной строки, для журнала. */
+static int orphan_of(pid_t pid, char *what, size_t wn) {
+    static char env[32768];
+    char cl[PATH_MAX + 256];
+    pid_t ppid = 0;
+    if (!proc_start(pid, &ppid)) return 0;
+    size_t n = proc_read(pid, "environ", env, sizeof(env));
+    if (!n || !nul_env(env, n, "STEER_EVENT_FD")) return 0;
+    size_t cn = proc_read(pid, "cmdline", cl, sizeof(cl));
+    const char *dir = plat()->state_dir;
+    const char *tag = nul_env(env, n, "STEER_SUPD");
+    if (tag) {
+        char *end = NULL;
+        long dp = strtol(tag, &end, 10);
+        if (end == tag || *end != ':' || dp <= 0) return 0;
+        const char *t = end + 1;
+        unsigned long long st = strtoull(t, &end, 10);
+        if (end == t || *end != ':') return 0;
+        dir = end + 1;
+        if (strcmp(dir, steer_state_dir()) != 0) return 0;
+        if (proc_start((pid_t)dp, NULL) == st) return 0;         /* его демон жив */
+    } else {
+        /* Сирота версии без метки: демон мёртв — значит, родитель уже init; каталог состояния —
+         * из --state-dir командной строки (helper_argv), без него — каталог платформы. */
+        if (ppid != 1) return 0;
+        for (size_t i = 0; i < cn;) {
+            size_t l = strnlen(cl + i, cn - i);
+            if (!strcmp(cl + i, "--state-dir") && i + l + 1 < cn) { dir = cl + i + l + 1; break; }
+            i += l + 1;
+        }
+        if (strcmp(dir, steer_state_dir()) != 0) return 0;
+    }
+    /* argv[1] и argv[2] — «vless vr», «obfs a»; у помощника-программы — её имя и первый флаг. */
+    const char *a1 = cn ? cl + strnlen(cl, cn) + 1 : cl;
+    const char *a2 = a1 < cl + cn ? a1 + strlen(a1) + 1 : a1;
+    if (a1 >= cl + cn) a1 = "";
+    if (a2 >= cl + cn) a2 = "";
+    snprintf(what, wn, "%s%s%s", a1, *a2 ? " " : "", a2);
+    return 1;
+}
+
+#define ORPHANS_MAX 32
+
+/* Погасить помощников прежнего демона этого каталога состояния (шапка, признак 3): SIGTERM всем
+ * сразу, три секунды на выход — столько же, сколько helpers_stop даёт своим, — дальше SIGKILL и
+ * секунда. Ждёт выхода: устройство TUN и порт освобождаются с выходом процесса, а запустить
+ * своего раньше — значит получить тот самый Resource busy. Не свои дети, поэтому выход узнаётся
+ * по /proc (proc_start), а не waitpid, и по той же паре «pid и время старта» SIGKILL не уйдёт
+ * процессу, занявшему pid заново. who — начало строки журнала. Возврат — сколько найдено. */
+static int orphans_stop(const char *who) {
+    DIR *d = opendir("/proc");
+    if (!d) return 0;
+    pid_t pid[ORPHANS_MAX];
+    unsigned long long st[ORPHANS_MAX];
+    size_t n = 0;
+    pid_t me = getpid();
+    struct dirent *e;
+    while ((e = readdir(d)) && n < ORPHANS_MAX) {
+        char *end = NULL;
+        long p = strtol(e->d_name, &end, 10);
+        if (!end || *end || p <= 1 || p == me) continue;
+        char what[128];
+        if (!orphan_of((pid_t)p, what, sizeof(what))) continue;
+        if (!(st[n] = proc_start((pid_t)p, NULL))) continue;
+        pid[n++] = (pid_t)p;
+        kill((pid_t)p, SIGTERM);
+        fprintf(stderr, "steer[info] %s: помощник прежнего демона (pid %ld, %s) остался без него — "
+                        "гашу\n", who, p, what);
+    }
+    closedir(d);
+    long due = helpers_now_ms() + 3000;
+    int hard = 0;
+    for (;;) {
+        size_t left = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (!pid[i]) continue;
+            if (proc_start(pid[i], NULL) != st[i]) pid[i] = 0;
+            else left++;
+        }
+        if (!left) break;
+        if (helpers_now_ms() >= due) {
+            if (hard) break;
+            for (size_t i = 0; i < n; i++)
+                if (pid[i]) {
+                    kill(pid[i], SIGKILL);
+                    fprintf(stderr, "steer[warn] %s: помощник прежнего демона (pid %d) не вышел "
+                                    "по SIGTERM за 3 с — SIGKILL\n", who, (int)pid[i]);
+                }
+            hard = 1;
+            due = helpers_now_ms() + 1000;
+        }
+        struct timespec ts = { 0, 50000000L };
+        nanosleep(&ts, NULL);
+    }
+    return (int)n;
+}
+
 /* ---- резолвер, переживший прежний демон (src/dnsd/adopt.c) --------------------------------- */
 
 static void child_cb(struct loop *l, pid_t pid, int status, void *arg);
@@ -534,6 +751,10 @@ static void orphan_stop(void) {
 }
 
 int supd_orphan_down(void) {
+    /* Помощники упавшего демона — тоже (шапка, признак 3): сами они по PDEATHSIG уже гаснут, а
+     * этот проход дожидается их выхода и добивает не вышедших. Помощников живого демона не
+     * трогает: их демон с той же меткой жив. */
+    orphans_stop("down");
     pid_t pid;
     if (!dnsd_down(&pid)) return 0;
     fprintf(stderr, "steer[info] down: резолвер, оставшийся без демона (pid %d), погашен\n",
@@ -744,6 +965,7 @@ static int start_one(struct helper *h, void *arg) {
         if (pid < 0) { close(p[0]); close(p[1]); return -1; }
         if (pid == 0) {
             loop_child_reset();
+            child_arm(s);
             child_fd3(p[1]);
             putenv("STEER_EVENT_FD=3");
             if (h->env[0]) putenv(h->env);
@@ -868,6 +1090,12 @@ struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
     snprintf(s->exe, sizeof(s->exe), "%s", s->seam ? seam : s->self);
     s->tm = loop_timer_new(s->l, supd_timer, s);
     if (!s->tm) { free(s); return NULL; }
+    s->me = getpid();
+    snprintf(s->tag, sizeof(s->tag), "STEER_SUPD=%d:%llu:%s", (int)s->me,
+             proc_start(s->me, NULL), steer_state_dir());
+    /* Раньше первого запуска своих: сирота прежнего демона держит устройство или порт, и свой
+     * помощник на них не встал бы (шапка, «Помощники демона не переживают»). */
+    orphans_stop("supervise");
     d->sup = s;
     /* status демона отвечает в процессе — ход перебора узлов берёт отсюда (probe.h). */
     g_probe_sup = s;
