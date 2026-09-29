@@ -362,6 +362,26 @@ static int tun_up_queues(struct spoke *s, struct tun_dev *q, int want, const cha
     return n;
 }
 
+/* Рукопожатие прошло — up демону, с именем устройства (поле dev, evline.h).
+ *
+ * По первому такому up за жизнь процесса демон привязывает к устройству маршрут выхода
+ * (daemon/supd.c, route_up) — с 1.10 (шаг 3) это не работа клиента: bind_device — код демона, и
+ * в бинарник модуля на libsteer (шаг 4) он не едет. Следующие up (второе соединение, новое
+ * рукопожатие после обрыва) несут то же dev, и демон их за привязку не считает: маршрут после
+ * отказа возвращает сторож, как и раньше.
+ *
+ * Привязка по up, а не по подъёму устройства (как было, когда клиент звал bind_device сам в
+ * spoke_run): пока рукопожатия нет, устройство трафик не несёт — send_frame без s->up его
+ * выбрасывает, — и таблица, привязанная к нему, уводила бы трафик выхода в пустоту даже при
+ * on_fail=direct, а при хабе, который не отвечает, так до решения сторожа. Теперь до up таблица
+ * держит то, что поставили apply или сторож. */
+static void xs_emit_up(const struct spoke *s) {
+    if (s->dev && s->dev[0])
+        evline_emit("up", "dev", EVLINE_STR, s->dev, (const char *)NULL);
+    else
+        evline_emit("up", (const char *)NULL);
+}
+
 /* Одно рукопожатие целиком. Блокирующее по существу: до его конца нести нечего, а
  * усложнять цикл ради параллельности с самим собой незачем. Ждём с таймаутом, потому что
  * молчащий хаб не должен подвесить процесс — procd поднимет заново. */
@@ -474,7 +494,7 @@ static int do_handshake(struct spoke *s) {
     s->cool_until = 0;
     s->last_drops = s->reasm.dropped;
     s->up = 1;
-    evline_emit("up", (const char *)NULL);
+    xs_emit_up(s);
     s->handshake_at = xs_now_ms();
     fprintf(stderr, LOG_I "рукопожатие с %s:%d прошло, порт %u, шифр %s\n",
             s->conf->peer[0].endpoint, s->hub_port, s->conn.sport,
@@ -646,10 +666,11 @@ static void session_down_why(struct spoke *s, const char *why) {
 static void session_down(struct spoke *s) { session_down_why(s, NULL); }
 
 /* Общий цикл обеих ролей вынесен, чтобы «поднять для выхода спеки» и «поднять на готовом
- * устройстве» отличались ровно тем, чем отличаются: владением устройством и маршрутизацией.
- * Скопировать цикл во второй раз значило бы два места для одной ошибки в пути данных. */
-static int spoke_run(struct spoke *s, const char *dev, const char *chain_label, int managed,
-                     struct output *o);
+ * устройстве» отличались ровно тем, чем отличаются: владением устройством. Маршрутизацией с 1.10
+ * (шаг 3) не владеет ни та, ни другая: у выхода спеки маршрут ставит демон по up (xs_emit_up), в
+ * режиме netifd — netifd. Скопировать цикл во второй раз значило бы два места для одной ошибки в
+ * пути данных. */
+static int spoke_run(struct spoke *s, const char *dev, const char *chain_label, int managed);
 static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const char *conf_path,
                            int stream, int stream_port);
 
@@ -688,7 +709,7 @@ int cmd_xsteer(const char *spec_path, const char *out_name, const char *conf_pat
         sd.out_name = device;
         snprintf(sd.state_path, sizeof(sd.state_path), "%s/xsteer-%.40s.json",
                  steer_state_dir(), device);
-        return spoke_run(&sd, device, device, 1, NULL);
+        return spoke_run(&sd, device, device, 1);
     }
     return cmd_xsteer_spec(spec_path, out_name, conf_path, stream, stream_port);
 }
@@ -706,10 +727,12 @@ static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const ch
     if (!o) die("нет такого выхода: %s", out_name);
     const struct xsteer_cfg *xc = out_xsteer(o);
     if (!xc) die("выход %s не kind=xsteer", out_name);
-    /* Реестр нужен ДО подъёма: из него берутся метка и номер таблицы выхода, а их привязка к
-     * устройству — работа этого процесса (см. bind_device ниже). Вызов идемпотентен и с apply
-     * не спорит: тот же файл, те же номера. Без него метка была бы нулевой, и правило
-     * `ip rule fwmark 0x0` поймало бы весь трафик роутера. */
+    /* Реестр нужен ДО подъёма: из него берётся метка выхода-цели при `via` (ниже; адрес
+     * устройства — из конфигурации xsteer, не из таблицы). Вызов идемпотентен и с apply не
+     * спорит: тот же файл, те же номера. До 1.10 отсюда же брались метка и таблица для привязки
+     * устройства этим процессом (без реестра метка была бы нулевой, и `ip rule fwmark 0x0`
+     * поймало бы весь трафик роутера); привязку теперь делает демон по своей спеке, где реестр
+     * назначен при загрузке (daemon/state.c). */
     if (registry_assign(&cfg, &e) < 0) err_die(&e);
     /* Метка соединения с хабом — out_underlay_mark: метка выхода-цели при `via`, иначе обычное
      * «мимо каналов» (см. «вложенные выходы» в spec.h). После registry_assign — у цели метка
@@ -754,11 +777,13 @@ static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const ch
     snprintf(s.state_path, sizeof(s.state_path), "%s/xsteer-%.40s.json",
              steer_state_dir(), o->name);
 
-    /* Таблицу к устройству привязывает САМ процесс: apply прошёл раньше, дождаться
-     * устройства снаружи нельзя, и момент готовности знает только тот, кто его создал. Тот
-     * же довод и тот же приём, что у клиента VLESS. В режиме netifd этого не делается вовсе:
-     * маршрутизацией там владеет он, а выход описывается в спеке как обычный interface. */
-    return spoke_run(&s, o->device, o->name, 0, o);
+    /* Таблицу к устройству привязывал до 1.10 САМ процесс: apply прошёл раньше, дождаться
+     * устройства снаружи нельзя, и момент готовности знает только тот, кто его создал. Момент
+     * по-прежнему знаем мы, но говорим о нём демону — up с именем устройства после рукопожатия
+     * (xs_emit_up), — а привязывает он, тем же bind_device в своём процессе (шаг 3, тот же довод,
+     * что у клиента VLESS в vlmain.c, vl_ready). В режиме netifd маршрутизацией владеет он, а
+     * выход описывается в спеке как обычный interface. */
+    return spoke_run(&s, o->device, o->name, 0);
 }
 
 /* Сколько соединений открывать. По одному на ядро, но не больше XS_CONNS_MAX.
@@ -801,9 +826,9 @@ static int worker_give_up(struct spoke *s) {
     return 0;
 }
 
-/* Установка: одно устройство, одно правило nft, одна привязка таблицы — и N воркеров. */
-static int spoke_run(struct spoke *s, const char *dev, const char *chain_label, int managed,
-                     struct output *o) {
+/* Установка: одно устройство, одно правило nft — и N воркеров. Привязку таблицы выхода к
+ * устройству делает демон по первому up (xs_emit_up). */
+static int spoke_run(struct spoke *s, const char *dev, const char *chain_label, int managed) {
     if (!s->hub_port) {
         /* Режим netifd: подготовка проще, но те же три величины обязаны быть посчитаны. */
         memcpy(s->hub_pub, s->conf->peer[0].pub, 32);
@@ -846,7 +871,13 @@ static int spoke_run(struct spoke *s, const char *dev, const char *chain_label, 
                                     s->hub_port, 0) != 0)
         fprintf(stderr, LOG_W "%s: правило против RST не встало — сессию может оборвать "
                               "собственное ядро (нет nft?)\n", chain_label);
-    if (o) bind_device(o, dev);
+    /* Без демона (трубы событий нет) маршрут выхода не привязывает никто из этого процесса —
+     * доводы те же, что у клиента VLESS (vlmain.c, vl_ready): без демона клиент в бою не
+     * запускается, а ручной запуск и стенды ставят маршрут в устройство сами. В режиме netifd
+     * маршрут и не наш. */
+    if (!managed && !evline_enabled())
+        fprintf(stderr, LOG_I "%s поднят; маршрут выхода к нему ставит демон — без демона "
+                              "таблица выхода не тронута\n", dev);
 
     /* Воркер 0 — этот же поток: при одном соединении процесс ведёт себя ровно так, как до
      * появления потоков, и отладка одного потока остаётся возможной. */
@@ -1180,7 +1211,7 @@ static int stream_handshake(struct spoke *s, const char *dev) {
     if (peer_mtu > 0 && peer_mtu < s->mtu_agreed) s->mtu_agreed = peer_mtu;
     s->mtu_confirmed = s->mtu_agreed;
     s->up = 1;
-    evline_emit("up", (const char *)NULL);
+    xs_emit_up(s);
     s->handshake_at = xs_now_ms();
     s->stream_rx = s->handshake_at;
     s->batch_max = XS_BATCH_FRAMES_MAX;

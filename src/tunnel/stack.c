@@ -2622,7 +2622,7 @@ static void stack_setup(const struct dialer *d) {
     for (int i = 0; i < SPARE_MAX; i++) g_spares[i].sess = m + (size_t)i * g_sess_stride;
 }
 
-int stack_run(struct output *o, const struct dialer *d) {
+int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, void *arg) {
     const char *dev = o->device;
     g_trace = getenv("STEER_TUN_TRACE") != NULL;
     g_stats = getenv("STEER_TUN_STATS") != NULL;
@@ -2659,15 +2659,21 @@ int stack_run(struct output *o, const struct dialer *d) {
     }
     tun_bring_up(dev, o->table);
 
-    /* Привязываем таблицу выхода к устройству ЗДЕСЬ, а не в apply.
+    /* Устройство готово — сказать об этом модулю, а маршрут НЕ трогать.
      *
-     * Apply уже прошёл к этому моменту и, не найдя устройства, поставил запрет — иначе и
-     * нельзя: пока туннеля нет, пускать в него трафик некуда. Дождаться устройства снаружи
-     * невозможно: procd запускает этот процесс только после того, как init-скрипт вернул
-     * управление, то есть уже после apply. Значит привязать может только тот, кто знает
-     * момент готовности, — а это мы. */
-    bind_device(o, dev);
-    fprintf(stderr, LOG_I "%s привязан к таблице %d\n", dev, o->table);
+     * До 1.10 здесь стоял bind_device: apply к этому моменту уже прошёл и, не найдя устройства,
+     * поставил запрет, а момент готовности TUN знает только тот, кто его создал, — вот стек и
+     * привязывал таблицу выхода сам. Момент по-прежнему знаем только мы, но привязка — работа
+     * демона (решение владельца, docs/architecture.md, «1.10 — решения владельца»): там же страж
+     * правил, сторож и postrouting_guard, и маршрутизация с её моделью не должна ехать в бинарник
+     * модуля на libsteer (шаг 4). Поэтому стек только зовёт ready, модуль пишет демону up с
+     * именем устройства (evline.h, поле dev), и демон привязывает тем же bind_device в своём
+     * процессе. Зовётся ДО потоков цикла, на том же месте, где стояла привязка: порядок «сначала
+     * устройство, потом маршрут в него» не меняется, меняется только процесс, который ставит
+     * маршрут. До привязки таблица выхода держит то, что поставили apply или сторож (запрет у
+     * on_fail=drop, «напрямую» у direct и zapret), а помеченный пакет не в устройство выхода
+     * отбрасывает postrouting_guard, так что окно — «ещё не работает», а не «мимо туннеля». */
+    if (ready) ready(arg, dev);
     char desc[512];
     d->ops->describe(d->ctx, desc, sizeof(desc));
     fprintf(stderr, LOG_I "%s -> %s\n", dev, desc);

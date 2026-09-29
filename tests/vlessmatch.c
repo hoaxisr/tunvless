@@ -102,9 +102,9 @@
 int x25519_shared_ext(const unsigned char priv[32], const unsigned char peer[32],
                       unsigned char out[32]);
 
-/* Заглушки того, что живёт в src/lib/run.c и src/daemon/failover.c: ни команд, ни устройств стенду не нужно. */
+/* Заглушка того, что живёт в src/lib/run.c: ни команд, ни устройств стенду не нужно. Заглушки
+ * bind_device (src/daemon/failover.c) нет: с 1.10 (шаг 3) модуль VLESS маршрут не привязывает. */
 int run_quiet(const char *const argv[]) { (void)argv; return 0; }
-void bind_device(struct output *o, const char *dev) { (void)o; (void)dev; }
 
 #if defined(__SANITIZE_ADDRESS__)
 # include <sanitizer/lsan_interface.h>

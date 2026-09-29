@@ -82,7 +82,20 @@ static struct {
     size_t sel_n;
     int cur;                        /* узел, которым идёт трафик */
     int checked;                    /* узел проверен при подъёме (перебор) */
+    char dev[16];                   /* устройство процесса — поле dev каждого up (evline.h) */
 } g_nw = { .mu = PTHREAD_MUTEX_INITIALIZER };
+
+/* up демону: watch — клиент дальше следит за узлом сам; dev — всегда, если известно. */
+static void nw_up(int watch) {
+    if (g_nw.dev[0] && watch)
+        evline_emit("up", "watch", EVLINE_INT, 1L, "dev", EVLINE_STR, g_nw.dev, (const char *)NULL);
+    else if (g_nw.dev[0])
+        evline_emit("up", "dev", EVLINE_STR, g_nw.dev, (const char *)NULL);
+    else if (watch)
+        evline_emit("up", "watch", EVLINE_INT, 1L, (const char *)NULL);
+    else
+        evline_emit("up", (const char *)NULL);
+}
 
 /* Исход рукопожатия с узлом — от установщика (и живого соединения, и запасной сессии). */
 void vl_watch_seen(int rc) {
@@ -172,7 +185,7 @@ static void *nw_thread(void *arg) {
             g_nw.streak = 0;
             g_nw.kick = 0;
             pthread_mutex_unlock(&g_nw.mu);
-            evline_emit("up", "watch", EVLINE_INT, 1L, (const char *)NULL);
+            nw_up(1);
             fprintf(stderr, LOG_I2 "узел %s снова отвечает\n", cur->name);
             due = nw_now_ms() + NW_PERIOD_S * 1000ull;
             continue;
@@ -191,12 +204,21 @@ static void *nw_thread(void *arg) {
     return NULL;
 }
 
-/* Узел выбран: сказать демону up и, если он слушает, завести слежку (шапка выше). Замок держится
- * от создания потока до записи up: первая проверка названного узла идёт сразу, и её down не
- * должен обогнать up в трубе. */
+/* Узел выбран и устройство dev поднято: сказать демону up и, если он слушает, завести слежку
+ * (шапка выше). Замок держится от создания потока до записи up: первая проверка названного узла
+ * идёт сразу, и её down не должен обогнать up в трубе.
+ *
+ * Зовётся из стека (ready у stack_run), когда устройство уже есть, — а не при выборе узла, как до
+ * 1.10: по up с dev демон привязывает к устройству маршрут выхода (evline.h), и up до появления
+ * устройства значил бы привязку к тому, чего нет, — table_bind откажет, и выход на миг уйдёт в
+ * отказ. Прежде так и было, только без вреда: демон по раннему up будил сторожа, а привязку тут
+ * же переписывал сам клиент. dev — во всех up процесса, и в up слежки тоже: демон привязывает по
+ * первому, а следующие ему — подтверждение того же устройства (потерянная в полной трубе первая
+ * запись не оставит выход без маршрута). */
 void vl_watch_start(const struct vless_node *nodes, const int *sel, size_t sel_n, int cur,
-                    int checked) {
-    if (!evline_enabled()) { evline_emit("up", (const char *)NULL); return; }
+                    int checked, const char *dev) {
+    snprintf(g_nw.dev, sizeof(g_nw.dev), "%s", dev ? dev : "");
+    if (!evline_enabled()) { nw_up(0); return; }
     pthread_condattr_t ca;
     pthread_condattr_init(&ca);
     pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
@@ -223,10 +245,10 @@ void vl_watch_start(const struct vless_node *nodes, const int *sel, size_t sel_n
          * (и так же не видит узла за ним — см. шапку). */
         fprintf(stderr, LOG_W2 "поток слежки за узлом не создался (%s) — потерю узла клиент "
                         "не заметит\n", strerror(err));
-        evline_emit("up", (const char *)NULL);
+        nw_up(0);
         return;
     }
     __atomic_store_n(&g_nw.on, 1, __ATOMIC_RELEASE);
-    evline_emit("up", "watch", EVLINE_INT, 1L, (const char *)NULL);
+    nw_up(1);
     pthread_mutex_unlock(&g_nw.mu);
 }

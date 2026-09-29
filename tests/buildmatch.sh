@@ -771,6 +771,21 @@ check "в src не осталось вызовов mbedtls" "" \
 check "в src не осталось заголовков mbedtls" "" \
     "$(grep -rlE '#include [<"]mbedtls/' src tests | tr '\n' ' ')"
 
+# ---- маршрут модуля ставит демон (1.10, шаг 3) ---------------------------------
+#
+# Клиенты VLESS и xsteer звали bind_device сами — код маршрутизации демона (таблица, ip rule,
+# conntrack, набор failopen; src/daemon/failover.c) в процессе помощника. С шага 3 помощник говорит
+# демону up с именем устройства (src/lib/evline.h, поле dev), а привязывает демон
+# (src/daemon/supd.c, route_up). На шаге 4 модули — свои бинарники на libsteer, и failover.c в них
+# быть не должно: один вызов из src/tunnel или src/proto потянул бы его обратно, а с ним и
+# модельные зависимости маршрутизации. Комментарии не в счёт — тот же приём, что у правила 5.
+modroute=""
+for f in $(find src/tunnel src/proto \( -name '*.c' -o -name '*.h' \)); do
+    hit=$(grep -vE '^[[:space:]]*(\*|//|/\*)' "$f" | grep -oE '\<(bind_device|table_bind|rule_ensure6?|rule_drop6?|route6_bind|route6_flush|conntrack_evict|failopen_mark|apply_failed|fo_fail_apply)\(' | sort -u | tr -d '(' | tr '\n' ' ')
+    [ -n "$hit" ] && modroute="$modroute$f: $hit"
+done
+check "src/tunnel и src/proto не зовут маршрутизацию демона (шаг 3 выпуска 1.10)" "" "$modroute"
+
 # ---- каждый тарбол в образе сверяется по контрольной сумме ---------------------
 #
 # Тарбол zig сверялся с самого начала, тарбол mbedtls — нет: он распаковывался ровно тем, что

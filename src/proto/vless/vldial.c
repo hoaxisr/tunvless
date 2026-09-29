@@ -424,7 +424,8 @@ static int vl_deliver(const void *ctx, void *sess, int udp, const unsigned char 
 
 /* ---- подъём ---------------------------------------------------------------------------- */
 
-int vless_tunnel_run(struct output *o, const struct vless_node *node) {
+int vless_tunnel_run(struct output *o, const struct vless_node *node,
+                     void (*ready)(void *arg, const char *dev), void *arg) {
     /* Идентификатор узла — ДО устройства и потоков, пока узел ещё можно назвать. Дальше он
      * разбирается заново на каждое соединение (vl_flow_open), и отказ там означал бы туннель,
      * который поднят, но закрывает всё подряд (I-097). */
@@ -439,7 +440,7 @@ int vless_tunnel_run(struct output *o, const struct vless_node *node) {
     static struct dialer d;
     d.ops = &vless_dialer;
     d.ctx = node;
-    return stack_run(o, &d);
+    return stack_run(o, &d, ready, arg);
 }
 
 const struct dialer_ops vless_dialer = {

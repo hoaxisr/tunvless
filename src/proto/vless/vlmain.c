@@ -34,6 +34,13 @@
  */
 #define MAX_NODES 128
 static struct vless_node g_nodes[MAX_NODES];
+/* Что нужно слежке за узлом, когда стек поднимет устройство (vl_ready). */
+struct vl_ready_arg {
+    const struct vless_node *nodes;
+    const int *sel;
+    size_t sel_n;
+    int cur, checked;
+};
 /* Спека — значение, а не глобалы (правило 6, docs/architecture.md, раздел 2): экземпляр
  * заводит каждая точка входа (cmd_vless, cmd_vless_nodes, cmd_vless_probe) и передаёт его
  * параметром в load_nodes и underlay_setup. Выделяется по требованию, а не static в каждой из
@@ -266,6 +273,31 @@ static void vl_probe_report(const char *out_name, enum probe_state st, int node,
     if (!evline_enabled()) probe_report(out_name, st, node, total);
 }
 
+/* Устройство поднято (ready у stack_run, stack.h): сказать up и завести слежку за узлом.
+ *
+ * МАРШРУТ ВЫХОДА ЗДЕСЬ НЕ СТАВИТСЯ (1.10, шаг 3). До того клиент сам звал bind_device — код
+ * демона в процессе помощника: таблица, ip rule, conntrack, набор failopen. С шага 4 модуль —
+ * свой бинарник на libsteer, и маршрутизации с её моделью в нём быть не должно, а под демоном она
+ * и не нужна: демон привязывает маршрут по этому же up (поле dev, evline.h) в своём процессе,
+ * рядом со стражем правил и сторожем.
+ *
+ * БЕЗ ДЕМОНА (трубы событий нет: ручной запуск, стенды вроде tests/run-tunnel.sh, прежний `steer
+ * supervise`) маршрут выхода не привязывает никто: ни этот процесс, ни сторож без демона
+ * (`steer failover --loop` — проверено в сетевом пространстве: таблица остаётся с запретом apply).
+ * Отказать в подъёме было бы хуже: такие запуски нужны именно туннелем, и маршрут в устройство
+ * стенд ставит себе сам (`ip route … dev vl` у tests/run-tunnel.sh). Потеряна при этом только
+ * связка «`steer supervise` + сторож без демона», а она в бою не живёт: на роутере и на телефоне
+ * помощников держит демон (init.d/steer, steerd.rc в vendor/der — `steerd daemon --watch
+ * --supervise --apply`). Об этом — одна строка в журнал, чтобы «туннель поднят, а трафика по
+ * каналам нет» не пришлось разгадывать. */
+static void vl_ready(void *arg, const char *dev) {
+    const struct vl_ready_arg *ra = arg;
+    vl_watch_start(ra->nodes, ra->sel, ra->sel_n, ra->cur, ra->checked, dev);
+    if (!evline_enabled())
+        fprintf(stderr, LOG_I2 "%s поднят; маршрут выхода к нему ставит демон — без демона "
+                        "таблица выхода не тронута\n", dev);
+}
+
 int cmd_vless(const char *spec_path, const char *out_name) {
     evline_open();
     struct output *o = NULL;
@@ -371,10 +403,16 @@ int cmd_vless(const char *spec_path, const char *out_name) {
      * поставил, иначе на каждом пути выхода из подъёма про неё придётся помнить.
      *
      * Под демоном об узле за устройством дальше говорит слежка (vl_watch_start, vlwatch.c):
-     * up с watch, down, когда узел перестал отвечать, и снова up. Без демона — прежний up,
-     * которого никто не читает. */
+     * up с watch, down, когда узел перестал отвечать, и снова up. Заводится она не здесь, а когда
+     * стек поднял устройство (vl_ready ниже): up несёт имя устройства, и по нему демон привязывает
+     * маршрут выхода. Без демона — прежний up, которого никто не читает. */
     probe_clear(out_name);
-    vl_watch_start(nodes, sel, sel_n, chosen, !out_node_named(o));
+    static struct vl_ready_arg ra;
+    ra.nodes = nodes;
+    ra.sel = sel;
+    ra.sel_n = sel_n;
+    ra.cur = chosen;
+    ra.checked = !out_node_named(o);
 
     /* Реестр — чтобы узнать таблицу выхода: из неё берётся адрес устройства. Вызов
      * идемпотентен и с apply не спорит: тот же файл, те же номера. Правило 5,
@@ -382,5 +420,5 @@ int cmd_vless(const char *spec_path, const char *out_name) {
      * изнутри registry_assign. */
     struct err e = {0};
     if (registry_assign(sp, &e) < 0) err_die(&e);
-    return vless_tunnel_run(o, &nodes[chosen]);
+    return vless_tunnel_run(o, &nodes[chosen], vl_ready, &ra);
 }

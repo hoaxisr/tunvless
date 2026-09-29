@@ -56,8 +56,8 @@ int run_quiet(const char *const argv[]) {
 }
 
 #include "../src/model/spec.h"
-/* Привязку таблицы делает failover.c; сюда он не входит — на этом стенде его не зовут. */
-void bind_device(struct output *o, const char *dev) { (void)o; (void)dev; }
+/* Привязку таблицы делает демон (failover.c, по up помощника); стек её с 1.10 не зовёт, и
+ * заглушка здесь больше не нужна. */
 
 #include "stack.h"
 #include "vldial.h"
