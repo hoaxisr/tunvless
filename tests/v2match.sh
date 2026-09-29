@@ -169,6 +169,20 @@ if [ -x "$XK" ]; then
     if [ -n "$bm" ] && echo "$out" | grep -q "meta nfproto ipv6 goto mark_$bm comment \"steer-balance-v6:bal\"" &&
        echo "$out" | grep -q 'reject with icmpx type admin-prohibited comment "steer-v6drop:bal"'; then ok; else
         bad "balance с членом без IPv6 — IPv6 группы в отказ" "$(echo "$out" | grep -E 'bal_|v6' | head -n 8)"; fi
+    # hysteria2 (модуль steer-hysteria2): туннель по подписке, ключи как у vless, но без transport;
+    # convert — неподвижная точка; `kind: hysteria2` в v2 — отказ с подсказкой.
+    printf 'version: 2\noutputs:\n  hy: { kind: tunnel, protocol: hysteria2, subscription: sub/hy, nodes: [1, 0] }\n' > "$tmp/hy1.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec hy1.yaml --state-dir "$tmp/state" 2>&1)"
+    if [ $? = 0 ]; then ok; else bad "protocol: hysteria2 — принят" "$(echo "$out" | head -n 3)"; fi
+    (cd "$tmp" && "$XKA" spec convert --spec hy1.yaml > c1.yaml 2>&1 && "$XKA" spec convert --spec c1.yaml > c2.yaml 2>&1)
+    if grep -q 'protocol: hysteria2' "$tmp/c1.yaml" && grep -q 'nodes: \[1, 0\]' "$tmp/c1.yaml" && cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml"; then ok; else
+        bad "convert печатает hysteria2 с nodes (неподвижная точка)" "$(grep -n hy "$tmp/c1.yaml")"; fi
+    printf 'version: 2\noutputs:\n  hy: { kind: tunnel, protocol: hysteria2, subscription: sub/hy, transport: ws }\n' > "$tmp/hy2.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec hy2.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -qF "у kind hysteria2 нет transport"; then ok; else bad "hysteria2 с transport — отказ" "$out"; fi
+    printf 'version: 2\noutputs:\n  hy: { kind: hysteria2, subscription: sub/hy }\n' > "$tmp/hy3.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec hy3.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -qF "туннель пишется kind: tunnel, protocol: hysteria2"; then ok; else bad "kind: hysteria2 в v2 — отказ с подсказкой" "$out"; fi
     # transport: у туннеля (шаг 5 выпуска 1.10) — фильтр транспортов узлов подписки: одно имя или
     # список; convert печатает его обратно (одно — строкой, несколько — списком в порядке имён) и
     # остаётся неподвижной точкой; отказы — с местом.

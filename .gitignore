@@ -41,6 +41,7 @@ build/specmatch
 build/failovermatch
 build/h2match
 build/submatch
+build/hy2match
 build/subfetchmatch
 build/fwmatch
 build/obfsmatch

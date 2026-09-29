@@ -842,7 +842,16 @@ static int connq_push(const struct connjob *j) {
         int made = 0, err = 0;
         for (int i = 0; i < CONNECTORS; i++) {
             pthread_t t;
-            if ((err = pthread_create(&t, &a, connector, NULL)) != 0) break;
+            err = pthread_create(&t, &a, connector, NULL);
+            /* EINVAL при скромном стеке: минимум потока у glibc включает статическую TLS всех
+             * загруженных библиотек, а у libsteer.so она под 300 КБ (thread-local буферы), так что
+             * 128 КБ оказываются меньше минимума. Повторяем с запасом; занятой станет лишь
+             * использованная часть виртуальной памяти. */
+            if (err == EINVAL && !made) {
+                pthread_attr_setstacksize(&a, 1024 * 1024);
+                err = pthread_create(&t, &a, connector, NULL);
+            }
+            if (err != 0) break;
             made++;
         }
         pthread_attr_destroy(&a);

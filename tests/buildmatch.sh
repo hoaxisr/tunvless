@@ -49,11 +49,13 @@ words() { tr ' ' '\n' | grep -v '^$'; }
 # Поэтому с каталогами ядра сверяется base вместе с ними, а их место — ниже, отдельной проверкой.
 # Тот же расклад у слоя примитивов (CRYPTO_SRC, src/lib/scrypto.c): лежит в каталоге ядра, в base не
 # входит — базовой сборке криптография не нужна, и wolfSSL в ней нет.
-m_base="$( { profile_src base; echo; profile_var KINDS_EXT_SRC; echo; profile_var CRYPTO_SRC; } | words | names)"
+# Вид hysteria2 (KINDS_HY2_SRC) — того же рода, но только для раскладки с libsteer.so: в статические
+# профили он не входит (телефон отложен), запись вида есть в libsteer, а модуль — steer-hysteria2.
+m_base="$( { profile_src base; echo; profile_var KINDS_EXT_SRC; echo; profile_var KINDS_HY2_SRC; echo; profile_var CRYPTO_SRC; } | words | names)"
 # Профили разделяемой раскладки (шаг 4 выпуска 1.10: libsteer, steerd, четыре модуля) — тоже
 # профили: точки входа модулей (src/modules/main_*.c) существуют только в них.
 m_ext="$( { profile_src extended; echo; profile_src server; echo; profile_src tgws; echo
-            for p in libsteer steerd mod_vless mod_xsteer mod_obfs mod_tgws; do profile_src "$p"; echo; done; } |
+            for p in libsteer steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2; do profile_src "$p"; echo; done; } |
           words | grep -E "^($(profile_var EXT_DIRS | tr ' ' '|'))/" | names)"
 check "sources.mk: профиль base (с видами расширенной части) — это все каталоги ядра"  "$disk_base" "$m_base"
 check "sources.mk: профили покрывают всю расширенную часть" "$disk_ext" "$m_ext"
@@ -71,7 +73,11 @@ check "каждый каталог src описан в INC_DIRS" "" "$stray"
 check "имена заголовков в src уникальны" "" \
     "$(find src -name '*.h' | sed 's|.*/||' | sort | uniq -d | tr '\n' ' ')"
 bp_inc="$(sed -n '/cc_defaults/,/^}/p' Android.bp | grep -oE '"src/[a-z_/]+"' | tr -d '"' | tr '\n' ' ')"
-check "Android.bp подключает ровно каталоги INC_DIRS" "$(profile_var INC_DIRS) " "$bp_inc"
+# За вычетом каталогов, которых нет в сборке телефона (PHONE_SKIP_DIRS, build/sources.mk).
+inc_phone="$(for d in $(profile_var INC_DIRS); do
+    case " $(profile_var PHONE_SKIP_DIRS) " in *" $d "*) ;; *) printf '%s ' "$d" ;; esac
+done)"
+check "Android.bp подключает ровно каталоги INC_DIRS (кроме PHONE_SKIP_DIRS)" "$inc_phone" "$bp_inc"
 
 # ---- сторонний код: не правится и собирается везде одинаково -------------------------------
 # libyaml лежит в дереве байт в байт как в теге upstream (суммы — в UPSTREAM рядом): правка «на
@@ -342,13 +348,17 @@ check "барьер релиза считает архитектуры тем ж
 for pkg in libsteer-wolfssl libsteer steer steer-extended; do
     check "build.sh упаковывает $pkg" "1" "$(grep -c "^ *pack $pkg " build.sh)"
 done
-check "build.sh упаковывает модули по кругу vless xsteer obfs tgws" "1 1" \
-    "$(grep -c '^ *pack "steer-\$m" ' build.sh) $(grep -c '^    for m in vless xsteer obfs tgws; do' build.sh)"
+check "build.sh упаковывает модули по кругу vless xsteer obfs tgws hysteria2" "1 1" \
+    "$(grep -c '^ *pack "steer-\$m" ' build.sh) $(grep -c '^    for m in vless xsteer obfs tgws hysteria2; do' build.sh)"
 check "pack зовёт apk mkpkg и mk_ipk из одного дерева" "1 1" \
     "$(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c 'apk mkpkg') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c 'mk_ipk ')"
 # Мета-пакет steer-extended ставит ядро и ВСЕ модули (имя ждёт splify2), а модули зависят от ядра.
 check "steer-extended зависит от ядра и четырёх модулей" "1" \
     "$(grep -c 'pack steer-extended "\$xroot" "steer steer-vless steer-xsteer steer-obfs steer-tgws"' build.sh)"
+# steer-hysteria2 — отдельный пакет: мета-пакет его не ставит (решение владельца), и вид без модуля
+# отвечает «требует пакет steer-hysteria2», а не отсылкой к steer-extended.
+check "steer-extended не включает steer-hysteria2" "0" \
+    "$(grep 'pack steer-extended' build.sh | grep -c hysteria2)"
 check "модули зависят от steer" "1" "$(grep -c 'mdeps="steer \$(pkg_deps' build.sh)"
 # Зависимости между нашими пакетами — точной версии (формат линии событий и ABI libsteer между
 # выпусками не обещаны).
@@ -814,19 +824,19 @@ check "src/tunnel и src/proto не зовут маршрутизацию дем
 # модулей одно — cli/modcmd.c: он входит в каждый бинарник, потому что слабые ссылки на cmd_*
 # решаются компоновкой, а не загрузчиком.
 sd="$(mktemp -d)"
-for p in libsteer steerd mod_vless mod_xsteer mod_obfs mod_tgws extended; do
+for p in libsteer steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 extended; do
     profile_src "$p" | words | sort -u > "$sd/$p"
 done
 modcmd="$(profile_var MODCMD_SRC)"
-for a in steerd mod_vless mod_xsteer mod_obfs mod_tgws; do
+for a in steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2; do
     check "раскладка: в libsteer и $a нет общих файлов" "" \
         "$(comm -12 "$sd/libsteer" "$sd/$a" | tr '\n' ' ')"
 done
-for a in mod_vless mod_xsteer mod_obfs mod_tgws; do
+for a in mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2; do
     check "раскладка: у steerd и $a общий один файл — modcmd.c" "$modcmd " \
         "$(comm -12 "$sd/steerd" "$sd/$a" | tr '\n' ' ')"
 done
-set -- mod_vless mod_xsteer mod_obfs mod_tgws
+set -- mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2
 while [ $# -gt 1 ]; do
     a="$1"; shift
     for b in "$@"; do
@@ -836,7 +846,7 @@ while [ $# -gt 1 ]; do
 done
 # Модуль не несёт ни демона, ни модели: демон (failover.c, supd.c, dnsd…) — в steerd, модель и виды —
 # в libsteer. В списках модулей нет ничего из каталогов демона, резолвера, компилятора и моделей.
-for a in mod_vless mod_xsteer mod_obfs mod_tgws; do
+for a in mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2; do
     check "раскладка: в $a нет файлов демона, компилятора, резолвера и модели" "" \
         "$(grep -E '^src/(daemon|dnsd|compile|model|kinds|platform)/' "$sd/$a" | tr '\n' ' ')"
 done
@@ -845,14 +855,14 @@ check "раскладка: libsteer не несёт демона, компиля
     "$(grep -E '^src/(daemon|dnsd|compile)/' "$sd/libsteer" | grep -v 'src/compile/nftcompat.c' | tr '\n' ' ')"
 # Всё, что было в статическом расширенном профиле, есть в раскладке (кроме файла профиля), а лишнее —
 # только четыре точки входа модулей.
-cat "$sd/libsteer" "$sd/steerd" "$sd/mod_vless" "$sd/mod_xsteer" "$sd/mod_obfs" "$sd/mod_tgws" | sort -u > "$sd/all"
+cat "$sd/libsteer" "$sd/steerd" "$sd/mod_vless" "$sd/mod_xsteer" "$sd/mod_obfs" "$sd/mod_tgws" "$sd/mod_hysteria2" | sort -u > "$sd/all"
 check "раскладка покрывает расширенный профиль (кроме файла профиля)" "src/profile/extended.c " \
     "$(comm -23 "$sd/extended" "$sd/all" | tr '\n' ' ')"
 # (Обёртка QUIC src/proto/quic — в libsteer, в статическом профиле её нет: потребителя нет, телефону — шаг 6.)
-check "  и добавляет только точки входа модулей и обёртку QUIC" "src/modules/main_obfs.c src/modules/main_tgws.c src/modules/main_vless.c src/modules/main_xsteer.c src/proto/quic/qcssl.c src/proto/quic/quic.c " \
+check "  и добавляет только точки входа модулей, обёртку QUIC и модуль hysteria2 с его видом" "src/kinds/hysteria2.c src/modules/main_hysteria2.c src/modules/main_obfs.c src/modules/main_tgws.c src/modules/main_vless.c src/modules/main_xsteer.c src/proto/hysteria2/hy2conn.c src/proto/hysteria2/hy2dial.c src/proto/hysteria2/hy2main.c src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2wire.c src/proto/quic/qcssl.c src/proto/quic/quic.c " \
     "$(comm -13 "$sd/extended" "$sd/all" | tr '\n' ' ')"
 # Точка входа — единственный main() модуля; steerd свой main держит в daemon/main.c.
-for a in vless xsteer obfs tgws; do
+for a in vless xsteer obfs tgws hysteria2; do
     check "src/modules/main_$a.c зовёт steer_module_main с именем модуля" "1" \
         "$(grep -c "steer_module_main(argc, argv, \"$a\", STEER_VERSION)" src/modules/main_$a.c)"
 done
@@ -1004,7 +1014,7 @@ check "ngtcp2: образ сборщика берёт исходники чер�
     "$(grep -c 'COPY ngtcp2/patches' build/Dockerfile) $(grep -c 'ngtcp2/fetch.sh /opt/ngtcp2' build/Dockerfile)"
 check "ngtcp2: build-libs.sh и libs-exports.sh собирают её рецептом build/ngtcp2/build.sh" "2" \
     "$(grep -l 'build/ngtcp2/build.sh' build/build-libs.sh build/libs-exports.sh | wc -l | tr -d ' ')"
-check "ngtcp2: патчи Brutal — в build/ngtcp2/patches" "1" \
+check "ngtcp2: патчи (Brutal и смена перегрузки на ходу) — в build/ngtcp2/patches" "2" \
     "$(ls build/ngtcp2/patches/*.patch | wc -l | tr -d ' ')"
 
 printf '\n%d проверок пройдено' "$pass"

@@ -57,6 +57,26 @@
 #define QC_CLOSE_HANDSHAKE  3   /* рукопожатие не уложилось в срок или отвергнуто (TLS, ALPN) */
 #define QC_CLOSE_ERROR      4   /* ошибка протокола или сокета */
 
+#define QC_HOP_RANGES 8     /* диапазонов портов в прыжках */
+
+/* Шов для обфускации: фильтр между ngtcp2 и сокетом. Нужен hysteria2 (Salamander: каждая
+ * датаграмма UDP — соль в 8 байт и исходный пакет, побитово смешанный с ключом из соли), а DoQ и
+ * обычный QUIC его не задают. Ни того, ни другого фильтра слой не знает: он вызывает функции
+ * и берёт длину результата.
+ *   tx  — из src (n байт) в dst (вмещает n + 64), вернуть длину; 0 — не отправлять;
+ *   rx  — из src в dst, dst МОЖЕТ совпадать с src (обработка на месте); вернуть длину; 0 —
+ *         датаграмма не наша, отбросить. */
+struct qc_filter {
+    size_t (*tx)(void *user, uint8_t *dst, const uint8_t *src, size_t n);
+    size_t (*rx)(void *user, uint8_t *dst, const uint8_t *src, size_t n);
+    void *user;
+    /* Вместо tx, когда одному пакету соответствует НЕСКОЛЬКО датаграмм (Gecko режет пакеты
+     * рукопожатия на куски): фильтр вызывает out(ctx, датаграмма, длина) на каждую. rx тогда
+     * возвращает 0, пока пакет не собран целиком, и длину собранного — когда собран. */
+    int (*tx_multi)(void *user, const uint8_t *src, size_t n,
+                    void (*out)(void *ctx, const uint8_t *d, size_t n), void *ctx);
+};
+
 struct qc;          /* соединение */
 struct qc_tls;      /* контекст TLS: корни проверки, при желании общий для соединений */
 
@@ -84,6 +104,10 @@ struct qc_cfg {
      * CERTV_DEFAULT_ROOTS; на телефоне путь даёт tls_cert_roots()) и имя sni. insecure = 1 —
      * не проверять ничего (как в hysteria2 с insecure: true). */
     int         insecure;
+    /* pinSHA256: 32 байта SHA-256 листового сертификата. Задан — цепочка и имя НЕ проверяются
+     * (как у эталона), а после рукопожатия отпечаток сверяется, и несовпадение закрывает
+     * соединение причиной QC_CLOSE_HANDSHAKE. Работает только с готовым cfg.tls == NULL. */
+    const uint8_t *pin_sha256;
     const uint8_t *ca_pem;
     size_t      ca_pem_n;
     const char *ca_file;
@@ -93,17 +117,39 @@ struct qc_cfg {
 
     /* Brutal: целевая скорость, БАЙТ/с. 0 — обычный CUBIC. */
     uint64_t    brutal_bps;
+    /* SO_MARK сокета до connect(): маршрут ядро выбирает по метке (собственный трафик туннеля идёт
+     * мимо самого туннеля, «подложка» в spec.h). mark_required — отказ SO_MARK отказывает открытие
+     * (иначе соединение молча ушло бы не туда), как у транспортов. */
+    uint32_t    sock_mark;
+    int         mark_required;
+    /* Обратное давление на приём: окна потоков и соединения НЕ продлеваются сами, потребитель
+     * возвращает их qc_stream_consumed по мере того, как отдал байты дальше. По умолчанию (0)
+     * окно продлевается сразу, как описано в шапке. */
+    int         flow_manual;
+    /* BBR вместо CUBIC (при brutal_bps == 0). */
+    int         bbr;
     /* Датаграммы RFC 9221: наибольшая принимаемая, 0 — датаграмм не принимаем (и не шлём). Нужны
      * hysteria2 (UDP-релей); DoQ их не использует. */
     size_t      datagram_max;
 
     /* Пределы; нули — умолчания. */
     unsigned    idle_ms;            /* max_idle_timeout, по умолчанию 30000 */
+    unsigned    keepalive_ms;       /* PING при молчании; 0 — не слать */
     unsigned    handshake_ms;       /* по умолчанию 10000 */
     uint64_t    max_data;           /* окно приёма соединения, по умолчанию 8 МиБ */
     uint64_t    max_stream_data;    /* окно приёма потока, по умолчанию 2 МиБ */
     uint64_t    max_streams;        /* потоков, которые открывает сервер, по умолчанию 16 */
     size_t      send_buf;           /* буфер отправки на поток (неподтверждённое + очередь), 1 МиБ */
+
+    /* Фильтр датаграмм сокета (обфускация hysteria2, Salamander); NULL — датаграммы идут как есть.
+     * Копируется при открытии. */
+    const struct qc_filter *filter;
+    /* Прыжки по портам сервера: hop_n диапазонов [hop[2i], hop[2i+1]] (порядок хоста, включительно),
+     * смена порта не чаще чем раз в hop_ms (0 — порт выбирается один раз). cfg.port остаётся
+     * «базовым» адресом сервера для ngtcp2 и SNI; отправка идёт на выбранный порт диапазона, приём
+     * — с любого порта диапазона. hop_n = 0 — прыжков нет. */
+    unsigned    hop_n, hop_ms;
+    uint16_t    hop[QC_HOP_RANGES * 2];
 };
 
 struct qc_stats {
@@ -141,6 +187,9 @@ int  qc_run(struct qc *q, int timeout_ms);
 int  qc_handshake_done(const struct qc *q);
 /* Двунаправленный поток. QC_EAGAIN — рукопожатие не завершено или у сервера нет разрешения. */
 int  qc_stream_open(struct qc *q, int64_t *sid);
+/* Однонаправленный поток (наша передача, приёма нет): управляющий поток HTTP/3 у hysteria2. Те же
+ * QC_EAGAIN и qc_stream_send. */
+int  qc_stream_open_uni(struct qc *q, int64_t *sid);
 /* Поставить n байт в очередь потока; fin — после них закрыть передачу. Возвращает принятое число
  * байт (0..n; меньше n — буфер потока полон, повторить после освобождения по ACK) или QC_E*. */
 ssize_t qc_stream_send(struct qc *q, int64_t sid, const uint8_t *d, size_t n, int fin);
@@ -153,6 +202,13 @@ int  qc_stream_reset(struct qc *q, int64_t sid, uint64_t app_err);
 int  qc_datagram_send(struct qc *q, const uint8_t *d, size_t n);
 /* Наибольшая датаграмма, что влезает сейчас (0 — сервер датаграмм не принимает). */
 size_t qc_datagram_max(const struct qc *q);
+
+/* Вернуть окна приёма (только при cfg.flow_manual): n байт потока sid отданы дальше. */
+void qc_stream_consumed(struct qc *q, int64_t sid, size_t n);
+/* Сменить перегрузку на ходу: brutal_bps != 0 — Brutal с этой скоростью (байт/с), 0 — BBR. Так
+ * hysteria2 применяет ответ сервера на авторизацию, когда соединение уже открыто. 0 — успех;
+ * QC_EINVAL — смена не поддержана. */
+int  qc_set_cc(struct qc *q, uint64_t brutal_bps);
 
 void qc_stats_get(struct qc *q, struct qc_stats *st);
 

@@ -38,6 +38,7 @@ xsteer — [docs/xsteer.md](xsteer.md).
 | `steer-xsteer` | `XSTEER_MODULE_SRC` | клиент звезды: `xsclient` и общая часть формата (`xswire`, `xsconf`, `xslink`, `xsroute`, `xsconn`, `xsstream`, `xsepoch`, `xshake`), служебные команды `xsadmin` |
 | `steer-obfs` | `OBFS_MODULE_SRC` | точка входа обфускатора (`obfsmain.c`); сам `obfs.c` — в `libsteer`, его зовёт и xsteer |
 | `steer-tgws` | `TGWS_MODULE_SRC` | мост Telegram (`tgws.c`); правила перехвата пишет ядро (`kinds/tgws.c`) |
+| `steer-hysteria2` | `HY2_MODULE_SRC` | клиент hysteria2 ([docs/hysteria2.md](hysteria2.md)): провод (`hy2wire`), узлы и подписка (`hy2sub`), соединение QUIC и мультиплексор потоков (`hy2conn`), дайлер стека (`hy2dial`), команды и слежка (`hy2main`); запись вида — `kinds/hysteria2.c` в `libsteer` (`KINDS_HY2_SRC`); в статические профили и в телефон не входит |
 
 Каждый модуль — свой `main` (`src/modules/main_<имя>.c`) и `src/cli/modcmd.c`; линкуется он с
 `libsteer.so`, thread-local таблицы туннеля живут в куче потока (раздел «Туннели»). В модуле нет
@@ -59,8 +60,9 @@ xsteer — [docs/xsteer.md](xsteer.md).
 
 Пакеты: `libsteer-wolfssl`, `libsteer` (зависит от предыдущего), `steer` (ядро: `steerd`, `steer`,
 `steer-tools`, `steer-nfqws`, init-скрипт, hotplug, `keep.d`; зависит от `libsteer`),
-`steer-vless`, `steer-xsteer`, `steer-obfs`, `steer-tgws` (по бинарнику; зависят от `steer` и
-`libsteer` той же версии) и мета-пакет `steer-extended` (ядро и все четыре модуля). Ядро зависит
+`steer-vless`, `steer-xsteer`, `steer-obfs`, `steer-tgws`, `steer-hysteria2` (по бинарнику; зависят
+от `steer` и `libsteer` той же версии) и мета-пакет `steer-extended` (ядро и первые четыре модуля;
+`steer-hysteria2` в него не входит). Ядро зависит
 от обеих библиотек, потому что `steerd` сам ходит по HTTPS (замер групп, `urltls.c`).
 
 Модуль, которого нет в системе, — не отсутствие команды. Вид выхода `vless` или `xsteer` при
@@ -160,7 +162,7 @@ steer-tools <команда>    ссылка на steerd: отвечает то�
 - **Помощники: резолвер — подкоманда `steerd`, туннели, обфускатор и мост — модули.** Резолвер
   демон запускает тем же файлом `steerd`, помощников выходов — бинарником модуля из каталога
   движка (`kind_helper.prog`, `helpers_plan` в `src/daemon/helpers.c`): `steer-vless`,
-  `steer-xsteer`, `steer-obfs`, `steer-tgws`. Слова у них те же, что у подкоманды
+  `steer-xsteer`, `steer-obfs`, `steer-tgws`, `steer-hysteria2`. Слова у них те же, что у подкоманды
   (`<команда> <выход> --spec … [--state-dir …]`), окружение — `STEER_EVENT_FD` и `STEER_SUPD`, как
   у прежних помощников. argv[0] у всех «…/steer» (`helper_argv0`): в списке процессов они
   выглядят как `steer dnsd`, `steer vless <выход>`, и поиск по командной строке (diag — обходом
@@ -464,10 +466,25 @@ configure) в статический архив с `-fPIC`; nghttp3 не бер�
 (ngtcp2 нужен сам TLS-стек, а не примитивы); `quic.c` держит сокет, потоки, датаграммы RFC 9221 и
 таймер и wolfSSL не видит. Модель выполнения — внешняя линия событий: соединение отдаёт дескриптор
 UDP-сокета и срок таймера (`qc_fd`, `qc_timeout_ms`), потребитель зовёт `qc_on_readable` и
-`qc_on_timer`. Перегрузка по умолчанию — CUBIC; при `brutal_bps` — Brutal из hysteria2, патч к
-ngtcp2: заданная скорость в байтах в секунду, окно `bps × RTT × 2 / доля подтверждённых пакетов`,
-без снижения при потерях. Потребителей в движке пока нет; из `libsteer.so` торчит интерфейс `qc_*`
-ради стенда `tests/qcbench.c` (`build/libs-exports.sh`).
+`qc_on_timer`. Перегрузка по умолчанию — CUBIC; при `bbr` — BBR; при `brutal_bps` — Brutal из
+hysteria2, патч к ngtcp2: заданная скорость в байтах в секунду, окно `bps × RTT × 2 / доля
+подтверждённых пакетов`, без снижения при потерях. Второй патч (`0002`) даёт смену перегрузки на
+установленном соединении (`qc_set_cc`: Brutal с другой скоростью или BBR).
+
+Швы для hysteria2, не меняющие остальное поведение слоя: фильтр датаграмм сокета (`qc_filter`,
+Salamander; `tx_multi` — один пакет в несколько датаграмм, Gecko), прыжки по портам сервера (`hop_*`: отправка на порт диапазона, приём с любого порта
+диапазона, для ngtcp2 путь остаётся один), метка сокета (`sock_mark`), проверка отпечатка
+сертификата (`pin_sha256`, вместо цепочки), однонаправленный поток (`qc_stream_open_uni` — управляющий
+поток HTTP/3), PING по молчанию (`keepalive_ms`) и ручное продление окон приёма (`flow_manual`,
+`qc_stream_consumed`) — обратное давление на сервер. Длина идентификатора соединения — четыре байта.
+Потребители — модуль `steer-hysteria2` и стенд `tests/qcbench.c` (`build/libs-exports.sh`).
+
+**Клиент hysteria2 в стеке туннеля.** Стек (`stack.c`) держит на каждое соединение клиента
+дескриптор, а QUIC-соединение у hysteria2 одно. Между ними — поток-мультиплексор модуля
+(`hy2conn.c`): владеет QUIC и для каждого соединения клиента держит пару сокетов `SOCK_SEQPACKET`,
+один конец которой стек опрашивает как обычный дескриптор (`hy2dial.c`, `caps = 0`, без пула
+запасных сессий). Запись в SEQPACKET принимается целиком либо не принимается — то, что требует
+`dialer_ops.send`; для UDP границы датаграмм сохраняются сокетом.
 
 ### DNS
 

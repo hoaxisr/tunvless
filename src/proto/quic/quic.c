@@ -40,7 +40,12 @@
 #define QC_TXBUF        (64 * 1024)     /* пачка — до send_quantum, а он не больше 64 КиБ */
 #define QC_DG_QUEUE     64
 #define QC_RXBUF        65536
-#define QC_CID_LEN      17
+#define QC_OBUF         (2 * 1500)      /* результат фильтра отправки: одна датаграмма с запасом */
+/* Длина нашего идентификатора соединения. Была 17; против сервера эталона (quic-go) это стоило
+ * потери датаграмм: он режет фрагменты UDP по предельному размеру датаграммы, посчитанному
+ * без учёта длинного CID адресата, и первый (самый большой) фрагмент не влезал в пакет и молча
+ * пропадал — UDP крупнее одного фрагмента не работал вовсе. Четыре байта — как у самого quic-go. */
+#define QC_CID_LEN      4
 
 /* Буфер отправки потока — цепочка блоков ФИКСИРОВАННОГО размера, и это не вкус. ngtcp2 не копирует
  * данные потока: указатель, отданный в ngtcp2_conn_writev_stream, она хранит для повторной отправки
@@ -107,8 +112,25 @@ struct qc {
     int       closed;           /* on_closed уже вызвано */
     int       in_cb;            /* внутри колбэка потребителя: qc_free запрещён */
     int       brutal;
+    int       flow_manual;      /* окна приёма продлевает потребитель (qc_stream_consumed) */
     uint8_t  *txbuf;
     uint8_t  *rxbuf;
+    /* Шов «фильтр датаграмм» (quic.h, struct qc_filter): обфускация всего, что идёт по сокету.
+     * obuf — куда фильтр отправки складывает результат (пачка ngtcp2 нарезана на кусочки размером
+     * с датаграмму, поэтому достаточно одной датаграммы с запасом). */
+    struct qc_filter filter;
+    uint8_t  *obuf;
+    /* Прыжки по портам сервера (quic.h): диапазоны, интервал, текущий порт и момент последней
+     * смены. Сокет тогда не connect()-нут: адрес назначения выбирает каждая отправка. */
+    uint16_t  hop[QC_HOP_RANGES * 2];
+    unsigned  hop_n, hop_ms;
+    uint16_t  hop_port;
+    uint64_t  hop_at_ns;
+    /* pinSHA256 (quic.h): сверка листового сертификата вместо цепочки. why — причина закрытия,
+     * которую колбэк ngtcp2 не может вернуть иначе, чем кодом. */
+    int       pin_on;
+    uint8_t   pin[32];
+    const char *why;
 };
 
 struct qc_tls {
@@ -226,6 +248,15 @@ static int new_cid_cb(ngtcp2_conn *conn, ngtcp2_cid *cid, ngtcp2_stateless_reset
 static int handshake_completed_cb(ngtcp2_conn *conn, void *ud) {
     struct qc *q = ud;
     (void)conn;
+    if (q->pin_on) {
+        /* Отпечаток листа — вместо цепочки (так у эталона: pinSHA256 заменяет проверку, а не
+         * дополняет её). Сравнение не за постоянное время: отпечаток не секрет. */
+        uint8_t h[32];
+        if (qcssl_peer_sha256(q->ssl, h) != 0 || memcmp(h, q->pin, 32) != 0) {
+            q->why = "сертификат сервера не совпал с pinSHA256";
+            return NGTCP2_ERR_CALLBACK_FAILURE;
+        }
+    }
     q->hs_done = 1;
     if (q->ops.on_handshake) {
         q->in_cb++;
@@ -244,9 +275,30 @@ static int recv_stream_data_cb(ngtcp2_conn *conn, uint32_t flags, int64_t sid, u
         q->ops.on_stream_data(q->user, sid, data, datalen, (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0);
         q->in_cb--;
     }
-    /* Окно приёма продлеваем сразу: обратного давления нет (quic.h). */
-    ngtcp2_conn_extend_max_stream_offset(conn, sid, datalen);
-    ngtcp2_conn_extend_max_offset(conn, datalen);
+    /* Окно приёма продлеваем сразу: обратного давления нет (quic.h). С flow_manual окно
+     * продлевает потребитель (qc_stream_consumed), когда отдал байты дальше: так медленный
+     * получатель тормозит отправителя, а не копит очередь в памяти роутера. */
+    if (!q->flow_manual) {
+        ngtcp2_conn_extend_max_stream_offset(conn, sid, datalen);
+        ngtcp2_conn_extend_max_offset(conn, datalen);
+    }
+    return 0;
+}
+
+void qc_stream_consumed(struct qc *q, int64_t sid, size_t n) {
+    if (!q || !q->conn || !n) return;
+    /* Поток мог закрыться раньше: его окно продлевать нечем и незачем, а окно соединения
+     * возвращается всё равно — иначе закрытые потоки съели бы его насовсем. */
+    (void)ngtcp2_conn_extend_max_stream_offset(q->conn, sid, n);
+    ngtcp2_conn_extend_max_offset(q->conn, n);
+}
+
+int qc_set_cc(struct qc *q, uint64_t brutal_bps) {
+    if (!q || !q->conn || q->closed) return QC_EINVAL;
+    /* Тот же потолок, что при открытии (settings_fill): bps * RTT не должно переполнять 64 бита. */
+    if (brutal_bps > 0x7fffffffULL) brutal_bps = 0x7fffffffULL;
+    ngtcp2_conn_set_cc_brutal(q->conn, brutal_bps, now_ns());     /* наш патч 0002 */
+    q->brutal = brutal_bps != 0;
     return 0;
 }
 
@@ -320,9 +372,67 @@ static const ngtcp2_callbacks g_client_cbs = {
 
 /* ---- отправка -------------------------------------------------------------------------------- */
 
+static uint16_t *sa_port(struct sockaddr_storage *ss) {
+    return ss->ss_family == AF_INET6 ? &((struct sockaddr_in6 *)ss)->sin6_port
+                                     : &((struct sockaddr_in *)ss)->sin_port;
+}
+
+/* Выбрать порт назначения из диапазонов прыжков: равновероятно по ПОРТАМ, а не по диапазонам
+ * (иначе порт из узкого диапазона выпадал бы чаще), как у эталона (udphop: rand.Intn на весь
+ * диапазон). Порт — в порядке хоста. */
+static uint16_t hop_pick(const struct qc *q) {
+    uint32_t total = 0;
+    for (unsigned i = 0; i < q->hop_n; i++) total += (uint32_t)q->hop[2 * i + 1] - q->hop[2 * i] + 1;
+    if (!total) return 0;
+    uint32_t r;
+    fill_random((uint8_t *)&r, sizeof r);
+    r %= total;
+    for (unsigned i = 0; i < q->hop_n; i++) {
+        uint32_t w = (uint32_t)q->hop[2 * i + 1] - q->hop[2 * i] + 1;
+        if (r < w) return (uint16_t)(q->hop[2 * i] + r);
+        r -= w;
+    }
+    return q->hop[0];
+}
+
+static void raw_send(struct qc *q, const uint8_t *p, size_t n);
+
+/* Выход фильтра из нескольких датаграмм (tx_multi): каждая уходит в сокет как есть. */
+static void multi_out(void *ctx, const uint8_t *d, size_t n) {
+    raw_send(ctx, d, n);
+}
+
 static void send_udp(struct qc *q, const uint8_t *p, size_t n) {
+    if (q->filter.tx_multi) {
+        (void)q->filter.tx_multi(q->filter.user, p, n, multi_out, q);
+        return;
+    }
+    if (q->filter.tx) {
+        /* Фильтр вправе отказать (0): пакет пропадает, как в сети, и ngtcp2 его пересдаст. */
+        n = q->filter.tx(q->filter.user, q->obuf, p, n);
+        if (!n) return;
+        p = q->obuf;
+    }
+    raw_send(q, p, n);
+}
+
+static void raw_send(struct qc *q, const uint8_t *p, size_t n) {
     /* EAGAIN — буфер сокета полон: пакет пропадает, как в сети, и ngtcp2 его пересдаст. Ждать
      * POLLOUT ради этого не стоит — линия событий потребителя не должна знать о записи. */
+    if (q->hop_n) {
+        /* Смена порта — при отправке, а не по своему таймеру: молчащее соединение шлёт
+         * keepalive, и следующий пакет уйдёт уже на новый порт; отдельный таймер ради этого
+         * стоил бы ещё одного срока в qc_timeout_ms. */
+        uint64_t now = now_ns();
+        if (!q->hop_port || (q->hop_ms && now - q->hop_at_ns >= (uint64_t)q->hop_ms * 1000000ull)) {
+            q->hop_port = hop_pick(q);
+            q->hop_at_ns = now;
+        }
+        struct sockaddr_storage to = q->remote;
+        *sa_port(&to) = htons(q->hop_port);
+        (void)sendto(q->fd, p, n, MSG_DONTWAIT, (struct sockaddr *)&to, q->remote_len);
+        return;
+    }
     if (q->connected) (void)send(q->fd, p, n, MSG_DONTWAIT);
     else (void)sendto(q->fd, p, n, MSG_DONTWAIT, (struct sockaddr *)&q->remote, q->remote_len);
 }
@@ -438,8 +548,9 @@ static int flush(struct qc *q) {
 
 static void fail_close(struct qc *q, int err) {
     int reason = QC_CLOSE_ERROR;
-    const char *why = ngtcp2_strerror(err);
-    if (err == NGTCP2_ERR_IDLE_CLOSE) reason = QC_CLOSE_IDLE;
+    const char *why = q->why ? q->why : ngtcp2_strerror(err);
+    if (q->why) reason = QC_CLOSE_HANDSHAKE;
+    else if (err == NGTCP2_ERR_IDLE_CLOSE) reason = QC_CLOSE_IDLE;
     else if (err == NGTCP2_ERR_HANDSHAKE_TIMEOUT || err == NGTCP2_ERR_CRYPTO) reason = QC_CLOSE_HANDSHAKE;
     else if (err == NGTCP2_ERR_DRAINING) reason = QC_CLOSE_PEER;
     /* Если ещё можно — отправить CONNECTION_CLOSE: сервер узнает причину, а не будет ждать idle. */
@@ -594,7 +705,9 @@ int qc_on_readable(struct qc *q) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             if (errno == ECONNREFUSED) { /* ICMP «порт закрыт»: сервера нет */
-                fail_close(q, NGTCP2_ERR_CLOSING);
+                /* Причина — первой: fail_close закрыл бы соединение своим текстом («ERR_CLOSING»), и
+                 * человек читал бы про состояние ngtcp2 вместо «порт закрыт». CONNECTION_CLOSE
+                 * слать некому — порт ответил ICMP. */
                 closed(q, QC_CLOSE_ERROR, "connection refused");
                 return QC_ECLOSED;
             }
@@ -604,6 +717,25 @@ int qc_on_readable(struct qc *q) {
         if (!q->conn && q->server && srv_accept(q, &from, fl, q->rxbuf, (size_t)n) != 0) continue;
 #endif
         if (!q->conn) continue;     /* клиент без соединения бывает только после qc_free — сюда не дойти */
+        if (q->hop_n) {
+            /* Ответ пришёл с порта диапазона, а ngtcp2 знает один путь — базовый адрес сервера.
+             * Чужой хозяин или порт вне диапазона — посторонний пакет: отбросить. Порт в пути
+             * подменяется базовым, и для ngtcp2 «прыжков» нет вовсе: это и есть смысл приёма
+             * эталона — QUIC не замечает смены порта. */
+            uint16_t fp = ntohs(*sa_port(&from)), ok = 0;
+            for (unsigned h = 0; h < q->hop_n; h++)
+                if (fp >= q->hop[2 * h] && fp <= q->hop[2 * h + 1]) ok = 1;
+            struct sockaddr_storage cmp = from;
+            *sa_port(&cmp) = *sa_port(&q->remote);
+            if (!ok || fl != q->remote_len || memcmp(&cmp, &q->remote, fl) != 0) continue;
+            from = q->remote;
+            fl = q->remote_len;
+        }
+        if (q->filter.rx) {
+            size_t m = q->filter.rx(q->filter.user, q->rxbuf, q->rxbuf, (size_t)n);
+            if (!m) continue;
+            n = (ssize_t)m;
+        }
         ngtcp2_path path = {
             .local = { .addr = (ngtcp2_sockaddr *)&q->local, .addrlen = q->local_len },
             .remote = { .addr = (ngtcp2_sockaddr *)&from, .addrlen = fl },
@@ -660,11 +792,10 @@ void qc_tls_free(struct qc_tls *t) {
 static void settings_fill(ngtcp2_settings *st, ngtcp2_transport_params *tp, uint64_t brutal_bps,
                           size_t datagram_max, unsigned idle_ms, unsigned hs_ms, uint64_t max_data,
                           uint64_t max_stream_data, uint64_t max_streams) {
-    ngtcp2_settings_default(st);        /* без суффикса версии: поле Brutal есть только у последней */
+    ngtcp2_settings_default(st);       /* без суффикса версии: поле Brutal есть только у последней */
     ngtcp2_transport_params_default(tp);
     st->initial_ts = now_ns();
-    st->handshake_timeout = (hs_ms ? hs_ms : 10000) * NGTCP2_MILLISECONDS;
-    if (brutal_bps) {
+    st->handshake_timeout = (hs_ms ? hs_ms : 10000) * NGTCP2_MILLISECONDS;    if (brutal_bps) {
         st->cc_algo = NGTCP2_CC_ALGO_BRUTAL;
         /* Потолок — чтобы bps * RTT не переполнял 64 бита (ngtcp2_brutal.c): 2^31 байт/с — 17 Гбит/с. */
         st->cc_brutal_bps = brutal_bps > 0x7fffffffULL ? 0x7fffffffULL : brutal_bps;
@@ -716,7 +847,8 @@ static struct qc *qc_alloc(const struct qc_ops *ops, void *user) {
     q->user = user;
     q->txbuf = malloc(QC_TXBUF);
     q->rxbuf = malloc(QC_RXBUF);
-    if (!q->txbuf || !q->rxbuf) { free(q->txbuf); free(q->rxbuf); free(q); return NULL; }
+    q->obuf = malloc(QC_OBUF);
+    if (!q->txbuf || !q->rxbuf || !q->obuf) { free(q->txbuf); free(q->rxbuf); free(q->obuf); free(q); return NULL; }
     fill_random(q->secret, sizeof q->secret);
     q->ref.get_conn = get_conn_cb;
     q->ref.user_data = q;
@@ -734,27 +866,58 @@ int qc_open(const struct qc_cfg *cfg, const struct qc_ops *ops, void *user, stru
     q->fd = socket(q->remote.ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (q->fd < 0) goto fail;
     sock_tune(q->fd);
-    /* connect() выбирает локальный адрес и включает ICMP-ошибки (ECONNREFUSED), которых у
-     * несвязанного сокета нет: без них мёртвый порт виден только по истечению рукопожатия. */
-    if (connect(q->fd, (struct sockaddr *)&q->remote, q->remote_len) != 0) goto fail;
-    q->connected = 1;
+    if (cfg->sock_mark && setsockopt(q->fd, SOL_SOCKET, SO_MARK, &cfg->sock_mark, sizeof cfg->sock_mark) != 0 &&
+        cfg->mark_required) {
+        rc = QC_ESOCK;
+        goto fail;
+    }
+    if (cfg->filter) q->filter = *cfg->filter;
+    q->flow_manual = cfg->flow_manual;
+    if (cfg->pin_sha256) { memcpy(q->pin, cfg->pin_sha256, 32); q->pin_on = 1; }
+    if (cfg->hop_n) {
+        if (cfg->hop_n > QC_HOP_RANGES) { rc = QC_EINVAL; goto fail; }
+        for (unsigned i = 0; i < cfg->hop_n; i++) {
+            if (cfg->hop[2 * i] > cfg->hop[2 * i + 1] || !cfg->hop[2 * i]) { rc = QC_EINVAL; goto fail; }
+            q->hop[2 * i] = cfg->hop[2 * i];
+            q->hop[2 * i + 1] = cfg->hop[2 * i + 1];
+        }
+        q->hop_n = cfg->hop_n;
+        q->hop_ms = cfg->hop_ms;
+    }
+    if (q->hop_n) {
+        /* Без connect(): адрес назначения меняется с каждым прыжком. Локальный адрес для пути
+         * ngtcp2 берём из связанного сокета — bind на любой порт, семейство по серверу. Платим
+         * ICMP-ошибками connect() (мёртвый порт виден только по истечению рукопожатия) — у
+         * прыжков «мёртвый порт» и так обычное дело, не всякий порт диапазона открыт. */
+        struct sockaddr_storage any;
+        memset(&any, 0, sizeof any);
+        any.ss_family = q->remote.ss_family;
+        if (bind(q->fd, (struct sockaddr *)&any, q->remote_len) != 0) goto fail;
+    } else {
+        /* connect() выбирает локальный адрес и включает ICMP-ошибки (ECONNREFUSED), которых у
+         * несвязанного сокета нет: без них мёртвый порт виден только по истечению рукопожатия. */
+        if (connect(q->fd, (struct sockaddr *)&q->remote, q->remote_len) != 0) goto fail;
+        q->connected = 1;
+    }
     q->local_len = sizeof q->local;
     if (getsockname(q->fd, (struct sockaddr *)&q->local, &q->local_len) != 0) goto fail;
 
     if (cfg->tls) {
         q->ctx = cfg->tls->ctx;
     } else {
-        q->ctx = qcssl_ctx_client(cfg->insecure, cfg->ca_pem, cfg->ca_pem_n, cfg->ca_file);
+        q->ctx = qcssl_ctx_client(cfg->insecure || cfg->pin_sha256, cfg->ca_pem, cfg->ca_pem_n, cfg->ca_file);
         if (!q->ctx) { rc = QC_ETLS; goto fail; }
         q->own_ctx = 1;
     }
-    q->ssl = qcssl_new(q->ctx, &q->ref, cfg->sni, cfg->alpn, 0, !cfg->insecure);
+    q->ssl = qcssl_new(q->ctx, &q->ref, cfg->sni, cfg->alpn, 0, !(cfg->insecure || cfg->pin_sha256));
     if (!q->ssl) { rc = QC_ETLS; goto fail; }
 
     ngtcp2_settings st;
     ngtcp2_transport_params tp;
     settings_fill(&st, &tp, cfg->brutal_bps, cfg->datagram_max, cfg->idle_ms, cfg->handshake_ms,
                   cfg->max_data, cfg->max_stream_data, cfg->max_streams);
+    /* BBR — когда скорость не задана (hysteria2 без up: эталон берёт BBR, а не CUBIC). */
+    if (cfg->bbr && !cfg->brutal_bps) st.cc_algo = NGTCP2_CC_ALGO_BBR;
     q->datagram_max = cfg->datagram_max;
     q->send_buf = cfg->send_buf ? cfg->send_buf : (1u << 20);
     q->brutal = cfg->brutal_bps != 0;
@@ -771,6 +934,10 @@ int qc_open(const struct qc_cfg *cfg, const struct qc_ops *ops, void *user, stru
     if (ngtcp2_conn_client_new(&q->conn, &dcid, &scid, &path, NGTCP2_PROTO_VER_V1, &g_client_cbs,
                                &st, &tp, NULL, q) != 0) { rc = QC_EQUIC; goto fail; }
     ngtcp2_conn_set_tls_native_handle(q->conn, q->ssl);
+    /* PING по молчанию: соединение без обмена умирает по idle_ms, а поток hysteria2 живёт часами
+     * без байта (ssh, долгий запрос). Эталон шлёт keepalive раз в 10 с. */
+    if (cfg->keepalive_ms)
+        ngtcp2_conn_set_keep_alive_timeout(q->conn, (uint64_t)cfg->keepalive_ms * NGTCP2_MILLISECONDS);
 
     /* Первый пакет рукопожатия. Отказ отправки здесь — отказ открытия, а не «закрыто потом»:
      * потребитель ещё не получил объект, on_closed ему не нужен. */
@@ -792,6 +959,16 @@ int qc_stream_open(struct qc *q, int64_t *sid) {
     if (!q || q->closed) return QC_ECLOSED;
     if (!q->hs_done) return QC_EAGAIN;
     int rv = ngtcp2_conn_open_bidi_stream(q->conn, sid, NULL);
+    if (rv == NGTCP2_ERR_STREAM_ID_BLOCKED) return QC_EAGAIN;
+    if (rv != 0) return QC_EQUIC;
+    if (!stream_get(q, *sid)) return QC_ENOMEM;
+    return 0;
+}
+
+int qc_stream_open_uni(struct qc *q, int64_t *sid) {
+    if (!q || q->closed) return QC_ECLOSED;
+    if (!q->hs_done) return QC_EAGAIN;
+    int rv = ngtcp2_conn_open_uni_stream(q->conn, sid, NULL);
     if (rv == NGTCP2_ERR_STREAM_ID_BLOCKED) return QC_EAGAIN;
     if (rv != 0) return QC_EQUIC;
     if (!stream_get(q, *sid)) return QC_ENOMEM;
@@ -885,6 +1062,7 @@ void qc_free(struct qc *q) {
     if (q->fd >= 0) close(q->fd);
     free(q->txbuf);
     free(q->rxbuf);
+    free(q->obuf);
     free(q);
 }
 

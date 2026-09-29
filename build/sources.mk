@@ -29,7 +29,7 @@ CORE_DIRS := src/lib src/model src/platform src/compile src/daemon src/kinds src
 # PLATFORM_SRC); остальные — по одному на профиль, у base своего файла нет. Отдельно от ядра и
 # от расширенной части, потому что файл профиля не входит ни в одну сборку, кроме своей.
 PROFILE_DIRS := src/profile
-EXT_DIRS  := src/tunnel src/proto/tls src/proto/transport src/proto/vless src/proto/xsteer src/proto/tgws src/proto/quic src/modules
+EXT_DIRS  := src/tunnel src/proto/tls src/proto/transport src/proto/vless src/proto/xsteer src/proto/tgws src/proto/quic src/proto/hysteria2 src/modules
 # Клиент сокета `steer` (src/client) — отдельный бинарник, не профиль движка: CLIENT_SRC ниже.
 CLIENT_DIRS := src/client
 # Сторонний код (src/third_party) — не слой движка: файлы в нём не правятся (см. UPSTREAM в
@@ -38,6 +38,10 @@ CLIENT_DIRS := src/client
 # yaml.h, ровно чтобы имена заголовков оставались уникальными (tests/buildmatch.sh).
 THIRD_DIRS := src/third_party/libyaml
 INC_DIRS  := $(CORE_DIRS) $(PROFILE_DIRS) $(EXT_DIRS) $(CLIENT_DIRS) $(THIRD_DIRS)
+# Каталоги, которых нет в сборке телефона (Android.bp их не подключает: hysteria2 в профиль android
+# не входит, телефон не собирает ни QUIC-клиента, ни его модуль). tests/buildmatch.sh сверяет
+# Android.bp с INC_DIRS за вычетом этого списка.
+PHONE_SKIP_DIRS := src/proto/hysteria2
 # Определения, которых ждёт сторонний код: yaml_private.h подключает config.h (номер версии
 # libyaml) только при HAVE_CONFIG_H. Ключ идёт во ВСЕ пути сборки движка — Makefile, build.sh,
 # build/build-ext*.sh (там он читается отсюда), в Android.bp — флагом библиотеки libsteer_yaml;
@@ -265,7 +269,15 @@ PROFILE_android  := $(PROFILE_extended)
 QUIC_SRC := src/proto/quic/quic.c src/proto/quic/qcssl.c
 QUIC_SSL_SRC := src/proto/quic/qcssl.c
 QUIC_STAND_SRC := tests/qcbench.c
-LIBSTEER_SRC := $(LIBSTEER_BASE_SRC) $(KINDS_EXT_SRC) $(STACK_SRC) $(TRANSPORT_SRC) \
+# hysteria2 (модуль steer-hysteria2, docs/hysteria2.md). Запись вида — в libsteer, как у vless и
+# xsteer, но НЕ в KINDS_EXT_SRC: тот список входит в статические профили (extended, android), а
+# hysteria2 в них нет — телефон отложен, и вид там отвечает записью отказа (kind.c). Модуль — свой
+# бинарник на libsteer.so: провод и подписка — hy2wire.c, hy2sub.c; соединение QUIC и мультиплексор
+# потоков — hy2conn.c; дайлер стека — hy2dial.c; команды и слежка — hy2main.c.
+KINDS_HY2_SRC := src/kinds/hysteria2.c
+HY2_MOD_SRC := src/proto/hysteria2/hy2wire.c src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2conn.c \
+               src/proto/hysteria2/hy2dial.c src/proto/hysteria2/hy2main.c
+LIBSTEER_SRC := $(LIBSTEER_BASE_SRC) $(KINDS_EXT_SRC) $(KINDS_HY2_SRC) $(STACK_SRC) $(TRANSPORT_SRC) \
                 src/tunnel/tun.c src/proto/tls/chello.c src/proto/tls/tls13.c \
                 src/proto/tls/certverify.c src/proto/tls/reality.c src/proto/tls/h2.c $(CRYPTO_SRC) \
                 $(QUIC_SRC)
@@ -278,6 +290,7 @@ XSTEER_MODULE_SRC := src/proto/xsteer/xsclient.c src/proto/xsteer/xswire.c src/p
                      src/proto/xsteer/xsadmin.c $(MODCMD_SRC) src/modules/main_xsteer.c
 OBFS_MODULE_SRC := $(OBFS_MOD_SRC) $(MODCMD_SRC) src/modules/main_obfs.c
 TGWS_MODULE_SRC := src/proto/tgws/tgws.c $(MODCMD_SRC) src/modules/main_tgws.c
+HY2_MODULE_SRC := $(HY2_MOD_SRC) $(MODCMD_SRC) src/modules/main_hysteria2.c
 
 PROFILE_libsteer   := $(LIBSTEER_SRC)
 PROFILE_steerd     := $(STEERD_DYN_SRC)
@@ -285,6 +298,7 @@ PROFILE_mod_vless  := $(VLESS_MODULE_SRC)
 PROFILE_mod_xsteer := $(XSTEER_MODULE_SRC)
 PROFILE_mod_obfs   := $(OBFS_MODULE_SRC)
 PROFILE_mod_tgws   := $(TGWS_MODULE_SRC)
+PROFILE_mod_hysteria2 := $(HY2_MODULE_SRC)
 
 # Два бинарника на пакет (docs/architecture.md, раздел 4а, «Бинарники»): профиль — это движок
 # steerd (демон, компилятор, apply, помощники, инструменты; ссылка steer-tools на него же), а

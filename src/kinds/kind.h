@@ -26,6 +26,7 @@ struct err;
 struct out_keys;
 struct out_obfs;
 struct vless_cfg;
+struct hy2_cfg;
 struct xsteer_cfg;
 struct tgws_cfg;
 struct group_cfg;
@@ -88,7 +89,7 @@ enum kind_key {
  * старте: супервизор кладёт в неё начальное значение FNV, вид подмешивает свои поля
  * (kind_sig_mix), общий код — цель `via`. */
 struct kind_helper {
-    char cmd[8];
+    char cmd[16];               /* «hysteria2» — девять знаков */
     unsigned long long sig;
     /* Помощник — не подкоманда движка, а своя программа рядом с ним (zapret: обработчик
      * steer-nfqws, init.d/steer). prog — имя файла в каталоге движка, arg — её аргументы
@@ -231,7 +232,7 @@ void kind_emit_all(struct nft_rs *rs, const struct spec *sp);
  * принятая с ним, значила бы то, чего v1 не обещал), своих правил и проверок у неё нет, а
  * собирает её перевод v1 (model/v1.c) напрямую. Разбор v2 находит её через kind_by_name_v2. */
 extern const struct kind_ops kind_direct, kind_interface, kind_vless, kind_xsteer, kind_zapret,
-                             kind_tgws, kind_awg, kind_group;
+                             kind_tgws, kind_awg, kind_group, kind_hysteria2;
 
 /* Вид обнулённого выхода (kind == NULL; так их собирают стенды) — direct, как у нулевого
  * значения прежнего перечня видов. Читает его kind_of в spec.h. */
@@ -357,6 +358,11 @@ const struct vless_cfg *out_vless(const struct output *o);
  * потому что перебирать вместо выбранного что попало значит увести трафик в локацию,
  * которую человек не выбирал. */
 size_t out_node_list(const struct output *o, size_t usable, int *dst, size_t max);
+/* hysteria2: настройка выхода, порядок перебора узлов и «назван ли узел» — те же вопросы, что у
+ * vless выше, с тем же смыслом (kinds/hysteria2.c). */
+const struct hy2_cfg *out_hysteria2(const struct output *o);
+size_t out_hy2_node_list(const struct output *o, size_t usable, int *dst, size_t max);
+int out_hy2_node_named(const struct output *o);
 /* Назван ли узел ЧЕЛОВЕКОМ — то есть выбирать не из чего и перебор не нужен.
  *
  * Отдельным вопросом, а не длиной списка кандидатов, потому что это разные вещи. Кандидат

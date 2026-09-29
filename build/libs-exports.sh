@@ -66,7 +66,7 @@ for f in $QUIC_STAND; do
     $CC $F $NGCFLAGS -Itests -c "$f" -o "$W/app/$(echo "$f" | tr / _).o"
 done
 {
-    for p in PROFILE_steerd PROFILE_mod_vless PROFILE_mod_xsteer PROFILE_mod_obfs PROFILE_mod_tgws; do
+    for p in PROFILE_steerd PROFILE_mod_vless PROFILE_mod_xsteer PROFILE_mod_obfs PROFILE_mod_tgws PROFILE_mod_hysteria2; do
         profile_var "$p"
     done
 } | tr ' ' '\n' | sort -u | grep -v '^$' > "$W/app.lst"
@@ -86,7 +86,7 @@ comm -12 "$W/defs" "$W/undef" > "$W/need"
 
 emit_libsteer() {
     echo "/* Экспорт libsteer.so — ЭТОТ ФАЙЛ ПОРОЖДАЕТ build/libs-exports.sh (gen), руками не правится."
-    echo " * Символы, которые steerd и модули (steer-vless, steer-xsteer, steer-obfs, steer-tgws) берут"
+    echo " * Символы, которые steerd и модули (steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2) берут"
     echo " * из библиотеки, и программный интерфейс QUIC (qc_*), который берёт стенд QUIC_STAND_SRC, пока"
     echo " * настоящих потребителей нет; остальное скрыто (local: *). Проверка: check. */"
     echo "LIBSTEER_1 {"

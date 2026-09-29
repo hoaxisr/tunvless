@@ -31,5 +31,7 @@ void  qcssl_ctx_free(void *ctx);
  * сертификате сверяется. NULL — не создалось. */
 void *qcssl_new(void *ctx, void *conn_ref, const char *sni, const char *alpn, int server, int verify_name);
 void  qcssl_free(void *ssl);
+/* SHA-256 листового сертификата сервера (DER) — для pinSHA256 у hysteria2. 0 — есть, -1 — нет. */
+int   qcssl_peer_sha256(void *ssl, uint8_t out[32]);
 
 #endif

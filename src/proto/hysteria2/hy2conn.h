@@ -1,0 +1,51 @@
+/* Соединение hysteria2: одно QUIC-соединение на туннель и мультиплексирование потоков клиента.
+ * Устройство и доводы — hy2conn.c и docs/hysteria2.md. */
+#ifndef STEER_HY2CONN_H
+#define STEER_HY2CONN_H
+#include <stddef.h>
+#include <stdint.h>
+
+#include "hy2.h"
+
+/* Исходы hy2c_open (отрицательные; неотрицательное — дескриптор). */
+#define HY2E_TIMEOUT (-1)       /* не уложились в срок */
+#define HY2E_DOWN    (-2)       /* соединение с узлом не поднялось или оборвалось (причина — hy2c_strerror) */
+#define HY2E_DENIED  (-3)       /* сервер отказал в этом потоке (адрес недоступен для него) */
+#define HY2E_NOUDP   (-4)       /* сервер не принимает UDP */
+#define HY2E_BUSY    (-5)       /* нет свободных потоков или слотов */
+#define HY2E_SYS     (-6)       /* сокет, память, поток */
+
+/* Метка сокета к узлу: до hy2c_start. mark == 0 — без метки. */
+void hy2c_set_mark(uint32_t mark, int required);
+
+/* Запустить поток соединения узла node (указатель живёт до конца процесса). Соединение
+ * открывается сразу, дальше — по требованию. 0 или -1. */
+int hy2c_start(const struct hy2_node *node);
+
+/* Открыть поток к host:port и вернуть дескриптор клиентского конца пары сокетов (неблокирующий,
+ * SOCK_SEQPACKET): байты, записанные в него, идут узлу, прочитанное — от узла. TCP несёт байтовый
+ * поток кусками не длиннее 16000, UDP — по датаграмме на сообщение. Блокирует до timeout_s. */
+int hy2c_open(int udp, const char *host, uint16_t port, int timeout_s);
+/* Текст последнего отказа для кода rc (копия в локальном буфере потока). */
+const char *hy2c_strerror(int rc);
+
+struct hy2c_status {
+    int up;                     /* QUIC поднят и авторизован */
+    int udp_ok;                 /* сервер принимает UDP */
+    int brutal;                 /* работает Brutal (иначе BBR) */
+    uint64_t brutal_bps;
+    uint32_t hs_ms;             /* рукопожатие + авторизация последнего подъёма, мс */
+    uint64_t rtt_us;
+    unsigned flows;
+    char err[160];              /* причина последнего отказа соединения, пока оно не поднято */
+};
+void hy2c_status(struct hy2c_status *st);
+
+/* Разовая проверка узла: рукопожатие QUIC и авторизация, без потоков. 0 — узел принял; иначе
+ * причина в why (для журнала и статуса). *hs_ms — сколько ушло на рукопожатие и авторизацию. */
+int hy2_probe(const struct hy2_node *n, int timeout_s, char *why, size_t why_n, int *hs_ms);
+
+/* Сообщение слежке за узлом об исходе открытия потока (hy2main.c). */
+void hy2_watch_seen(int rc);
+
+#endif
