@@ -54,11 +54,15 @@ int hy2_parse_url(const char *url, struct hy2_node *n);
 size_t hy2_parse_sub(const char *text, struct hy2_node *out, size_t max, struct hy2_sub_stats *st);
 /* Тело подписки → текст: base64 разворачивается, если это он (как у vless_sub_text); иначе то же. */
 const char *hy2_sub_text(const char *raw, size_t raw_n, char *dec, size_t dec_n);
+/* Подписка из файла целиком, в куче: массив узлов (free) и их число; NULL — не открылся, файл
+ * больше 64 МиБ или нет памяти. Числа узлов ограничивает память, а не константа. */
+struct hy2_node *hy2_load_sub(const char *path, size_t *cnt, struct hy2_sub_stats *st);
 
 /* Скорость «100 mbps» / «100» (Мбит/с) → байт/с. 0 — не разобралось или пусто. */
 uint64_t hy2_parse_bandwidth(const char *s);
 /* Список портов «443», «20000-30000», «443,5000-6000»: порт узла — первый, диапазоны — для
- * прыжков (если портов больше одного). Возвращает 0 или -1. */
+ * прыжков (если портов больше одного). Возвращает 0; -1 — не разобралось; -2 — диапазонов
+ * больше HY2_HOP_RANGES. */
 int hy2_parse_ports(const char *s, uint16_t *first, uint16_t *hop, unsigned *hop_n);
 
 #endif

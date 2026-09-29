@@ -34,8 +34,18 @@
 #define LOG_W2 "steer[warn]: "
 #define LOG_I2 "steer[info]: "
 
-#define MAX_NODES 128
-static struct hy2_node g_nodes[MAX_NODES];
+/* Узлы подписки — в куче по числу узлов в файле (hy2_load_sub), а не массив на заданное число. */
+static struct hy2_node *g_nodes;
+
+/* Номера узлов для перебора: не больше, чем пригодных узлов и записей выбора nodes. */
+static int *sel_alloc(const struct output *o, size_t cnt, size_t *cap) {
+    size_t c = cnt;
+    if (o && o->hy2.nodes_n > c) c = o->hy2.nodes_n;
+    *cap = c;
+    int *s = calloc(c + 1, sizeof(*s));
+    if (!s) die("нет памяти под список узлов", NULL);
+    return s;
+}
 
 static struct spec *spec_new(void) {
     struct spec *sp = calloc(1, sizeof(*sp));
@@ -46,14 +56,8 @@ static struct spec *spec_new(void) {
 /* ---- подписка --------------------------------------------------------------------------------- */
 
 static int load_nodes_file(const char *path, size_t *cnt, struct hy2_sub_stats *st) {
-    FILE *f = fopen(path, "r");
-    if (!f) { fprintf(stderr, LOG_W2 "%s не читается\n", path); return 2; }
-    static char raw[262144], dec[262144];
-    size_t n = fread(raw, 1, sizeof(raw) - 1, f);
-    raw[n] = '\0';
-    fclose(f);
-    const char *text = hy2_sub_text(raw, n, dec, sizeof(dec));
-    *cnt = hy2_parse_sub(text, g_nodes, MAX_NODES, st);
+    g_nodes = hy2_load_sub(path, cnt, st);
+    if (!g_nodes) { fprintf(stderr, LOG_W2 "%s не читается (или больше 64 МиБ)\n", path); return 2; }
     return 0;
 }
 
@@ -158,13 +162,14 @@ int cmd_hysteria2_probe(const char *spec_path, const char *out_name, int node, i
         printf("{\"ok\":false,\"error\":\"узла %d нет, всего %zu\"}\n", node, cnt);
         return 1;
     }
-    static int sel[MAX_NODES];
+    size_t sel_cap;
+    int *sel = sel_alloc(o, cnt, &sel_cap);
     size_t sel_n = 0;
     if (node >= 0) { sel[0] = node; sel_n = 1; }
     else if (by_file) {
-        for (size_t i = 0; i < cnt && i < MAX_NODES; i++) sel[sel_n++] = (int)i;
+        for (size_t i = 0; i < cnt; i++) sel[sel_n++] = (int)i;
     } else {
-        sel_n = out_hy2_node_list(o, cnt, sel, MAX_NODES);
+        sel_n = out_hy2_node_list(o, cnt, sel, sel_cap);
         if (!sel_n) {
             printf("{\"ok\":false,\"error\":\"выбранных узлов нет в подписке, пригодных всего %zu\"}\n", cnt);
             return 1;
@@ -446,8 +451,9 @@ int cmd_hysteria2(const char *spec_path, const char *out_name) {
     }
     fprintf(stderr, LOG_I2 "узлов %zu (пропущено %zu, чужих %zu)\n", cnt, st.skipped, st.foreign);
 
-    static int sel[MAX_NODES];
-    size_t sel_n = out_hy2_node_list(o, cnt, sel, MAX_NODES);
+    size_t sel_cap;
+    int *sel = sel_alloc(o, cnt, &sel_cap);          /* живёт до конца процесса: его читает сторож */
+    size_t sel_n = out_hy2_node_list(o, cnt, sel, sel_cap);
     if (!sel_n) {
         h2_probe_report(out_name, PROBE_NO_SUCH_NODE, o->hy2.nodes_n ? o->hy2.nodes[0] : -1, (int)cnt);
         evline_emit("nonode", "node", EVLINE_INT, (long)(o->hy2.nodes_n ? o->hy2.nodes[0] : -1),
