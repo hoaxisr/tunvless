@@ -8,14 +8,18 @@
  * разбирал вовсе — «не наш поток». Стенды tests/run-tunnel*.sh до этого не достают: у
  * поддельного сервера там голый tcp, без xhttp.
  *
- * КАК. Файл включает src/proto/vless/client.c целиком (up_drain и up_request статические) и берёт
- * настоящий h2.c. Связь выгрузки — голая (plain, как при security=none) на сокетной паре:
- * что клиент пишет, стенд вычитывает и выбрасывает, а «сервер» пишет на другой конец кадры
- * HTTP/2 руками. TLS и Reality стенду не нужны и подменены заглушками; заголовки mbedtls —
- * из tests/stub. Сетей и прав не нужно, поэтому стенд живёт в `make test`. */
-#include "../src/proto/vless/client.c"
+ * КАК. Файл включает транспорт xhttp целиком — src/proto/transport/trxhttp.c (up_drain и
+ * up_request статические; до шага 2 выпуска 1.10 они жили в клиенте VLESS, client.c) — и берёт
+ * настоящий h2.c и остальные ярусы транспорта отдельными объектами. Связь выгрузки — голая
+ * (plain, как при security=none) на сокетной паре: что клиент пишет, стенд вычитывает и
+ * выбрасывает, а «сервер» пишет на другой конец кадры HTTP/2 руками. TLS и Reality стенду не
+ * нужны и подменены заглушками; заголовки mbedtls — из tests/stub. Сетей и прав не нужно,
+ * поэтому стенд живёт в `make test`. */
+#include "../src/proto/transport/trxhttp.c"
 
+#include <stdlib.h>
 #include <sys/socket.h>
+#include "reality.h"
 
 /* ---- заглушки TLS и Reality: связь стенда голая, до них дело не доходит ------------ */
 
@@ -63,15 +67,15 @@ static void srv_headers(uint32_t sid, unsigned char hpack, int end_stream) {
     if (write(g_srv, f, sizeof(f)) != (ssize_t)sizeof(f)) { perror("write"); exit(2); }
 }
 
-static void conn_init(struct vless_conn *c, enum xhttp_mode xh, int fd) {
+static void conn_init(struct transport *c, enum xhttp_mode xh, int fd) {
     memset(c, 0, sizeof(*c));
-    c->fd = -1;
-    c->tr = VT_XHTTP;
-    c->xh = xh;
-    c->up.fd = fd;
-    c->up.plain = 1;
-    snprintf(c->authority, sizeof(c->authority), "stand.example");
-    snprintf(c->up_path, sizeof(c->up_path), "/xh/0f1e2d3c");
+    c->link.fd = -1;
+    c->fr = &tr_xhttp;
+    c->xh.mode = xh;
+    c->xh.up.link.fd = fd;
+    c->xh.up.link.plain = 1;
+    snprintf(c->xh.authority, sizeof(c->xh.authority), "stand.example");
+    snprintf(c->xh.up_path, sizeof(c->xh.up_path), "/xh/0f1e2d3c");
 }
 
 static int new_pair(int *cli) {
@@ -89,16 +93,16 @@ static const unsigned char piece[] = "кусок выгрузки";
 static void t_packet_up(unsigned char hpack, int want_refused, const char *what) {
     int fd;
     if (new_pair(&fd) != 0) { check(0, "сокетная пара"); return; }
-    struct vless_conn c;
+    struct transport c;
     conn_init(&c, XH_PACKET_UP, fd);
-    int rc0 = vless_send(&c, piece, sizeof(piece));     /* кусок 0, поток 1 */
+    int rc0 = transport_write(&c, piece, sizeof(piece));     /* кусок 0, поток 1 */
     srv_drain();
-    srv_headers(1, hpack, 1);                           /* ответ на кусок 0 */
-    int rc1 = vless_send(&c, piece, sizeof(piece));     /* кусок 1, поток 3 */
+    srv_headers(1, hpack, 1);                                /* ответ на кусок 0 */
+    int rc1 = transport_write(&c, piece, sizeof(piece));     /* кусок 1, поток 3 */
     srv_drain();
     if (want_refused)
         check(rc0 == 0 && rc1 == H2_ESTATUS &&
-              strstr(vless_strerror(rc1), "400") != NULL, what);
+              strstr(transport_strerror(rc1), "400") != NULL, what);
     else
         check(rc0 == 0 && rc1 == 0, what);
     close(fd);
@@ -108,15 +112,15 @@ static void t_packet_up(unsigned char hpack, int want_refused, const char *what)
 static void t_stream_up(unsigned char hpack, int want_refused, const char *what) {
     int fd;
     if (new_pair(&fd) != 0) { check(0, "сокетная пара"); return; }
-    struct vless_conn c;
+    struct transport c;
     conn_init(&c, XH_STREAM_UP, fd);
     int ro = up_request(&c, -1);                        /* как up_open: POST открыт сразу */
     srv_drain();
     srv_headers(1, hpack, 0);
-    int rc = vless_send(&c, piece, sizeof(piece));
+    int rc = transport_write(&c, piece, sizeof(piece));
     srv_drain();
     if (want_refused)
-        check(ro == 0 && rc == H2_ESTATUS && strstr(vless_strerror(rc), "400") != NULL, what);
+        check(ro == 0 && rc == H2_ESTATUS && strstr(transport_strerror(rc), "400") != NULL, what);
     else
         check(ro == 0 && rc == 0, what);
     close(fd);

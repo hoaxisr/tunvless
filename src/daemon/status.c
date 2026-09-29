@@ -267,7 +267,7 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
                                  ",\"total\":%d}", pr.node, pr.total);
             }
             /* Устройство есть, а узел за ним клиент потерял (слежка за узлом под демоном,
-             * src/tunnel/tunnel.c). Обычно выход тогда и в отказе (up:false, failed:true — сторож
+             * src/proto/vless/vlwatch.c). Обычно выход тогда и в отказе (up:false, failed:true — сторож
              * принял down клиента), но поле своё, а не probe: probe значит «устройства нет, подъём
              * идёт или не удался», а устройство на месте. Причина — словами клиента, время —
              * когда сказал. Поля нет — узел отвечает или сказать нечего (без демона слежки нет). */

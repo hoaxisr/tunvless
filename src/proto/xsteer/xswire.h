@@ -295,7 +295,7 @@ static inline void xs_nonce(const uint8_t iv[12], uint32_t rel, uint8_t out[12])
 #define XS_AGE_RETIRE_MS (1200 * 1000)  /* или 20 минут — что раньше */
 /* Успешник поднимается заранее, на девяти десятых порога: три X25519 на MIPS это
  * 50-100 мс, и делать их в потоке пересылки значит подарить пакетам такую же паузу. Тот
- * же приём и та же причина, что у пула connector в tunnel.c. */
+ * же приём и та же причина, что у пула connector в стеке туннеля (src/tunnel/stack.c). */
 #define XS_RENEW_NUM 9
 #define XS_RENEW_DEN 10
 

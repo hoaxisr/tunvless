@@ -7,18 +7,21 @@
  * эти случаи задаются руками, а смотрится то, что видно снаружи: пакеты, ушедшие в
  * устройство, и то, осталось ли соединение живым.
  *
- * КАК. Стенд включает src/tunnel/tunnel.c целиком (всё нужное в нём статическое) и подменяет
- * клиента VLESS (client.c не входит): vless_connect, vless_send и vless_recv_zc отвечают
- * так, как велит проверка. Устройство — сокетная пара: что туннель пишет в «TUN», стенд
- * читает с другого конца и разбирает тем же ip_parse. Дескриптор «сессии» — канал с
- * непрочитанным байтом: poll на нём всегда видит готовность к чтению, а читает из него
- * только подменённый клиент, то есть никто.
+ * КАК. Стенд включает стек туннеля src/tunnel/stack.c целиком (всё нужное в нём статическое),
+ * берёт настоящий дайлер VLESS (src/proto/vless/vldial.c: заголовок, Vision, разбор ответа) и
+ * подменяет под ним соединение с узлом: vless_connect и transport_* отвечают так, как велит
+ * проверка. До шага 2 выпуска 1.10 стек и VLESS были одним файлом (tunnel.c), и подменялся
+ * клиент VLESS — граница подмены осталась той же, изменились только имена. Устройство —
+ * сокетная пара: что туннель пишет в «TUN», стенд читает с другого конца и разбирает тем же
+ * ip_parse. Дескриптор «сессии» — канал с непрочитанным байтом: poll на нём всегда видит
+ * готовность к чтению, а читает из него только подменённый транспорт, то есть никто.
  *
- * РАЗМЕР СТЕКА. Таблица соединений живёт в __thread, это около 14 МБ на поток, а glibc
- * кладёт статический TLS в стек потока: установщик со стеком 128 КБ на glibc НЕ СОЗДАЁТСЯ
- * (на musl роутера — создаётся, там TLS отдельно). Это и есть честный отказ pthread_create
- * для проверки I-322. Для остальных проверок стенд подменяет pthread_attr_setstacksize и
- * поднимает стек, когда велено (g_big_stack).
+ * ОТКАЗ СОЗДАНИЯ ПОТОКОВ (I-322). Прежде его давал сам glibc: таблица соединений жила в
+ * __thread, около 14 МБ на поток, glibc кладёт статический TLS в стек потока, и установщик со
+ * стеком 128 КБ не создавался. Теперь таблица в куче (см. «таблицы потока» в stack.c), TLS
+ * маленький, и отказ стенд делает сам: пока велено (g_refuse_threads), подменённый
+ * pthread_attr_setstacksize просит невозможный стек, и pthread_create отказывает — на любой
+ * libc, а не только там, где TLS случайно не влез.
  *
  * Сетей, прав и mbedtls не нужно: заголовки берутся из tests/stub, а всё, что требует TLS,
  * подменено. Поэтому стенд живёт в `make test`.
@@ -37,13 +40,15 @@
 
 /* ---- стек установщиков --------------------------------------------------------- */
 
-static int g_big_stack;
+static int g_refuse_threads;
 
 int pthread_attr_setstacksize(pthread_attr_t *a, size_t s) {
     static int (*real)(pthread_attr_t *, size_t);
     if (!real) real = (int (*)(pthread_attr_t *, size_t))dlsym(RTLD_NEXT,
                                                                "pthread_attr_setstacksize");
-    if (g_big_stack && s < (64u << 20)) s = 64u << 20;
+    /* 2^62 байт — больше любого адресного пространства: отображение под стек не выделится, и
+     * pthread_create вернёт отказ, не создав потока. */
+    if (g_refuse_threads) s = (size_t)1 << 62;
     return real(a, s);
 }
 
@@ -87,32 +92,34 @@ int run_quiet(const char *const argv[]) {
 void bind_device(struct output *o, const char *dev) { (void)o; (void)dev; }
 
 #include "jsonw.h"
-#include "../src/tunnel/tunnel.c"
+#include "../src/tunnel/stack.c"
+#include "vldial.h"
+#include "client.h"
 
-/* ---- подменённый клиент VLESS -------------------------------------------------- */
+/* ---- подменённое соединение с узлом -------------------------------------------- */
 
 static int g_sess_pipe[2] = { -1, -1 };
-static int g_send_rc;                 /* что вернёт vless_send: 0 или H2_EWINDOW */
+static int g_send_rc;                 /* что вернёт transport_write: 0 или H2_EWINDOW */
 static int g_send_again_n;            /* столько раз подряд вернуть H2_EWINDOW, потом 0 */
 static int g_recv_calls;
-static int g_recv_rc;                 /* что вернёт vless_recv_zc: 0 или -1 (конец потока) */
+static int g_recv_rc;                 /* что вернёт transport_read_zc: 0 или -1 (конец потока) */
 static unsigned char g_recv_buf[4096];
 static size_t g_recv_n;               /* сколько отдать при g_recv_rc == 0 (разово) */
 
-int vless_connect(const struct vless_node *node, struct vless_conn *conn, int timeout_s) {
+int vless_connect(const struct vless_node *node, struct transport *conn, int timeout_s) {
     (void)node; (void)timeout_s;
     memset(conn, 0, sizeof(*conn));
-    conn->fd = g_sess_pipe[0];
-    conn->plain = 1;
+    conn->link.fd = g_sess_pipe[0];
+    conn->link.plain = 1;
     return 0;
 }
-int vless_send(struct vless_conn *c, const unsigned char *d, size_t n) {
+int transport_write(struct transport *c, const unsigned char *d, size_t n) {
     (void)c; (void)d; (void)n;
     if (g_send_again_n > 0) { g_send_again_n--; return H2_EWINDOW; }
     return g_send_rc;
 }
-int vless_recv_zc(struct vless_conn *c, unsigned char *buf, size_t cap,
-                  const unsigned char **data, size_t *got) {
+int transport_read_zc(struct transport *c, unsigned char *buf, size_t cap,
+                      const unsigned char **data, size_t *got) {
     (void)c; (void)buf; (void)cap;
     g_recv_calls++;
     *got = 0;
@@ -122,11 +129,11 @@ int vless_recv_zc(struct vless_conn *c, unsigned char *buf, size_t cap,
     g_recv_n = 0;
     return 0;
 }
-int vless_has_data(const struct vless_conn *c) { (void)c; return 0; }
-void vless_close(struct vless_conn *c) { c->fd = -1; }   /* канал общий — не закрываем */
+int transport_has_data(const struct transport *c) { (void)c; return 0; }
+void transport_close(struct transport *c) { c->link.fd = -1; }   /* канал общий — не закрываем */
+void transport_moved(struct transport *c) { (void)c; }
+void transport_direct(struct transport *c) { c->link.rx_direct = 1; }
 const char *vless_strerror(int rc) { (void)rc; return "подмена"; }
-/* Метка сокетов к узлу (via) — у подменённого клиента сокетов нет, метить нечего. */
-void vless_set_sock_mark(uint32_t mark, int required) { (void)mark; (void)required; }
 int vless_probe(const struct vless_node *node, int timeout_s, char *why, size_t why_n) {
     (void)node; (void)timeout_s; (void)why; (void)why_n; return -1;
 }
@@ -141,6 +148,9 @@ int vless_probe_timed(const struct vless_node *node, int timeout_s, char *why, s
 static struct tun_dev g_tun;
 static int g_dev_peer = -1;           /* второй конец «TUN»: сюда приходит написанное туннелем */
 static struct vless_node g_node;
+/* Дайлер стека: настоящий VLESS к узлу стенда. ctx подменяется на время проверки негодного
+ * узла (syn_bad) — так же, как прежде туда уходил другой узел аргументом handle_packet. */
+static struct dialer g_dial = { .ops = &vless_dialer, .ctx = &g_node };
 
 #define CLI_IP  0x0164330au           /* 10.51.100.1 в сетевом порядке — как читает ip_parse */
 #define SRV_IP  0x0771cbcbu
@@ -158,7 +168,7 @@ static void cli_send(uint32_t seq, uint32_t ack, unsigned char flags, uint16_t w
     unsigned char p[2048];
     size_t l = tcp_build(p, sizeof(p), CLI_IP, SRV_IP, CLI_PORT, SRV_PORT, seq, ack, flags,
                          d, n, win, 0, -1);
-    handle_packet(&g_tun, &g_node, p, l);
+    handle_packet(&g_tun, p, l);
 }
 
 /* Вычитать всё, что туннель написал в устройство. Возвращает число пакетов, в last — ключ
@@ -188,8 +198,8 @@ static int wait_ready(struct conn *c, int ms) {
     for (int i = 0; i < ms; i++) {
         if (__atomic_load_n(&c->done, __ATOMIC_ACQUIRE)) {
             c->pending = 0;
-            c->fd = SESS(c)->v.fd;
-            if (c->early) early_flush(c, &g_node);
+            c->fd = g_dl->ops->fd(SESS(c));
+            if (c->early) early_flush(c);
             return 0;
         }
         struct timespec ts = { 0, 1000000 };
@@ -212,10 +222,12 @@ static struct conn *open_conn(uint16_t win) {
     g_recv_buf[0] = 0; g_recv_buf[1] = 0;                 /* ответ VLESS: версия, длина доп. */
     memset(g_recv_buf + 2, 'r', 1000);
     g_recv_n = 1002;
-    drain_conn(c, &g_node, &g_tun);
+    drain_conn(c, &g_tun);
     dev_drain(NULL);
-    /* Стенд сам себя проверяет: без этого «провал» мог бы означать сломанную подготовку. */
-    if (!c->established || c->rtx.len != 1000 || c->srv_closed) return NULL;
+    /* Стенд сам себя проверяет: без этого «провал» мог бы означать сломанную подготовку.
+     * «Ответ VLESS снят» — состояние дайлера, оно в его сессии. */
+    const struct vl_sess *vs = SESS(c);
+    if (!vs->established || c->rtx.len != 1000 || c->srv_closed) return NULL;
     return c;
 }
 
@@ -224,7 +236,7 @@ static struct conn *open_conn(uint16_t win) {
 /* I-322: установщиков не создалось ни одного. Прежде очередь считалась запущенной, SYN
  * получал SYN-ACK, а заявка висела pending навсегда — ни RST, ни повторной попытки. */
 static void t_no_connectors(void) {
-    g_big_stack = 0;
+    g_refuse_threads = 1;
     struct flow_key k = cli_key();
     cli_send(1000, 0, TCP_SYN, 65535, NULL, 0);
     struct conn *c = conn_find(&k);
@@ -236,7 +248,7 @@ static void t_no_connectors(void) {
     if (c) conn_drop(c);
 
     /* Стек дали — следующий SYN обязан получить установщика: отказ не залипает. */
-    g_big_stack = 1;
+    g_refuse_threads = 0;
     cli_send(1000, 0, TCP_SYN, 65535, NULL, 0);
     c = conn_find(&k);
     check(c && c->pending && wait_ready(c, 2000) == 0,
@@ -408,7 +420,9 @@ static void syn_bad(void *arg) {
     unsigned char p[128];
     size_t l = tcp_build(p, sizeof(p), CLI_IP, SRV_IP, CLI_PORT, SRV_PORT, 1000, 0, TCP_SYN,
                          NULL, 0, 65535, 0, -1);
-    handle_packet(&g_tun, bad, p, l);
+    g_dial.ctx = bad;
+    handle_packet(&g_tun, p, l);
+    g_dial.ctx = &g_node;
 }
 
 static int g_run_rc;
@@ -418,11 +432,12 @@ static void run_bad(void *arg) {
     /* Имя длиннее 15 символов: tun_open откажет и сам, так что устройство не появится ни до
      * правки, ни после — различается только названа ли причина. */
     snprintf(o.device, sizeof(o.device), "tunnelmatch-no-such-dev");
-    g_run_rc = tunnel_run(&o, arg);
+    g_run_rc = vless_tunnel_run(&o, arg);
 }
 
 /* I-097: UUID узла не разбирается. Прежде соединение закрывалось молча — ни строки, ни
- * причины, — а tunnel_run поднимал устройство, которое закрывало бы всё подряд. */
+ * причины, — а подъём (tunnel_run, теперь vless_tunnel_run) поднимал устройство, которое
+ * закрывало бы всё подряд. */
 static void t_bad_uuid(void) {
     struct vless_node bad = g_node;
     /* Короче 31 знака — законный «производный» UUID (sha1 строки, как у Xray); длиннее 36
@@ -440,7 +455,7 @@ static void t_bad_uuid(void) {
     if (c) conn_drop(c);
     dev_drain(NULL);
     said = stderr_has(run_bad, &bad, "не разбирается UUID");
-    check(said && g_run_rc == 1, "I-097: tunnel_run называет негодный UUID до подъёма устройства");
+    check(said && g_run_rc == 1, "I-097: подъём называет негодный UUID до подъёма устройства");
 }
 
 static void send_refused(void *arg) {
@@ -520,6 +535,26 @@ static void t_dns_evict(void) {
     check(!full_table_gives_udp(53, 3), "I-055: поток DNS, молчащий 3 с, не вытесняется");
 }
 
+/* Пул запасных: готовая сессия отдаётся соединению, и слот после этого пуст. Жило в
+ * tests/devupmatch.c вместе с проверкой самоуказателей; самоуказатели теперь чинит транспорт
+ * (xhttp_moved) по вызову дайлера (vl_take), и их проверка осталась там, на настоящем
+ * транспорте, а слот пула — забота стека, и проверяется здесь. */
+static void t_spare_slot(void) {
+    static struct vl_sess spare;
+    memset(&spare, 0, sizeof(spare));
+    spare.t.link.fd = -1;
+    struct spare *sp = &g_spares[0];
+    struct spare save = *sp;
+    sp->sess = &spare;
+    sp->state = SPARE_READY;
+    sp->born_ns = now_ns();
+    static struct vl_sess out;
+    memset(&out, 0, sizeof(out));
+    check(spare_checkout(&out) == 0, "пул запасных: готовая сессия взята");
+    check(sp->state == SPARE_EMPTY, "пул запасных: слот освобождён");
+    *sp = save;
+}
+
 int main(void) {
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0 || pipe(g_sess_pipe) != 0) return 2;
@@ -529,8 +564,11 @@ int main(void) {
     g_dev_peer = sp[1];
     snprintf(g_node.uuid, sizeof(g_node.uuid), "8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124");
     snprintf(g_node.host, sizeof(g_node.host), "stand");
-    conn_table_init();
+    /* То, что stack_run делает до потоков: дайлер и шаг сессий. Пул запасных выключен —
+     * stack_setup тогда и памяти под него не берёт. */
     g_spare_want = 0;
+    stack_setup(&g_dial);
+    if (conn_table_init() != 0) return 2;
     g_now_ns = now_ns();
     g_now_s = (time_t)(g_now_ns / 1000000000ull);
 
@@ -544,6 +582,7 @@ int main(void) {
     t_bad_uuid();
     t_send_refused();
     t_dns_evict();
+    t_spare_slot();
 
     printf(g_fail ? "\ntunnelmatch: ПРОВАЛ\n" : "\nвсе проверки прошли\n");
     return g_fail;

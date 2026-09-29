@@ -29,7 +29,7 @@ CORE_DIRS := src/lib src/model src/platform src/compile src/daemon src/kinds src
 # PLATFORM_SRC); остальные — по одному на профиль, у base своего файла нет. Отдельно от ядра и
 # от расширенной части, потому что файл профиля не входит ни в одну сборку, кроме своей.
 PROFILE_DIRS := src/profile
-EXT_DIRS  := src/tunnel src/proto/tls src/proto/vless src/proto/xsteer src/proto/tgws
+EXT_DIRS  := src/tunnel src/proto/tls src/proto/transport src/proto/vless src/proto/xsteer src/proto/tgws
 # Клиент сокета `steer` (src/client) — отдельный бинарник, не профиль движка: CLIENT_SRC ниже.
 CLIENT_DIRS := src/client
 # Сторонний код (src/third_party) — не слой движка: файлы в нём не правятся (см. UPSTREAM в
@@ -155,8 +155,23 @@ XS_COMMON_SRC := src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/x
                  src/proto/tls/tls13.c src/proto/tls/certverify.c \
                  src/proto/tls/reality.c src/tunnel/tun.c src/proto/tls/h2.c \
                  src/proto/xsteer/xsadmin.c
-EXT_ROUTER_SRC := src/proto/vless/sub.c src/proto/vless/vless_proto.c src/proto/vless/vision.c \
-                  src/proto/vless/client.c src/tunnel/tunnel.c src/tunnel/rtx.c \
+# Туннель VLESS — стек отдельно от протокола (шаг 2 выпуска 1.10, docs/architecture.md, «Туннели:
+# стек, дайлер, транспорт»). Три списка — по тому, куда файлы уйдут на шаге 4, когда появятся
+# libsteer.so и бинарники модулей; пока все три входят в расширенный профиль целиком:
+#   STACK_SRC      стек TUN ↔ потоки TCP/UDP (tun.c — в XS_COMMON_SRC: на нём стоит и xsteer) —
+#                  в libsteer;
+#   TRANSPORT_SRC  транспорты до узла (сокет, security, tcp/grpc/xhttp) и корни проверки
+#                  сертификата — в libsteer, вместе с TLS;
+#   VLESS_MOD_SRC  протокол: подкоманды vless*, дайлер, слежка за узлом, проверка узла,
+#                  заголовок и Vision — в бинарник модуля steer-vless.
+# sub.c (разбор подписки) — не в модуле: его зовёт и `steer-tools sub-fetch` (subfetch.c).
+STACK_SRC := src/tunnel/stack.c src/tunnel/rtx.c
+TRANSPORT_SRC := src/proto/transport/transport.c src/proto/transport/trdial.c \
+                 src/proto/transport/trsec.c src/proto/transport/trgrpc.c \
+                 src/proto/transport/trxhttp.c src/proto/tls/roots.c
+VLESS_MOD_SRC := src/proto/vless/vlmain.c src/proto/vless/vldial.c src/proto/vless/vlwatch.c \
+                 src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/vless/vision.c
+EXT_ROUTER_SRC := src/proto/vless/sub.c $(VLESS_MOD_SRC) $(STACK_SRC) $(TRANSPORT_SRC) \
                   src/proto/xsteer/xsclient.c src/proto/vless/subfetch.c src/proto/tgws/tgws.c src/proto/tls/tlsprobe.c \
                   src/proto/tls/urltls.c
 EXT_SERVER_SRC := src/proto/xsteer/xshub.c
