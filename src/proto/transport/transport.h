@@ -189,11 +189,33 @@ struct ws_rx {
  * Выбросить их значило бы разъехаться с сервером на первые же байты потока — у httpupgrade это
  * начало ответа VLESS, у ws — первый кадр. В куче и только когда они есть: это редкость, а
  * буфер в каждом соединении стоил бы 16 КБ на каждое из сотен соединений пула. Кто прочитал, тот
- * и освобождает (h1_stash_take); остаток до чтения освобождает transport_close. */
+ * и освобождает (tr_h1_free); остаток до чтения освобождает transport_close.
+ *
+ * РАННИЕ ДАННЫЕ (`?ed=N` в пути, Ed у Xray) меняют, КОГДА уходит запрос и когда разбирается ответ,
+ * — ровно как у Xray (подробности — trws.c и trupgrade.c):
+ *   ws           запрос откладывается до первой записи (H1_DEFER); запись не длиннее Ed уезжает в
+ *                Sec-WebSocket-Protocol, длиннее — отдельно, кадрами после ответа 101;
+ *   httpupgrade  запрос уходит сразу, но ответа не ждём: данные идут следом, ответ разбирается
+ *                первым чтением (H1_WAIT).
+ * Пока ответа 101 нет (H1_WAIT), ws копит свои записи в очереди q — у Xray запись в это время
+ * просто ждёт ответа, а цикл туннеля ждать не вправе; очередь уходит кадрами сразу за 101. */
+enum { H1_OPEN = 0, H1_DEFER, H1_WAIT };
+struct h1_resp;
 struct h1_state {
     unsigned char *stash;
     uint32_t stash_n, stash_off;
     struct ws_rx rx;           /* только ws */
+    uint8_t phase;             /* H1_OPEN, H1_DEFER, H1_WAIT */
+    uint8_t upgraded;          /* ответ 101 принят: у ws при закрытии уходит close 1000 */
+    uint32_t ed;               /* Ed из пути (trpath.h) */
+    /* Для отложенного запроса ws: копия узла (сама struct tr_node живёт на стеке открывающего,
+     * указатели в ней — в узел подписки, который живёт дольше соединения). */
+    struct tr_node node;
+    struct h1_resp *resp;      /* разбор ответа в H1_WAIT — в куче, на время ожидания */
+    char accept[29];           /* ожидаемый Sec-WebSocket-Accept */
+    /* ws в H1_WAIT: записи до ответа 101, каждая — [длина 4 байта][данные], в куче. */
+    unsigned char *q;
+    uint32_t q_n, q_cap;
 };
 
 struct transport;
@@ -233,6 +255,10 @@ struct transport_ops {
      * готовности сокета, а данные остались бы лежать до следующего пакета от сервера — которого
      * может и не быть, если сервер уже всё сказал (см. transport_has_data). NULL — такого нет. */
     int  (*pending)(const struct transport *t);
+    /* Транспорт ещё разбирает своё поверх записей TLS (ответ 101 у httpupgrade с ранними
+     * данными): чтение без копии (zc) пока нельзя, даже когда своего непрочитанного нет. NULL —
+     * такого не бывает. */
+    int  (*busy)(const struct transport *t);
 };
 
 /* Безопасность — поле security= ссылки. Различаются только рукопожатием (см. шапку). */
@@ -308,14 +334,27 @@ extern const struct security_ops tr_sec_none, tr_sec_tls, tr_sec_reality;
 
 /* ---- ws и httpupgrade: общий запрос Upgrade (trupgrade.c) и кадры (trws.c) ------------- */
 
-/* Запрос Upgrade и ответ 101 по HTTP/1.1 — синхронно, в пределах timeout_s (открытие идёт в
- * потоке установщика, а не в цикле туннеля). ws — 1 для WebSocket (со Sec-WebSocket-Key и
- * проверкой Accept), 0 для httpupgrade. Остаток за ответом кладётся в t->h1.stash. */
+/* Открытие ws или httpupgrade поверх защищённой связи. Без ранних данных — запрос Upgrade и ответ
+ * 101 синхронно, в пределах timeout_s (открытие идёт в потоке установщика, а не в цикле туннеля),
+ * остаток за ответом — в t->h1.stash. С ранними данными — как у Xray (h1_state): ws откладывает
+ * запрос до первой записи, httpupgrade шлёт его и ответа не ждёт. ws — 1 для WebSocket, 0 для
+ * httpupgrade. */
 int tr_h1_upgrade(struct transport *t, const struct tr_node *n, int ws, int timeout_s);
 
+/* Послать запрос Upgrade по узлу t->h1.node; у ws — с новым ключом (ожидаемый Accept — в
+ * t->h1.accept) и, если ed не NULL, с ранними данными в Sec-WebSocket-Protocol (base64url без
+ * выравнивания, как RawURLEncoding у Xray). */
+int tr_h1_send(struct transport *t, int ws, const unsigned char *ed, size_t ed_n);
+
+/* Отложенный ответ (H1_WAIT): скормить кусок входа. 0 — ответ ещё не кончился, 1 — принят
+ * (фаза H1_OPEN, *used — сколько байт ушло на заголовки, остальное — уже поток), иначе код TR_*. */
+int tr_h1_lazy(struct transport *t, int ws, const unsigned char *in, size_t n, size_t *used);
+
 /* Собрать запрос Upgrade в out — без сети, для открытия и для стенда (tests/wsmatch.c). key —
- * Sec-WebSocket-Key у ws, NULL у httpupgrade. Длина запроса либо 0: не влез или путь негоден. */
-size_t tr_h1_request(const struct tr_node *n, int ws, const char *key, char *out, size_t cap);
+ * Sec-WebSocket-Key у ws, NULL у httpupgrade; proto — Sec-WebSocket-Protocol (ранние данные) или
+ * NULL. Длина запроса либо 0: не влез или путь негоден. */
+size_t tr_h1_request(const struct tr_node *n, int ws, const char *key, const char *proto,
+                     char *out, size_t cap);
 
 /* Ответ на запрос Upgrade — потоком, по кускам как угодно разрезанного входа. */
 struct h1_resp {

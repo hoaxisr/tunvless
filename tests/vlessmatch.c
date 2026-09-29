@@ -177,6 +177,9 @@ struct plan {
      * и приём ответа клиента (1 — ws, 2 — httpupgrade). */
     int reality_ok;
     int upg;
+    /* ws с ранними данными (путь `?ed=2048`): клиент пишет «hello» ДО чтения, и оно обязано уехать
+     * в Sec-WebSocket-Protocol запроса — запрос у Xray при Ed > 0 откладывается до первой записи. */
+    int ed_first;
 };
 
 struct srv {
@@ -595,6 +598,11 @@ static int app_phase_dirs(struct srv *s, struct dir *cd, struct dir *sd) {
     }
     if (rec_seal(sd, s->fd, (const unsigned char *)resp, (size_t)k)) return -1;
 
+    /* Ранние данные ws (Ed > 0): «hello» клиента приехало в самом запросе, base64url без `=`. */
+    if (s->plan->ed_first) {
+        s->got_hello = strstr(s->req, "\r\nSec-WebSocket-Protocol: aGVsbG8\r\n") != NULL;
+        return 0;
+    }
     if (rec_open(cd, s->fd, buf, sizeof(buf), &n, &inner) || inner != 0x17) return -1;
     if (s->plan->upg == 1) {
         /* 0x82, 0x80|5, маска, «hello» под маской. */
@@ -922,6 +930,7 @@ static int run_upg(const struct plan *pl, struct vless_node *n, struct srv *s) {
     struct transport c;
     int rc = vless_connect(n, &c, 3);
     g_tcp_dial = NULL;
+    if (rc == 0 && pl->ed_first) rc = transport_write(&c, (const unsigned char *)"hello", 5);
     if (rc == 0) {
         static unsigned char buf[VLESS_MIN_RECV_CAP];
         size_t got = 0;
@@ -933,7 +942,7 @@ static int run_upg(const struct plan *pl, struct vless_node *n, struct srv *s) {
             rc = transport_read(&c, buf, sizeof(buf), &got);
         }
         if (!rc && (got != 5 || memcmp(buf, "FIRST", 5))) rc = -102;
-        if (!rc) rc = transport_write(&c, (const unsigned char *)"hello", 5);
+        if (!rc && !pl->ed_first) rc = transport_write(&c, (const unsigned char *)"hello", 5);
         transport_close(&c);
     }
     pthread_join(th, NULL);
@@ -1085,13 +1094,18 @@ int main(void) {
         printf("%-64s %s\n", "пара сервера Reality", "ПРОВАЛ");
         fails++;
     } else {
-        static const char *rtype[] = { "tcp", "ws", "httpupgrade" };
-        for (int u = 0; u < 3; u++) {
-            struct plan up = { .name = "reality", .reality_ok = 1, .upg = u };
+        /* ws — без ранних данных (ed=0: вырезается, Ed 0) и с ними (ed=2048: запрос уходит первой
+         * записью, «hello» — в Sec-WebSocket-Protocol); httpupgrade с ed=2048 — ответ 101 читается
+         * лениво, первым чтением. */
+        static const char *rtype[] = { "tcp", "ws", "httpupgrade", "ws ed" };
+        static const char *rpath[] = { "/w?ed=0", "/w?ed=0", "/w?ed=2048", "/w?ed=2048" };
+        for (int u = 0; u < 4; u++) {
+            struct plan up = { .name = "reality", .reality_ok = 1, .upg = u == 2 ? 2 : u ? 1 : 0,
+                               .ed_first = u == 3 };
             struct vless_node rn;
-            node_reality(&rn, rtype[u]);
+            node_reality(&rn, u == 3 ? "ws" : rtype[u]);
             b64url(g_rs_pub, 32, rn.pbk);
-            snprintf(rn.path, sizeof(rn.path), "%s", "/w?ed=2048");
+            snprintf(rn.path, sizeof(rn.path), "%s", rpath[u]);
             snprintf(rn.http_host, sizeof(rn.http_host), "%s", "cdn.example");
             char what[160];
             int fd0 = fd_count();
@@ -1112,7 +1126,8 @@ int main(void) {
             check(what, 1, s.alpn_h11);
             snprintf(what, sizeof(what), "reality + %s: запрос Upgrade — путь без ed, Host из host", rtype[u]);
             check(what, 1, !strncmp(s.req, "GET /w HTTP/1.1\r\nHost: cdn.example\r\n", 36));
-            snprintf(what, sizeof(what), "reality + %s: ответ клиента после 101 дошёл", rtype[u]);
+            snprintf(what, sizeof(what), u == 3 ? "reality + %s: «hello» в Sec-WebSocket-Protocol запроса"
+                                                : "reality + %s: ответ клиента после 101 дошёл", rtype[u]);
             check(what, 1, s.got_hello);
             snprintf(what, sizeof(what), "reality + %s: дескрипторы вернулись к исходному числу", rtype[u]);
             check(what, fd0, fd_count());
@@ -1224,12 +1239,12 @@ int main(void) {
         }
         /* ws и httpupgrade поверх обычного TLS со своей цепочкой: то же, что у Reality выше,
          * плюс настоящая проверка сертификата — путь, которым идут узлы за CDN. */
-        static const char *ttype[] = { "ws", "httpupgrade" };
-        for (int u = 1; u <= 2; u++) {
-            struct plan up = { .name = "tls", .chain = LEAF_OK, .upg = u };
+        static const char *ttype[] = { "ws", "httpupgrade", "ws ed" };
+        for (int u = 1; u <= 3; u++) {
+            struct plan up = { .name = "tls", .chain = LEAF_OK, .upg = u == 2 ? 2 : 1, .ed_first = u == 3 };
             struct vless_node tn;
-            node_tls(&tn, ttype[u - 1]);
-            snprintf(tn.path, sizeof(tn.path), "%s", "/w?ed=2048");
+            node_tls(&tn, u == 2 ? "httpupgrade" : "ws");
+            snprintf(tn.path, sizeof(tn.path), "%s", u == 1 ? "/w?ed=0" : "/w?ed=2048");
             char what[160];
             int fd0 = fd_count();
             static struct srv s;

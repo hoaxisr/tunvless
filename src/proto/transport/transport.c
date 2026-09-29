@@ -100,6 +100,11 @@ static int fr_pending(const struct transport *t) {
     return t->fr && t->fr->pending && t->fr->pending(t);
 }
 
+/* Разбирает ли транспорт ещё своё поверх записей TLS (transport_ops.busy). */
+static int fr_busy(const struct transport *t) {
+    return t->fr && t->fr->busy && t->fr->busy(t);
+}
+
 /* ---- сборка ярусов -------------------------------------------------------------------- */
 
 int transport_open(struct transport *t, const struct tr_node *n, int timeout_s) {
@@ -169,7 +174,7 @@ int transport_read_zc(struct transport *t, unsigned char *buf, size_t cap,
      * Прямое копирование (rx_direct) и security=none читают сокет сами. Своё непрочитанное у
      * транспорта (остаток после ответа 101 у httpupgrade) — раньше записей TLS: оно раньше
      * их и приехало. */
-    if (t->fr->zc && !t->link.plain && !t->link.rx_direct && !fr_pending(t))
+    if (t->fr->zc && !t->link.plain && !t->link.rx_direct && !fr_pending(t) && !fr_busy(t))
         return tls13_read_ref(&t->link.tls, data, got);
     return transport_read(t, buf, cap, got);
 }
@@ -200,12 +205,13 @@ void transport_moved(struct transport *t) {
 }
 
 void transport_close(struct transport *t) {
-    tr_link_close(&t->link);
-    /* Вторая связь закрывается ЗДЕСЬ ЖЕ и по тому же доводу (transport_ops.close). Забыть её
-     * значило бы утечку ровно вдвое злее обычной: на соединение приходится и лишний
-     * дескриптор, и лишний набор контекстов шифра. fr пуст, если открытие не дошло до выбора
-     * транспорта — тогда и второй связи не было. */
+    /* Своё транспорт закрывает ПЕРВЫМ, пока связь жива: ws шлёт при закрытии кадр close, как
+     * Xray, и шифровать его после tr_link_close было бы нечем. Вторая связь xhttp закрывается
+     * ЗДЕСЬ ЖЕ и по тому же доводу (transport_ops.close). Забыть её значило бы утечку ровно вдвое
+     * злее обычной: на соединение приходится и лишний дескриптор, и лишний набор контекстов
+     * шифра. fr пуст, если открытие не дошло до выбора транспорта — тогда и второй связи не было. */
     if (t->fr && t->fr->close) t->fr->close(t);
+    tr_link_close(&t->link);
 }
 
 const char *transport_strerror(int rc) {

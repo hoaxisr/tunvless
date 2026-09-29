@@ -138,6 +138,20 @@ static void test_path(void) {
     }
     char tiny[4];
     check(tr_upgrade_target("/long/path", 1, tiny, sizeof(tiny), NULL) != 0, "не влезло в out — отказ");
+
+    /* Ed — как Build у Xray: uint32(strconv.Atoi(первое значение ed)), если ed вырезан. */
+    static const struct { const char *path; uint32_t ed; } E[] = {
+        { "/w?ed=2048", 2048 }, { "/w?x=1&ed=16", 16 }, { "/w?ed=", 0 }, { "/w?ed=abc", 0 },
+        { "/w?ed=+5", 0 } /* «+» в запросе — пробел */, { "/w?ed=%2B5", 5 }, { "/w?ed=-1", 4294967295u }, { "/w?ed=4294967296", 0 }, { "/w", 0 },
+        { "/a%zz?ed=9", 0 },
+    };
+    for (size_t i = 0; i < sizeof(E) / sizeof(*E); i++) {
+        char out[256], what[96];
+        uint32_t ed = 7;
+        tr_upgrade_target_ed(E[i].path, 0, out, sizeof(out), NULL, &ed);
+        snprintf(what, sizeof(what), "Ed пути «%s» — %u, как у Xray", E[i].path, E[i].ed);
+        check(ed == E[i].ed, what);
+    }
 }
 
 /* ---- 2. запрос Upgrade ------------------------------------------------------------- */
@@ -160,7 +174,7 @@ static void test_request(void) {
     n.path = "/w?ed=2048";
     n.http_host = "cdn.example.com";
     n.headers = "x-custom: v1\naccept: text/x\n";
-    tr_h1_request(&n, 1, key, out, sizeof(out));
+    tr_h1_request(&n, 1, key, NULL,out, sizeof(out));
     check_str("ws: запрос как у Xray (свои заголовки — канонически, Accept узла главнее)",
         "GET /w HTTP/1.1\r\n"
         "Host: cdn.example.com\r\n"
@@ -187,7 +201,7 @@ static void test_request(void) {
     n.path = "/w?ed=2048";
     n.http_host = "cdn.example.com";
     n.headers = "x-custom: v1\nPragma: p\n";
-    tr_h1_request(&n, 0, NULL, out, sizeof(out));
+    tr_h1_request(&n, 0, NULL, NULL, out, sizeof(out));
     check_str("httpupgrade: запрос как у Xray (свой ключ — как написан, Pragma узла главнее)",
         "GET /w HTTP/1.1\r\n"
         "Host: cdn.example.com\r\n"
@@ -211,7 +225,7 @@ static void test_request(void) {
     node0(&n, "ws");
     n.http_host = "h";
     n.headers = "User-Agent: MyUA/1\n";
-    tr_h1_request(&n, 1, key, out, sizeof(out));
+    tr_h1_request(&n, 1, key, NULL,out, sizeof(out));
     check_str("ws: свой User-Agent — облика браузера нет",
         "GET /w HTTP/1.1\r\nHost: h\r\nUser-Agent: MyUA/1\r\nConnection: Upgrade\r\n"
         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
@@ -220,26 +234,92 @@ static void test_request(void) {
     node0(&n, "httpupgrade");
     n.http_host = "h";
     n.headers = "user-agent: MyUA/1\n";
-    tr_h1_request(&n, 0, NULL, out, sizeof(out));
+    tr_h1_request(&n, 0, NULL, NULL, out, sizeof(out));
     check(strstr(out, "\r\nUser-Agent: " UA "\r\n") && strstr(out, "\r\nuser-agent: MyUA/1\r\n"),
           "httpupgrade: user-agent строчными — не узнан (как у Go), облик остаётся");
 
     /* Host: host, иначе sni, иначе адрес узла. */
     node0(&n, "ws");
     n.sni = "mask.example";
-    tr_h1_request(&n, 1, key, out, sizeof(out));
+    tr_h1_request(&n, 1, key, NULL,out, sizeof(out));
     check(strstr(out, "\r\nHost: mask.example\r\n") != NULL, "Host без host — sni");
     node0(&n, "ws");
-    tr_h1_request(&n, 1, key, out, sizeof(out));
+    tr_h1_request(&n, 1, key, NULL,out, sizeof(out));
     check(strstr(out, "\r\nHost: 127.0.0.1\r\n") != NULL, "Host без host и sni — адрес узла");
     node0(&n, "ws");
     n.host = "2001:db8::1";
-    tr_h1_request(&n, 1, key, out, sizeof(out));
+    tr_h1_request(&n, 1, key, NULL,out, sizeof(out));
     check(strstr(out, "\r\nHost: [2001:db8::1]\r\n") != NULL, "Host по адресу IPv6 — в скобках");
 
     char small[64];
     node0(&n, "ws");
-    check(tr_h1_request(&n, 1, key, small, sizeof(small)) == 0, "запрос не влез — 0, а не обрезок");
+    check(tr_h1_request(&n, 1, key, NULL, small, sizeof(small)) == 0, "запрос не влез — 0, а не обрезок");
+
+    /* Ранние данные и облики по слову в User-Agent — против той же программы на Go (net/http,
+     * browser.go и dialer.go Xray с нашими зашитыми версиями). */
+    node0(&n, "ws");
+    n.http_host = "h";
+    tr_h1_request(&n, 1, key, "aGVsbG8sIGVhcmx5IGRhdGEA_w", out, sizeof(out));
+    check_str("ws: ранние данные в Sec-WebSocket-Protocol — между Key и Version, как у Xray",
+        "GET /w HTTP/1.1\r\nHost: h\r\nUser-Agent: " UA "\r\nAccept: */*\r\n"
+        "Accept-Language: en-US,en;q=0.9\r\nCache-Control: no-cache\r\nConnection: Upgrade\r\n"
+        "DNT: 1\r\nPragma: no-cache\r\nSec-CH-UA: " CH "\r\nSec-CH-UA-Mobile: ?0\r\n"
+        "Sec-CH-UA-Platform: \"Windows\"\r\nSec-Fetch-Dest: empty\r\nSec-Fetch-Mode: websocket\r\n"
+        "Sec-Fetch-Site: same-origin\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Protocol: aGVsbG8sIGVhcmx5IGRhdGEA_w\r\nSec-WebSocket-Version: 13\r\n"
+        "Upgrade: websocket\r\n\r\n", out);
+    static const struct { const char *word, *want; } B[] = {
+        { "firefox",
+          "GET /w HTTP/1.1\r\nHost: h\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) "
+          "Gecko/20100101 Firefox/153.0\r\nAccept: */*\r\nAccept-Language: en-US,en;q=0.5\r\n"
+          "Cache-Control: no-cache\r\nConnection: Upgrade\r\nDNT: 1\r\nPragma: no-cache\r\n"
+          "Sec-Fetch-Dest: empty\r\nSec-Fetch-Mode: websocket\r\nSec-Fetch-Site: same-origin\r\n"
+          "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+          "Upgrade: websocket\r\n\r\n" },
+        { "safari",
+          "GET /w HTTP/1.1\r\nHost: h\r\nUser-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+          "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6 Safari/605.1.15\r\nAccept: */*\r\n"
+          "Accept-Language: en-US,en;q=0.9\r\nCache-Control: no-cache\r\nConnection: Upgrade\r\n"
+          "Pragma: no-cache\r\nSec-Fetch-Dest: websocket\r\nSec-Fetch-Mode: websocket\r\n"
+          "Sec-Fetch-Site: same-origin\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+          "Sec-WebSocket-Version: 13\r\nUpgrade: websocket\r\n\r\n" },
+        { "edge",
+          "GET /w HTTP/1.1\r\nHost: h\r\nUser-Agent: " UA "Edg/149.0.0.0\r\nAccept: */*\r\n"
+          "Accept-Language: en-US,en;q=0.9\r\nCache-Control: no-cache\r\nConnection: Upgrade\r\n"
+          "DNT: 1\r\nPragma: no-cache\r\nSec-CH-UA: \"Microsoft Edge\";v=\"149\", \"Chromium\";v=\"149\", "
+          "\"Not)A;Brand\";v=\"24\"\r\nSec-CH-UA-Mobile: ?0\r\nSec-CH-UA-Platform: \"Windows\"\r\n"
+          "Sec-Fetch-Dest: empty\r\nSec-Fetch-Mode: websocket\r\nSec-Fetch-Site: same-origin\r\n"
+          "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+          "Upgrade: websocket\r\n\r\n" },
+        { "curl",
+          "GET /w HTTP/1.1\r\nHost: h\r\nUser-Agent: curl/8.20.0\r\nConnection: Upgrade\r\n"
+          "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+          "Upgrade: websocket\r\n\r\n" },
+        { "golang",
+          "GET /w HTTP/1.1\r\nHost: h\r\nUser-Agent: Go-http-client/1.1\r\nConnection: Upgrade\r\n"
+          "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+          "Upgrade: websocket\r\n\r\n" },
+    };
+    for (size_t i = 0; i < sizeof(B) / sizeof(*B); i++) {
+        char hv[64], what[96];
+        snprintf(hv, sizeof(hv), "User-Agent: %s\n", B[i].word);
+        node0(&n, "ws");
+        n.http_host = "h";
+        n.headers = hv;
+        tr_h1_request(&n, 1, key, NULL, out, sizeof(out));
+        snprintf(what, sizeof(what), "ws: User-Agent «%s» — облик Xray", B[i].word);
+        check_str(what, B[i].want, out);
+    }
+    node0(&n, "httpupgrade");
+    n.http_host = "h";
+    n.headers = "connection: keep-alive\nUpgrade: h2c\n";
+    tr_h1_request(&n, 0, NULL, NULL, out, sizeof(out));
+    check_str("httpupgrade: свои Connection и Upgrade — как у Xray (Set перекрывает только точный ключ)",
+        "GET /w HTTP/1.1\r\nHost: h\r\nUser-Agent: " UA "\r\nAccept: */*\r\n"
+        "Accept-Language: en-US,en;q=0.9\r\nCache-Control: no-cache\r\nConnection: Upgrade\r\n"
+        "DNT: 1\r\nPragma: no-cache\r\nSec-CH-UA: " CH "\r\nSec-CH-UA-Mobile: ?0\r\n"
+        "Sec-CH-UA-Platform: \"Windows\"\r\nSec-Fetch-Dest: empty\r\nSec-Fetch-Mode: websocket\r\n"
+        "Sec-Fetch-Site: same-origin\r\nUpgrade: websocket\r\nconnection: keep-alive\r\n\r\n", out);
 }
 
 /* ---- 3. Accept и кадр клиента ------------------------------------------------------ */
@@ -437,7 +517,9 @@ static void test_resp(void) {
 
 /* ---- 6. на сокете: сервер-стенд ----------------------------------------------------- */
 
-enum plan { P_WS_OK, P_HU_OK, P_404, P_NOUP, P_BADACC, P_SILENT, P_HANGUP };
+enum plan { P_WS_OK, P_HU_OK, P_404, P_NOUP, P_BADACC, P_SILENT, P_HANGUP,
+            /* ранние данные (Ed > 0) — srv_ed */
+            P_WS_ED, P_WS_EDBIG, P_HU_ED };
 
 struct srv {
     int lfd, port;
@@ -448,6 +530,10 @@ struct srv {
     unsigned char got[9000 + 8192];
     size_t got_n;
     int frames, masked_all, pong_ok, close_ok, ops_ok;
+    /* ранние данные: что было в Sec-WebSocket-Protocol, пришли ли данные до ответа (httpupgrade),
+     * пришёл ли close 1000 при закрытии клиентом */
+    char proto[128];
+    int early_before_101, close1000;
 };
 
 static int rd_until(int fd, char *buf, size_t cap, const char *end) {
@@ -489,6 +575,59 @@ static int rd_cframe(int fd, int *op, int *fin, int *masked, unsigned char *body
     return 0;
 }
 
+/* Ранние данные. P_WS_ED: клиент первой записью шлёт «hello» (не длиннее Ed) — она обязана
+ * приехать в Sec-WebSocket-Protocol запроса, а вторая запись (9000 байт, сделанная ДО ответа) —
+ * кадрами строго после ответа 101. P_WS_EDBIG: первая запись 9000 байт длиннее Ed — запрос без
+ * ранних данных, запись — кадрами после 101. P_HU_ED: запрос приходит сразу при открытии, данные
+ * клиента — следом, не дожидаясь ответа. Во всех трёх в конце клиент закрывается сам — у ws обязан
+ * прийти close 1000. */
+static void *srv_ed(struct srv *s, int fd) {
+    const char *p = strstr(s->req, "\r\nSec-WebSocket-Protocol: ");
+    if (p) sscanf(p + 26, "%127[^\r]", s->proto);
+    unsigned char resp[512];
+    int n;
+    if (s->plan == P_HU_ED) {
+        /* security=none: ответ клиент ждёт и при Ed > 0 (trupgrade.c: сервер Xray теряет данные,
+         * приехавшие одним сегментом с запросом). До ответа — тишина, после — «echo». */
+        struct pollfd pf0 = { .fd = fd, .events = POLLIN, .revents = 0 };
+        s->early_before_101 = poll(&pf0, 1, 200) > 0;
+        n = snprintf((char *)resp, sizeof(resp), "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n"
+                     "Upgrade: websocket\r\n\r\nRAW-START");
+        if (write(fd, resp, (size_t)n) != n) { close(fd); return NULL; }
+        char b[8];
+        s->got_n = rd_all(fd, (unsigned char *)b, 4) == 0 && !memcmp(b, "echo", 4);
+        s->rc = 0;
+        close(fd);
+        return NULL;
+    }
+    /* До ответа от клиента не должно прийти НИЧЕГО сверх запроса (gorilla рвёт такое). */
+    struct pollfd pf = { .fd = fd, .events = POLLIN, .revents = 0 };
+    s->early_before_101 = poll(&pf, 1, 200) > 0;
+    char acc[29] = "";
+    const char *k = strstr(s->req, "\r\nSec-WebSocket-Key: ");
+    if (k) { char key[32]; sscanf(k + 21, "%31[^\r]", key); tr_ws_accept(key, acc); }
+    n = snprintf((char *)resp, sizeof(resp), "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                 "Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", acc);
+    n += (int)srv_frame(resp + n, 2, 1, "FIRST", 5);
+    if (write(fd, resp, (size_t)n) != n) { close(fd); return NULL; }
+    int op, fin, masked;
+    size_t bn;
+    unsigned char body[8192];
+    s->masked_all = 1;
+    while (s->got_n < 9000) {
+        if (rd_cframe(fd, &op, &fin, &masked, body, sizeof(body), &bn)) { close(fd); return NULL; }
+        if (!masked) s->masked_all = 0;
+        memcpy(s->got + s->got_n, body, bn);
+        s->got_n += bn;
+        s->frames++;
+    }
+    if (rd_cframe(fd, &op, &fin, &masked, body, sizeof(body), &bn) == 0)
+        s->close1000 = op == 8 && masked && bn == 2 && body[0] == 0x03 && body[1] == 0xe8;
+    s->rc = 0;
+    close(fd);
+    return NULL;
+}
+
 static void *srv_main(void *arg) {
     struct srv *s = arg;
     int fd = accept(s->lfd, NULL, NULL);
@@ -497,6 +636,7 @@ static void *srv_main(void *arg) {
     if (s->plan == P_HANGUP) { close(fd); s->rc = 0; return NULL; }
     if (rd_until(fd, s->req, sizeof(s->req), "\r\n\r\n") < 0) { close(fd); return NULL; }
     if (s->plan == P_SILENT) { sleep(2); close(fd); s->rc = 0; return NULL; }
+    if (s->plan >= P_WS_ED) return srv_ed(s, fd);
 
     char acc[29] = "";
     const char *k = strstr(s->req, "\r\nSec-WebSocket-Key: ");
@@ -628,7 +768,7 @@ static void test_socket(void) {
     if (srv_start(&s, P_WS_OK, &th)) { check(0, "сервер-стенд поднялся"); return; }
     node0(&n, "ws");
     n.port = (uint16_t)s.port;
-    n.path = "/w?ed=2048";
+    n.path = "/w?ed=0";                        /* ed вырезается, Ed = 0: апгрейд сразу */
     n.http_host = "cdn.example.com";
     int rc = transport_open(&t, &n, 3);
     check(rc == 0, "ws: апгрейд на сокете прошёл");
@@ -681,6 +821,68 @@ static void test_socket(void) {
     srv_stop(&s, th);
     check(strstr(s.req, "Sec-WebSocket-Key") == NULL && strstr(s.req, "\r\nUpgrade: websocket\r\n"),
           "httpupgrade: Upgrade без ключа WebSocket");
+
+    /* Ранние данные — как у Xray: ws откладывает запрос до первой записи. */
+    static unsigned char big[9000];
+    for (size_t i = 0; i < sizeof(big); i++) big[i] = (unsigned char)(i * 31);
+    for (int v = 0; v < 2; v++) {
+        const int small = v == 0;
+        if (srv_start(&s, small ? P_WS_ED : P_WS_EDBIG, &th)) { check(0, "сервер-стенд поднялся"); return; }
+        node0(&n, "ws");
+        n.port = (uint16_t)s.port;
+        n.path = small ? "/w?ed=2048" : "/w?ed=16";
+        rc = transport_open(&t, &n, 3);
+        const char *tag = small ? "ws ed=2048, первая запись 5 байт" : "ws ed=16, первая запись 9000 байт";
+        char what[160];
+        snprintf(what, sizeof(what), "%s: открытие без запроса", tag);
+        check(rc == 0, what);
+        if (!rc) {
+            if (small) check(transport_write(&t, (const unsigned char *)"hello", 5) == 0, "ws ed: ранние данные записаны");
+            snprintf(what, sizeof(what), "%s: запись 9000 байт до ответа 101 — в очередь", tag);
+            check(transport_write(&t, big, sizeof(big)) == 0, what);
+            rc = tread(&t, buf, sizeof(buf), &got);
+            snprintf(what, sizeof(what), "%s: ответ 101 принят, первый кадр за ним", tag);
+            check(!rc && got == 5 && !memcmp(buf, "FIRST", 5), what);
+            transport_close(&t);
+        }
+        srv_stop(&s, th);
+        snprintf(what, sizeof(what), "%s: Sec-WebSocket-Protocol", tag);
+        check_str(what, small ? "aGVsbG8" : "", s.proto);
+        snprintf(what, sizeof(what), "%s: до ответа 101 кадров нет", tag);
+        check(!s.early_before_101, what);
+        same = s.got_n == 9000 && s.masked_all;
+        for (size_t i = 0; same && i < 9000; i++) if (s.got[i] != big[i]) same = 0;
+        snprintf(what, sizeof(what), "%s: 9000 байт кадрами с маской после 101", tag);
+        check(same, what);
+        snprintf(what, sizeof(what), "%s: при закрытии — close 1000", tag);
+        check(s.close1000, what);
+    }
+
+    /* httpupgrade с ed поверх security=none: ответ ждём (почему — trupgrade.c, tr_h1_upgrade);
+     * ленивый разбор ответа поверх TLS и REALITY проверяет vlessmatch в ext-test. */
+    if (srv_start(&s, P_HU_ED, &th)) { check(0, "сервер-стенд поднялся"); return; }
+    node0(&n, "httpupgrade");
+    n.port = (uint16_t)s.port;
+    n.path = "/u?ed=1";
+    rc = transport_open(&t, &n, 3);
+    check(rc == 0, "httpupgrade ed без TLS: открытие с ответом 101");
+    if (!rc) {
+        check(transport_write(&t, (const unsigned char *)"echo", 4) == 0, "httpupgrade ed: запись после 101");
+        const unsigned char *data = NULL;
+        size_t tot = 0;
+        char acc[32] = "";
+        for (int i = 0; i < 20 && tot < 9 && ready(&t); i++) {
+            rc = transport_read_zc(&t, buf, sizeof(buf), &data, &got);
+            if (rc) break;
+            if (tot + got < sizeof(acc)) memcpy(acc + tot, data, got);
+            tot += got;
+        }
+        check(!rc && tot == 9 && !memcmp(acc, "RAW-START", 9), "httpupgrade ed: остаток за ответом цел");
+        transport_close(&t);
+    }
+    srv_stop(&s, th);
+    check(!s.early_before_101 && s.got_n == 1, "httpupgrade ed без TLS: данные — только после ответа");
+    check(!strncmp(s.req, "GET /u HTTP/1.1\r\n", 17), "httpupgrade ed: ed вырезан из пути");
 
     /* Отказы. */
     static const struct { enum plan p; const char *type; int want; const char *what; } F[] = {

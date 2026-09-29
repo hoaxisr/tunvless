@@ -32,14 +32,22 @@
  * отвечает gorilla по умолчанию) и конец потока. Данные, приехавшие в одном куске ДО close,
  * отдаются, а конец потока — следующим чтением.
  *
- * Своего close при закрытии соединения не шлём (Xray шлёт его со сроком 5 секунд): закрытие идёт
- * из цикла туннеля, и блокирующая запись в соединение, которое, возможно, уже мертво, стояла бы
- * там до срока сокета. Сервер видит FIN, как у любого другого транспорта. */
+ * При закрытии соединения уходит свой close 1000, как у Xray (connection.Close) — неблокирующей
+ * записью, см. ws_close.
+ *
+ * РАННИЕ ДАННЫЕ (Ed > 0, `?ed=N` в пути) — как у Xray, байт в байт на проводе: запрос Upgrade
+ * откладывается до первой записи; она, если не длиннее Ed, уезжает в Sec-WebSocket-Protocol
+ * (base64url без выравнивания), иначе — кадрами после ответа 101. Пока ответа нет, записи копятся
+ * в очереди и уходят сразу за ним (ws_write, ws_read): у Xray запись в это время ждёт ответа в
+ * своей горутине, а цикл туннеля ждать не вправе. Сервер Xray ранние данные принимает всегда,
+ * какой бы Ed ни стоял у него самого (hub.go читает Sec-WebSocket-Protocol безусловно). */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 
 #include "transport.h"
 
@@ -200,7 +208,8 @@ static int ws_open(struct transport *t, const struct tr_node *n, int timeout_s) 
     return tr_h1_upgrade(t, n, 1, timeout_s);
 }
 
-static int ws_write(struct transport *t, const unsigned char *d, size_t n) {
+/* Одна запись — одно сообщение, кадрами по WS_FRAG (WriteMessage у gorilla). */
+static int ws_frames(struct transport *t, const unsigned char *d, size_t n) {
     static __thread unsigned char fb[WS_FRAG + 14];
     size_t off = 0;
     int op = 2;                                /* binary, дальше — continuation */
@@ -217,15 +226,104 @@ static int ws_write(struct transport *t, const unsigned char *d, size_t n) {
     return 0;
 }
 
+/* Предел очереди до ответа 101. Сверх него запись не принимается ЦЕЛИКОМ (H2_EWINDOW: дайлер
+ * понимает это как «ничего не ушло, повторить», как закрытое окно HTTP/2), а не частично. */
+#define WS_QMAX (256 * 1024)
+
+static int q_push(struct h1_state *s, const unsigned char *d, size_t n) {
+    size_t need = (size_t)s->q_n + 4 + n;
+    if (need > WS_QMAX) return H2_EWINDOW;
+    if (need > s->q_cap) {
+        size_t cap = s->q_cap ? s->q_cap : 8192;
+        while (cap < need) cap *= 2;
+        unsigned char *q = realloc(s->q, cap);
+        if (!q) return TR_EIO;
+        s->q = q;
+        s->q_cap = (uint32_t)cap;
+    }
+    unsigned char *p = s->q + s->q_n;
+    p[0] = (unsigned char)(n >> 24); p[1] = (unsigned char)(n >> 16);
+    p[2] = (unsigned char)(n >> 8);  p[3] = (unsigned char)n;
+    memcpy(p + 4, d, n);
+    s->q_n = (uint32_t)need;
+    return 0;
+}
+
+/* Очередь — кадрами, запись за записью, как их писал бы Xray после ответа 101. */
+static int q_flush(struct transport *t) {
+    struct h1_state *s = &t->h1;
+    size_t off = 0;
+    int rc = 0;
+    while (!rc && off + 4 <= s->q_n) {
+        const unsigned char *p = s->q + off;
+        size_t n = ((size_t)p[0] << 24) | ((size_t)p[1] << 16) | ((size_t)p[2] << 8) | p[3];
+        rc = ws_frames(t, p + 4, n);
+        off += 4 + n;
+    }
+    free(s->q);
+    s->q = NULL;
+    s->q_n = s->q_cap = 0;
+    return rc;
+}
+
+/* Запись по фазе (h1_state):
+ *
+ *   H1_DEFER  первая запись при Ed > 0 — у Xray это delayDialConn.Write: запись не длиннее Ed
+ *             уезжает ранними данными в самом запросе и считается записанной, длиннее — запрос без
+ *             них, а запись — кадрами после ответа 101 (здесь — в очередь);
+ *   H1_WAIT   ответа 101 ещё нет: у Xray запись ждёт его внутри dialWebSocket, у нас — в очереди,
+ *             которую чтение отправит сразу за принятым ответом. Байты на проводе те же: запрос,
+ *             ответ, кадры; отправлять кадры раньше ответа нельзя — gorilla на той стороне
+ *             рвёт соединение («client sent data before handshake is complete»);
+ *   H1_OPEN   кадры сразу. */
+static int ws_write(struct transport *t, const unsigned char *d, size_t n) {
+    struct h1_state *s = &t->h1;
+    if (s->phase == H1_OPEN) return ws_frames(t, d, n);
+    if (s->phase == H1_WAIT) return q_push(s, d, n);
+    /* H1_DEFER: первая запись. */
+    int early = n <= s->ed;
+    int rc = early ? 0 : q_push(s, d, n);
+    if (rc) return rc;
+    s->resp = calloc(1, sizeof(*s->resp));
+    if (!s->resp) return TR_EIO;
+    rc = tr_h1_send(t, 1, early ? d : NULL, n);
+    if (rc) return rc;
+    s->phase = H1_WAIT;
+    return 0;
+}
+
 /* Кусок входа — целиком в разбор, тела кадров — в d. Выход не длиннее входа (заголовки кадров
- * только убывают), поэтому запись TLS, влезающая в d, влезает и разобранной. */
+ * только убывают), поэтому запись TLS, влезающая в d, влезает и разобранной.
+ *
+ * В H1_WAIT сперва дочитывается ответ 101 (tr_h1_lazy): ответ не тот — отказ его кодом, принят —
+ * очередь записей уходит кадрами, а то, что приехало за ответом тем же куском, — уже кадры. В
+ * H1_DEFER сервер молчать обязан: запроса ещё не было. */
 static int ws_read(struct transport *t, unsigned char *d, size_t cap, size_t *got) {
     struct h1_state *s = &t->h1;
     struct ws_rx *r = &s->rx;
     if (r->closed) return TR_ECLOSED;
     size_t on = 0;
     int rc;
-    if (s->stash) {
+    if (s->phase != H1_OPEN) {
+        const unsigned char *in = d;
+        size_t n = 0;
+        if (t->link.plain) {
+            ssize_t k = read(t->link.fd, d, cap);
+            if (k <= 0) return k == 0 ? TR_ECLOSED : TR_EIO;
+            n = (size_t)k;
+        } else {
+            rc = tls13_read_ref(&t->link.tls, &in, &n);
+            if (rc) return rc;
+        }
+        if (!n) return 0;
+        if (s->phase == H1_DEFER) return TR_EWSFRAME;
+        size_t used = 0;
+        rc = tr_h1_lazy(t, 1, in, n, &used);
+        if (rc <= 0) return rc;
+        rc = q_flush(t);
+        if (rc) return rc;
+        rc = tr_ws_parse(r, in + used, n - used, d, cap, &on);
+    } else if (s->stash) {
         /* Сначала то, что приехало вместе с ответом 101. */
         size_t left = s->stash_n - s->stash_off;
         size_t take = left < cap ? left : cap;
@@ -259,7 +357,25 @@ static int ws_pending(const struct transport *t) {
     return t->h1.stash != NULL || t->h1.rx.closed;
 }
 
-static void ws_close(struct transport *t) { tr_h1_free(t); }
+/* Закрытие — как connection.Close у Xray: close с кодом 1000 и пустой причиной, затем сокет. Только
+ * после принятого 101 (до него кадров не было) и если close ещё не уходил (ответ на close сервера).
+ *
+ * Сокет на эту запись — неблокирующий. Закрытие идёт из цикла туннеля, и соединение может быть
+ * уже мёртвым с полным буфером отправки: блокирующая запись стояла бы там до срока сокета (у Xray
+ * — до 5 секунд, но горутина соединения своя). Кадр в 8 байт в исправное соединение уходит всегда;
+ * не ушёл — значит и доставлять его было некому. */
+static void ws_close(struct transport *t) {
+    struct h1_state *s = &t->h1;
+    if (s->upgraded && !s->rx.close_sent && t->link.fd >= 0) {
+        s->rx.close_sent = 1;
+        int fl = fcntl(t->link.fd, F_GETFL, 0);
+        if (fl >= 0 && fcntl(t->link.fd, F_SETFL, fl | O_NONBLOCK) == 0) {
+            static const unsigned char c[2] = { 0x03, 0xE8 };
+            (void)ws_control(t, 8, c, 2);
+        }
+    }
+    tr_h1_free(t);
+}
 
 const struct transport_ops tr_ws = {
     .name = "ws", .alpn = "http/1.1", .zc = 0,
