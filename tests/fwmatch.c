@@ -150,6 +150,67 @@ static const char RS_ONLY_STEER[] =
 "	}\n"
 "}\n";
 
+/* ---- подмена по семействам (с 1.10, шаг 8): masq и masq6 зоны fw4 — разные правила ----------
+ *
+ * Зона vpn с одним masq6 (`option masq6 '1'` без masq): у fw4 это правило `meta nfproto ipv6
+ * masquerade`. Прежде оно засчитывалось и за IPv4 — выход получал «NAT есть» при IPv4, уходящем в
+ * туннель с адресами локальной сети. */
+static const char RS_MASQ6_ONLY[] =
+"table inet fw4 {\n"
+"	chain srcnat {\n"
+"		type nat hook postrouting priority srcnat; policy accept;\n"
+"		oifname \"wg0\" jump srcnat_vpn comment \"!fw4: Handle vpn IPv4/IPv6 srcnat traffic\"\n"
+"	}\n"
+"	chain srcnat_vpn {\n"
+"		meta nfproto ipv6 masquerade comment \"!fw4: Masquerade IPv6 vpn traffic\"\n"
+"	}\n"
+"}\n";
+
+/* Зона с masq и masq6 — оба правила в одной цепочке. */
+static const char RS_MASQ_BOTH[] =
+"table inet fw4 {\n"
+"	chain srcnat {\n"
+"		type nat hook postrouting priority srcnat; policy accept;\n"
+"		oifname \"wg0\" jump srcnat_vpn comment \"!fw4: Handle vpn IPv4/IPv6 srcnat traffic\"\n"
+"	}\n"
+"	chain srcnat_vpn {\n"
+"		meta nfproto ipv4 masquerade comment \"!fw4: Masquerade IPv4 vpn traffic\"\n"
+"		meta nfproto ipv6 masquerade comment \"!fw4: Masquerade IPv6 vpn traffic\"\n"
+"	}\n"
+"}\n";
+
+/* Руками: правило без семейства в inet — подменяет оба; в таблице ip6 — только IPv6; в ip —
+ * только IPv4. */
+static const char RS_HAND_FAMS[] =
+"table inet hand {\n"
+"	chain post {\n"
+"		type nat hook postrouting priority srcnat; policy accept;\n"
+"		oifname \"wga\" masquerade\n"
+"	}\n"
+"}\n"
+"table ip6 hand6 {\n"
+"	chain post {\n"
+"		type nat hook postrouting priority srcnat; policy accept;\n"
+"		oifname \"wgb\" masquerade\n"
+"	}\n"
+"}\n"
+"table ip hand4 {\n"
+"	chain post {\n"
+"		type nat hook postrouting priority srcnat; policy accept;\n"
+"		oifname \"wgc\" masquerade\n"
+"	}\n"
+"}\n";
+
+static void probe6(const char *what, const char *ruleset, const char *device, int want4,
+                   int want6) {
+    char label[256];
+    struct fwcheck r = fw_check_dump(ruleset, device);
+    snprintf(label, sizeof(label), "%s — masquerade IPv4", what);
+    check(label, r.masqueraded, want4);
+    snprintf(label, sizeof(label), "%s — masquerade IPv6", what);
+    check(label, r.masq6, want6);
+}
+
 /* Похоже на полный fw4 25.12: безымянные наборы устройств зоны, карта вердиктов ct state, flowtable
  * на устройстве, карта вердиктов по устройству (так пишут руками), маска имени, oif по номеру,
  * fib и префикс log. Нужно только для второй части стенда — печати набора правил от ядра. */
@@ -262,6 +323,8 @@ static void kernel_probe(const char *what, const char *rs, const char *dir,
     check(label, k.in_firewall, t.in_firewall);
     snprintf(label, sizeof(label), "%s — %s masquerade: ядро и nft", what, device);
     check(label, k.masqueraded, t.masqueraded);
+    snprintf(label, sizeof(label), "%s — %s masquerade IPv6: ядро и nft", what, device);
+    check(label, k.masq6, t.masq6);
     if (want_in_firewall >= 0) {
         snprintf(label, sizeof(label), "%s — %s в firewall (ядро)", what, device);
         check(label, k.in_firewall, want_in_firewall);
@@ -283,12 +346,14 @@ static void kernel_part(void) {
         fprintf(stderr, "fwmatch: dummy-устройства нет — flowtable не проверен\n");
     static const char *const devs[] = {
         "warp0", "warp", "br-lan", "wan", "tun0", "proton_nl", "eth1", "pppoe-wan", "eth0",
-        "wg0", "wg1", "fwm0", "lo", "wanlog0",
+        "wg0", "wg1", "fwm0", "lo", "wanlog0", "wga", "wgb", "wgc",
     };
     const struct { const char *what, *rs; } sets[] = {
         { "зона = устройство", RS_ZONE_EQ_DEVICE }, { "зона переименована", RS_ZONE_RENAMED },
         { "зона без masquerade", RS_ZONE_NO_MASQ }, { "snat", RS_SNAT_RENAMED },
         { "только steer", RS_ONLY_STEER }, { "полный fw4", RS_FW4_FULL },
+        { "только masq6", RS_MASQ6_ONLY }, { "masq и masq6", RS_MASQ_BOTH },
+        { "руками по семействам", RS_HAND_FAMS },
     };
     for (size_t i = 0; i < sizeof(sets) / sizeof(sets[0]); i++) {
         const char *rs = sets[i].rs;
@@ -316,6 +381,24 @@ static void kernel_part(void) {
         kernel_probe("полный fw4", RS_FW4_FULL, dir, "warp0", 0, 0);
         kernel_probe("полный fw4", RS_FW4_FULL, dir, "wanlog0", 1, 0);
     }
+    /* Семейство подмены — и в тексте от ядра (слово `meta nfproto`, nftdump.c): masq6 зоны не
+     * засчитывается за IPv4 и там. */
+    if (kernel_load(RS_MASQ6_ONLY, dir) == 0) {
+        fwcheck_reset_cache();
+        struct fwcheck k = fw_check("wg0");
+        check("ядро: зона только с masq6 — IPv4", k.masqueraded, 0);
+        check("ядро: зона только с masq6 — IPv6", k.masq6, 1);
+    } else g_fail++;
+    if (kernel_load(RS_HAND_FAMS, dir) == 0) {
+        fwcheck_reset_cache();
+        struct fwcheck a = fw_check("wga"), b = fw_check("wgb"), c = fw_check("wgc");
+        check("ядро: без семейства в inet — IPv4", a.masqueraded, 1);
+        check("ядро: без семейства в inet — IPv6", a.masq6, 1);
+        check("ядро: таблица ip6 — IPv4", b.masqueraded, 0);
+        check("ядро: таблица ip6 — IPv6", b.masq6, 1);
+        check("ядро: таблица ip — IPv4", c.masqueraded, 1);
+        check("ядро: таблица ip — IPv6", c.masq6, 0);
+    } else g_fail++;
     char cmd[300];
     snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
     if (system(cmd) != 0) { /* временный каталог остался — не повод проваливать стенд */ }
@@ -349,6 +432,15 @@ int main(void) {
 
     /* 8. Собственная таблица движка не доказывает ни зоны, ни NAT. */
     probe("только table inet steer", RS_ONLY_STEER, "warp0", 0, 0);
+
+    /* 9. Подмена по семействам: masq и masq6 зоны — разные вопросы. */
+    probe6("зона только с masq6", RS_MASQ6_ONLY, "wg0", 0, 1);
+    probe6("зона с masq и masq6", RS_MASQ_BOTH, "wg0", 1, 1);
+    probe6("зона только с masq", RS_ZONE_RENAMED, "warp0", 1, 0);
+    probe6("правило без семейства в inet", RS_HAND_FAMS, "wga", 1, 1);
+    probe6("правило в таблице ip6", RS_HAND_FAMS, "wgb", 0, 1);
+    probe6("правило в таблице ip", RS_HAND_FAMS, "wgc", 1, 0);
+    probe6("snat IPv4 в зоне", RS_SNAT_RENAMED, "proton_nl", 1, 0);
 
     /* ---- чем объясняется совпадение в explain -----------------------------------
      *

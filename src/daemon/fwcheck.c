@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <time.h>
+#include <ifaddrs.h>
 
 #include "spec.h"
 #include "awg.h"
@@ -159,8 +160,39 @@ struct fwcheck fw_check(const char *device) {
     return fw_check_dump(nl_dump(), device);
 }
 
+/* Семейства правила подмены — битами: 1 — IPv4, 2 — IPv6.
+ *
+ * ПО СЕМЕЙСТВАМ (с 1.10, шаг 8). fw4 пишет masquerade зоны правилом на семейство: `meta nfproto
+ * ipv4 masquerade` — это masq зоны, `meta nfproto ipv6 masquerade` — masq6 (шаблон
+ * zone-masq.uc). Прежде проверка засчитывала любое такое правило за оба семейства, и выход с одним
+ * masq6 получал «NAT есть» для IPv4 (а с одним masq — для IPv6, которого нет). Выход, несущий
+ * IPv6, без подмены IPv6 отправляет в туннель адреса клиентов как есть — и ответ не вернётся,
+ * если хост их не маршрутизует; ровно это diag и должен называть отдельно.
+ *
+ * Откуда семейство: слово `nfproto ipv4|ipv6` в правиле (его печатает и nft, и текст от ядра —
+ * nftdump.c), иначе адреса в правиле (`ip saddr`, `ip6 daddr` — у nft зависимость от семейства не
+ * печатается), иначе семейство таблицы: ip — IPv4, ip6 — IPv6, inet — оба. Правило без семейства в
+ * inet (`oifname "wg0" masquerade`, как пишут руками) подменяет оба — так его и считаем. */
+static unsigned rule_fams(const char *line, unsigned table_fams) {
+    if (strstr(line, "nfproto ipv4")) return 1;
+    if (strstr(line, "nfproto ipv6")) return 2;
+    if (strstr(line, "ip6 saddr") || strstr(line, "ip6 daddr") || strstr(line, "snat ip6 to"))
+        return 2;
+    if (strstr(line, "ip saddr") || strstr(line, "ip daddr") || strstr(line, "snat ip to"))
+        return 1;
+    return table_fams;
+}
+
+static unsigned table_fams_of(const char *line) {
+    const char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!strncmp(p, "table ip6 ", 10)) return 2;
+    if (!strncmp(p, "table ip ", 9)) return 1;
+    return 3;
+}
+
 struct fwcheck fw_check_dump(const char *dump, const char *device) {
-    struct fwcheck r = { 0, 0 };
+    struct fwcheck r = { 0, 0, 0 };
     /* Зона может называться не так, как устройство, и тогда оба признака ниже молчат:
      * fw4 пишет имя ЗОНЫ и в имя цепочки (`srcnat_vpn`), и в комментарий правила
      * ("Masquerade IPv4 vpn traffic"), а устройство называет ТОЛЬКО на переходе в эту
@@ -171,8 +203,11 @@ struct fwcheck fw_check_dump(const char *dump, const char *device) {
      * засчитывается вместе со своим содержимым. Порядок строк не предполагается: дамп
      * может назвать цепочку и до перехода, и после, поэтому оба множества собираются за
      * один проход и пересекаются в конце. */
-    char dev_chain[FWC_CHAINS][64], masq_chain[FWC_CHAINS][64];
-    size_t dev_chain_n = 0, masq_chain_n = 0;
+    /* Цепочки с подменой — по семейству отдельно (masq_chain[0] — IPv4, [1] — IPv6): у зоны fw4 в
+     * одной цепочке srcnat_<зона> бывает одно правило, другое или оба. */
+    char dev_chain[FWC_CHAINS][64], masq_chain[2][FWC_CHAINS][64];
+    size_t dev_chain_n = 0, masq_chain_n[2] = { 0, 0 };
+    unsigned tfams = 3;
     /* Без содержимого именованных наборов (как у `nft -t`): проверка смотрит на имена
      * устройств в правилах и цепочках, а элементы наборов ей не нужны — при этом их бывают
      * десятки тысяч, и полный дамп на слабом роутере стоил секунды НА КАЖДЫЙ ВЫЗОВ. */
@@ -188,6 +223,7 @@ struct fwcheck fw_check_dump(const char *dump, const char *device) {
             if (strstr(line, want)) in_steer = 1;
             else if (!strncmp(line, "table ", 6)) in_steer = 0;
         }
+        if (!strncmp(line, "table ", 6)) tfams = table_fams_of(line);
         if (in_steer) continue;
 
         const char *c = strstr(line, "chain ");
@@ -210,17 +246,24 @@ struct fwcheck fw_check_dump(const char *dump, const char *device) {
             remember_chain(dev_chain, &dev_chain_n, t);
         }
         if (strstr(line, "masquerade") || strstr(line, "snat")) {
-            if (names_device(line, device) || names_device(chain, device)) r.masqueraded = 1;
-            else {
+            unsigned f = rule_fams(line, tfams);
+            if (names_device(line, device) || names_device(chain, device)) {
+                if (f & 1) r.masqueraded = 1;
+                if (f & 2) r.masq6 = 1;
+            } else {
                 char t[64];
                 chain_token(chain, t, sizeof t);
-                remember_chain(masq_chain, &masq_chain_n, t);
+                for (int k = 0; k < 2; k++)
+                    if (f & (1u << k)) remember_chain(masq_chain[k], &masq_chain_n[k], t);
             }
         }
     }
-    for (size_t i = 0; i < dev_chain_n && !r.masqueraded; i++)
-        for (size_t k = 0; k < masq_chain_n; k++)
-            if (!strcmp(dev_chain[i], masq_chain[k])) { r.masqueraded = 1; break; }
+    for (int fam = 0; fam < 2; fam++) {
+        int *got = fam ? &r.masq6 : &r.masqueraded;
+        for (size_t i = 0; i < dev_chain_n && !*got; i++)
+            for (size_t k = 0; k < masq_chain_n[fam]; k++)
+                if (!strcmp(dev_chain[i], masq_chain[fam][k])) { *got = 1; break; }
+    }
     return r;
 }
 
@@ -322,6 +365,26 @@ int report_mark_overlap(void) {
     return n_said;
 }
 
+/* Есть ли у клиентов IPv6 наружу: глобальный адрес IPv6 (не fe80::/10) на одном из устройств
+ * раздачи. Роутер раздаёт клиентам префиксы своих адресов (odhcpd), и без такого адреса на
+ * устройстве раздачи у клиентов нет IPv6 дальше своей сети — спрашивать про его подмену незачем,
+ * и строка «нет masquerade IPv6» была бы постоянной ложной тревогой. Адреса — getifaddrs
+ * (netlink внутри libc), без процесса: зовут diag в процессе демона и apply. */
+int lan_has_global_v6(const struct spec *sp) {
+    struct ifaddrs *ifa = NULL;
+    if (getifaddrs(&ifa) != 0) return 0;
+    int yes = 0;
+    for (struct ifaddrs *p = ifa; p && !yes; p = p->ifa_next) {
+        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET6 || !p->ifa_name) continue;
+        const struct in6_addr *a = &((const struct sockaddr_in6 *)p->ifa_addr)->sin6_addr;
+        if (IN6_IS_ADDR_LINKLOCAL(a) || IN6_IS_ADDR_LOOPBACK(a)) continue;
+        for (size_t i = 0; i < sp->lan_dev_n && !yes; i++)
+            if (!strcmp(p->ifa_name, sp->lan_dev[i])) yes = 1;
+    }
+    freeifaddrs(ifa);
+    return yes;
+}
+
 /* Только на платформе с fw4 (plat()->fw4) — см. конец cmd_apply. */
 void report_output_deps(const struct spec *sp) {
     for (size_t i = 0; i < sp->out_n; i++) {
@@ -352,11 +415,18 @@ void report_output_deps(const struct spec *sp) {
         else if (out_self_natting(out_for_device(sp, &sp->out[i], sp->out[i].device))) {
             /* нечего проверять */
         }
-        else if (!c.masqueraded)
-            fprintf(stderr, LOG_W "output %s: no masquerade/snat rule found for %s — "
-                            "if that path needs NAT, packets leave with LAN addresses and "
-                            "the channel goes quiet while its counter still rises\n",
-                    sp->out[i].name, sp->out[i].device);
+        else {
+            if (!c.masqueraded)
+                fprintf(stderr, LOG_W "output %s: no masquerade/snat rule found for %s — "
+                                "if that path needs NAT, packets leave with LAN addresses and "
+                                "the channel goes quiet while its counter still rises\n",
+                        sp->out[i].name, sp->out[i].device);
+            /* IPv6 — своим вопросом (fw_check по семействам, шаг 8 выпуска 1.10): masq6 зоны. */
+            if (!c.masq6 && out_route6(&sp->out[i]) && lan_has_global_v6(sp))
+                fprintf(stderr, LOG_W "output %s: у %s нет masquerade IPv6 — IPv6 клиентов уйдёт "
+                                "в туннель с их адресами, и ответ не вернётся; включите masq6 у "
+                                "зоны выхода\n", sp->out[i].name, sp->out[i].device);
+        }
     }
 }
 

@@ -238,6 +238,12 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
                    sp->out[i].device, up ? "true" : "false", failed ? ",\"failed\":true" : "",
                    sp->out[i].mark, sp->out[i].table,
                    c.in_firewall ? "true" : "false", c.masqueraded ? "true" : "false");
+            /* С 1.10 `nat` — подмена IPv4 (masq зоны), а `nat6` — IPv6 (masq6), отдельно
+             * (fw_check по семействам, fwcheck.c): прежде одно поле засчитывало любое правило
+             * masquerade за оба. `nat6` — только у выхода, который несёт IPv6 (out_route6): у
+             * остальных IPv6 его правил отвергается, и вопрос о подмене не стоит. */
+            if (out_route6(&sp->out[i]))
+                fprintf(out, ",\"nat6\":%s", c.masq6 ? "true" : "false");
             /* Кандидаты и режим отказа: без них failover не виден из интерфейса, и
              * человек не может понять, почему выход вдруг ведёт в другое устройство. */
             /* Ход подъёма — рядом с up, а не отдельным вызовом: интерфейс уже читает

@@ -662,6 +662,21 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
             diag("output", "ok", what,
                  kind_of(nat_o)->selfnat_why ? kind_of(nat_o)->selfnat_why : "");
         }
+        /* ПОДМЕНА IPv6 — ОТДЕЛЬНЫМ ВОПРОСОМ (с 1.10, шаг 8). Выход, несущий IPv6 (out_route6),
+         * отправляет в туннель IPv6 клиентов с их адресами — провайдерскими или ULA, — и ответ
+         * вернётся, только если адреса подменены (masq6 зоны) или хост их маршрутизует. Прежде
+         * строкой выше засчитывалось любое правило masquerade, в том числе одно IPv4, и о
+         * половине IPv6 diag молчал. Говорим, только когда у клиентов вообще есть IPv6 наружу
+         * (глобальный адрес на устройстве раздачи): без него вопроса нет, и строка была бы
+         * постоянной ложной тревогой. */
+        if (c.in_firewall && out_route6(&sp->out[i]) && !out_self_natting(nat_o) && !c.masq6 &&
+            lan_has_global_v6(sp)) {
+            snprintf(what, sizeof(what), "выход %.40s: у %.24s нет masquerade IPv6",
+                     sp->out[i].name, sp->out[i].device);
+            diag("output_nat6", "warn", what,
+                 "IPv6 клиентов уйдёт в туннель с их адресами, и ответ не вернётся — включите "
+                 "masq6 у зоны выхода");
+        }
     }
 
     /* 8. Свои проверки видов (kind_ops.diag): обфускация транспорта у interface, обработчик

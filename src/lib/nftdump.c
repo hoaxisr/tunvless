@@ -1017,7 +1017,11 @@ static void flowtables_cb(const struct nlmsghdr *h, void *arg) {
 
 /* ---- правило строкой ----------------------------------------------------------------------- */
 
-enum rk { RK_NONE, RK_IFNAME, RK_IFINDEX, RK_CTSTATE, RK_CTSTATUS };
+/* RK_NFPROTO — `meta nfproto`: семейство, для которого правило в таблице inet написано. Печатается
+ * ради fw_check (src/daemon/fwcheck.c): fw4 пишет masquerade зоны двумя правилами — `meta nfproto
+ * ipv4 masquerade` (masq) и `meta nfproto ipv6 masquerade` (masq6), — и проверка NAT по семействам
+ * (шаг 8 выпуска 1.10) без этого слова в тексте от ядра засчитала бы masq6 за IPv4, как раньше. */
+enum rk { RK_NONE, RK_IFNAME, RK_IFINDEX, RK_CTSTATE, RK_CTSTATUS, RK_NFPROTO };
 
 struct rctx {
     struct rs *r;
@@ -1082,6 +1086,11 @@ static void put_value(struct sbuf *s, enum rk k, const uint8_t *d, size_t l) {
         uint32_t v;
         memcpy(&v, d, 4);
         put_bits(s, k, v);
+    } else if (k == RK_NFPROTO && l >= 1) {
+        /* NFPROTO_IPV4 = 2, NFPROTO_IPV6 = 10 — так их и пишет nft (`meta nfproto ipv4`). */
+        char num[8];
+        snprintf(num, sizeof(num), "%u", d[0]);
+        put_word(s, d[0] == NFPROTO_IPV4 ? "ipv4" : d[0] == NFPROTO_IPV6 ? "ipv6" : num);
     }
 }
 
@@ -1119,6 +1128,7 @@ static void expr_meta(struct rctx *c, const struct nlattr *data) {
     case NFT_META_OIFNAME: c->kind[sl] = RK_IFNAME; put_word(c->s, "oifname"); break;
     case NFT_META_IIF: c->kind[sl] = RK_IFINDEX; put_word(c->s, "iif"); break;
     case NFT_META_OIF: c->kind[sl] = RK_IFINDEX; put_word(c->s, "oif"); break;
+    case NFT_META_NFPROTO: c->kind[sl] = RK_NFPROTO; put_word(c->s, "meta nfproto"); break;
     default: c->kind[sl] = RK_NONE; break;
     }
 }
