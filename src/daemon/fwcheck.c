@@ -89,7 +89,7 @@ static void remember_chain(char tab[FWC_CHAINS][64], size_t *n, const char *name
  *
  * ТЕКСТ ОТ ЯДРА ПО NETLINK (nl_dump) — для fw_check, то есть для status и diag. status интерфейс
  * опрашивает раз в несколько секунд, и `sh -c nft -t list ruleset` на каждый вызов — два
- * процесса ради одного вопроса (docs/architecture.md, «Замечания проверки 1.8»). Текст
+ * процесса ради одного вопроса (docs/architecture.md, «4а», «Сокет и протокол»). Текст
  * собирает src/lib/nftdump.c в форме `nft -t list ruleset` — ровно в объёме того, что читает
  * fw_check ниже, — и разбор остаётся одним: тем, что закрыт стендом fwmatch на дампах с живого
  * fw4. Стенд же сверяет, что оба текста дают fw_check один ответ на наборе правил в ядре.
@@ -108,8 +108,8 @@ static void remember_chain(char tab[FWC_CHAINS][64], size_t *n, const char *name
 static char *g_nft_dump, *g_nl_dump;
 
 /* Сброс кэша дампа — единственное, что стенду нужно от него самого, а не через fw_check().
- * Кэши — static (правило 4, docs/architecture.md, раздел 4: только то, что пересекает границу
- * файла, выходит из static, и то функцией, а не голым указателем). */
+ * Кэши — static (правило юнит-стендов, docs/architecture.md, раздел 4: только то, что
+ * пересекает границу файла, выходит из static, и то функцией, а не голым указателем). */
 void fwcheck_reset_cache(void) {
     free(g_nft_dump);
     g_nft_dump = NULL;

@@ -1,6 +1,6 @@
 #!/bin/sh
-# `/etc/init.d/network restart` под трафиком (проверка на QEMU 04664a5, OpenWrt 25.12.5;
-# docs/architecture.md, раздел 5, «Замечания проверки на QEMU 04664a5 (2026-09-28)»).
+# `/etc/init.d/network restart` под трафиком (проверка на QEMU 04664a5, OpenWrt 25.12.5,
+# 2026-09-28; устройство — docs/architecture.md, раздел 4а, «Страж правил»).
 #
 # Что было. netifd при старте снимает все правила ip rule и ставит свои (local, main, default) —
 # вместе с ними пропадает правило fwmark выхода, а br-lan пересоздаётся, и ядро снимает с него

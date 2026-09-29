@@ -1,5 +1,5 @@
 #!/bin/sh
-# Демон целиком, как его держит один сервис (docs/architecture.md, раздел 4а, шаг 6): `steerd
+# Демон целиком, как его держит один сервис (docs/architecture.md, раздел 4а): `steerd
 # daemon --watch --supervise --apply` в своём сетевом пространстве с настоящим nft, и клиент
 # `steer` (src/client/main.c) — тот, которым пользуются rpcd, init.d и человек.
 #

@@ -61,7 +61,7 @@ THIRD_DEFS := -DHAVE_CONFIG_H
 # поле роутера в plat(), так что платформа без профиля не компонуется.
 PLATFORM_SRC := src/platform/platform.c src/platform/openwrt.c src/platform/android.c src/profile/profile.c
 
-# Чтение YAML (docs/architecture.md, «4в. Устройство 1.9», шаг 2): событийный парсер libyaml 0.2.5
+# Чтение YAML (docs/architecture.md, «3. Спека v2»): событийный парсер libyaml 0.2.5
 # (src/third_party/libyaml, MIT; только разбор — без загрузчика и эмиттера) и обёртка движка
 # src/lib/ynode.c, которая строит из событий дерево с пределами и отказом на алиасах. В ядре, а
 # не в полном пакете: спеку v2 читает и мини-движок, и полный. JSON спеки v1 читается тем же
@@ -96,7 +96,7 @@ MODEL_SRC := $(PLATFORM_SRC) src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src
 # ниже), а resolver-типов ctnl.h больше не подключает.
 #
 # DNSD_TABLE_SRC — сборка и разбор таблицы доменных каналов (src/dnsd/tabfmt.h, docs/
-# architecture.md, раздел 4а, шаг 1): table.c (dch_build — то же построение, что и раньше) и
+# architecture.md, раздел 4а, «dnsd»): table.c (dch_build — то же построение, что и раньше) и
 # tabfmt.c (текст ↔ g_dch). Отдельной переменной, а не прямо в DNSD_SRC, потому что демону 1.8
 # они понадобятся БЕЗ остального резолвера (сети, epoll, fake-IP) — он таблицу только собирает
 # и шлёт в трубу, обслуживать LAN не обслуживает сам. Сегодня это подмножество DNSD_SRC (один
@@ -136,8 +136,8 @@ CORE_SRC := src/lib/run.c src/lib/jsonw.c src/lib/evline.c src/compile/groups.c 
             src/daemon/folat.c src/lib/ctlcall.c \
             $(KINDS_BASE_SRC)
 
-# Слой криптографических примитивов (src/lib/scrypto.h, docs/architecture.md, «1.10 — решения
-# владельца», шаг 1): единственный файл движка, который видит wolfSSL. Лежит в src/lib, потому
+# Слой криптографических примитивов (src/lib/scrypto.h, docs/architecture.md, «Криптография»):
+# единственный файл движка, который видит wolfSSL. Лежит в src/lib, потому
 # что это кирпич библиотеки (в 1.10 он уходит в libsteer.so вместе с TLS и стеком), но в профиль
 # base не входит: базовому движку криптография не нужна, и библиотеки в его сборке нет. Поэтому
 # отдельной переменной — как KINDS_EXT_SRC, у которых тот же расклад: каталог ядра, профили

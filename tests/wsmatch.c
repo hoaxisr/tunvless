@@ -9,7 +9,7 @@
  *     ниже сняты программой на net/url и net/http Go 1.22, повторяющей код Xray (infra/conf Build,
  *     websocket/dialer.go с gorilla client.go, httpupgrade/dialer.go) с нашей версией Chrome. Порядок
  *     заголовков и `%3F` у httpupgrade сверх того сверены перехватом настоящего Xray 26.3.27
- *     (в docker, см. docs/architecture.md, «1.10 — ход работ», шаг 5);
+ *     (в docker);
  *   - Sec-WebSocket-Accept — против примера RFC 6455 (1.3);
  *   - кадр клиента — против примера RFC 6455 (5.7, «Hello» с маской 37 fa 21 3d);
  *   - разбор кадров сервера — фрагменты, служебный кадр посреди сообщения, длины 125/126/65536,

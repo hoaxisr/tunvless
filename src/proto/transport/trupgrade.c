@@ -12,7 +12,7 @@
  * (transport/internet/websocket/dialer.go, httpupgrade/dialer.go), а не sing-box: у Xray облик
  * Chrome (common/utils/browser.go, applyMasqueradedHeaders с вариантом "ws"), у sing-box —
  * «Go-http-client/1.1», то есть заведомо не браузер. Сверено перехватом Xray 26.3.27 (клиент в
- * docker, сервер — слушающий сокет; как — docs/architecture.md, «1.10 — ход работ», шаг 5):
+ * docker, сервер — слушающий сокет):
  *
  *   GET /p/q?x=1 HTTP/1.1                         ← ws; у httpupgrade `?` уезжает как %3F
  *   Host: cdn.example.com                         ← host, иначе sni, иначе адрес узла

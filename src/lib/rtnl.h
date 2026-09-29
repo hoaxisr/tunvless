@@ -66,8 +66,8 @@ int rtnl_route6_backstop(int table, int metric);
 /* `ip -4 route flush table TABLE`: снять всё, что в таблице лежит. 0 или errno. */
 int rtnl_table_flush(int table);
 
-/* Вопросы diag — те, что он задавал запуском `ip` (docs/architecture.md, «Замечания проверки
- * 1.8»: diag стоил около двадцати процессов).
+/* Вопросы diag — те, что он задавал запуском `ip` (diag стоил около двадцати процессов;
+ * docs/architecture.md, «4а», «Сокет и протокол»).
  *
  * Есть ли маршрут IPv6 по умолчанию в таблице main — `ip -6 route show default | grep -q .`:
  * 1 — есть, 0 — нет, -1 — спросить не вышло. */

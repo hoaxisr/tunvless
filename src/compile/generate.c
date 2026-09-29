@@ -330,7 +330,7 @@ static size_t g_ctr_up_n, g_ctr_down_n;
  *
  * Спрашивается ядро по netlink (src/lib/nftdump.c), а не `nft -a list chain`: status интерфейс
  * опрашивает раз в несколько секунд, и запуск `sh -c nft …` на каждый вызов был половиной его
- * цены в процессах (docs/architecture.md, «Замечания проверки 1.8»). Имя канала — в комментарии
+ * цены в процессах (docs/architecture.md, «4а», «Сокет и протокол»). Имя канала — в комментарии
  * правила (userdata, как его пишет nft), число — в выражении counter того же правила. */
 static void ctr_take(void *arg, const char *comment, int has_counter,
                      uint64_t packets, uint64_t bytes) {
@@ -865,7 +865,7 @@ static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const s
  *   91,8 тыс. пакетов/с с ingress против 93,4 тыс. только в prerouting и 134,7 тыс. без движка
  *   (серия из семи кругов — 94,1, 98,9 и 139,9) — пересылка пакета на 2-5 % дороже, разбросы
  *   перекрываются; TCP на veth с GRO — в пределах разброса.
- *   Числа и доводы — docs/architecture.md, раздел 5, «inet ingress». */
+ *   Устройство — docs/architecture.md, раздел 2, «Набор правил», «Разметка на ingress». */
 static size_t ingress_devs(const struct spec *sp, const struct groups *gr, const char **devs) {
     if (!(g_nftc & NFTC_INGRESS) || (g_nftc & NFTC_LEGACY)) return 0;
     if (!plat()->lan_devs_persist || !steer_ingress_seen_ok()) return 0;
@@ -1148,7 +1148,7 @@ static void build_forward_v6(struct nft_table *t, const struct spec *sp, const s
 
 /* ---- ПОМЕЧЕННЫЙ ПАКЕТ НЕ ТУДА — НИКУДА: postrouting_guard ------------------------------------
  *
- * ЧТО СЛУЧИЛОСЬ (проверка на QEMU 04664a5, OpenWrt 25.12.5, docs/architecture.md, раздел 5).
+ * ЧТО СЛУЧИЛОСЬ (проверка на QEMU 04664a5, OpenWrt 25.12.5).
  * `/etc/init.d/network restart`: netifd при старте снимает ВСЕ правила ip rule и ставит свои
  * (local, main, default), и вместе с ними пропадает наше `fwmark <метка>/<маска> lookup <таблица>`.
  * Разметка при этом цела — prerouting_mark метит, dnat fake-IP подменяет адрес, — а правила нет:

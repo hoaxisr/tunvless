@@ -166,7 +166,7 @@ snapshot-record: all $(BUILD)/steer-android $(BUILD)/tgwssim
 # пропускается, а не падает.
 #
 # wolfSSL для телефона. В дереве прошивки она будет своим репозиторием (external/der-wolfssl, форк
-# в der-exp — шаг 6 выпуска 1.10, docs/architecture.md) с Android.bp из build/wolfssl/Android.bp.
+# в der-exp — шаг 6 выпуска 1.10) с Android.bp из build/wolfssl/Android.bp.
 # Пока форка нет, цель собирает ровно его: исходники того же выпуска, что у роутера (скачивание со
 # сверкой суммы — build/wolfssl/fetch.sh, NDK_WOLFSSL переопределяет каталог готовых исходников),
 # и тот Android.bp рядом с ними. Так проверяется то, что потом соберёт Soong, а не заменитель.
@@ -309,7 +309,8 @@ $(BUILD)/obfsmatch: tests/obfsmatch.c src/proto/obfs/obfs.c src/proto/obfs/obfs.
 
 # Выход kind=awg без ядра: разбор файла awg-quick, спека, побайтная сборка сообщений netlink.
 # Модель (MODEL_SRC) линкуется отдельным объектом, src/kinds/awg.c — по-прежнему #include
-# (вне пяти каталогов правила 4, docs/architecture.md, раздел 4) — см. шапку tests/awgmatch.c.
+# (вне пяти каталогов правила юнит-стендов, docs/architecture.md, раздел 4) — см. шапку
+# tests/awgmatch.c.
 # Дважды — роутерная и Android-сборка: у них разная метка сокета туннеля без via (0 против
 # STEER_SELF_MARK). С ядром — tests/awgns.sh.
 $(BUILD)/awgmatch: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/lib/nlbuf.h $(MODEL_KINDS) src/model/spec.h
