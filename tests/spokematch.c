@@ -34,9 +34,9 @@
 #include "../src/proto/xsteer/xsclient.c"
 #include "unit.h"
 
-/* Заглушки того, что живёт в src/lib/run.c и src/daemon/failover.c: ни команд, ни устройств стенду не нужно. */
+/* Заглушка того, что живёт в src/lib/run.c: ни команд, ни устройств стенду не нужно. Заглушки
+ * bind_device (src/daemon/failover.c) нет: с 1.10 (шаг 3) клиент xsteer маршрут не привязывает. */
 int run_quiet(const char *const argv[]) { (void)argv; return 0; }
-void bind_device(struct output *o, const char *dev) { (void)o; (void)dev; }
 
 /* Ключи в том виде, в каком их оставляет split_keys: AES-128, контекст развёрнут.
  * Именно AES, а не ChaCha: при mbedtls в куче лежал контекст только у AES внутри GCM, и на нём

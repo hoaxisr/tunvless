@@ -90,7 +90,9 @@ int run_quiet(const char *const argv[]) {
 }
 
 #include "../src/model/spec.h"
-void bind_device(struct output *o, const char *dev) { (void)o; (void)dev; }
+/* Заглушки bind_device здесь больше нет: с 1.10 (шаг 3) стек маршрут не привязывает — это работа
+ * демона по up с именем устройства (src/daemon/supd.c, route_up), и стек без failover.c
+ * компонуется сам. Вернись вызов в stack.c — стенд не соберётся, и это нарочно. */
 
 #include "jsonw.h"
 #include "../src/tunnel/stack.c"
@@ -433,7 +435,7 @@ static void run_bad(void *arg) {
     /* Имя длиннее 15 символов: tun_open откажет и сам, так что устройство не появится ни до
      * правки, ни после — различается только названа ли причина. */
     snprintf(o.device, sizeof(o.device), "tunnelmatch-no-such-dev");
-    g_run_rc = vless_tunnel_run(&o, arg);
+    g_run_rc = vless_tunnel_run(&o, arg, NULL, NULL);
 }
 
 /* I-097: UUID узла не разбирается. Прежде соединение закрывалось молча — ни строки, ни

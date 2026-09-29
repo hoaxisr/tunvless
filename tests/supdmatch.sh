@@ -600,7 +600,8 @@ upline='{"ev":"up"}' downline='{"ev":"down","why":"стенд: отказ"}'
 case "\$1 \$2" in
 nfqws*) while :; do sleep 0.1; done ;;
 "vless vl") printf '{"ev":"node","n":2,"total":5}\n' >&9; while :; do sleep 0.1; done ;;
-vless*) upline='{"ev":"up","watch":1}' downline='{"ev":"down","why":"стенд: узел молчит"}' ;;
+vless*) upline="{\"ev\":\"up\",\"watch\":1,\"dev\":\"\$2\"}" downline='{"ev":"down","why":"стенд: узел молчит"}' ;;
+xsteer*) upline="{\"ev\":\"up\",\"dev\":\"\$2\"}" ;;
 esac
 last=""
 while :; do
@@ -672,17 +673,47 @@ EOF
         "xsteer True True" \
         "$(wctl helper xa | python3 -c 'import json,sys; d=json.loads(json.load(sys.stdin)["stdout"]); print(d["helper"], d["running"], d["up"])' 2>&1)"
 
+    # Маршрут выхода помощника ставит демон по его up с устройством (1.10, шаг 3; src/daemon/supd.c,
+    # route_up): помощник-заглушка маршрута не трогает вовсе, а таблица выхода xa смотрит в xa и
+    # правило по метке стоит. Номер таблицы — из строки демона о привязке.
+    xat() { sed -n 's/.*supervise: xsteer xa — xa поднят, маршрут выхода привязан (таблица \([0-9]*\)).*/\1/p' "$W/d.err" | head -1; }
+    wait_for '[ -n "$(xat)" ]' 10
+    XT="$(xat)"
+    check "up с устройством: демон привязал маршрут выхода xa (строка в журнале)" "yes" \
+        "$([ -n "$XT" ] && echo yes)"
+    check "  таблица выхода xa — в устройство xa" "default dev xa" \
+        "$(ip route show table "${XT:-0}" 2>/dev/null | grep -o '^default dev xa')"
+    # Правило — фильтром по таблице, а не разбором вывода: ip печатает имя таблицы из rt_tables
+    # машины (steer_xa), если оно там есть.
+    xrule() { ip rule show table "${XT:-0}" 2>/dev/null | grep -c fwmark; }
+    check "  правило по метке выхода xa стоит" "1" "$(xrule)"
+    check "  и у vless va — тем же путём" "1" \
+        "$(grep -c 'supervise: vless va — va поднят, маршрут выхода привязан' "$W/d.err")"
+
     touch "$W/down.xa"
     wait_for 'grep -q "\"ev\":\"switched\",\"out\":\"vpn\",\"from\":\"xa\"" "$W/sub.out"' 40
     check "помощник xa пишет down — выход переключён на следующее устройство" \
         '{"v":1,"ev":"switched","out":"vpn","from":"xa","to":"xb","why":"down"}' \
         "$(grep '"ev":"switched","out":"vpn","from":"xa"' "$W/sub.out")"
     check "  status — новое устройство" '"xb"' "$(wst '["outputs"]["vpn"]["device"]')"
+    # down помощника — решает сторож, как прежде: у xa on_fail=direct, правило снято, таблица
+    # пуста (трафик выхода — напрямую). Второго пути решения у демона нет.
+    wait_for '[ -z "$(ip route show table "${XT:-0}" 2>/dev/null)" ]' 10
+    check "  down: сторож снял маршрут выхода xa (on_fail=direct)" "" \
+        "$(ip route show table "${XT:-0}" 2>/dev/null)"
+    check "  и правило по его метке" "0" "$(xrule)"
     rm -f "$W/down.xa"
     wait_for 'grep -q "\"ev\":\"switched\",\"out\":\"vpn\",\"from\":\"xb\"" "$W/sub.out"' 40
     check "помощник xa пишет up — возврат на него" \
         '{"v":1,"ev":"switched","out":"vpn","from":"xb","to":"xa","why":"preferred"}' \
         "$(grep '"ev":"switched","out":"vpn","from":"xb"' "$W/sub.out")"
+    # Снова up того же процесса: маршрут возвращает проход сторожа (was «-» → устройство), а
+    # демон по up второй раз не привязывает — привязка одна на подъём устройства.
+    wait_for '[ -n "$(ip route show table "${XT:-0}" 2>/dev/null | grep "^default dev xa")" ]' 10
+    check "  маршрут выхода xa вернулся (сторож)" "default dev xa" \
+        "$(ip route show table "${XT:-0}" 2>/dev/null | grep -o '^default dev xa')"
+    check "  демон по второму up того же процесса не привязывал" "1" \
+        "$(grep -c 'supervise: xsteer xa — xa поднят, маршрут выхода привязан' "$W/d.err")"
     check "  файлов probe-* и xsteer-*.json в каталоге состояния нет" "" "$(nofiles)"
 
     # Клиент vless, следящий за узлом сам (up с watch): его слово — приговор, пробы TCP нет. Через

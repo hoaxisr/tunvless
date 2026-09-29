@@ -48,9 +48,11 @@ extern const struct dialer_ops vless_dialer;
 void vl_set_trace(int on);
 
 /* Поднять туннель выхода к узлу node: проверка узла, которую нельзя отложить до первого
- * соединения, и стек с дайлером VLESS (stack_run). Возвращает код выхода процесса, всегда
- * ненулевой — успешного выхода у цикла нет. */
+ * соединения, и стек с дайлером VLESS (stack_run). ready — как у stack_run (stack.h,
+ * stack_ready_fn): устройство поднято, и модуль говорит об этом демону; NULL — никому. Возвращает
+ * код выхода процесса, всегда ненулевой — успешного выхода у цикла нет. */
 struct output;
-int vless_tunnel_run(struct output *o, const struct vless_node *node);
+int vless_tunnel_run(struct output *o, const struct vless_node *node,
+                     void (*ready)(void *arg, const char *dev), void *arg);
 
 #endif

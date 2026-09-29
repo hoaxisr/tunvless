@@ -146,6 +146,49 @@ static void wake_watch(struct supd *s, const struct helper *h) {
     if (o && out_engine_managed(o)) watchd_helper_changed(s->d->watch);
 }
 
+/* up с устройством (поле dev, evline.h): помощник выхода поднял TUN — привязать к нему маршрут
+ * выхода. Шаг 3 выпуска 1.10 (docs/architecture.md, «1.10 — решения владельца»: «кто привязывает
+ * маршрут модуля — демон по событию up»).
+ *
+ * ЧТО БЫЛО. bind_device звали сами клиенты: VLESS — из стека сразу после подъёма устройства,
+ * xsteer — из spoke_run. Это код демона (таблица, ip rule, conntrack, набор failopen — failover.c)
+ * в процессе помощника, а с шага 4 помощник — бинарник модуля на libsteer, и маршрутизации с её
+ * моделью в нём быть не должно. Момент готовности устройства по-прежнему знает только помощник,
+ * поэтому он о нём говорит, а привязывает демон — тем же bind_device, в своём процессе, без
+ * ребёнка: bind_device зовёт и проход сторожа на этом же цикле событий.
+ *
+ * ОДИН РАЗ НА ПРОЦЕСС (st->bound). Помощник пишет dev в каждом up: клиент vless — и после
+ * возврата узла, xsteer — на каждом рукопожатии каждого соединения. Привязка же — событие «маршрут
+ * меняется» (первое устройство процесса), а не «помощник снова здоров»: bind_device снимает
+ * соединения выхода (conntrack_evict), и повтор на каждом рукопожатии рвал бы людям закачки.
+ * Прежде клиент тоже привязывал ровно раз — при подъёме устройства. Маршрут после отказа (down →
+ * сторож поставил on_fail → снова up) возвращает проход сторожа, которого будит тот же up
+ * (wake_watch): решение об отказе и возврате одно, у сторожа, второго пути здесь нет.
+ *
+ * НЕ ПРИВЯЗЫВАЕТСЯ: выход не наш по виду (устройством владеет не наш процесс — out_engine_managed),
+ * без метки или таблицы (реестр не назначен — `ip rule fwmark 0` поймал бы весь трафик), и
+ * устройство не то, что у выхода в спеке: помощник поднимает TUN с именем устройства выхода, и
+ * другое имя — чужой или устаревший помощник; строка в журнал, и решает сторож.
+ *
+ * Вызывается ДО helper-up подписчикам и до внеочередного прохода: проход, которого будит этот up,
+ * видит уже привязанный маршрут, а подписчик, получивший helper-up, — выход, по которому идёт
+ * трафик. */
+static void route_up(struct supd *s, struct helper *h, const char *dev) {
+    struct helper_state *st = &h->st;
+    if (!s->d->have || !dev[0] || !strcmp(st->bound, dev)) return;
+    struct output *o = out_by_name(s->d->sp, h->name);
+    if (!o || !out_engine_managed(o) || !o->mark || !o->table) return;
+    if (strcmp(dev, o->device) != 0) {
+        fprintf(stderr, LOG_SW "%s %s сообщил устройство %.15s, а у выхода — %s: маршрут не "
+                        "привязан\n", h->cmd, h->name, dev, o->device);
+        return;
+    }
+    bind_device(o, dev);
+    snprintf(st->bound, sizeof(st->bound), "%s", dev);
+    fprintf(stderr, "steer[info] supervise: %s %s — %s поднят, маршрут выхода привязан "
+                    "(таблица %d)\n", h->cmd, h->name, dev, o->table);
+}
+
 /* health (мост tgws): путь до ДЦ отставлен — оценка пути, а не помощника целиком, поэтому
  * здоровья выхода она не меняет и сторожа не будит (выход моста сторож не выбирает: устройства у
  * него нет). Демон её помнит — status выхода показывает отставленные пути, пока их срок не
@@ -197,6 +240,8 @@ static void ev_line(struct supd *s, struct helper *h, const char *line) {
         st->watch = evline_int(&e, "watch", &v) && v == 1;
         st->since = (long)time(NULL);
         st->why[0] = '\0';
+        const char *dev = evline_str(&e, "dev");
+        if (dev) route_up(s, h, dev);
         emit_state(s, h, "helper-up", NULL);
         wake_watch(s, h);
     } else if (!strcmp(e.ev, "down")) {
@@ -713,6 +758,7 @@ static int start_one(struct helper *h, void *arg) {
         if (h->st.started) h->st.restarts++;
         h->st.running = 1;
         h->st.up = h->st.known = h->st.said_down = h->st.watch = 0;
+        h->st.bound[0] = '\0';
         h->st.node = h->st.total = h->st.nonode = 0;
         h->st.health_n = 0;
         h->st.started = (long)time(NULL);
