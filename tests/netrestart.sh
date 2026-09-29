@@ -391,7 +391,7 @@ wait_for 'grep -q "спека применена при старте" "$tmp/d7.e
 sleep 4
 TW="$(awk '$1 == "wg" { print $3 }' "$tmp/st/registry")"
 ours6() { "$real_ip" -6 rule show | grep -c "fwmark 0x$MW/"; }
-bs6() { "$real_ip" -6 route show table "$TW" | grep -c '^blackhole default.*metric 65535'; }
+bs6() { "$real_ip" -6 route show table "$TW" | grep -c '^prohibit default.*metric 65535'; }
 dev6() { "$real_ip" -6 route show table "$TW" | grep -c '^default dev t[02]'; }
 v6off() { for d in t0 t2; do sysctl -qw "net.ipv6.conf.$d.disable_ipv6=$1"; done; }
 check "A7: до опыта у выхода wg правило IPv6, запрет и маршрут IPv6 в устройство" "1 1 1" \

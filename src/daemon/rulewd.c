@@ -92,7 +92,7 @@
  * меняет раскладку правил на обеих платформах (приоритеты, сверка сторожа, снимки) — ради окна,
  * которое страж закрывает и так. Поэтому запрет остаётся на lo, а снятым его возвращает страж:
  * событие RTM_DELROUTE запрета с метрикой STEER_BACKSTOP_METRIC — та же проверка через 100 мс, и
- * запрет — одним сообщением rtnetlink (rtnl_route6_blackhole). Ставится он и при лежащем lo (ядро
+ * запрет — одним сообщением rtnetlink (rtnl_route6_backstop, вид prohibit — как у table_bind6). Ставится он и при лежащем lo (ядро
  * принимает, и подъём lo его не трогает — проверено там же). Запрет обязан лежать у выхода, чья
  * таблица IPv4 занята: table_bind6 кладёт его при любой привязке, а снимают его только вместе со
  * всей маршрутизацией выхода (те же снятия, что выше). Маршрут `default dev wgX` страж не
@@ -277,7 +277,7 @@ static int rulewd_restore(struct rulewd *r, const struct spec *sp, char *all, ch
                                               (int)pref_of(r, 4, o->mark)) != 0) bad = 1;
         /* Запрет — раньше правила IPv6: вернувшееся правило должно найти в таблице запрет, а не
          * пустоту (тот же порядок, что у привязки: маршрут первым, правило вторым). */
-        if ((m & MISS_BS6) && rtnl_route6_blackhole(o->table, STEER_BACKSTOP_METRIC) != 0) bad = 1;
+        if ((m & MISS_BS6) && rtnl_route6_backstop(o->table, STEER_BACKSTOP_METRIC) != 0) bad = 1;
         if ((m & MISS_R6) && rtnl_rule_fwmark(6, o->mark, STEER_MARK_MASK, o->table,
                                               (int)pref_of(r, 6, o->mark)) != 0) bad = 1;
         list_add(all, n, &k, cnt++, o->name);
@@ -365,13 +365,16 @@ static int rule_is_ours(const struct nlmsghdr *h, int *fam, uint32_t *markp, uin
 }
 
 /* Снят ли запасной запрет IPv6 (см. шапку, «ЗАПРЕТ IPv6 УХОДИТ ВМЕСТЕ С lo»): маршрут IPv6
- * `blackhole default` с метрикой STEER_BACKSTOP_METRIC. Чья это таблица, событие не решает — это
+ * `prohibit default` (или `blackhole default` прежней версии — его заменяет первая же привязка) с
+ * метрикой STEER_BACKSTOP_METRIC. Чья это таблица, событие не решает — это
  * сверка по спеке (out_missing): так чужой запрет с той же метрикой стоит лишь одной проверки. */
 static int route_is_backstop6(const struct nlmsghdr *h) {
     const struct rtmsg *rt = NLMSG_DATA(h);
     size_t hl = NLMSG_ALIGN(sizeof(*rt));
     if (h->nlmsg_len < NLMSG_HDRLEN + hl) return 0;
-    if (rt->rtm_family != AF_INET6 || rt->rtm_type != RTN_BLACKHOLE || rt->rtm_dst_len) return 0;
+    if (rt->rtm_family != AF_INET6 || rt->rtm_dst_len ||
+        (rt->rtm_type != RTN_PROHIBIT && rt->rtm_type != RTN_BLACKHOLE))
+        return 0;
     const char *p = (const char *)rt + hl, *e = (const char *)h + h->nlmsg_len;
     while (p + sizeof(struct rtattr) <= e) {
         const struct rtattr *a = (const struct rtattr *)p;
@@ -443,14 +446,15 @@ static int rulewd_open(void) {
     uint16_t swr = (uint16_t)((tr >> 8) | (tr << 8));
     struct sock_filter code[] = {
         /* 0 */ BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 4),
-        /* 1 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t, 6, 0),       /* → 8 принять */
-        /* 2 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, sw, 5, 0),      /* → 8 */
+        /* 1 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t, 7, 0),       /* → 9 принять */
+        /* 2 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, sw, 6, 0),      /* → 9 */
         /* 3 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, tr, 1, 0),      /* → 5 */
-        /* 4 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, swr, 0, 2),     /* → 5, иначе → 7 */
+        /* 4 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, swr, 0, 3),     /* → 5, иначе → 8 */
         /* 5 */ BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 16 + 7),
-        /* 6 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, RTN_BLACKHOLE, 1, 0),
-        /* 7 */ BPF_STMT(BPF_RET | BPF_K, 0),
-        /* 8 */ BPF_STMT(BPF_RET | BPF_K, 0xffff),
+        /* 6 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, RTN_PROHIBIT, 2, 0),  /* → 9 */
+        /* 7 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, RTN_BLACKHOLE, 1, 0), /* → 9 */
+        /* 8 */ BPF_STMT(BPF_RET | BPF_K, 0),
+        /* 9 */ BPF_STMT(BPF_RET | BPF_K, 0xffff),
     };
     struct sock_fprog prog = { (unsigned short)(sizeof(code) / sizeof(code[0])), code };
     setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof(prog));
