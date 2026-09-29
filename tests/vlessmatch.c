@@ -21,8 +21,12 @@
  * (их число обязано вернуться к исходному) и кучу — через LeakSanitizer, отдельной
  * проверкой после каждого случая, а не одним отчётом на выходе.
  *
+ * С шага 2 выпуска 1.10 установление живёт в транспорте (src/proto/transport: transport_open,
+ * tr_link_open, security в trsec.c), а vless_connect лишь отдаёт ему узел; ветви отказа и
+ * способы закрыться на них — прежние, а номера строк выше указывают на client.c до переезда.
+ *
  * КАК ЭТО РАБОТАЕТ БЕЗ УЗЛА И БЕЗ СЕТИ. Установление TCP вынесено в шов g_tcp_dial
- * (src/proto/vless/client.c) — так же, как замер задержки в failover.c. Стенд отдаёт клиенту конец
+ * (src/proto/transport/trdial.c) — так же, как замер задержки в failover.c. Стенд отдаёт клиенту конец
  * socketpair, а на другом конце сам говорит серверную половину TLS 1.3: разбирает
  * ClientHello, достаёт из него key_share, считает X25519, выводит расписание ключей
  * рукопожатия по RFC 8446 §7.1 и шлёт зашифрованные EncryptedExtensions, при надобности
@@ -51,7 +55,7 @@
  * Поэтому стенд выпускает цепочку сам: корень и лист на имя SNI, ключи ECDSA P-256, сроки
  * от текущего времени (замороженный в репозитории сертификат однажды истёк бы и покрасил
  * стенд не по своей вине). Корень уезжает файлом PEM, путь к нему отдаётся движку швом
- * g_cert_roots в client.c — вторым такой же природы, что g_tcp_dial. Серверная половина
+ * g_cert_roots в src/proto/tls/roots.c — вторым такой же природы, что g_tcp_dial. Серверная половина
  * подписывает CertificateVerify настоящей подписью над транскриптом по Certificate
  * включительно (RFC 8446 §4.4.3, приставка из 64 пробелов и метки), и клиент проверяет её
  * своим кодом, а не нашим: расхождение здесь означает ошибку в движке.
@@ -66,8 +70,8 @@
  * STEER_HAVE_X509WRITE, стенд говорит о пропуске сам) — молчаливый пропуск читался бы как
  * «прошло», ровно как в I-232.
  */
-/* До любого include: client.c просит расширения GNU, а первый подключённый заголовок
- * фиксирует набор. */
+/* До любого include: включаемые исходники просят расширения GNU, а первый подключённый
+ * заголовок фиксирует набор. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <string.h>
@@ -76,10 +80,14 @@
 #include <dirent.h>
 #include <stdint.h>
 
-/* Исходник целиком, а не компоновка: шов g_tcp_dial статический, и дотянуться до него
- * иначе значило бы объявить его в client.h — то есть завести в движке публичную точку
- * подмены ради стенда. Тот же приём, что в tests/devupmatch.c и tests/failovermatch.c. */
-#include "../src/proto/vless/client.c"
+/* Исходники целиком, а не компоновка — ровно два, ради двух швов: g_tcp_dial (trdial.c) и
+ * g_cert_roots (roots.c) статические, и дотянуться до них иначе значило бы объявить их в
+ * заголовке — то есть завести в движке публичную точку подмены ради стенда. Тот же приём, что
+ * в tests/failovermatch.c. Остальное — клиент VLESS и ярусы транспорта — компонуется
+ * отдельными объектами (tests/ext-test.sh). */
+#include "../src/proto/transport/trdial.c"
+#include "../src/proto/tls/roots.c"
+#include "client.h"
 
 #include "mbedtls/hkdf.h"
 #include "mbedtls/md.h"
@@ -706,7 +714,7 @@ static int fake_dial(const char *host, uint16_t port, int timeout_s) {
     (void)host; (void)port;
     int fd = g_give_fd;
     g_give_fd = -1;
-    if (fd < 0) return VLESS_CONN_ECONNECT;
+    if (fd < 0) return TR_ECONNECT;
     /* Ровно то, что делает tcp_connect с победившим сокетом: срок на чтение и запись.
      * Без него ошибка в серверной половине вешала бы стенд, а не роняла его. */
     sock_ready(fd, timeout_s);
@@ -775,14 +783,15 @@ static int run_case(const struct plan *pl, struct vless_node *n, char *reason, s
 
     g_give_fd = sv[0];
     g_tcp_dial = fake_dial;
-    struct vless_conn c;
+    struct transport c;
     int rc = vless_connect(n, &c, 3);
-    if (rc == 0) vless_close(&c);
+    if (rc == 0) transport_close(&c);
     g_tcp_dial = NULL;
 
     if (reason && rn) snprintf(reason, rn, "%s", tls13_verify_reason());
-    if (ctx_left) *ctx_left = (c.tls.rd.ctx_ready ? 1 : 0) + (c.tls.wr.ctx_ready ? 1 : 0) +
-                              (c.up.tls.rd.ctx_ready ? 1 : 0) + (c.up.tls.wr.ctx_ready ? 1 : 0);
+    if (ctx_left) *ctx_left = (c.link.tls.rd.ctx_ready ? 1 : 0) + (c.link.tls.wr.ctx_ready ? 1 : 0) +
+                              (c.xh.up.link.tls.rd.ctx_ready ? 1 : 0) +
+                              (c.xh.up.link.tls.wr.ctx_ready ? 1 : 0);
 
     pthread_join(th, NULL);
     if (s.fd >= 0) close(s.fd);
@@ -943,11 +952,11 @@ int main(void) {
             { .name = "tls: алгоритм не из предложенных",.chain = LEAF_OK, .cv_bad_alg = 1 },
         };
         /* Транспорт: у случая с ALPN он ОБЯЗАН быть не raw. Для tcp ALPN не просят вовсе
-         * (client.c: cfg.alpn = NULL при VT_RAW), и проверка «сервер назвал не h2» там не
+         * (transport.c: у tr_tcp alpn = NULL), и проверка «сервер назвал не h2» там не
          * стоит — то есть на tcp этот случай молча прошёл бы успехом. */
         static const char *tls_type[] = { "tcp", "grpc", "tcp", "tcp", "tcp", "tcp", "tcp" };
         static const int tls_want[] = {
-            0, VLESS_CONN_ENOH2, TLS13_ECERT, TLS13_ECERT,
+            0, TR_ENOH2, TLS13_ECERT, TLS13_ECERT,
             TLS13_ECERT, TLS13_ECERT, TLS13_ECERT,
         };
         /* ОЖИДАЕТСЯ ТО, ЧТО ДОХОДИТ СЕГОДНЯ, а не то, что написано в certverify.c, и разница
@@ -1032,13 +1041,13 @@ int main(void) {
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 2;
         g_give_fd = sv[0];
         g_tcp_dial = fake_dial;
-        struct vless_conn c;
+        struct transport c;
         int rc = vless_connect(&plain, &c, 3);
         g_tcp_dial = NULL;
         check("security=none поверх tcp: соединение установлено", 0, rc);
-        check("security=none: TLS не разворачивался", 1, c.plain);
-        if (rc == 0) vless_close(&c);
-        check("security=none: дескриптор закрыт vless_close", -1, c.fd);
+        check("security=none: TLS не разворачивался", 1, c.link.plain);
+        if (rc == 0) transport_close(&c);
+        check("security=none: дескриптор закрыт vless_close", -1, c.link.fd);
         close(sv[1]);
         check("security=none: в куче ничего не осталось", 0, LEAK_CHECK());
     }

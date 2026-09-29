@@ -612,7 +612,7 @@ static uint8_t *build_ahead(struct fconn *c, uint8_t *base, size_t plen, size_t 
      * за метку, которая всё равно измеряется с гранулярностью TICK_MS = 20.
      *
      * Ровно это решение уже принято в туннеле, по той же причине и с тем же объяснением:
-     * см. g_now_ns в src/tunnel/tunnel.c. */
+     * см. g_now_ns в src/tunnel/stack.c. */
     c->last_tx = now;
     c->last_data_tx = now;
     c->last_ack = now;
