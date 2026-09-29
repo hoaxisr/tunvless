@@ -108,17 +108,9 @@ static uint32_t get32(const unsigned char *p) {
  * дней; на сентябрь 2026 это 149. Заголовок sec-ch-ua собран его же правилом — три марки,
  * одна поддельная, перемешанные по номеру версии (seed=149 даёт именно такой порядок).
  *
- * ЧИСЛО ЗАШИТО, А НЕ СЧИТАЕТСЯ ОТ ЧАСОВ. Считать значило бы, что роутер с уехавшими часами
- * (а на роутере без батарейки это обычное дело) представляется Chrome из будущего или из
- * позапрошлого года — приметнее, чем слегка отставшая версия. Обновляется вместе с
- * остальными приметами облика, когда обновляют ClientHello. */
-#define UA_CHROME_MAJOR "149"
-#define UA_CHROME \
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " \
-    "Chrome/" UA_CHROME_MAJOR ".0.0.0 Safari/537.36"
-#define UA_CH_CHROME \
-    "\"Google Chrome\";v=\"" UA_CHROME_MAJOR "\", \"Chromium\";v=\"" UA_CHROME_MAJOR \
-    "\", \"Not)A;Brand\";v=\"24\""
+ * Сами строки (UA_CHROME, UA_CH_CHROME) — в h2.h: тем же обликом представляются и запросы
+ * Upgrade у ws и httpupgrade (proto/transport/trupgrade.c), и версия браузера у двух
+ * транспортов одного узла расходиться не должна. */
 
 struct wbuf { unsigned char *p; size_t n, cap; };
 

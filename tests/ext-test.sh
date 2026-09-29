@@ -183,6 +183,7 @@ echo "ext-test: собираю и прогоняю vlessmatch (ASan: ${ASAN:-н�
 $CC -O1 -g -w $STEER_INC -Itests $ASAN -DSTEER_HAVE_X509WRITE -o "$BUILD/vlessmatch" tests/vlessmatch.c \
 	src/proto/vless/client.c src/proto/transport/transport.c src/proto/transport/trsec.c \
 	src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c \
+	src/proto/transport/trupgrade.c src/proto/transport/trws.c src/proto/transport/trpath.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
 	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
 	$MODEL_SRC $KINDS_SRC $CERTGEN $CRYPTO -lpthread
@@ -199,6 +200,7 @@ $CC -O1 -g -w $STEER_INC -Itests -DSTEER_HAVE_X509WRITE -DSTEER_DEFAULT_PLATFORM
 	-o "$BUILD/androidroots" tests/androidroots.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
 	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
+	src/proto/transport/trpath.c \
 	$MODEL_SRC $KINDS_SRC $CERTGEN $CRYPTO -lpthread
 "$BUILD/androidroots"
 
@@ -224,6 +226,7 @@ $CC -O2 -w $STEER_INC -o "$BUILD/devupmatch" tests/devupmatch.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/vless/sub.c \
 	src/proto/transport/transport.c src/proto/transport/trdial.c src/proto/transport/trsec.c \
 	src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c src/proto/tls/roots.c \
+	src/proto/transport/trupgrade.c src/proto/transport/trws.c src/proto/transport/trpath.c \
 	src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c src/proto/tls/h2.c \
 	src/lib/jsonw.c src/lib/evline.c \
 	$MODEL_SRC $KINDS_SRC $CRYPTO -lpthread

@@ -52,6 +52,7 @@ build/xsepochmatch
 build/tungromatch
 build/tunnelmatch
 build/xhupmatch
+build/wsmatch
 build/tunnamematch
 build/xsconfmatch
 build/xsroutematch

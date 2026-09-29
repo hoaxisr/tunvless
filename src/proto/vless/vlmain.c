@@ -123,6 +123,19 @@ static void node_json(const struct vless_node *n, int index) {
     printf("}");
 }
 
+/* Ключ `transport:` спеки v2 (vless_cfg.transports в spec.h): из кандидатов остаются узлы с
+ * этими транспортами, порядок предпочтения прежний. Одна функция на подъём и на `vless-probe` —
+ * по той же причине, что out_node_list. Возвращает, сколько осталось. */
+static size_t transport_filter(const struct output *o, const struct vless_node *nodes, int *sel,
+                               size_t sel_n) {
+    unsigned want = o ? o->vless.transports : 0;
+    if (!want) return sel_n;
+    size_t k = 0;
+    for (size_t i = 0; i < sel_n; i++)
+        if (tunnel_transport_bit(nodes[sel[i]].type) & want) sel[k++] = sel[i];
+    return k;
+}
+
 /* Причины, по которым узлы не попали в список. Массив, а не одна строка: причин у
  * одной подписки бывает несколько, и «поддержки ws нет» рядом с «reality без pbk» —
  * это два разных действия для владельца подписки. Печатается всегда, в том числе
@@ -235,6 +248,12 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
         if (!sel_n) {
             printf("{\"ok\":false,\"error\":\"выбранных узлов нет в подписке, "
                    "пригодных всего %zu\"}\n", cnt);
+            return 1;
+        }
+        sel_n = transport_filter(o, g_nodes, sel, sel_n);
+        if (!sel_n) {
+            printf("{\"ok\":false,\"error\":\"среди выбранных узлов нет узлов с транспортом "
+                   "из transport\"}\n");
             return 1;
         }
     }
@@ -355,6 +374,19 @@ int cmd_vless(const char *spec_path, const char *out_name) {
     if (sel_n < o->vless.nodes_n)
         fprintf(stderr, LOG_W2 "узлов выбрано %zu, в подписке есть %zu — остальные номера "
                         "вне подписки\n", o->vless.nodes_n, sel_n);
+    /* transport: — фильтр по транспорту узла. Не осталось никого — отказ со своей причиной, а
+     * не перебор чего попало: человек написал `transport: ws`, и увести туннель на tcp-узел
+     * значило бы молча сменить путь трафика (например, мимо CDN). */
+    size_t before = sel_n;
+    sel_n = transport_filter(o, nodes, sel, sel_n);
+    if (!sel_n) {
+        vl_probe_report(out_name, PROBE_FAILED, 0, 0);
+        evline_emit("down", "why", EVLINE_STR, "в подписке нет узлов с транспортом из transport",
+                    (const char *)NULL);
+        fprintf(stderr, LOG_W2 "среди %zu выбранных узлов нет ни одного с транспортом из "
+                        "transport — проверьте transport и подписку\n", before);
+        return 1;
+    }
 
     int chosen = -1;
     if (out_node_named(o)) {

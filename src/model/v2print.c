@@ -246,6 +246,18 @@ static void output_flow(FILE *f, const struct output *o, const char (*oname)[32]
             for (size_t i = 0; i < kk.nodes_n; i++) fprintf(f, "%s%d", i ? ", " : "", kk.nodes[i]);
             fputc(']', f);
         }
+        if (kk.transports) {
+            /* Одно имя — строкой, как в примере раздела 3 (`transport: ws`), несколько — списком
+             * в порядке имён (tcp, grpc, xhttp, ws, httpupgrade), не в порядке записи: это
+             * множество, и печать обязана быть неподвижной точкой convert. */
+            unsigned c = 0;
+            for (unsigned i = 0; i < TT_COUNT; i++) c += (kk.transports >> i) & 1u;
+            fk(&w, "transport");
+            if (c > 1) fputc('[', f);
+            for (unsigned i = 0, m = 0; i < TT_COUNT; i++)
+                if (kk.transports & (1u << i)) fprintf(f, "%s%s", m++ ? ", " : "", tunnel_transport_name(i));
+            if (c > 1) fputc(']', f);
+        }
         if (kk.conf[0]) fpath(&w, "conf", kk.conf);
         if (kk.stream) { fk(&w, "stream"); fputs("true", f); }
         if (kk.stream_port) { fk(&w, "stream_port"); fprintf(f, "%d", kk.stream_port); }

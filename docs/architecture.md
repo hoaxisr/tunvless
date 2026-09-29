@@ -249,7 +249,8 @@ src/
               tlsprobe, urltls)
               transport/ (transport.h — struct transport_ops и security_ops; transport.c —
               сборка ярусов и транспорт tcp; trdial.c — сокет до узла; trsec.c — none, tls,
-              reality; trgrpc.c; trxhttp.c)
+              reality; trgrpc.c; trxhttp.c; trupgrade.c — запрос Upgrade по HTTP/1.1 и
+              httpupgrade; trws.c — кадры WebSocket; trpath.c — путь запроса Upgrade)
               vless/ (vlmain.c — подкоманды vless*, vldial.c — дайлер стека, vlwatch.c — слежка
               за узлом, client.c — vless_connect и проверка узла, vless_proto, vision, sub,
               subfetch)
@@ -259,9 +260,8 @@ src/
   third_party/libyaml (разбор YAML; файлы не правятся — см. UPSTREAM)
 ```
 
-Ещё не заведено то, что в плане названо дальше: транспорты `ws` и `httpupgrade` (шаг 5 выпуска
-1.10, файлы рядом с `trgrpc.c`), апстримы и кэш резолвера (`dnsd/upstream.c`, `dnsd/cache.c` —
-1.11). Отдельного `tunnel/main.c` нет и не будет: точка входа туннеля — у модуля протокола
+Ещё не заведено то, что в плане названо дальше: апстримы и кэш резолвера (`dnsd/upstream.c`,
+`dnsd/cache.c` — 1.11). Отдельного `tunnel/main.c` нет и не будет: точка входа туннеля — у модуля протокола
 (`proto/vless/vlmain.c`), а стек — библиотека, которую модуль зовёт (`stack_run`).
 
 Переносятся все файлы, включая защищённые пути `reality.c`, `tls13.c`, `vision.c`,
@@ -330,8 +330,9 @@ struct kind_ops {
   в модуле протокола (`vlmain.c`, `vlwatch.c`);
 - **транспорт** (`proto/transport`): как поток дайлера едет до узла — сокет по всем адресам
   имени с меткой `over` (`trdial.c`), безопасность `security=` — none, tls, reality (`trsec.c`) —
-  и транспорт `type=` — tcp, grpc, xhttp (`transport.c`, `trgrpc.c`, `trxhttp.c`); ws и
-  httpupgrade — шаг 5, ещё две таблицы `transport_ops`.
+  и транспорт `type=` — tcp, grpc, xhttp, ws, httpupgrade (`transport.c`, `trgrpc.c`,
+  `trxhttp.c`, `trws.c`, `trupgrade.c`); ws и httpupgrade добавлены шагом 5 двумя таблицами
+  `transport_ops`, без правки стека и дайлера.
 
 Интерфейсы — сокращённо, полностью с доводами в заголовках:
 
@@ -353,15 +354,16 @@ struct dialer_ops {              /* src/tunnel/dialer.h — vless; позже tr
     /* служебные: peer, describe, strerror, close, clear, fd, has_data */
 };
 
-struct transport_ops {           /* src/proto/transport/transport.h — tcp, grpc, xhttp (ws, httpupgrade) */
+struct transport_ops {           /* src/proto/transport/transport.h — tcp, grpc, xhttp, ws, httpupgrade */
     const char *name;
-    const char *alpn;            /* что просить в ALPN; NULL у tcp */
+    const char *alpn;            /* что просить в ALPN; NULL у tcp, http/1.1 у ws и httpupgrade */
     int zc;                      /* данные лежат в записях TLS как есть — чтение без копии */
     int  (*open)(struct transport *, const struct tr_node *, int timeout_s);
     int  (*write)(struct transport *, const unsigned char *, size_t);
     int  (*read)(struct transport *, unsigned char *, size_t cap, size_t *got);
     void (*moved)(struct transport *);       /* структура переехала — поправить самоуказатели */
     void (*close)(struct transport *);       /* своё сверх основной связи: вторая связь xhttp */
+    int  (*pending)(const struct transport *); /* своё непрочитанное: остаток за ответом 101 */
 };
 struct security_ops {            /* none, tls, reality */
     const char *name;
@@ -454,8 +456,8 @@ wolfSSL включает один `src/lib/scrypto.c` (это проверяет
 переезд — пакет libwolfssl OpenWrt не годится (без QUIC, SONAME с хешем опций), размер на флеше
 против mbedtls, сборка на телефоне, — записано в «1.10 — ход работ» в разделе 5.
 
-Новый протокол — это файл дайлера, а стек не трогается. Первая очередь после пересборки —
-транспорт WebSocket/HTTPUpgrade (шаг 5): две таблицы `transport_ops`, дайлер и стек не меняются.
+Новый протокол — это файл дайлера, а стек не трогается. Новый транспорт — таблица
+`transport_ops`: так шагом 5 пришли WebSocket и HTTPUpgrade, без правки дайлера и стека.
 
 ### DNS
 
@@ -555,7 +557,7 @@ rules:                                # сверху вниз, выше — си
   `dns.traceroute_hops`. `to` у правила обязателен, `to: all` — весь трафик (слово `all` и есть
   согласие, `allow_all` не нужен); `name` правила — по умолчанию `rule-<номер>`.
 - Чего движок ещё не умеет (`pick: balance` у правил на сам телефон, IPv6, `dns.cache` и
-  `upstreams`, `transport`, встроенные `domains`/`prefixes`, `app`, несводимые клиенты или списки
+  `upstreams`, встроенные `domains`/`prefixes`, `app`, несводимые клиенты или списки
   одного правила), разбор принимает, проверяет, хранит в модели, где есть место, и отвергает
   отказом «ещё не поддерживается в этой версии движка: …» — после всех настоящих проверок.
 
@@ -665,6 +667,7 @@ HTTPUpgrade, gRPC, xhttp, REALITY, vision) сверяются с Xray-core — �
    которого нет, — «нужен пакет steer-<модуль>» из одного места (текст отказа — контракт со
    splify2, меняется в паре с ним; пока splify2 не трогаем, прежняя подстрока сохраняется).
 5. Транспорты WebSocket и HTTPUpgrade (`transport:` в v2, `type=ws|httpupgrade` в подписке).
+   *Сделано — «1.10 — ход работ» в разделе 5.*
 6. Телефон: форк wolfSSL в der-exp, `libsteer.so` в `der/`, file_contexts, доработка
    `bpbuild.py`.
 7. Заготовка к 1.11 и hysteria2: ngtcp2 на нашем wolfSSL с патчем Brutal, собирается на всех
@@ -1435,6 +1438,75 @@ procd держит один `steerd daemon --watch --supervise --apply`; на т
   `down` — сторож снимает их (`on_fail=direct`), второй `up` того же процесса не привязывает, маршрут
   возвращает проход сторожа. Заглушки `bind_device` ушли из `tunnelmatch`, `vlessmatch`,
   `devupmatch`, `spokematch`: стек и клиенты компонуются без неё. Не проверено: QEMU.
+
+**Шаг 5 — транспорты WebSocket и HTTPUpgrade (сделано в ветке шага, не выпущено).** Набор правил не
+менялся: снимок генератора совпадает (139 снимков). Стек и дайлер не тронуты — две таблицы
+`transport_ops` (`tr_ws` в `trws.c`, `tr_httpupgrade` в `trupgrade.c`) и общий запрос Upgrade.
+
+- **Что шлём.** GET по HTTP/1.1 — байт в байт клиент Xray (`websocket/dialer.go` с gorilla
+  `client.go`, `httpupgrade/dialer.go`): облик Chrome (`applyMasqueradedHeaders`, вариант `ws`),
+  порядок net/http (`Host`, `User-Agent`, остальные по алфавиту ключа), регистр ключей Go (прямое
+  присваивание — как написан, Set/Add — канонически; свои заголовки узла у ws канонически, у
+  httpupgrade — как написаны). Версия Chrome — зашитая, общая с xhttp (`UA_CHROME` переехал в
+  `h2.h`). Host — `host`, иначе `sni`, иначе адрес. Путь — по трём разборам Go, как у Xray
+  (`trpath.c`): `ed=` вырезается и запрос пересобирается `url.Values.Encode`, у httpupgrade путь с
+  `?` уезжает целиком экранированным (`%3F`). sing-box шлёт `Go-http-client/1.1` — не браузер, ему
+  не следуем.
+- **ALPN только `http/1.1`** у tls и reality (`trsec.c` зовёт `reality_build_hello_carry` с
+  `alpn_http11`, как мост tgws): с `h2` в списке сервер за TLS вправе выбрать HTTP/2. Hello
+  остальных транспортов не менялся (`hellofreeze`). Сервер выбрал не `http/1.1` — `TR_ENOH1`.
+- **Ранние данные (`ed`) не шлём** — решение шага. Выигрыш — один круг на новом соединении, а
+  соединения к узлу и так открываются заранее, пулом (`DC_PRECONNECT`); апгрейд в первой записи шёл
+  бы из цикла туннеля, где ждать ответа нельзя, а слать данные до 101 нельзя тоже — сервер Xray на
+  gorilla рвёт такое соединение («client sent data before handshake is complete»). Запрос без
+  `Sec-WebSocket-Protocol` — тот, что Xray шлёт при первой записи длиннее `ed`, и сервер его
+  принимает. У httpupgrade `ed` у Xray — «не ждать 101»; мы ждём всегда (сервер Xray теряет данные,
+  приехавшие одним куском с запросом).
+- **Кадры** (`trws.c`): отправка по 4096 байт, как gorilla у Xray (binary без FIN, continuation, FIN
+  на последнем; кадр — своя запись), маска на каждый кадр из `getrandom` пачкой (у слоя `scrypto`
+  генератора нет — случайность в проекте берётся у ядра). Приём — потоком: фрагменты, служебные
+  кадры посреди сообщения, длины до 2^63; ping → pong, close → ответный close и конец потока;
+  нарушения RFC 6455 (маска от сервера, RSV, служебный длиннее 125 или разрезанный, continuation вне
+  сообщения, опкоды 3–7 и 11+) — `TR_EWSFRAME`. Своего close при закрытии не шлём (запись из цикла
+  туннеля в, возможно, мёртвое соединение ждала бы срока сокета): сервер видит FIN, Xray пишет в
+  журнал уровня info «close 1006».
+- **Ответ 101** разбирается потоком (`tr_h1_resp_feed`), с пределом 16 КБ: у ws — как gorilla
+  (слово `websocket`/`upgrade` в списках, `Sec-WebSocket-Accept` — SHA-1 своя, 40 строк: это не
+  криптография, и в `make test` библиотеки нет), у httpupgrade — как Xray и sing-box (первые значения
+  целиком). Отказы — свои коды с текстом: «сервер ответил 404 вместо 101 (проверьте path и host)»,
+  «ответ 101 без Upgrade», «неверный Sec-WebSocket-Accept», таймаут. **Остаток за ответом** той же
+  записи — в куче (`h1_state.stash`, только когда он есть) и отдаётся первым; `transport_ops.pending`
+  говорит о нём `transport_has_data`, и у httpupgrade чтение без копии (`zc`) включается, лишь когда
+  остатка нет.
+- **Подписка** (`sub.c`): `type=ws|httpupgrade`, `path`, `host` в ссылке (путь раскодируется до
+  обрезки по полю — прежде путь целиком процентами обрезался на трети, это било и xhttp); в конфиге
+  Xray — `network: ws|websocket|httpupgrade`, `wsSettings`/`httpupgradeSettings` с `path`, `host`,
+  `headers` (переносятся в узел по `network` в конце разбора, поэтому `wsSettings` рядом с
+  `xhttpSettings` пути xhttp не затирает; Host из headers у ws — в host, у httpupgrade — отказ, как у
+  Xray). Непригодны с причиной: Vision поверх ws/httpupgrade, путь, который Xray не разобрал бы
+  (у ws — битая `%XX`), host с пробелом, негодные или не влезшие заголовки, Upgrade/Connection/
+  Sec-WebSocket-* в headers.
+- **Спека v2** — `transport:` у `kind: tunnel`: **фильтр** транспортов узлов подписки (одно имя или
+  список), а не замена — транспорт принадлежит входу на сервере. Вместе с `nodes` — пересечение,
+  номера прежние; не осталось узлов — туннель не поднимается со своей причиной (`vlmain.c`,
+  `transport_filter`, и так же `vless-probe`). `spec convert` печатает ключ; в подпись помощника он
+  подмешивается, только когда задан (прежние спеки не перезапускают помощник).
+- **Проверено.** `tests/wsmatch.c` в `make test` (131 проверка): путь против значений net/url Go
+  1.22 на коде Xray (20 путей, оба транспорта), запрос байт в байт, Accept и кадр по примерам RFC
+  6455, разбор кадров (фрагменты, ping посредине, 125/126/65535/65536/70000, по байту, на месте, 10
+  нарушений), ответ 101 и отказы, на сокете с сервером-стендом — первый кадр и остаток
+  httpupgrade за 101, выгрузка 9000 байт кадрами 4096+4096+808 с маской, pong, ответный close, 404,
+  нет Upgrade, неверный Accept, таймаут, закрытие; под ASan/UBSan чисто. ext-test (`vlessmatch`,
+  ASan): удавшийся Reality (стенд подписывает временный сертификат HMAC на authkey) и tls со своей
+  цепочкой — ws и httpupgrade до данных, ALPN один `http/1.1`, у tcp — прежний. `submatch`,
+  `v2match` (разбор, отказы с местом, convert — неподвижная точка). **С настоящими серверами** (в
+  docker, не в стендах: образы `ghcr.io/xtls/xray-core` 26.3.27 и `ghcr.io/sagernet/sing-box`
+  1.14.2): перехват запроса клиента Xray — порядок и регистр заголовков, `%3F`, кадры 4096 на
+  выгрузке; сервер Xray (security none) — ws и httpupgrade с путём `/u?x=1` проходят
+  `vless-probe`, чужой путь и host — «404 вместо 101» и закрытие, выгрузка 300 КБ записями
+  1…20000 байт и загрузка 1 МБ сходятся по sha256; сервер sing-box с REALITY — ws и httpupgrade,
+  та же выгрузка и загрузка. Не проверено: настоящий сервер за обычным TLS (нужны свои корни у
+  роутерной сборки — покрыто ext-test), QEMU.
 
 ### Долги, перенесённые дальше
 

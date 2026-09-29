@@ -169,6 +169,33 @@ if [ -x "$XK" ]; then
     if [ -n "$bm" ] && echo "$out" | grep -q "meta nfproto ipv6 goto mark_$bm comment \"steer-balance-v6:bal\"" &&
        echo "$out" | grep -q 'reject with icmpx type admin-prohibited comment "steer-v6drop:bal"'; then ok; else
         bad "balance с членом без IPv6 — IPv6 группы в отказ" "$(echo "$out" | grep -E 'bal_|v6' | head -n 8)"; fi
+    # transport: у туннеля (шаг 5 выпуска 1.10) — фильтр транспортов узлов подписки: одно имя или
+    # список; convert печатает его обратно (одно — строкой, несколько — списком в порядке имён) и
+    # остаётся неподвижной точкой; отказы — с местом.
+    printf 'version: 2\noutputs:\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl, transport: ws }\n' > "$tmp/tr1.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec tr1.yaml --state-dir "$tmp/state" 2>&1)"
+    if [ $? = 0 ]; then ok; else bad "transport: ws — принят" "$(echo "$out" | head -n 3)"; fi
+    (cd "$tmp" && "$XKA" spec convert --spec tr1.yaml > c1.yaml 2>&1 && "$XKA" spec convert --spec c1.yaml > c2.yaml 2>&1)
+    if grep -q 'transport: ws[,} ]' "$tmp/c1.yaml" && cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml"; then ok; else
+        bad "convert печатает transport: ws (неподвижная точка)" "$(grep -n transport "$tmp/c1.yaml")"; fi
+    printf 'version: 2\noutputs:\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl, transport: [httpupgrade, ws] }\n' > "$tmp/tr2.yaml"
+    (cd "$tmp" && "$XKA" spec convert --spec tr2.yaml > c1.yaml 2>&1 && "$XKA" spec convert --spec c1.yaml > c2.yaml 2>&1)
+    if grep -q 'transport: \[ws, httpupgrade\]' "$tmp/c1.yaml" && cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml"; then ok; else
+        bad "convert печатает список транспортов в порядке имён" "$(grep -n transport "$tmp/c1.yaml")"; fi
+    trref() {   # имя, значение transport, строка отказа, место
+        printf 'version: 2\noutputs:\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl, transport: %s }\n' "$2" > "$tmp/tr3.yaml"
+        out="$(cd "$tmp" && "$XKA" apply --dry-run --spec tr3.yaml --state-dir "$tmp/state" 2>&1)"
+        rc=$?
+        if [ "$rc" = 2 ] && echo "$out" | grep -qF -- "$3" && echo "$out" | grep -qF "tr3.yaml:$4:"; then ok; else
+            bad "$1" "код $rc: $out"; fi
+    }
+    trref "transport: kcp — отказ с местом" kcp "«kcp» — нужен tcp, grpc, xhttp, ws или httpupgrade" 3:73
+    trref "transport: [ws, ws] — отказ" "[ws, ws]" "ws указан дважды" 3:78
+    trref "transport: [] — отказ" "[]" "пустой список" 3:73
+    printf 'version: 2\noutputs:\n  wg: { kind: interface, device: wg0, transport: ws }\n' > "$tmp/tr4.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec tr4.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -qF "ключ transport есть только у kind: tunnel"; then ok; else
+        bad "transport у interface — отказ «только у kind: tunnel»" "$out"; fi
 else
     bad "не собран $XK (make build/steer-xk)"
 fi

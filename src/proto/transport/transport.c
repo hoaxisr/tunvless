@@ -86,11 +86,18 @@ const struct transport_ops tr_tcp = {
 };
 
 /* Транспорт по полю ссылки. Неподдержанное отсеивает разбор подписки (sub.c), поэтому сюда
- * доходят только эти три; всё прочее — tcp, как было всегда. */
+ * доходят только эти пять; всё прочее — tcp, как было всегда. */
 static const struct transport_ops *transport_of(const char *type) {
     if (!strcmp(type, "grpc")) return &tr_grpc;
     if (!strcmp(type, "xhttp")) return &tr_xhttp;
+    if (!strcmp(type, "ws")) return &tr_ws;
+    if (!strcmp(type, "httpupgrade")) return &tr_httpupgrade;
     return &tr_tcp;
+}
+
+/* Лежит ли у транспорта своё непрочитанное (transport_ops.pending). */
+static int fr_pending(const struct transport *t) {
+    return t->fr && t->fr->pending && t->fr->pending(t);
 }
 
 /* ---- сборка ярусов -------------------------------------------------------------------- */
@@ -132,7 +139,9 @@ int transport_open(struct transport *t, const struct tr_node *n, int timeout_s) 
     if (!t->link.plain && t->fr->alpn && t->link.tls.alpn[0] &&
         strcmp(t->link.tls.alpn, t->fr->alpn) != 0) {
         transport_close(t);
-        return TR_ENOH2;
+        /* Код — по тому, ЧТО просили: ws и httpupgrade просят только http/1.1, и «не согласился
+         * на HTTP/2» у них было бы неправдой, отправляющей человека не туда. */
+        return strcmp(t->fr->alpn, "h2") ? TR_ENOH1 : TR_ENOH2;
     }
     /* security=none с транспортом поверх HTTP/2: прежде единственная ветка отказа, которая
      * дескриптор НЕ закрывала. Узел, который не отвечает по h2, за сутки опроса упирал
@@ -157,8 +166,10 @@ int transport_read_zc(struct transport *t, unsigned char *buf, size_t cap,
     *got = 0;
     *data = buf;
     /* Без копии — только там, где данные лежат в записях TLS как есть (transport_ops.zc).
-     * Прямое копирование (rx_direct) и security=none читают сокет сами. */
-    if (t->fr->zc && !t->link.plain && !t->link.rx_direct)
+     * Прямое копирование (rx_direct) и security=none читают сокет сами. Своё непрочитанное у
+     * транспорта (остаток после ответа 101 у httpupgrade) — раньше записей TLS: оно раньше
+     * их и приехало. */
+    if (t->fr->zc && !t->link.plain && !t->link.rx_direct && !fr_pending(t))
         return tls13_read_ref(&t->link.tls, data, got);
     return transport_read(t, buf, cap, got);
 }
@@ -171,8 +182,12 @@ int transport_read_zc(struct transport *t, unsigned char *buf, size_t cap,
  * Три режима, а не один. Без TLS буфера нет вовсе. В прямом копировании нет и границ
  * записей — значимо просто «есть байты». В обычном режиме — только ЦЕЛАЯ запись: по части
  * записи мы всё равно ничего не сможем отдать, и считать её готовностью значило бы крутить
- * цикл впустую до прихода остатка. */
+ * цикл впустую до прихода остатка.
+ *
+ * И четвёртое, раньше всех: своё непрочитанное у транспорта (transport_ops.pending) — остаток
+ * после ответа 101 и конец потока ws, о котором сокет уже ничего не скажет. */
 int transport_has_data(const struct transport *t) {
+    if (fr_pending(t)) return 1;
     if (t->link.plain) return 0;
     if (t->link.rx_direct) return tls13_buffered(&t->link.tls) > 0;
     return tls13_has_record(&t->link.tls);
@@ -203,6 +218,20 @@ const char *transport_strerror(int rc) {
         case TR_ECLOSED: return "сервер закрыл соединение";
         case TR_ENOH2: return "сервер не согласился на HTTP/2 (нужен для grpc и xhttp)";
         case TR_EGRPC: return "поток gRPC в неожиданной форме";
+        case TR_ENOH1: return "сервер выбрал не HTTP/1.1 (нужен для ws и httpupgrade)";
+        /* Код ответа — в тексте: 404 и 400 почти всегда значат не тот path или host (сервер Xray
+         * так отвечает на чужой путь), 403 и 5xx — посредника или CDN перед сервером. */
+        case TR_EUPSTATUS: {
+            static __thread char why[96];
+            snprintf(why, sizeof why, "сервер ответил %d вместо 101 (проверьте path и host)",
+                     tr_h1_last_status());
+            return why;
+        }
+        case TR_ENOUPGRADE: return "ответ 101 без Upgrade: websocket";
+        case TR_EWSACCEPT: return "ответ 101 с неверным Sec-WebSocket-Accept";
+        case TR_EUPTIMEOUT: return "сервер не ответил на запрос Upgrade (таймаут)";
+        case TR_EUPTOOBIG: return "ответ на запрос Upgrade не разобрался";
+        case TR_EWSFRAME: return "кадр WebSocket не по RFC 6455";
         case H2_EIO: case H2_EPROTO: case H2_ESTATUS:
         case H2_ERESET: case H2_ETOOBIG: case H2_EWINDOW: return h2_strerror(rc);
         case REALITY_EBADKEY: return "pbk или sid не разобрались";
