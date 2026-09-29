@@ -2,6 +2,8 @@
 # Прогон стендов расширенной части, которым нужна НАСТОЯЩАЯ криптобиблиотека (wolfSSL за слоем
 # src/lib/scrypto.h), а не подменённые функции, как в `make test`:
 #
+#   tests/scryptomatch.c — слой примитивов против известных векторов (RFC, NIST) и цепочка X.509
+#                        с подписями, выпущенными OpenSSL (tests/scrypto-pki.h);
 #   tests/hellofreeze.c — ClientHello байт в байт против заморозки (tests/chello-frozen.h):
 #                        сборщик Hello зовёт X25519 слоя, и отпечаток не должен сдвинуться ни на бит;
 #   tests/xsepochmatch.c — ратчет эпох xsteer против векторов реализации на Go;
@@ -89,7 +91,11 @@ $CC -O2 -g -w $STEER_INC $WCFLAGS -c tests/certgen.c -o "$BUILD/wolfssl-host/cer
 CRYPTO="$BUILD/wolfssl-host/scrypto-$CCTAG.o $WLIB"
 CERTGEN="$BUILD/wolfssl-host/certgen-$CCTAG.o"
 
-# ---- заморозка Hello ---------------------------------------------------------------------------
+# ---- векторы слоя и заморозка Hello ------------------------------------------------------------
+echo "ext-test: собираю и прогоняю scryptomatch..."
+$CC -O2 -g -w $STEER_INC -Itests -o "$BUILD/scryptomatch" tests/scryptomatch.c $CRYPTO -lpthread
+"$BUILD/scryptomatch"
+
 echo "ext-test: собираю и прогоняю hellofreeze..."
 $CC -O2 -w $STEER_INC -o "$BUILD/hellofreeze" tests/hellofreeze.c $CRYPTO -lpthread
 "$BUILD/hellofreeze"
