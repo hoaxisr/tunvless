@@ -47,6 +47,13 @@
  * памяти (realip_reassert) и отвечает «ok\n»; соединение закрывается. Хозяина она не требует и
  * ничем его не меняет — просит её не демон, а тот, кто только что заменил таблицу.
  *
+ * ЧЕТВЁРТАЯ ПРОСЬБА — «flush\n»: её шлёт тот же загрузчик прямо перед засевом карты и наборов
+ * fake-IP из файла состояния (supd_dnsd_flush в supd.c, зовёт ruleset_load в src/daemon/apply.c).
+ * Резолвер записывает файл, если в памяти есть незаписанное (fakeip_state_flush), и отвечает
+ * «ok\n» уже после записи; соединение закрывается. Зачем — у fakeip_state_flush в fakeip.c:
+ * перезапись по сроку отставала от памяти до минуты, и засев ставил в новую таблицу имена без
+ * подмены и прежние адреса. Хозяина не требует, как и «reassert».
+ *
  * ДОСТУП — как у журнала: каталог состояния 0700, сокет 0600 с рождения, собеседник сверяется
  * по SO_PEERCRED — root или тот же uid, что у резолвера (на роутере и телефоне оба — root).
  *
@@ -208,6 +215,15 @@ void adopt_conn_event(int *slot) {
         if (n)
             fprintf(stderr, "steer dnsd: real-ip: %zu element(s) re-asserted right after the "
                             "ruleset load\n", n);
+        say(*slot, "ok\n");
+        conn_drop(slot);
+        return;
+    }
+    if (m == 6 && !memcmp(buf, "flush\n", 6)) {
+        for (size_t i = 0; i < nfd; i++) close(fds[i]);
+        /* Загрузчик сейчас засеет карту и наборы из файла состояния (fpseed.c): файл обязан
+         * быть тем, что знает память, а не тем, что было до минуты назад (fakeip_state_flush). */
+        fakeip_state_flush();
         say(*slot, "ok\n");
         conn_drop(slot);
         return;

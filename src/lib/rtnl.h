@@ -57,6 +57,12 @@ int rtnl_rule_fwmark(int fam, uint32_t mark, uint32_t mask, int table, int prio)
  * шлюза). 0 или errno. */
 int rtnl_route_default_dev(int table, int ifindex);
 
+/* `ip -6 route replace blackhole default metric METRIC table TABLE` — запасной запрет таблицы IPv6
+ * выхода (STEER_BACKSTOP_METRIC в spec.h). Устройство ядро назначает само: в IPv6 запрет всегда
+ * висит на lo. 0 или errno. Этим страж правил демона возвращает запрет, который ядро сняло вместе
+ * с lo (src/daemon/rulewd.c, «ЗАПРЕТ IPv6 УХОДИТ ВМЕСТЕ С lo»). */
+int rtnl_route6_blackhole(int table, int metric);
+
 /* `ip -4 route flush table TABLE`: снять всё, что в таблице лежит. 0 или errno. */
 int rtnl_table_flush(int table);
 

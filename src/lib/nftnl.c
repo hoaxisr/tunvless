@@ -701,11 +701,15 @@ static const struct nlattr *nla_find(const uint8_t *p, size_t len, uint16_t type
 #define NLA_PAY(a) ((const uint8_t *)(a) + NLA_HDRLEN)
 #define NLA_PLEN(a) ((size_t)(a)->nla_len - NLA_HDRLEN)
 
-/* Граница отрезка, в котором лежит key: end = 0 — его начало, 1 — его маркер конца (исключающий).
- * 0 — найдено, ключ в out, *timed — у элемента есть срок; -ENOENT — адрес ни в каком отрезке; иное
- * — отказ ядра или ответа нет (-ETIMEDOUT). Обычный запрос, не транзакция: GET в пакет не входит. */
-static int nftlk_get_bound(const char *table, const char *set, const uint8_t *key, size_t alen,
-                           int end, uint8_t *out, int *timed) {
+/* Элемент по ключу: у интервального набора — граница отрезка, в котором лежит key (end = 0 — его
+ * начало, 1 — его маркер конца, исключающий), у карты без интервалов — сам элемент. 0 — найдено,
+ * ключ в out, *timed — у элемента есть срок, и если data не NULL — значение элемента карты в data
+ * (alen байт), *has_data — оно было в ответе; -ENOENT — такого ключа нет; иное — отказ ядра (старое
+ * ядро отдаёт элементы только дампом и на одиночный GET отвечает -EOPNOTSUPP) или ответа нет
+ * (-ETIMEDOUT). Обычный запрос, не транзакция: GET в пакет не входит. */
+static int nftlk_get_elem(const char *table, const char *set, const uint8_t *key, size_t alen,
+                          int end, uint8_t *out, int *timed, uint8_t *data, int *has_data) {
+    if (has_data) *has_data = 0;
     if (g_nlk_fd < 0) return -ENOTCONN;
     const char *fam_str, *tbl_str;
     nftlk_split_table(table, &fam_str, &tbl_str);
@@ -775,9 +779,68 @@ static int nftlk_get_bound(const char *table, const char *set, const uint8_t *ke
                 f = ntohl(f);
             }
             if (((f & NFT_SET_ELEM_INTERVAL_END) != 0) != (end != 0)) return -ENOENT;
+            if (data && has_data) {
+                const struct nlattr *da = nla_find(NLA_PAY(e1), NLA_PLEN(e1), NFTA_SET_ELEM_DATA);
+                const struct nlattr *dv = da ? nla_find(NLA_PAY(da), NLA_PLEN(da), NFTA_DATA_VALUE)
+                                             : NULL;
+                if (dv && NLA_PLEN(dv) == alen) {
+                    memcpy(data, NLA_PAY(dv), alen);
+                    *has_data = 1;
+                }
+            }
             found = 1;
         }
     }
+}
+
+static int nftlk_get_bound(const char *table, const char *set, const uint8_t *key, size_t alen,
+                           int end, uint8_t *out, int *timed) {
+    return nftlk_get_elem(table, set, key, alen, end, out, timed, NULL, NULL);
+}
+
+/* ---- элемент карты подмены — по тому, что стоит в ядре ------------------------------------------
+ *
+ * ЗАЧЕМ (проверка на QEMU 98b7964, 2026-09-28, docs/architecture.md, раздел 5). После замены набора
+ * правил карта fakeip приходит засеянной текстом (fpseed.c, print.c) — из файла состояния, а не из
+ * памяти резолвера. Резолвер, получив таблицу, ставил каждую подмену заново простым add (у
+ * fakeip_rehydrate «что стоит в ядре» не известно), и EEXIST значил для него «желаемое
+ * состояние». Но EEXIST говорит только, что КЛЮЧ занят: засеянный отставшим файлом адрес .11
+ * оставался в карте, память резолвера (и его быстрый путь по real_host) считала, что стоит .10, и
+ * повторный вопрос имени ничего не менял — в ответе .10, «установлено» .10, менять нечего. Клиенты
+ * шли на прежний адрес, пока не перезапустили резолвер.
+ *
+ * КАК. Сначала спросить ядро (NFT_MSG_GETSETELEM с ключом): значение то же — ничего не делать;
+ * другое — снять и положить одной транзакцией (map_set с changed); ключа нет — простой add. Цена
+ * та же, что у прежнего add: один обмен netlink на имя в обычном случае (засев совпал), два — когда
+ * ключа нет (после перезапуска резолвера карта пуста) и транзакция — когда значение разошлось.
+ * Ядро без одиночного GET (старое: только дамп) или иной отказ ответа — прежний простой add: хуже,
+ * чем было, не становится. Горячий
+ * путь ответа DNS это не зовёт: там «установленное» знает память (known_real), и засевом она не
+ * расходится — расхождение возникает только на замене набора, после которой и зовут этот проход.
+ *
+ * 0 — в ядре желаемое значение (стояло или добавлено), 1 — стояло другое и заменено, иначе
+ * отрицательный errno ядра. */
+static int map_ensure(const char *table, const char *map_name, const void *k, const void *d,
+                      size_t alen) {
+    uint8_t got_k[16], cur[16];
+    int timed = 0, has = 0;
+    int rc = nftlk_get_elem(table, map_name, k, alen, 0, got_k, &timed, cur, &has);
+    if (rc == 0 && has) {
+        if (!memcmp(cur, d, alen)) return 0;
+        rc = map_set(table, map_name, k, d, alen, 1);
+        return rc == 0 ? 1 : rc;
+    }
+    return map_set(table, map_name, k, d, alen, 0);
+}
+
+int nft_map_ensure_element(const char *map_name, uint32_t fake_host, uint32_t real_host) {
+    uint32_t k = htonl(fake_host), d = htonl(real_host);
+    return map_ensure(g_nft_map_table, map_name, &k, &d, 4);
+}
+
+int nft_map_ensure_element6(const char *map_name, const uint8_t fake[16],
+                            const uint8_t real[16]) {
+    return map_ensure(g_nft_map6_table, map_name, fake, real, 16);
 }
 
 /* Отрезок [lo, hi) интервального набора одним сообщением: начало и маркер конца (как у

@@ -386,6 +386,10 @@ static void reassert_routes(void) {
         if (restored || routed)
             fprintf(stderr, "steer dnsd: fake-IP: %zu map, %zu routes re-asserted\n",
                     restored, routed);
+        /* Карта ядра расходилась с памятью (засев из отставшего файла) — заменено по памяти. */
+        if (g_fakeip_fixed)
+            fprintf(stderr, "steer dnsd: fake-IP: в карте ядра у %zu имён стоял другой адрес — "
+                            "заменён на тот, что знает резолвер\n", g_fakeip_fixed);
     }
     size_t ri = realip_reassert();
     if (ri) fprintf(stderr, "steer dnsd: real-ip: %zu element(s) re-asserted with remaining TTL\n", ri);
@@ -1978,11 +1982,9 @@ int run_proxy(int listen_port, int upstream_port) {
              * секунды изменений при жёстком отключении не страшно (домен
              * просто ре-резолвится), а вот молотить носитель на каждый переезд
              * backend'а под живым трафиком — страшно вполне. */
-            if (now - g_fakeip_last_rewrite >= FAKEIP_ANSWER_TTL) {
-                fakeip_state_rewrite();
-                g_fakeip_dirty = 0;
-                g_fakeip_last_rewrite = now;
-            }
+            /* Там, где из файла читают, он пишется сразу: перед засевом по просьбе загрузчика
+             * и при выходе (fakeip_state_flush, fakeip.c). */
+            if (now - g_fakeip_last_rewrite >= FAKEIP_ANSWER_TTL) fakeip_state_flush();
         }
         /* Тишина — спать до события: сигнал перезагрузки или остановки будит epoll_wait
          * через EINTR. Грязная таблица fake-IP — проснуться к сроку её перезаписи. */
@@ -2045,6 +2047,10 @@ int run_proxy(int listen_port, int upstream_port) {
         }
     }
 
+    /* Выход (SIGTERM от демона или procd, срок без демона, просьба «down»): дописать файл
+     * состояния — его прочитают следующий резолвер и засев следующей загрузки набора правил, и
+     * имена последней минуты иначе терялись бы (fakeip_state_flush, fakeip.c). */
+    fakeip_state_flush();
     tcp_close_all();
     dlog_close();
     adopt_close();

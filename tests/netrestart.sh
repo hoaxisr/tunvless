@@ -28,6 +28,14 @@
 #      отбрасывается; у провайдера ни одного.
 #  A6. Шторм: правило снимают шесть раз подряд — каждый раз оно назад, в журнале одна строка о
 #      шторме (страж перешёл на возврат через секунду после пачки).
+#  A7. IPv6 на `network restart` (проверка на QEMU 98b7964, 2026-09-28): netifd кладёт lo — ядро
+#      снимает с ним запасной запрет таблицы IPv6 выхода, — устройство выхода теряет IPv6 (маршрут
+#      `default dev` уходит из таблицы IPv6), и только потом правила сняты обоих семейств. Новый
+#      демон (без памяти о прежних возвратах, шторма нет). Запрет IPv6 назад быстрее 300 мс после
+#      lo down; правило IPv6 — быстрым путём стража (быстрее 300 мс, «возвращены», а не reload
+#      «правила fwmark IPv6 нет»), хотя таблица IPv6 в этот миг пуста; у провайдера — ни одного
+#      пакета IPv6. Затем мост пересоздан и lo лёг вместе со снятием правил — цепочка ingress_mark
+#      и правила обоих семейств назад быстрее 500 мс.
 #
 # B — резолвер поднят раньше набора правил (steer restart): его восстановление подмены уходит в
 # пустоту (ENOENT), затем набор правил, вопрос одного имени, перезапись файла состояния, снятое
@@ -110,21 +118,41 @@ sysctl -qw net.ipv4.conf.r0.forwarding=0 2>/dev/null
 link t0 t1 "$T" 10.9.0.1/30 10.9.0.2/30
 link t2 t3 "$T" 10.9.1.1/30 10.9.1.2/30
 link w0 w1 "$W" 10.77.0.1/30 10.77.0.2/30
+# IPv6 (A7) — на тех же звеньях, без DAD: адрес готов сразу.
+sysctl -qw net.ipv6.conf.all.forwarding=1 2>/dev/null
+v6up() {   # адреса IPv6 устройств выхода (A7 снимает их, выключая IPv6 на устройстве)
+    "$real_ip" -6 addr add fd09::1/64 dev t0 nodad 2>/dev/null
+    "$real_ip" -6 addr add fd09:1::1/64 dev t2 nodad 2>/dev/null
+}
+v6up
+$IT "$real_ip" -6 addr add fd09::2/64 dev t1 nodad
+$IT "$real_ip" -6 addr add fd09:1::2/64 dev t3 nodad
+"$real_ip" -6 addr add fd77::1/64 dev w0 nodad
+$IW "$real_ip" -6 addr add fd77::2/64 dev w1 nodad
+$IC "$real_ip" -6 addr add fd77:1::2/64 dev c0 nodad
 # Мост раздачи — как br-lan у netifd: пересоздаётся целиком (mkbr после `ip link del br0`).
 mkbr() {
     "$real_ip" link add br0 type bridge
     "$real_ip" link set r0 master br0
     "$real_ip" addr add 10.77.1.1/24 dev br0
+    "$real_ip" -6 addr add fd77:1::1/64 dev br0 nodad
     "$real_ip" link set br0 up
 }
 mkbr
 $IC "$real_ip" route add default via 10.77.1.1
+$IC "$real_ip" -6 route add default via fd77:1::1
 "$real_ip" route add default via 10.77.0.2 dev w0
+"$real_ip" -6 route add default via fd77::2 dev w0
 for ns in "$IT" "$IW"; do
     $ns "$real_ip" link add dum0 type dummy
     $ns "$real_ip" link set dum0 up
     $ns "$real_ip" addr add 203.0.113.10/32 dev dum0
 done
+# Настоящий IPv6 за туннелем — на самих t1 и t3: маршрут выхода `default dev t0` без шлюза, и сосед
+# ищется по ND, а ND отвечает только за адрес своего устройства (у ARP IPv4 — за любой свой).
+$IT "$real_ip" -6 addr add 2001:db8:77::10/128 dev t1 nodad
+$IT "$real_ip" -6 addr add 2001:db8:77::10/128 dev t3 nodad
+$IW "$real_ip" -6 addr add 2001:db8:77::10/128 dev dum0 nodad
 # Цели пробы сторожа — за туннелем (выход жив, пока их видно через t0 и t2).
 $IT "$real_ip" addr add 1.1.1.1/32 dev dum0
 $IT "$real_ip" addr add 8.8.8.8/32 dev dum0
@@ -136,6 +164,7 @@ table inet cnt {
         type filter hook prerouting priority -300; policy accept;
         iifname "t1" ip daddr 203.0.113.10 counter comment "real1"
         iifname "t3" ip daddr 203.0.113.10 counter comment "real3"
+        ip6 daddr 2001:db8:77::10 counter comment "real6"
     }
 }
 N
@@ -147,6 +176,7 @@ table inet cnt {
         ip daddr 198.18.0.0/15 counter comment "pool"
         ip daddr 198.51.100.7 counter comment "direct"
         ip daddr 198.51.100.8 counter comment "fo"
+        ip6 daddr 2001:db8:77::10 counter comment "real6"
     }
 }
 N
@@ -172,9 +202,10 @@ export PATH
 cat > "$tmp/send.py" <<'PY'
 import os, socket, sys, time
 dst, stop = sys.argv[1], sys.argv[2]
+fam = socket.AF_INET6 if ':' in dst else socket.AF_INET
 n = 0
 while not os.path.exists(stop):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s = socket.socket(fam, socket.SOCK_DGRAM)
     try:
         s.sendto(b'x', (dst, 9999)); n += 1
     except OSError:
@@ -189,7 +220,7 @@ send_stop() { : > "$tmp/stop"; wait "$SENDER" 2>/dev/null; sleep 0.2; cat "$tmp/
 burst() { $IC python3 -c "
 import socket, time
 for i in range($2):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s = socket.socket(socket.AF_INET6 if ':' in '$1' else socket.AF_INET, socket.SOCK_DGRAM)
     try: s.sendto(b'x', ('$1', 9999))
     except OSError: pass
     s.close(); time.sleep(0.005)
@@ -198,6 +229,7 @@ for i in range($2):
 printf 's19.test\n' > "$tmp/d.lst"
 printf '198.51.100.7\n' > "$tmp/dir.lst"
 printf '198.51.100.8\n' > "$tmp/fo.lst"
+printf '2001:db8:77::10/128\n' > "$tmp/v6.lst"
 cat > "$tmp/spec.json" <<EOF
 { "schema": 2, "lan_devices": ["br0"],
   "outputs": { "wg": { "kind": "interface", "devices": ["t0", "t2"], "on_fail": "drop" },
@@ -206,7 +238,8 @@ cat > "$tmp/spec.json" <<EOF
   "channels": [ { "name": "dir", "match": { "prefixes_files": ["$tmp/dir.lst"] }, "out": "dr" },
                 { "name": "fo", "match": { "prefixes_files": ["$tmp/fo.lst"] }, "out": "dx" },
                 { "name": "s", "match": { "domains_files": ["$tmp/d.lst"], "mode": "fakeip" },
-                  "out": "wg" } ] }
+                  "out": "wg" },
+                { "name": "v6", "match": { "prefixes_files": ["$tmp/v6.lst"] }, "out": "wg" } ] }
 EOF
 mkdir -p "$tmp/st"
 printf 's19.test\t198.18.0.1\t203.0.113.10\n' > "$tmp/st/fakeip.state"
@@ -346,6 +379,98 @@ check "  в журнале — шторм, одной строкой" "1" "$(gre
 
 # NETRESTART_KEEP=ФАЙЛ — журнал демона сохранить (разбор упавшего опыта).
 [ -n "${NETRESTART_KEEP:-}" ] && cp "$tmp/d.err" "$NETRESTART_KEEP"
+kill "$D" 2>/dev/null
+wait "$D" 2>/dev/null
+
+# ---- A7. IPv6: lo лёг, IPv6 устройства выхода ушёл, правила сняты ------------------------------
+# Новый демон: у прежнего после A6 — шторм, и он возвращал бы правила через секунду.
+"$BIN" daemon --watch --watch-period 3 --apply --socket "$tmp/s.sock" $S >"$tmp/d7.out" 2>"$tmp/d7.err" &
+D=$!
+pids="$pids $D"
+wait_for 'grep -q "спека применена при старте" "$tmp/d7.err"' 15
+sleep 4
+TW="$(awk '$1 == "wg" { print $3 }' "$tmp/st/registry")"
+ours6() { "$real_ip" -6 rule show | grep -c "fwmark 0x$MW/"; }
+bs6() { "$real_ip" -6 route show table "$TW" | grep -c '^blackhole default.*metric 65535'; }
+dev6() { "$real_ip" -6 route show table "$TW" | grep -c '^default dev t[02]'; }
+v6off() { for d in t0 t2; do sysctl -qw "net.ipv6.conf.$d.disable_ipv6=$1"; done; }
+check "A7: до опыта у выхода wg правило IPv6, запрет и маршрут IPv6 в устройство" "1 1 1" \
+    "$(ours6) $(bs6) $(dev6)"
+W6="$(cnt "$IW" real6)" T6="$(cnt "$IT" real6)"
+burst 2001:db8:77::10 20
+check "  IPv6 канала v6 — в туннель, у провайдера ни одного" "yes 0" \
+    "$([ $(($(cnt "$IT" real6) - T6)) -ge 18 ] && echo yes || echo "no:$(($(cnt "$IT" real6) - T6))") $(($(cnt "$IW" real6) - W6))"
+W6="$(cnt "$IW" real6)"
+nr0="$(grep -c 'сняты снаружи — возвращены: wg' "$tmp/d7.err")"
+send_start 2001:db8:77::10
+sleep 0.3
+t0="$(now_ms)"
+"$real_ip" link set lo down
+wait_for '[ "$(bs6)" = 1 ]' 5
+ms=$(( $(now_ms) - t0 ))
+echo "     (запрет IPv6 назад через $ms мс после lo down)"
+check "  lo down: ядро сняло запрет IPv6, страж вернул его быстрее 300 мс" "yes" \
+    "$([ "$(bs6)" = 1 ] && [ $ms -lt 300 ] && echo yes || echo "no:$ms ms")"
+check "  в журнале — «запрет IPv6 … возвращён: wg»" "1" \
+    "$(grep -c 'запрет IPv6 в таблице выхода снят .* возвращён: wg' "$tmp/d7.err")"
+v6off 1
+wait_for '[ "$(dev6)" = 0 ]' 3
+t0="$(now_ms)"
+"$real_ip" rule flush
+"$real_ip" rule add priority 32766 table main
+"$real_ip" rule add priority 32767 table default
+"$real_ip" -6 rule flush
+"$real_ip" -6 rule add priority 32766 table main
+wait_for '[ "$(ours6)" = 1 ] && [ "$(ours)" = 1 ]' 5
+ms=$(( $(now_ms) - t0 ))
+echo "     (правила обоих семейств назад через $ms мс; таблица IPv6 — только запрет)"
+check "  правило IPv6 назад быстрым путём стража, быстрее 300 мс" "yes" \
+    "$([ "$(ours6)" = 1 ] && [ $ms -lt 300 ] && echo yes || echo "no:$ms ms, $(ours6)")"
+check "  в журнале — «возвращены: wg», а не перепривязка reload" "yes 0" \
+    "$([ "$(grep -c 'сняты снаружи — возвращены: wg' "$tmp/d7.err")" -gt "$nr0" ] && echo yes || echo no) $(grep -c 'правила fwmark IPv6 нет' "$tmp/d7.err")"
+"$real_ip" link set lo up
+v6off 0
+v6up
+sleep 0.5
+sent="$(send_stop)"
+check "  у провайдера ни одного пакета IPv6 (отправлено $sent)" "0" "$(($(cnt "$IW" real6) - W6))"
+wait_for '[ "$(dev6)" = 1 ]' 20
+check "  IPv6 на устройстве вернулся — проход сторожа вернул маршрут IPv6, запрет на месте" "1 1" \
+    "$(dev6) $(bs6)"
+T6="$(cnt "$IT" real6)"
+burst 2001:db8:77::10 20
+check "  IPv6 канала снова в туннель" "yes" \
+    "$([ $(($(cnt "$IT" real6) - T6)) -ge 18 ] && echo yes || echo "no:$(($(cnt "$IT" real6) - T6))")"
+sleep 6
+# Мост пересоздан, lo лёг, IPv6 устройства выхода ушёл, правила сняты — всё разом, как netifd.
+check "A7: до опыта цепочка ingress_mark на br0" "yes" "$(ing_on_br0)"
+W0="$(cnt "$IW" real)" W6="$(cnt "$IW" real6)"
+send_start 198.18.0.1
+sleep 0.3
+"$real_ip" link del br0
+t0="$(now_ms)"
+mkbr
+"$real_ip" link set lo down
+v6off 1
+"$real_ip" rule flush
+"$real_ip" rule add priority 32766 table main
+"$real_ip" rule add priority 32767 table default
+"$real_ip" -6 rule flush
+"$real_ip" -6 rule add priority 32766 table main
+wait_for '[ "$(ing_on_br0)" = yes ] && [ "$(ours)" = 1 ] && [ "$(ours6)" = 1 ] && [ "$(bs6)" = 1 ]' 10
+ms=$(( $(now_ms) - t0 ))
+echo "     (цепочка ingress, правила и запрет IPv6 назад через $ms мс)"
+check "  цепочка ingress_mark на новом br0, правила обоих семейств и запрет IPv6 — быстрее 500 мс" "yes" \
+    "$([ "$(ing_on_br0)" = yes ] && [ "$(ours)" = 1 ] && [ "$(ours6)" = 1 ] && [ $ms -lt 500 ] && echo yes || echo "no:$ms ms")"
+check "  reload не перепривязывал правило IPv6" "0" "$(grep -c 'правила fwmark IPv6 нет' "$tmp/d7.err")"
+"$real_ip" link set lo up
+v6off 0
+v6up
+sleep 0.5
+sent="$(send_stop)"
+check "  у провайдера ни одного пакета (отправлено $sent)" "0 0" \
+    "$(($(cnt "$IW" real) - W0)) $(($(cnt "$IW" real6) - W6))"
+[ -n "${NETRESTART_KEEP:-}" ] && cp "$tmp/d7.err" "$NETRESTART_KEEP.a7"
 kill "$D" 2>/dev/null
 wait "$D" 2>/dev/null
 "$BIN" down --state-dir "$tmp/st" >/dev/null 2>&1
