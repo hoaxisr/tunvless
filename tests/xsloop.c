@@ -9,12 +9,15 @@
  * Ровно эта ошибка тут и была найдена при первом прогоне: хаб генерировал свою эфемерную
  * пару ДО того, как сохранял чужую, и затирал её — ee у сторон не совпадал.
  *
- * Ни сети, ни прав root: обе стороны обмениваются байтами через буфер. Но нужен настоящий
- * mbedtls (здесь считается криптография), поэтому в make test стенд не входит.
+ * Ни сети, ни прав root: обе стороны обмениваются байтами через буфер. Но нужна настоящая
+ * криптобиблиотека (здесь считается криптография), поэтому в make test стенд не входит;
+ * собирает и прогоняет его tests/ext-test.sh (make ext-test). Библиотеку и слой он собирает
+ * сам, после этого стенд руками:
  *
- *     cc -O2 -w -Isrc -I<mbedtls>/include -o build/xsloop tests/xsloop.c \
+ *     cc -O2 -w $(make -s print-inc) -o build/xsloop tests/xsloop.c \
  *        src/proto/xsteer/xshake.c src/proto/tls/chello.c src/proto/xsteer/xswire.c src/proto/tls/reality.c \
- *        src/proto/tls/tls13.c src/proto/tls/h2.c <mbedtls>/library/libmbedcrypto.a
+ *        src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c \
+ *        build/wolfssl-host/scrypto-cc.o build/wolfssl-host/libwolfssl-cc.a -lpthread
  */
 #include <stdio.h>
 #include <string.h>
