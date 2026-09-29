@@ -70,6 +70,11 @@ struct platform_ops {
      * раздачи создаёт включение раздачи (телефон: rndis0, wlan1, ncm0), каждое включение и
      * выключение меняло бы набор правил в ядре и звало бы его полную замену. */
     unsigned lan_devs_persist : 1;
+    /* Раздачу IPv6 в LAN ведут netifd и odhcpd — настройка человека, по которой адреса префикса
+     * хоста доходят до клиентов (ip6prefix, ip6assign). Тогда действуют `ipv6: routed` и `ipv6:
+     * nat` у выхода (шаг 8 выпуска 1.10, spec.h: out_ipv6_mode). На телефоне раздачей IPv6
+     * владеет Tethering Android, и эти режимы там — отсутствие ключа с предупреждением. */
+    unsigned lan_ipv6_host : 1;
     unsigned warn_iptables_nat : 1;   /* старое ядро: предупреждать о живом nat iptables */
     unsigned dnsd_origdst : 1;        /* резолвер переспрашивает того, к кому шёл запрос (умолчание) */
     const char *ctl_allow_domain;     /* SELinux-домен клиента сокета; NULL — проверки нет */

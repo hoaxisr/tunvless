@@ -1839,6 +1839,97 @@ check "ingress: группа latency с idle_timeout — тоже на ingress (
 # Телефон (устройства раздачи по требованию) — androidmatch.sh: здесь платформа — у бинарника
 # стенда (platmatch гоняет этот стенд и сборкой под телефон с платформой openwrt).
 
+# ---- IPv6 от хоста: ключ ipv6 у выхода (шаг 8 выпуска 1.10) ----------------------------------
+# Спека без ключа — прежний набор правил до байта (снимок: прежние вызовы стендов совпадают).
+# С ключом: routed — набор v6donor с префиксом хоста, «всё несовпавшее из префикса — в донора»
+# последним правилом разметки, запрет источника из префикса мимо донора и ULA-источника в донора
+# (forward_v6), IPv6 правил в другие выходы — отказ (forward_v6 по метке), их доменные группы без
+# половины IPv6; nat — своя цепочка masquerade IPv6 на устройство выхода; off — отказ по метке.
+# Устройство раздачи — несуществующее: префикс без prefix: выводится по адресам устройства
+# раздачи, и на машине стенда его нет — вывод от машины не зависит.
+printf '203.0.113.0/24\n2001:db8:a::/48\n' > "$tmp/h6a.lst"
+printf '198.51.100.0/24\n2001:db8:b::/48\n' > "$tmp/h6b.lst"
+printf '2001:db8:c::/48\n' > "$tmp/h6c.lst"
+printf 'host.example\n' > "$tmp/h6a.dom"
+printf 'other.example\n' > "$tmp/h6b.dom"
+h6spec() {   # h6spec ФАЙЛ КЛЮЧИ_ДОНОРА КЛЮЧИ_ВТОРОГО
+    cat > "$1" <<EOF
+version: 2
+lan: { devices: [steer-nolan0] }
+lists:
+  a:  { prefixes_file: $tmp/h6a.lst }
+  b:  { prefixes_file: $tmp/h6b.lst }
+  c:  { prefixes_file: $tmp/h6c.lst }
+  da: { domains_file: $tmp/h6a.dom }
+  db: { domains_file: $tmp/h6b.dom }
+outputs:
+  host:  { kind: interface, device: wg1$2 }
+  other: { kind: interface, device: wg2$3 }
+  dir:   { kind: direct }
+rules:
+  - { name: a,  to: a,  out: host }
+  - { name: b,  to: b,  out: other }
+  - { name: c,  to: c,  out: dir }
+  - { name: da, to: da, out: host }
+  - { name: db, to: db, out: other }
+EOF
+}
+H6="--state-dir $tmp/st-h6"
+h6spec "$tmp/h6r.yaml" ', ipv6: routed, prefix: "2001:db8:1::/56"' ''
+h6r="$("$BIN" apply --dry-run --spec "$tmp/h6r.yaml" $H6 2>/dev/null)"
+check "ipv6 routed: компилируется" "0" "$?"
+check "ipv6 routed: набор v6donor с префиксом хоста" "1" \
+    "$(printf '%s\n' "$h6r" | sed -n '/set v6donor {/,/}/p' | grep -c 'elements = { 2001:db8:1::/56 }')"
+check "ipv6 routed: «всё несовпавшее из префикса — в донора» — последним правилом разметки" \
+    'ip6 saddr @v6donor ip6 daddr != @v6donor ip6 daddr != { fc00::/7, fe80::/10, ff00::/8 } meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer-v6donor:host"' \
+    "$(chain_of "$h6r" prerouting_mark | sed -n '$!p' | tail -n 1 | sed 's/^ *//')"
+check "ipv6 routed: источник из префикса — только в донора и в LAN" "1" \
+    "$(chain_of "$h6r" forward_v6 | grep -c 'ip6 saddr @v6donor ip6 daddr != @v6donor oifname != { "wg1", "steer-nolan0" } counter reject with icmpx type admin-prohibited comment "steer-v6src:host"')"
+check "ipv6 routed: ULA-источник в донора — отказ, если префикс не ULA" "1" \
+    "$(chain_of "$h6r" forward_v6 | grep -c 'oifname "wg1" ip6 saddr fc00::/7 ip6 saddr != @v6donor counter reject')"
+check "ipv6 routed: IPv6 правил во второй выход — отказ по его метке" "1" \
+    "$(chain_of "$h6r" forward_v6 | grep -c 'comment "steer-v6drop:other"')"
+# Парный набор у группы второго выхода есть — ради строк IPv6 адресного списка, — но без срока:
+# резолвер в него адресов не кладёт (dom6_ok — нет), и AAAA её имён пуст.
+check "ipv6 routed: доменная группа второго выхода — без половины IPv6 резолвера (AAAA пуст)" "0" \
+    "$(printf '%s\n' "$h6r" | sed -n '/set other_dom6 {/,/}/p' | grep -c timeout)"
+check "ipv6 routed: доменная группа донора — с половиной IPv6" "1" \
+    "$(printf '%s\n' "$h6r" | sed -n '/set host_dom6 {/,/}/p' | grep -c 'flags interval,timeout')"
+check "ipv6 routed: у донора своя метка и в postrouting_guard" "1" \
+    "$(chain_of "$h6r" postrouting_guard | grep -c 'comment "steer-guard:host"')"
+check "ipv6 routed: резолвер — у имён второго выхода только IPv4" "46 4" \
+    "$("$BIN" dnsd-table --spec "$tmp/h6r.yaml" $H6 2>/dev/null | awk -F'|' '$5 == "da" { a = $4 } $5 == "db" { b = $4 } END { print a, b }')"
+# Без prefix: — префикс выводится по адресам раздачи; на стенде их нет: набор пуст, apply говорит,
+# чего не хватает.
+h6spec "$tmp/h6d.yaml" ', ipv6: routed' ''
+h6d_err="$("$BIN" apply --dry-run --spec "$tmp/h6d.yaml" $H6 2>&1 >/dev/null)"
+check "ipv6 routed без prefix: набор объявлен без элементов" "0" \
+    "$("$BIN" apply --dry-run --spec "$tmp/h6d.yaml" $H6 2>/dev/null | sed -n '/set v6donor {/,/}/p' | grep -c elements)"
+check "ipv6 routed без prefix: apply говорит, чего не хватает" "1" \
+    "$(printf '%s\n' "$h6d_err" | grep -c 'задайте ip6prefix у интерфейса wg1 и ip6assign у LAN (или prefix: у выхода)')"
+# ingress: правило «всё несовпавшее» и на ingress, а метка донора — в карте узнавания.
+h6i="$(STEER_NFT_INGRESS=all "$BIN" apply --dry-run --spec "$tmp/h6r.yaml" $H6 2>/dev/null)"
+check "ipv6 routed, ingress: «всё несовпавшее» — и в ingress_mark" "1" \
+    "$(chain_of "$h6i" ingress_mark | grep -c 'comment "steer-v6donor:host"')"
+check "ipv6 routed, ingress: метка донора в карте prerouting_mark" "1" \
+    "$(chain_of "$h6i" prerouting_mark | grep -c '0x00100000 : goto ingress_ct')"
+h6spec "$tmp/h6n.yaml" ', ipv6: nat' ', ipv6: nat'
+h6n="$("$BIN" apply --dry-run --spec "$tmp/h6n.yaml" $H6 2>/dev/null)"
+check "ipv6 nat: masquerade IPv6 своей цепочкой — на оба выхода" "2" \
+    "$(chain_of "$h6n" postrouting_nat6 | grep -c 'meta nfproto ipv6 counter masquerade comment "steer-nat6:')"
+check "ipv6 nat: цепочка — nat на srcnat" "1" \
+    "$(chain_of "$h6n" postrouting_nat6 | grep -c 'type nat hook postrouting priority srcnat; policy accept;')"
+check "ipv6 nat: набора v6donor и отказов по источнику нет" "0" "$(printf '%s\n' "$h6n" | grep -c 'v6donor')"
+h6nl="$(STEER_NFT_COMPAT=legacy "$BIN" apply --dry-run --spec "$tmp/h6n.yaml" $H6 2>/dev/null)"
+check "ipv6 nat, старое ядро: masquerade — в ip6 postrouting_nat" "2" \
+    "$(printf '%s\n' "$h6nl" | sed -n '/^table ip6 /,/^}/p' | grep -c 'oifname "wg[12]" counter masquerade comment "steer-nat6:')"
+h6spec "$tmp/h6o.yaml" ', ipv6: off' ''
+h6o="$("$BIN" apply --dry-run --spec "$tmp/h6o.yaml" $H6 2>/dev/null)"
+check "ipv6 off: IPv6 правил выхода — отказ по метке" "1" \
+    "$(chain_of "$h6o" forward_v6 | grep -c 'comment "steer-v6drop:host"')"
+check "ipv6 off: у второго выхода без ключа IPv6 прежний (не отвергается)" "0" \
+    "$(chain_of "$h6o" forward_v6 | grep -c 'steer-v6drop:other')"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
 

@@ -600,6 +600,9 @@ static void kel_set(void *arg, const struct nfd_set *s) {
     struct kel_sets *c = arg;
     if (s->flags & (KEL_ANONYMOUS | KEL_MAP | KEL_EVAL | KEL_OBJECT)) return;
     if (!strcmp(s->name, FAILOPEN_SET)) return;
+    /* Префикс хоста у донора IPv6: элементы ведёт сторож (v6donor_sync, failover.c) — выведенный
+     * префикс меняется без смены спеки, и сверка считала бы каждое такое изменение чужой правкой. */
+    if (!strcmp(s->name, V6DONOR_SET)) return;
     if (c->n == sizeof(c->v) / sizeof(c->v[0])) { c->over = 1; return; }
     c->v[c->n++] = *s;
 }

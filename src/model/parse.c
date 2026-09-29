@@ -252,11 +252,86 @@ void group_set_name_extra(const struct spec *sp, char *dst, size_t n, const char
 int dom6_ok(const struct spec *sp, const struct output *o, const char (*from)[64], size_t from_n,
             int realip, int nftc) {
     if (out_needs_mark(o) && !out_has_cap(o, KC_IPV6)) return 0;
+    /* IPv6 выхода снят (spec_v6_resolve): `ipv6: off` или выход рядом с донором. Отдельной
+     * строкой ради direct — у него метки нет, и строка выше его не касается, а рядом с донором
+     * IPv6 из префикса хоста напрямую не пускается (forward_v6), и адрес ему отвечать незачем. */
+    if (o->v6_denied) return 0;
     int who = !from_n || spec_is_mac(from[0]) || from_same(from, from_n, sp->lan.from, sp->lan.from_n);
     for (size_t i = 0; i < from_n && !who; i++) who = strchr(from[i], ':') != NULL;
     if (!who) return 0;
     if (!realip && (nftc & NFTC_LEGACY) && !(nftc & NFTC_IP6NAT)) return 0;
     return 1;
+}
+
+/* ---- IPv6 от хоста (spec.h, enum out_ipv6) ------------------------------------------------- */
+
+int v6pfx_parse(const char *s, struct v6pfx *p, char *why, size_t n) {
+    memset(p, 0, sizeof(*p));
+    char buf[64];
+    const char *sl = strchr(s, '/');
+    if (!sl || (size_t)(sl - s) >= sizeof(buf)) {
+        snprintf(why, n, "«%s» — нужен префикс IPv6 с длиной, например 2001:db8:1::/56", s);
+        return -1;
+    }
+    memcpy(buf, s, (size_t)(sl - s));
+    buf[sl - s] = '\0';
+    char *end = NULL;
+    long len = strtol(sl + 1, &end, 10);
+    struct in6_addr a;
+    if (!sl[1] || *end || inet_pton(AF_INET6, buf, &a) != 1) {
+        snprintf(why, n, "«%s» — не префикс IPv6 (нужно вида 2001:db8:1::/56)", s);
+        return -1;
+    }
+    /* Не длиннее /64: из префикса хоста netifd выдаёт LAN куски по /64 (ip6assign), и SLAAC
+     * клиентов работает только в /64 — префикс длиннее раздать нечем. */
+    if (len < 1 || len > 64) {
+        snprintf(why, n, "«%s» — длина префикса от 1 до 64 (сеть клиентов — /64, раздавать её "
+                 "нужно из префикса не длиннее)", s);
+        return -1;
+    }
+    memcpy(p->a, &a, 16);
+    p->len = (unsigned char)len;
+    struct v6pfx m = *p;
+    uint8_t lo[16], hi[16];
+    v6pfx_range(&m, lo, hi);
+    if (memcmp(lo, p->a, 16) != 0) {
+        char net[INET6_ADDRSTRLEN];
+        inet_ntop(AF_INET6, lo, net, sizeof(net));
+        snprintf(why, n, "«%s» — у префикса ненулевые биты хоста: сеть этой длины — %s/%ld", s, net,
+                 len);
+        memset(p, 0, sizeof(*p));
+        return -1;
+    }
+    /* Служебные диапазоны префиксом хоста не бывают: link-local, multicast, петля и пул fake-IP
+     * v6 движка (fdfe:dcba:9876::/96 — его адреса клиенты видят как настоящие назначения). */
+    static const uint8_t fake6[12] = { FAKEIP6_PREFIX_BYTES };
+    if (IN6_IS_ADDR_LINKLOCAL(&a) || IN6_IS_ADDR_MULTICAST(&a) || IN6_IS_ADDR_UNSPECIFIED(&a) ||
+        IN6_IS_ADDR_LOOPBACK(&a) || !memcmp(p->a, fake6, sizeof(fake6))) {
+        snprintf(why, n, "«%s» — служебный диапазон, префиксом хоста он быть не может", s);
+        memset(p, 0, sizeof(*p));
+        return -1;
+    }
+    return 0;
+}
+
+/* КОМУ СНЯТЬ IPv6. `ipv6: off` — самому выходу. Рядом с донором (`ipv6: routed`) — всем, кроме
+ * донора и выходов с `ipv6: nat`: у клиентов LAN адреса из префикса хоста, и такой адрес в любом
+ * другом выходе ответа не получит (другой сервер WireGuard отбросит его по AllowedIPs, провайдер —
+ * по BCP38). Поэтому IPv6 правил в другие выходы отвергается сразу (forward_v6 по метке, а у
+ * direct — правило «источник из префикса не мимо донора»), имена под ними получают пустой AAAA
+ * (dom6_ok), и клиент идёт по IPv4 в нужный выход. Выход с `ipv6: nat` рядом с донором IPv6 несёт
+ * (masquerade), но адрес из префикса и туда не уходит — это держит правило в forward_v6; с ULA
+ * клиенты туда ходят. Группа — такой же выход: она не донор, и IPv6 её правил снят (адрес из
+ * префикса нельзя отдать члену, который не донор, а выбор члена меняется без замены набора правил).
+ *
+ * Спека без ключа ipv6 (и спека v1) — ни одному выходу ничего не снимается: поведение 1.9. */
+void spec_v6_resolve(struct spec *sp) {
+    const struct output *donor = spec_v6_donor(sp);
+    for (size_t i = 0; i < sp->out_n; i++) {
+        struct output *o = &sp->out[i];
+        enum out_ipv6 m = out_ipv6_mode(o);
+        o->v6_denied = m == OUT_V6_OFF || (donor && o != donor && m != OUT_V6_NAT);
+    }
 }
 
 /* Поддельный адрес IPv6 из поддельного IPv4: префикс пула и адрес IPv4 в младших 32 битах. */

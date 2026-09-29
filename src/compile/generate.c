@@ -619,6 +619,55 @@ static void x_counter_mh(struct nft_rule *r, const char *name, enum mark_hook mh
 
 static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const struct group *g,
                              const struct output *o, enum mark_hook mh);
+
+/* ---- IPv6 ОТ ХОСТА: донор (ipv6: routed), шаг 8 выпуска 1.10 ------------------------------
+ *
+ * Устройство режимов — у enum out_ipv6 в spec.h. Здесь — три куска набора правил донора, и все
+ * они стоят только в спеке с донором (spec_v6_donor), поэтому спека без ключа ipv6 даёт прежний
+ * текст до байта.
+ *
+ * НАБОР v6donor (V6DONOR_SET) — префикс хоста: `prefix:` спеки или выведенный из адресов раздачи
+ * (v6donor_derive, failover.c). Набор, а не адрес в тексте правил: выведенный префикс меняется без
+ * смены спеки (netifd выдал LAN адрес позже, чем встал движок; человек сменил ip6prefix), и сторож
+ * переписывает элементы набора сам (v6donor_sync), не заменяя набор правил. Элементы в тексте —
+ * то, что известно при apply, чтобы с загрузки до первого прохода набор не стоял пустым.
+ *
+ * ВСЁ НЕСОВПАВШЕЕ ИЗ ПРЕФИКСА — В ДОНОРА: последнее правило разметки (v6donor_catchall). Правила
+ * каналов стоят выше и решают первыми: правило в донора — его метка, правило в другой выход — метка
+ * того выхода, и такой IPv6 отвергает forward_v6 (IPv6 у выхода рядом с донором снят,
+ * spec_v6_resolve), правило direct — без метки, и его отвергает запрет источника ниже. Назначения
+ * внутри своей сети в донора не уводятся: сам префикс (другие куски LAN), ULA, link-local и
+ * multicast — их маршрут в main, а метка увела бы их в таблицу донора, то есть в туннель.
+ *
+ * ИСТОЧНИК ИЗ ПРЕФИКСА — ТОЛЬКО В ДОНОРА (v6donor_guard, цепочка forward_v6): пересылаемый пакет с
+ * адресом из префикса, который уходит не в устройство донора и не в устройство раздачи, —
+ * отвергается сразу (ICMPv6 admin-prohibited, клиент переходит на IPv4). Это fail-closed на все
+ * случаи сразу: правило канала direct, упавший донор с on_fail=direct (правило fwmark снято, пакет
+ * пошёл по main — в WAN), снятое netifd правило ip rule, чужой маршрут. Ответа на такой пакет всё
+ * равно не было бы: другой сервер отбросит чужой источник по AllowedIPs, провайдер — по BCP38. По
+ * имени устройства, как postrouting_guard, и в forward: там reject разрешён, и туда не попадает
+ * трафик к самому роутеру. Там же — ULA-источник в донора (клиент идёт к поддельному адресу
+ * fake-IP fdfe:… со своего ULA: так выбирает источник RFC 6724), если префикс хоста не сам ULA:
+ * хост маршрутизует только префикс, и такой пакет он отбросит молча — отказ сразу лучше таймаута.
+ *
+ * Трафик самого роутера (хук output) сюда не входит: наружу роутер ходит со своих адресов WAN и
+ * туннелей (выбор источника по устройству выхода), а не с адреса раздачи. */
+static void v6donor_catchall(struct nft_chain *c, const struct spec *sp, enum mark_hook mh) {
+    const struct output *d = spec_v6_donor(sp);
+    if (!d || !d->mark) return;
+    struct nft_rule *r = ir_rule(c);
+    ir_rule_fam(r, 6);
+    ir_setref(r, "ip6 saddr", V6DONOR_SET);
+    ir_setref(r, "ip6 daddr !=", V6DONOR_SET);
+    ir_x(r, "ip6 daddr != { fc00::/7, fe80::/10, ff00::/8 }");
+    unsigned mk = out_skips_zapret(d) ? (d->mark | ZAPRET_SKIP_MARK) : d->mark;
+    if (mh == MH_INGRESS) x_mark_ingress(r, d, mk);
+    else x_mark(r, d, mk);
+    ir_counter(r, 0, 0);
+    ir_x(r, "return");
+    ir_comment(r, "steer-v6donor:%s", d->name);
+}
+
 static int build_mark_rules(struct nft_chain *c, const struct spec *sp, const struct groups *gr,
                             enum mark_hook mh, struct err *e) {
     for (size_t i = 0; i < gr->n; i++) {
@@ -658,6 +707,7 @@ static int build_mark_rules(struct nft_chain *c, const struct spec *sp, const st
             ir_comment(r6, "steer:%s", g->name);
         }
     }
+    v6donor_catchall(c, sp, mh);
     return 0;
 }
 
@@ -848,10 +898,17 @@ static void ingress_trust(struct nft_table *t, struct nft_chain *pm, const struc
     uint32_t keys[MAX_OUTPUTS];
     size_t nk = 0;
     int ct = 0;
-    for (size_t i = 0; i < gr->n; i++) {
-        const struct group *g = &gr->g[i];
-        if (group_is_local(g)) continue;
-        const struct output *o = out_by_name(sp, g->out);
+    /* Последним — донор IPv6: его метку ставит и правило «всё несовпавшее из префикса»
+     * (v6donor_catchall), даже если ни одно правило в донора не ведёт. */
+    for (size_t i = 0; i <= gr->n; i++) {
+        const struct output *o;
+        if (i == gr->n) {
+            o = spec_v6_donor(sp);
+        } else {
+            const struct group *g = &gr->g[i];
+            if (group_is_local(g)) continue;
+            o = out_by_name(sp, g->out);
+        }
         if (!o || (!out_balanced(o) && !out_needs_mark(o))) continue;
         size_t k = 0;
         while (k < nk && keys[k] != o->mark) k++;
@@ -1028,6 +1085,34 @@ static void build_postrouting_down(struct nft_table *t, const struct spec *sp,
  * сети кончился бы целиком. forward видит ровно то, что ушло бы наружу. reject, а не drop: клиент
  * с двумя стеками получает отказ сразу и переходит на IPv4 (так выбирает адрес любой клиент),
  * а не ждёт таймаута соединения. Цепочка — только в спеке, где такой трафик вообще бывает. */
+/* Запрет источника из префикса мимо донора и ULA-источника в донора — доводы у v6donor_catchall.
+ * Устройства, куда адресу из префикса уходить можно: донор и устройства раздачи (соседний кусок
+ * сети между двумя устройствами раздачи — тоже своя сеть; назначение в самом префиксе пропускается
+ * и так). */
+static void v6donor_guard(struct nft_chain *c, const struct spec *sp, const struct output *d) {
+    struct sbuf b = { .n = 0 };
+    sb_add(&b, "oifname != { \"%s\"", d->device);
+    for (size_t i = 0; i < sp->lan_dev_n; i++)
+        if (strcmp(sp->lan_dev[i], d->device)) sb_add(&b, ", \"%s\"", sp->lan_dev[i]);
+    sb_add(&b, " }");
+    struct nft_rule *r = ir_rule(c);
+    ir_rule_fam(r, 6);
+    ir_setref(r, "ip6 saddr", V6DONOR_SET);
+    ir_setref(r, "ip6 daddr !=", V6DONOR_SET);
+    ir_x(r, "%s", b.s);
+    ir_counter(r, 0, 0);
+    ir_x(r, "reject with icmpx type admin-prohibited");
+    ir_comment(r, "steer-v6src:%s", d->name);
+    r = ir_rule(c);
+    ir_rule_fam(r, 6);
+    ir_x(r, "oifname \"%s\"", d->device);
+    ir_x(r, "ip6 saddr fc00::/7");
+    ir_setref(r, "ip6 saddr !=", V6DONOR_SET);
+    ir_counter(r, 0, 0);
+    ir_x(r, "reject with icmpx type admin-prohibited");
+    ir_comment(r, "steer-v6ula:%s", d->name);
+}
+
 static void build_forward_v6(struct nft_table *t, const struct spec *sp, const struct groups *gr) {
     uint32_t marks[MAX_OUTPUTS];
     const char *names[MAX_OUTPUTS];
@@ -1046,7 +1131,9 @@ static void build_forward_v6(struct nft_table *t, const struct spec *sp, const s
             n++;
         }
     }
-    if (!n) return;
+    const struct output *d = spec_v6_donor(sp);
+    if (d && !d->device[0]) d = NULL;
+    if (!n && !d) return;
     struct nft_chain *c = ir_base_chain_add(t, "forward_v6", "filter", "forward", "mangle", 0);
     for (size_t k = 0; k < n; k++) {
         struct nft_rule *r = ir_rule(c);
@@ -1056,6 +1143,7 @@ static void build_forward_v6(struct nft_table *t, const struct spec *sp, const s
         ir_x(r, "reject with icmpx type admin-prohibited");
         ir_comment(r, "steer-v6drop:%s", names[k]);
     }
+    if (d) v6donor_guard(c, sp, d);
 }
 
 /* ---- ПОМЕЧЕННЫЙ ПАКЕТ НЕ ТУДА — НИКУДА: postrouting_guard ------------------------------------
@@ -1160,6 +1248,8 @@ static void build_guard(struct nft_table *t, const struct spec *sp, const struct
     for (size_t i = 0; i < gr->n; i++) guard_use(sp, out_by_name(sp, gr->g[i].out), used, 0);
     for (size_t i = 0; i < sp->out_n; i++)
         if (sp->out[i].over[0]) guard_use(sp, out_over(sp, &sp->out[i]), used, 0);
+    /* Метку донора IPv6 ставит и правило «всё несовпавшее из префикса» (v6donor_catchall). */
+    guard_use(sp, spec_v6_donor(sp), used, 0);
     struct nft_chain *c = NULL;
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
@@ -1657,10 +1747,30 @@ void v6_notes(const struct spec *sp, const struct groups *gr, v6_note_fn fn, voi
         int used = 0;
         for (size_t k = 0; k < gr->n && !used; k++) used = !strcmp(gr->g[k].out, o->name);
         if (!used) continue;
-        snprintf(what, sizeof(what), "выход %.40s: IPv6 не поддерживается", o->name);
+        /* IPv6 снят спекой, а не видом (spec_v6_resolve): сказать, чем именно. */
+        const struct output *d = spec_v6_donor(sp);
+        if (o->v6_denied && out_ipv6_mode(o) == OUT_V6_OFF)
+            snprintf(what, sizeof(what), "выход %.40s: IPv6 выключен (ipv6: off)", o->name);
+        else if (o->v6_denied && d)
+            snprintf(what, sizeof(what), "выход %.40s: IPv6 идёт только через %.40s (ipv6: routed)",
+                     o->name, d->name);
+        else
+            snprintf(what, sizeof(what), "выход %.40s: IPv6 не поддерживается", o->name);
         snprintf(why, sizeof(why), "IPv6 правил этого выхода отбрасывается, а не идёт напрямую; "
                  "сайты откроются по IPv4");
         fn(ctx, "ipv6_output", "note", what, why);
+    }
+    /* ipv6: routed и nat там, где раздачей IPv6 владеет не netifd (телефон): ключ разобран, но
+     * действует как его отсутствие (out_ipv6_mode) — сказать об этом, а не молчать. */
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct output *o = &sp->out[i];
+        if ((o->ipv6 != OUT_V6_ROUTED && o->ipv6 != OUT_V6_NAT) || out_ipv6_mode(o) == o->ipv6)
+            continue;
+        snprintf(what, sizeof(what), "выход %.40s: ipv6: %s здесь не действует", o->name,
+                 o->ipv6 == OUT_V6_ROUTED ? "routed" : "nat");
+        snprintf(why, sizeof(why), "раздачей IPv6 на телефоне владеет Android — IPv6 выхода идёт "
+                 "как без ключа ipv6");
+        fn(ctx, "ipv6_host", "note", what, why);
     }
     /* Свой клиент правила из одних адресов IPv4: его IPv6 правилом не узнаётся. */
     for (size_t k = 0; k < gr->n; k++) {
@@ -1673,12 +1783,58 @@ void v6_notes(const struct spec *sp, const struct groups *gr, v6_note_fn fn, voi
     }
 }
 
+/* Набор v6donor — префикс хоста у донора IPv6 (доводы — у v6donor_catchall). Объявлен всегда, когда
+ * донор есть, даже без известного префикса: правила ссылаются на него, а элементы кладёт сторож,
+ * как только префикс узнаётся (v6donor_sync). Пустой набор ничего не забирает и ничего не
+ * запрещает — IPv6 правил в донора идёт по меткам, как без префикса. */
+static void build_v6donor_set(struct nft_table *t, const struct spec *sp) {
+    const struct output *d = spec_v6_donor(sp);
+    if (!d || !d->mark) return;
+    struct nft_set *s = ir_set_add(t, V6DONOR_SET, "ipv6_addr");
+    if (!s) return;
+    s->flags = NFT_SET_INTERVAL;
+    if (d->v6pfx.len) {
+        char p[64];
+        v6pfx_str(&d->v6pfx, p, sizeof(p));
+        ir_set_value(s, ir_strdup(t->rs, p));
+    }
+}
+
+/* NAT66 выхода `ipv6: nat` (spec.h, enum out_ipv6). ЯВНОЕ ИСКЛЮЧЕНИЕ из «steer не трогает
+ * файрвол» (шапка src/daemon/fwcheck.c; docs/contract-v1.md, §7): masquerade IPv6 на устройство
+ * выхода ставит сам движок, в своей таблице и только по этому ключу — решение владельца (шаг 8
+ * выпуска 1.10). Довод: у пира один адрес IPv6, клиенты LAN на ULA, и без подмены IPv6 в туннель
+ * не пойдёт вовсе, а masq6 зоны fw4 — это «подменять всё IPv6 зоны», то есть настройка чужого
+ * пакета, которую человек заводил бы ради одного туннеля. Своё правило — ровно на устройство
+ * выхода, снимается вместе с нашей таблицей, и fw4 оно не трогает. Если masq6 у зоны тоже
+ * включён — вреда нет: подмену соединения выбирает первая цепочка nat, вторая его уже не меняет.
+ *
+ * По устройству, а не по метке: в устройство выхода IPv6 клиентов уводит только наша метка, а
+ * свой трафик роутер шлёт с адреса этого же устройства — masquerade ему ничего не меняет. Цепочка
+ * nat в inet; старая раскладка (legacy.c) переносит правило в ip6 по его семейству. */
+static void build_nat6(struct nft_table *t, const struct spec *sp) {
+    struct nft_chain *c = NULL;
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct output *o = &sp->out[i];
+        if (out_ipv6_mode(o) != OUT_V6_NAT || !o->device[0] || !out_route6(o)) continue;
+        if (!c) c = ir_base_chain_add(t, "postrouting_nat6", "nat", "postrouting", "srcnat", 0);
+        struct nft_rule *r = ir_rule(c);
+        ir_rule_fam(r, 6);
+        ir_x(r, "oifname \"%s\"", o->device);
+        ir_family(r, 6);
+        ir_counter(r, 0, 0);
+        ir_x(r, "masquerade");
+        ir_comment(r, "steer-nat6:%s", o->name);
+    }
+}
+
 /* Дерево набора правил современной раскладки. Порядок объектов — порядок печати, и он
  * прежний до байта (снимок tests/golden/ruleset). */
 int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
               struct err *e) {
     struct nft_table *t = ir_table_add(rs, NFT_FAM_INET, nft_table());
     build_group_sets(t, gr);
+    build_v6donor_set(t, sp);
     if (build_mark(t, sp, gr, e) != 0) return -1;
     /* Группы balance: цепочки, карты и цепочки меток (compile/balance.c). Без таких групп — ничего,
      * и текст прежний до байта. */
@@ -1689,6 +1845,7 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
     build_postrouting_down(t, sp, gr);
     build_forward_v6(t, sp, gr);
     build_guard(t, sp, gr);
+    build_nat6(t, sp);
     /* Построители видов (kind_ops.emit): по видам, в порядке реестра, поэтому все цепочки
      * zapret в тексте стоят раньше цепочки моста, в каком бы порядке выходы ни шли в спеке
      * (kind.c: kind_emit_all). */

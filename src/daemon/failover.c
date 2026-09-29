@@ -56,6 +56,7 @@
 #include "fogroup.h"
 #include "folat.h"
 #include "urltest.h"
+#include "nftvmap.h"
 
 /* Уровень в журнале приписывается КАЖДОЙ строке — это контракт, по которому управляющий
  * слой (splify2) раскрашивает журнал, и он разбирает именно префикс, а не текст. Базовый
@@ -791,6 +792,116 @@ void failopen_mark(const struct output *o, int on) {
     const char *cmd[] = { "nft", on ? "add" : "delete", "element", "inet", nft_table(),
                           FAILOPEN_SET, el, NULL };
     run_quiet(cmd);
+}
+
+/* ---- IPv6 от хоста: префикс донора (шаг 8 выпуска 1.10; устройство — spec.h, enum out_ipv6) ---
+ *
+ * ОТКУДА ПРЕФИКС, КОГДА `prefix:` НЕ ЗАПИСАН. Раздачу IPv6 ведёт netifd по настройке человека:
+ * `ip6prefix` у интерфейса туннеля объявляет префикс хоста, `ip6assign` у LAN берёт из него кусок,
+ * и netifd ставит на устройство раздачи адрес из этого куска. Кто владелец префикса, знает только
+ * сам netifd (ubus); в ядре от этого остаются две приметы, и по ним префикс и выводится — без
+ * процесса, чтением rtnetlink и адресов:
+ *   - нуль-маршрут `unreachable P metric 2147483647` в main: netifd ставит его на КАЖДЫЙ префикс,
+ *     который раздаёт (interface_ip_set_prefix: «null-route to avoid routing loops»);
+ *   - адрес на устройстве раздачи внутри P (так же ищет «свой» префикс и odhcpd: parse_routes по
+ *     unreachable-маршрутам, накрывающим адреса интерфейса).
+ * Кандидат — нуль-маршрут не длиннее /64, накрывающий глобальный адрес устройства раздачи (не ULA:
+ * у ula_prefix netifd тоже есть нуль-маршрут, но префиксом хоста ULA сама не выводится — её
+ * пишут `prefix:` явно). Префикс провайдера (DHCPv6-PD на wan6) — такой же кандидат; его отличает
+ * маршрут по умолчанию с источником `default from P … dev <wan>`, который netifd ставит на префикс
+ * провайдера (sourcefilter), и кандидат с таким маршрутом через чужое устройство отбрасывается.
+ * Остался ровно один — это префикс донора. Ни одного — префикса нет (у LAN нет адреса из префикса
+ * хоста: diag говорит, чего не хватает). Больше одного — угадывать нельзя: префикс не выводится, и
+ * diag просит записать `prefix:`.
+ *
+ * Выведенный префикс — состояние, как device: apply вписывает его в набор v6donor текстом
+ * (v6donor_adopt), а сторож на каждом проходе выводит заново и переписывает элементы набора сам
+ * (v6donor_sync), если они разошлись: netifd выдаёт LAN адрес из префикса, когда поднимется
+ * интерфейс туннеля, — часто позже, чем встал движок, — а человек может сменить ip6prefix, не
+ * трогая спеку. Проход идёт и по событию адреса IPv6 (watchd слушает RTMGRP_IPV6_IFADDR), так что
+ * набор догоняет netifd за секунды. */
+#define V6_LAN_ADDRS 32
+
+int v6donor_derive(const struct spec *sp, const struct output *d, struct v6pfx *p) {
+    memset(p, 0, sizeof(*p));
+    static struct rtnl_route6 rt[256];
+    int n = rtnl_main6_routes(rt, sizeof(rt) / sizeof(rt[0]));
+    if (n <= 0) return 0;
+    uint8_t lan[V6_LAN_ADDRS][16];
+    size_t ln = 0;
+    struct ifaddrs *ifa = NULL;
+    if (getifaddrs(&ifa) != 0) return 0;
+    for (struct ifaddrs *a = ifa; a && ln < V6_LAN_ADDRS; a = a->ifa_next) {
+        if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET6 || !a->ifa_name) continue;
+        const uint8_t *x = ((const struct sockaddr_in6 *)a->ifa_addr)->sin6_addr.s6_addr;
+        if ((x[0] & 0xfe) == 0xfc || (x[0] == 0xfe && (x[1] & 0xc0) == 0x80) || x[0] == 0xff)
+            continue;                        /* ULA, link-local, multicast */
+        int ours = 0;
+        for (size_t i = 0; i < sp->lan_dev_n && !ours; i++) ours = !strcmp(a->ifa_name, sp->lan_dev[i]);
+        if (ours) memcpy(lan[ln++], x, 16);
+    }
+    freeifaddrs(ifa);
+    int donor_if = d->device[0] ? (int)if_nametoindex(d->device) : 0;
+    struct v6pfx found[4];
+    int fn = 0;
+    for (int i = 0; i < n; i++) {
+        if (rt[i].type != RTN_UNREACHABLE || !rt[i].dst_len || rt[i].dst_len > 64) continue;
+        struct v6pfx c;
+        memcpy(c.a, rt[i].dst, 16);
+        c.len = rt[i].dst_len;
+        int covers = 0;
+        for (size_t k = 0; k < ln && !covers; k++) covers = v6pfx_has(&c, lan[k]);
+        if (!covers) continue;
+        int isp = 0;
+        for (int j = 0; j < n && !isp; j++) {
+            if (!rt[j].src_len || rt[j].dst_len) continue;
+            struct v6pfx s;
+            memcpy(s.a, rt[j].src, 16);
+            s.len = rt[j].src_len;
+            /* Источник маршрута — сам кандидат или кусок из него, и ведёт не в туннель донора. */
+            if ((v6pfx_has(&s, c.a) || v6pfx_has(&c, s.a)) && rt[j].oif && rt[j].oif != donor_if)
+                isp = 1;
+        }
+        if (isp) continue;
+        int dup = 0;
+        for (int k = 0; k < fn; k++)
+            if (found[k].len == c.len && !memcmp(found[k].a, c.a, 16)) dup = 1;
+        if (dup) continue;
+        if (fn < 4) found[fn] = c;
+        fn++;
+    }
+    if (fn == 1) { *p = found[0]; return 1; }
+    return fn ? -1 : 0;
+}
+
+void v6donor_adopt(struct spec *sp) {
+    const struct output *cd = spec_v6_donor(sp);
+    if (!cd || cd->v6pfx_given) return;
+    struct output *d = &sp->out[cd - sp->out];
+    v6donor_derive(sp, d, &d->v6pfx);
+}
+
+void v6donor_sync(const struct spec *sp) {
+    const struct output *d = spec_v6_donor(sp);
+    if (!d || !d->mark) return;
+    struct v6pfx want = d->v6pfx;
+    if (!d->v6pfx_given) v6donor_derive(sp, d, &want);
+    struct nfv_range6 w[1], have[NFV_RANGES6_MAX];
+    size_t wn = v6pfx_range(&want, w[0].lo, w[0].hi) == 0 ? 1 : 0;
+    /* NFPROTO_INET — 1: наша таблица всегда inet (набор читает forward_v6 в filter). */
+    int hn = nfv_ranges6_read(1, nft_table(), V6DONOR_SET, have, NFV_RANGES6_MAX);
+    if (hn < 0) return;                     /* набора нет (набор правил ещё не стоит) — нечего */
+    if ((size_t)hn == wn && (!wn || (!memcmp(have[0].lo, w[0].lo, 16) &&
+                                     !memcmp(have[0].hi, w[0].hi, 16))))
+        return;
+    char ps[64];
+    v6pfx_str(&want, ps, sizeof(ps));
+    if (nfv_ranges6_write(1, nft_table(), V6DONOR_SET, w, wn) != 0)
+        fprintf(stderr, LOG_W "выход %s: префикс хоста %s в набор %s не лёг: %s\n", d->name, ps,
+                V6DONOR_SET, strerror(errno));
+    else
+        fprintf(stderr, LOG_I "выход %s: префикс хоста — %s\n", d->name,
+                wn ? ps : "не найден (у LAN нет адреса из префикса хоста)");
 }
 
 /* announce=0 — то же самое приведение состояния в порядок, но без объявления отказа:
@@ -2615,6 +2726,9 @@ static void fo_step(struct fo_run *r) {
         case S_END:
             active_save(r->st, sp, r->streak_new, r->failed);
             fog_groups_save(r->st, sp, r->grp_cur, r->grp_alive);
+            /* Префикс хоста у донора IPv6 — по ядру этого прохода (v6donor_sync: без спеки с
+             * донором — ничего, два чтения netlink и getifaddrs — иначе). */
+            v6donor_sync(sp);
             if (!r->changed && r->verbose) fprintf(stderr, LOG_I "изменений нет\n");
             /* Строки о переключении — в stdout: у долгоживущего процесса он буферизован, а
              * читают его журнал сервиса и стенды — сразу после прохода. */

@@ -265,6 +265,18 @@ static void output_flow(FILE *f, const struct output *o, const char (*oname)[32]
     }
     if (o->over[0]) fs(&w, "over", o->over);
     if (o->on_fail != FAIL_DROP) fs(&w, "on_fail", on_fail_name(o->on_fail));
+    /* Ключ ipv6 (шаг 8 выпуска 1.10) — как записан, а prefix — только записанный: выведенный из
+     * адресов раздачи — состояние, а не настройка. Спека v1 ключа не знает, и её перевод печатается
+     * прежним текстом. */
+    if (o->ipv6 != OUT_V6_KIND) {
+        static const char *const V6[] = { "", "routed", "nat", "off" };
+        fs(&w, "ipv6", V6[o->ipv6]);
+        if (o->ipv6 == OUT_V6_ROUTED && o->v6pfx_given) {
+            char p[64];
+            v6pfx_str(&o->v6pfx, p, sizeof(p));
+            fs(&w, "prefix", p);
+        }
+    }
     fputs(" }", f);
 }
 

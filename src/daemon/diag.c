@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <time.h>
+#include <ifaddrs.h>
 
 #include "spec.h"
 #include "awg.h"
@@ -236,6 +237,327 @@ static int bridge_nf_on(void) {
     if (c == '0') return 0;
     if (c == '1') return 1;
     return -1;
+}
+
+/* ---- IPv6 от хоста: чего не хватает (шаг 8 выпуска 1.10) ------------------------------------
+ *
+ * Раздачу IPv6 в LAN настраивает человек (ip6prefix у интерфейса туннеля, ip6assign у LAN,
+ * ra_default в odhcpd), и steer её не пишет (раздел 2 docs/architecture.md, «чужие пакеты —
+ * настройка человека»). Поэтому diag говорит, какой строки не хватает, — по ядру (адреса, MTU) и
+ * по файлам настройки, которые он только ЧИТАЕТ: /etc/config/network и /etc/config/dhcp (формат
+ * UCI — строки `config`, `option`, `list`). Каталог — швом STEER_UCI_DIR (стенды; на телефоне этих
+ * файлов нет, и проверки молчат).
+ *
+ * Проба — один эхо-запрос ICMPv6 через выход (SO_MARK выхода, у routed — с адреса LAN из префикса)
+ * к STEER_V6PROBE_TARGET (умолчание — 2606:4700:4700::1111, anycast DNS Cloudflare, отвечает на
+ * эхо). Ждёт не дольше 800 мс: diag отвечает и из процесса демона, и цикл демона на это время
+ * стоит — это цена одного ответа, который иначе не узнать: сервер не пускает источник молча. */
+
+static const char *uci_dir(void) {
+    const char *d = getenv("STEER_UCI_DIR");
+    return d && *d ? d : "/etc/config";
+}
+
+/* Слово UCI без кавычек: 'x', "x" или x. */
+static void uci_word(const char **pp, char *out, size_t n) {
+    const char *p = *pp;
+    while (*p == ' ' || *p == '\t') p++;
+    size_t k = 0;
+    char q = (*p == '\'' || *p == '"') ? *p++ : 0;
+    while (*p && (q ? *p != q : (*p != ' ' && *p != '\t' && *p != '\n' && *p != '\r'))) {
+        if (k + 1 < n) out[k++] = *p;
+        p++;
+    }
+    if (q && *p == q) p++;
+    out[k] = '\0';
+    *pp = p;
+}
+
+/* В файле UCI cfg — секция типа type, у которой option или list key равен val; её option want —
+ * в out (пусто — нет такого), имя секции — в sec. 1 — секция есть; 0 — нет; -1 — файла нет. */
+static int uci_find(const char *cfg, const char *type, const char *key, const char *val,
+                    const char *want, char *out, size_t on, char *sec, size_t sn) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", uci_dir(), cfg);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char line[512], cur_type[64] = "", cur_name[64] = "", cur_want[128] = "";
+    int match = 0, found = 0;
+    out[0] = '\0';
+    if (sec && sn) sec[0] = '\0';
+    for (int eof = 0; !found && !eof; ) {
+        eof = !fgets(line, sizeof(line), f);
+        const char *p = line;
+        char w[128];
+        if (!eof) {
+            while (*p == ' ' || *p == '\t') p++;
+            uci_word(&p, w, sizeof(w));
+        }
+        if (eof || !strcmp(w, "config")) {
+            if (match && !strcmp(cur_type, type)) {
+                snprintf(out, on, "%s", cur_want);
+                if (sec && sn) snprintf(sec, sn, "%s", cur_name);
+                found = 1;
+                break;
+            }
+            if (eof) break;
+            uci_word(&p, cur_type, sizeof(cur_type));
+            uci_word(&p, cur_name, sizeof(cur_name));
+            cur_want[0] = '\0';
+            match = 0;
+            continue;
+        }
+        if (strcmp(w, "option") && strcmp(w, "list")) continue;
+        char k[64], v[128];
+        uci_word(&p, k, sizeof(k));
+        uci_word(&p, v, sizeof(v));
+        if (!strcmp(k, key) && !strcmp(v, val)) match = 1;
+        if (!strcmp(k, want)) snprintf(cur_want, sizeof(cur_want), "%s", v);
+    }
+    fclose(f);
+    return found;
+}
+
+/* Адреса IPv6 устройств раздачи: глобальные (не ULA) и ULA — сколько каких, и первый глобальный
+ * внутри префикса p (если p задан) — в in_p. */
+struct lan6 { int gua, ula; int in_p; uint8_t a_in_p[16]; };
+
+static struct lan6 lan6_scan(const struct spec *sp, const struct v6pfx *p) {
+    struct lan6 r;
+    memset(&r, 0, sizeof(r));
+    struct ifaddrs *ifa = NULL;
+    if (getifaddrs(&ifa) != 0) return r;
+    for (struct ifaddrs *a = ifa; a; a = a->ifa_next) {
+        if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET6 || !a->ifa_name) continue;
+        int ours = 0;
+        for (size_t i = 0; i < sp->lan_dev_n && !ours; i++) ours = !strcmp(a->ifa_name, sp->lan_dev[i]);
+        if (!ours) continue;
+        const uint8_t *x = ((const struct sockaddr_in6 *)a->ifa_addr)->sin6_addr.s6_addr;
+        if ((x[0] == 0xfe && (x[1] & 0xc0) == 0x80) || x[0] == 0xff) continue;
+        if ((x[0] & 0xfe) == 0xfc) r.ula++;
+        else r.gua++;
+        if (p && p->len && !r.in_p && v6pfx_has(p, x)) {
+            r.in_p = 1;
+            memcpy(r.a_in_p, x, 16);
+        }
+    }
+    freeifaddrs(ifa);
+    return r;
+}
+
+/* Глобальный адрес IPv6 на самом устройстве выхода (не fe80::). */
+static int dev_has_v6(const char *dev) {
+    struct ifaddrs *ifa = NULL;
+    if (getifaddrs(&ifa) != 0) return 0;
+    int yes = 0;
+    for (struct ifaddrs *a = ifa; a && !yes; a = a->ifa_next) {
+        if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET6 || !a->ifa_name) continue;
+        const struct in6_addr *x = &((const struct sockaddr_in6 *)a->ifa_addr)->sin6_addr;
+        if (!strcmp(a->ifa_name, dev) && !IN6_IS_ADDR_LINKLOCAL(x)) yes = 1;
+    }
+    freeifaddrs(ifa);
+    return yes;
+}
+
+static long dev_mtu(const char *dev) {
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/class/net/%.63s/mtu", dev);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    long m = -1;
+    if (fscanf(f, "%ld", &m) != 1) m = -1;
+    fclose(f);
+    return m;
+}
+
+/* Эхо ICMPv6 через выход: 1 — ответ пришёл; 0 — ответа нет за ms; -1 — отправить не вышло (*err —
+ * errno: у пира WireGuard в AllowedIPs нет ::/0 — ENOKEY, маршрута нет — ENETUNREACH…). */
+static int v6_probe(const uint8_t *src, uint32_t mark, int ms, int *err) {
+    const char *t = getenv("STEER_V6PROBE_TARGET");
+    if (!t || !*t) t = "2606:4700:4700::1111";
+    struct sockaddr_in6 dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin6_family = AF_INET6;
+    if (inet_pton(AF_INET6, t, &dst.sin6_addr) != 1) { *err = EINVAL; return -1; }
+    int fd = socket(AF_INET6, SOCK_RAW | SOCK_CLOEXEC, IPPROTO_ICMPV6);
+    if (fd < 0) { *err = errno; return -1; }
+    setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
+    if (src) {
+        struct sockaddr_in6 s;
+        memset(&s, 0, sizeof(s));
+        s.sin6_family = AF_INET6;
+        memcpy(&s.sin6_addr, src, 16);
+        if (bind(fd, (struct sockaddr *)&s, sizeof(s)) != 0) { *err = errno; close(fd); return -1; }
+    }
+    uint8_t req[16] = { 128, 0, 0, 0, 0x57, 0x36, 0, 1, 's', 't', 'e', 'e', 'r', '6', 0, 0 };
+    if (sendto(fd, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+        *err = errno;
+        close(fd);
+        return -1;
+    }
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long left = ms - ((now.tv_sec - t0.tv_sec) * 1000 + (now.tv_nsec - t0.tv_nsec) / 1000000);
+        if (left <= 0) break;
+        struct pollfd pf = { fd, POLLIN, 0 };
+        if (poll(&pf, 1, (int)left) <= 0) break;
+        uint8_t buf[256];
+        struct sockaddr_in6 from;
+        socklen_t fl = sizeof(from);
+        ssize_t n = recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fl);
+        if (n < 8) continue;
+        /* Ответ на наш запрос; ошибка ICMPv6 о нём (unreachable, prohibited) — тоже «нет». */
+        if (buf[0] == 129 && buf[4] == 0x57 && buf[5] == 0x36 &&
+            !memcmp(&from.sin6_addr, &dst.sin6_addr, 16)) {
+            close(fd);
+            return 1;
+        }
+        if (buf[0] < 128 && n >= 8 + 40 + 8 && buf[8 + 40] == 128 && buf[8 + 40 + 4] == 0x57) {
+            *err = buf[0] == 1 && buf[1] == 1 ? EACCES : EHOSTUNREACH;
+            close(fd);
+            return -1;
+        }
+    }
+    close(fd);
+    return 0;
+}
+
+/* Имя интерфейса netifd по устройству раздачи (секция interface с option device) — для текста и
+ * для поиска его секции dhcp. */
+static int lan_ifname(const struct spec *sp, char *name, size_t n, char *assign, size_t an) {
+    for (size_t i = 0; i < sp->lan_dev_n; i++) {
+        int r = uci_find("network", "interface", "device", sp->lan_dev[i], "ip6assign", assign, an,
+                         name, n);
+        if (r == 1) return 1;
+        if (r < 0) return -1;
+    }
+    return 0;
+}
+
+static void diag_v6_host(const struct spec *sp, const struct groups *gr) {
+    char what[200], why[400];
+    int ra_said = 0;
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct output *o = &sp->out[i];
+        enum out_ipv6 m = out_ipv6_mode(o);
+        if (m != OUT_V6_ROUTED && m != OUT_V6_NAT) continue;
+        if (!o->device[0]) continue;
+        char devpath[128];
+        snprintf(devpath, sizeof(devpath), "/sys/class/net/%.63s", o->device);
+        if (access(devpath, F_OK) != 0) continue;   /* устройства нет — говорит проверка output */
+        /* MTU ниже 1280: ядро выключает IPv6 на устройстве (минимум IPv6 — RFC 8200), и маршрут
+         * IPv6 в него не встаёт. У WireGuard MTU по умолчанию 1420, но его снижают под обёртки. */
+        long mtu = dev_mtu(o->device);
+        if (mtu > 0 && mtu < 1280) {
+            snprintf(what, sizeof(what), "выход %.40s: у %.24s MTU %ld — IPv6 на нём не работает",
+                     o->name, o->device, mtu);
+            diag("ipv6_host", "fail", what, "IPv6 требует MTU не меньше 1280 — поднимите MTU интерфейса");
+            continue;
+        }
+        char lname[64] = "", assign[32] = "";
+        int have_uci = lan_ifname(sp, lname, sizeof(lname), assign, sizeof(assign)) >= 0;
+        struct v6pfx p = o->v6pfx;
+        int derived = 0;
+        if (m == OUT_V6_ROUTED && !o->v6pfx_given) derived = v6donor_derive(sp, o, &p);
+        if (m == OUT_V6_ROUTED && !o->v6pfx_given && derived != 1) p.len = 0;
+        struct lan6 l = lan6_scan(sp, &p);
+        const uint8_t *probe_src = NULL;
+        if (m == OUT_V6_ROUTED) {
+            char ps[64];
+            v6pfx_str(&p, ps, sizeof(ps));
+            if (!p.len && derived < 0) {
+                snprintf(what, sizeof(what), "выход %.40s: префикс хоста не узнать", o->name);
+                diag("ipv6_host", "warn", what,
+                     "у LAN адреса из нескольких префиксов, и который из них от хоста, не видно — "
+                     "задайте prefix: у выхода");
+                continue;
+            }
+            if (!p.len || !l.in_p) {
+                if (p.len)
+                    snprintf(what, sizeof(what), "выход %.40s: у LAN нет адреса из префикса %.48s",
+                             o->name, ps);
+                else
+                    snprintf(what, sizeof(what), "выход %.40s: у LAN нет адреса из префикса хоста",
+                             o->name);
+                snprintf(why, sizeof(why), "клиенты не получат IPv6 от хоста — задайте ip6prefix "
+                         "у интерфейса %.24s и ip6assign у LAN%s", o->device,
+                         o->v6pfx_given ? "" : " (или prefix: у выхода)");
+                diag("ipv6_host", "warn", what, why);
+            } else {
+                snprintf(what, sizeof(what), "выход %.40s: префикс хоста %.48s, у LAN адрес из него",
+                         o->name, ps);
+                diag("ipv6_host", "ok", what, "");
+                probe_src = l.a_in_p;
+            }
+            /* ip6assign короче префикса (число меньше длины): кусок такого размера из префикса не
+             * выдать, и netifd LAN адреса не даёт. */
+            long as = assign[0] ? strtol(assign, NULL, 10) : 0;
+            if (have_uci && p.len && as > 0 && as < p.len) {
+                snprintf(what, sizeof(what), "ip6assign %ld у %.24s больше префикса хоста /%u",
+                         as, lname[0] ? lname : "LAN", p.len);
+                diag("ipv6_host", "warn", what, "netifd не выдаст LAN кусок больше самого префикса — "
+                     "задайте ip6assign не меньше длины префикса (обычно 64)");
+            }
+            /* ULA рядом с префиксом и доменные правила fake-IP в донора: поддельный адрес IPv6 —
+             * ULA (fdfe:dcba:9876::/96), и к нему клиент идёт со своего ULA (RFC 6724), а такой
+             * источник хост не пропустит — forward_v6 отвергает его сразу, клиент идёт по IPv4. */
+            int fake = 0;
+            for (size_t k = 0; k < gr->n && !fake; k++)
+                fake = gr->g[k].domains && !gr->g[k].realip && !strcmp(gr->g[k].out, o->name);
+            if (fake && l.ula) {
+                snprintf(what, sizeof(what), "выход %.40s: у LAN есть ULA рядом с префиксом хоста",
+                         o->name);
+                diag("ipv6_host", "note", what,
+                     "к поддельным адресам fake-IP клиенты идут с ULA, такой IPv6 хост не пропустит, "
+                     "и доменные правила идут по IPv4 — оставьте LAN только префикс хоста (ip6class) "
+                     "или переведите правило на realip");
+            }
+        } else {
+            if (!dev_has_v6(o->device)) {
+                snprintf(what, sizeof(what), "выход %.40s: у %.24s нет адреса IPv6", o->name,
+                         o->device);
+                diag("ipv6_host", "fail", what, "подменять адрес клиентов нечем — задайте у интерфейса "
+                     "адрес IPv6, который хост выдал пиру");
+                continue;
+            }
+            /* У LAN только ULA: маршрут по умолчанию в RA odhcpd объявляет без глобального префикса,
+             * только если ra_default у секции dhcp этой сети не 0. */
+            if (l.ula && !l.gua && have_uci && lname[0] && !ra_said) {
+                ra_said = 1;            /* это про LAN, а не про выход: один раз на отчёт */
+                char rd[16] = "", sec[64] = "";
+                int r = uci_find("dhcp", "dhcp", "interface", lname, "ra_default", rd, sizeof(rd),
+                                 sec, sizeof(sec));
+                if (r >= 0 && (!rd[0] || !strcmp(rd, "0"))) {
+                    snprintf(what, sizeof(what), "у LAN только ULA, а ra_default не задан");
+                    snprintf(why, sizeof(why), "задайте ra_default=1 в dhcp.%.40s, иначе клиенты не "
+                             "получат маршрут IPv6", sec[0] ? sec : lname);
+                    diag("ipv6_host", "warn", what, why);
+                }
+            }
+        }
+        if (o->failed) continue;
+        if (m == OUT_V6_ROUTED && !probe_src) continue;
+        int err = 0;
+        int pr = v6_probe(probe_src, o->mark, 800, &err);
+        if (pr == 1) {
+            snprintf(what, sizeof(what), "выход %.40s: IPv6 через %.24s отвечает", o->name, o->device);
+            diag("ipv6_host", "ok", what, "");
+        } else if (pr < 0 && err == ENOKEY) {
+            snprintf(what, sizeof(what), "выход %.40s: IPv6 в %.24s не уходит", o->name, o->device);
+            diag("ipv6_host", "warn", what, "у пира в AllowedIPs нет ::/0 — добавьте его в настройке "
+                 "пира на роутере");
+        } else {
+            snprintf(what, sizeof(what), "выход %.40s: хост не отвечает по IPv6", o->name);
+            diag("ipv6_host", "warn", what, m == OUT_V6_ROUTED
+                 ? "сервер не пускает адреса префикса — проверьте AllowedIPs пира на хосте и маршрут "
+                   "префикса к нему"
+                 : "сервер не пускает адрес пира или не выпускает IPv6 наружу — проверьте AllowedIPs "
+                   "пира на хосте и NAT66 на нём");
+        }
+    }
 }
 
 /* Замечания IPv6 (v6_notes в generate.c) — проверками diag с их приговором. */
@@ -669,15 +991,31 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
          * половине IPv6 diag молчал. Говорим, только когда у клиентов вообще есть IPv6 наружу
          * (глобальный адрес на устройстве раздачи): без него вопроса нет, и строка была бы
          * постоянной ложной тревогой. */
+        /* С ключом ipv6 (шаг 8) вопрос другой: у nat подмену ставит сам движок (своя таблица, её
+         * fw_check не читает), у routed её не нужно вовсе — хост маршрутизует префикс, а masq6
+         * зоны подменил бы адреса префикса адресом туннеля. */
+        enum out_ipv6 m6 = out_ipv6_mode(&sp->out[i]);
         if (c.in_firewall && out_route6(&sp->out[i]) && !out_self_natting(nat_o) && !c.masq6 &&
-            lan_has_global_v6(sp)) {
+            m6 == OUT_V6_KIND && lan_has_global_v6(sp)) {
             snprintf(what, sizeof(what), "выход %.40s: у %.24s нет masquerade IPv6",
                      sp->out[i].name, sp->out[i].device);
             diag("output_nat6", "warn", what,
                  "IPv6 клиентов уйдёт в туннель с их адресами, и ответ не вернётся — включите "
                  "masq6 у зоны выхода");
         }
+        if (c.masq6 && m6 == OUT_V6_ROUTED) {
+            snprintf(what, sizeof(what), "выход %.40s: у зоны %.24s включён masq6", sp->out[i].name,
+                     sp->out[i].device);
+            diag("ipv6_host", "warn", what,
+                 "адреса из префикса хоста подменяются адресом туннеля, и снаружи клиентов не видно "
+                 "по их адресам — для ipv6: routed снимите masq6 у зоны выхода");
+        }
     }
+
+    /* 7a. IPv6 от хоста (ipv6: routed и nat, шаг 8 выпуска 1.10): чего не хватает в настройке
+     *     роутера и хоста — раздачу IPv6 ведёт человек (netifd, odhcpd), и diag называет, что именно
+     *     дописать. */
+    diag_v6_host(sp, gr);
 
     /* 8. Свои проверки видов (kind_ops.diag): обфускация транспорта у interface, обработчик
      *    очереди и файл стратегии у zapret.

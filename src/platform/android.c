@@ -205,6 +205,9 @@ const struct platform_ops plat_android = {
      * цепочка ingress на таком устройстве жила бы до первого выключения раздачи, а каждое
      * включение звало бы полную замену набора правил — на батарее. */
     .lan_devs_persist = 0,
+    /* Раздачей IPv6 владеет модуль Tethering Android: префикс хоста туда не отдать, и ipv6:
+     * routed/nat у выхода здесь действуют как отсутствие ключа (spec.h, out_ipv6_mode). */
+    .lan_ipv6_host = 0,
     /* Таблица nat iptables есть всегда, но PREROUTING в ней у netd — пустая oem_nat_pre, и
      * предупреждать о ней не о чем. */
     .warn_iptables_nat = 0,

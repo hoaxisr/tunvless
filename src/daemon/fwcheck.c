@@ -39,6 +39,12 @@
  * even rises, and every site behind it simply hangs. That failure is invisible from
  * inside steer's own state — which is exactly why it must be REPORTED.
  *
+ * ОДНО ЯВНОЕ ИСКЛЮЧЕНИЕ (шаг 8 выпуска 1.10, решение владельца): у выхода с `ipv6: nat`
+ * masquerade IPv6 на его устройство ставит сам движок — в СВОЕЙ таблице (цепочка
+ * postrouting_nat6, compile/generate.c: build_nat6) и только по этому ключу спеки. Зоны fw4 он
+ * по-прежнему не трогает, и проверки ниже свою таблицу не читают: подмену IPv6 такого выхода
+ * diag засчитывает по ключу, а не по дампу (docs/contract-v1.md, §7).
+ *
  * Both checks are textual and deliberately conservative: a false "looks fine" is
  * worse than a false warning, so anything unrecognised reads as missing. */
 
@@ -422,7 +428,9 @@ void report_output_deps(const struct spec *sp) {
                                 "the channel goes quiet while its counter still rises\n",
                         sp->out[i].name, sp->out[i].device);
             /* IPv6 — своим вопросом (fw_check по семействам, шаг 8 выпуска 1.10): masq6 зоны. */
-            if (!c.masq6 && out_route6(&sp->out[i]) && lan_has_global_v6(sp))
+            /* У `ipv6: nat` подмену ставит сам движок, у `ipv6: routed` её не нужно вовсе. */
+            if (!c.masq6 && out_route6(&sp->out[i]) && out_ipv6_mode(&sp->out[i]) == OUT_V6_KIND &&
+                lan_has_global_v6(sp))
                 fprintf(stderr, LOG_W "output %s: у %s нет masquerade IPv6 — IPv6 клиентов уйдёт "
                                 "в туннель с их адресами, и ответ не вернётся; включите masq6 у "
                                 "зоны выхода\n", sp->out[i].name, sp->out[i].device);
