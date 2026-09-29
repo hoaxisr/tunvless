@@ -27,6 +27,7 @@
 #include "srs.h"
 #include "ctl.h"
 #include "daemon.h"
+#include "kind.h"
 #include "nftdump.h"
 
 /* ---- what an interface output depends on, and does not own ----------------- */
@@ -75,6 +76,12 @@ static void chain_token(const char *s, char *out, size_t cap) {
            && s[i] != '{' && s[i] != ';')
         out[i] = s[i], i++;
     out[i] = 0;
+}
+
+/* Зона fw4 по имени её цепочки подмены: fw4 зовёт её srcnat_<зона> (шаблон zone-masq.uc). Не
+ * такое имя — цепочка не зоны fw4 (своя таблица человека), и зону не назвать: out пуст. */
+static void zone_of_chain(const char *tok, char *out, size_t n) {
+    if (!strncmp(tok, "srcnat_", 7) && tok[7]) snprintf(out, n, "%s", tok + 7);
 }
 
 #define FWC_CHAINS 16
@@ -198,7 +205,8 @@ static unsigned table_fams_of(const char *line) {
 }
 
 struct fwcheck fw_check_dump(const char *dump, const char *device) {
-    struct fwcheck r = { 0, 0, 0 };
+    struct fwcheck r;
+    memset(&r, 0, sizeof(r));
     /* Зона может называться не так, как устройство, и тогда оба признака ниже молчат:
      * fw4 пишет имя ЗОНЫ и в имя цепочки (`srcnat_vpn`), и в комментарий правила
      * ("Masquerade IPv4 vpn traffic"), а устройство называет ТОЛЬКО на переходе в эту
@@ -255,7 +263,16 @@ struct fwcheck fw_check_dump(const char *dump, const char *device) {
             unsigned f = rule_fams(line, tfams);
             if (names_device(line, device) || names_device(chain, device)) {
                 if (f & 1) r.masqueraded = 1;
-                if (f & 2) r.masq6 = 1;
+                if (f & 2) {
+                    r.masq6 = 1;
+                    /* Устройство названо именем цепочки (зона зовётся как устройство:
+                     * srcnat_wg0) — это и есть зона; названо в самом правиле — зоны нет. */
+                    if (!r.zone6[0] && !names_device(line, device)) {
+                        char t[64];
+                        chain_token(chain, t, sizeof t);
+                        zone_of_chain(t, r.zone6, sizeof(r.zone6));
+                    }
+                }
             } else {
                 char t[64];
                 chain_token(chain, t, sizeof t);
@@ -268,7 +285,11 @@ struct fwcheck fw_check_dump(const char *dump, const char *device) {
         int *got = fam ? &r.masq6 : &r.masqueraded;
         for (size_t i = 0; i < dev_chain_n && !*got; i++)
             for (size_t k = 0; k < masq_chain_n[fam]; k++)
-                if (!strcmp(dev_chain[i], masq_chain[fam][k])) { *got = 1; break; }
+                if (!strcmp(dev_chain[i], masq_chain[fam][k])) {
+                    *got = 1;
+                    if (fam) zone_of_chain(dev_chain[i], r.zone6, sizeof(r.zone6));
+                    break;
+                }
     }
     return r;
 }
@@ -391,6 +412,36 @@ int lan_has_global_v6(const struct spec *sp) {
     return yes;
 }
 
+/* Ключ ipv6, которым судить устройство (daemon.h). Проверка на QEMU-роутере 4192267: группа man
+ * (члены wg0 и wg1, сейчас wg1, у wg1 `ipv6: nat`) получала «у wg1 нет masquerade IPv6» и в apply,
+ * и в diag output_nat6, хотя всё, что уходит в wg1, маскирует наш postrouting_nat6: проверка брала
+ * ключ группы (не записан — KIND, «подмену ставит зона»), а не владельца устройства, — та же
+ * ошибка, от которой out_self_natting уже спрашивает out_for_device. Ключ, записанный у самой
+ * группы, важнее: build_nat6 ставит тогда правило на её устройство.
+ *
+ * Владелец здесь — не только device_owner (он знает лишь устройства, которые заводит движок:
+ * vless, xsteer, awg), но и член группы, чьё устройство dev: у interface-члена устройство заводит
+ * netifd, и device_owner его не назовёт. Член ищется вглубь вложенных групп. */
+static const struct output *member_for_device(const struct spec *sp, const struct output *o,
+                                              const char *dev, int depth) {
+    const struct group_cfg *g = out_group(o);
+    if (!g || depth > 8) return o;
+    for (size_t k = 0; k < g->members_n; k++) {
+        const struct output *m = &sp->out[g->members[k]];
+        if (m != o && !strcmp(m->device, dev)) return member_for_device(sp, m, dev, depth + 1);
+    }
+    return o;
+}
+
+int out_ipv6_mode_dev(const struct spec *sp, const struct output *o, const char *dev) {
+    enum out_ipv6 m = out_ipv6_mode(o);
+    if (m != OUT_V6_KIND) return m;
+    const struct output *leaf = member_for_device(sp, o, dev, 0);
+    m = out_ipv6_mode(leaf);
+    if (m != OUT_V6_KIND) return m;
+    return out_ipv6_mode(out_for_device(sp, leaf, dev));
+}
+
 /* Только на платформе с fw4 (plat()->fw4) — см. конец cmd_apply. */
 void report_output_deps(const struct spec *sp) {
     for (size_t i = 0; i < sp->out_n; i++) {
@@ -429,7 +480,9 @@ void report_output_deps(const struct spec *sp) {
                         sp->out[i].name, sp->out[i].device);
             /* IPv6 — своим вопросом (fw_check по семействам, шаг 8 выпуска 1.10): masq6 зоны. */
             /* У `ipv6: nat` подмену ставит сам движок, у `ipv6: routed` её не нужно вовсе. */
-            if (!c.masq6 && out_route6(&sp->out[i]) && out_ipv6_mode(&sp->out[i]) == OUT_V6_KIND &&
+            /* Ключ — устройства, а не выхода (out_ipv6_mode_dev): у группы с членом `ipv6: nat`. */
+            if (!c.masq6 && out_route6(&sp->out[i]) &&
+                out_ipv6_mode_dev(sp, &sp->out[i], sp->out[i].device) == OUT_V6_KIND &&
                 lan_has_global_v6(sp))
                 fprintf(stderr, LOG_W "output %s: у %s нет masquerade IPv6 — IPv6 клиентов уйдёт "
                                 "в туннель с их адресами, и ответ не вернётся; включите masq6 у "

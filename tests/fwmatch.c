@@ -442,6 +442,18 @@ int main(void) {
     probe6("правило в таблице ip", RS_HAND_FAMS, "wgc", 1, 0);
     probe6("snat IPv4 в зоне", RS_SNAT_RENAMED, "proton_nl", 1, 0);
 
+    /* 10. Зона fw4, чей masq6 подменяет IPv6 устройства (fwcheck.zone6): по имени цепочки
+     * srcnat_<зона>, а не по устройству — wg0 в зоне vpn называет vpn; правило на самом устройстве
+     * (своя таблица) зоны не называет; без masq6 зоны нет. */
+    {
+        struct fwcheck z = fw_check_dump(RS_MASQ6_ONLY, "wg0");
+        check("зона masq6 — vpn, а не wg0", strcmp(z.zone6, "vpn") == 0, 1);
+        z = fw_check_dump(RS_HAND_FAMS, "wga");
+        check("masquerade на самом устройстве — зоны нет", z.zone6[0] == 0, 1);
+        z = fw_check_dump(RS_ZONE_RENAMED, "warp0");
+        check("без masq6 — зоны нет", z.zone6[0] == 0, 1);
+    }
+
     /* ---- чем объясняется совпадение в explain -----------------------------------
      *
      * Фраза выводилась из ИМЕНИ набора, и у группы с доменами она всегда была «domain set».

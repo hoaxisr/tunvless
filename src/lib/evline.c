@@ -7,17 +7,37 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/prctl.h>
 
 /* -2 — evline_open() ещё не звали (ленивая инициализация из evline_emit); -1 — звали, и
  * труба выключена; иначе — дескриптор. Один процесс — одна труба, глобал оправдан тем же,
  * чем оправдан он у остальных помощников (g_sp, g_cf и соседи в xsclient.c): второй трубы
  * событий у процесса не бывает. */
 static int g_fd = -2;
+
+/* Помощник демона не переживает демона (src/daemon/supd.c, шапка, «Помощники демона не
+ * переживают»). Демон ставит ребёнку PR_SET_PDEATHSIG(SIGTERM) до exec и метку STEER_SUPD=<pid
+ * демона>:<время старта>:<каталог>; здесь, уже после exec, — вторая половина: признак взводится
+ * заново (exec файла с set-uid или capabilities его снимает, а поставить его заново ничего не
+ * стоит), и если родитель уже не тот pid — демон умер раньше, чем мы дошли досюда, и помощник
+ * выходит тем же SIGTERM, который прислало бы ядро: своим обычным путём (обработчик SIGTERM,
+ * если он уже поставлен, иначе действие по умолчанию). Без метки (ручной запуск, стенды,
+ * `steer supervise`) — ничего не делает. */
+static void supd_parent_check(void) {
+    const char *t = getenv("STEER_SUPD");
+    if (!t || !*t) return;
+    char *end = NULL;
+    long p = strtol(t, &end, 10);
+    if (end == t || *end != ':' || p <= 0) return;
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+    if (getppid() != (pid_t)p) raise(SIGTERM);
+}
 
 void evline_open(void) {
     if (g_fd != -2) return;             /* идемпотентно — вторая попытка ничего не меняет */
@@ -33,6 +53,7 @@ void evline_open(void) {
     if (fl < 0) return;                 /* дескриптора нет вовсе — выключено */
     if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) return;
     g_fd = fd;
+    supd_parent_check();
 }
 
 static void evline_ensure_open(void) {
@@ -84,8 +105,18 @@ void evline_emit(const char *ev, ...) {
 
     /* Одна запись, атомарная по построению трубы; O_NONBLOCK (evline_open) не даёт ей
      * заблокировать помощника, если демон отстал, — короткая запись или EAGAIN теряют
-     * событие молча, ошибку никому сообщать не нужно (следующее событие важнее этого). */
-    if (mem && n > 0 && n <= EVLINE_WRITE_MAX) { ssize_t w = write(g_fd, mem, n); (void)w; }
+     * событие молча, ошибку никому сообщать не нужно (следующее событие важнее этого).
+     *
+     * EPIPE — другое: конец чтения закрыт, то есть демона нет (он держит его до supd_stop, а там
+     * гасит помощника раньше, чем закрывает трубу — и тогда помощник уже в своём SIGTERM). Так
+     * бывает только у помощника с выключенным SIGPIPE (tgws — ради сокетов): с SIGPIPE по
+     * умолчанию та же запись убила бы процесс и без нас. Помощник без демона не нужен
+     * (src/daemon/supd.c, «Помощники демона не переживают») — выход тем же SIGTERM, что по
+     * PDEATHSIG. Только с меткой демона: у ручного запуска с чужой трубой свои правила. */
+    if (mem && n > 0 && n <= EVLINE_WRITE_MAX) {
+        ssize_t w = write(g_fd, mem, n);
+        if (w < 0 && errno == EPIPE && getenv("STEER_SUPD")) raise(SIGTERM);
+    }
     free(mem);
 }
 

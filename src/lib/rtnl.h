@@ -90,4 +90,17 @@ struct rtnl_route6 {
 };
 int rtnl_main6_routes(struct rtnl_route6 *v, size_t max);
 
+/* Адреса IPv6 всех устройств — `ip -6 addr show` с признаками, которых getifaddrs не отдаёт:
+ * flags — IFA_F_* (IFA_F_DEPRECATED ставится и по сроку предпочтения 0: адрес «устарел» — netifd
+ * снял префикс, из которого его выдал, и новых соединений с него ядро не заводит). ifindex —
+ * номер устройства. Сколько записано (<= max) или -1. Нужны diag (IPv6 от хоста): устаревший
+ * адрес LAN из снятого префикса — не «адрес из префикса хоста». */
+struct rtnl_addr6 {
+    uint8_t a[16];
+    uint8_t plen;
+    int ifindex;
+    uint32_t flags;
+};
+int rtnl_addrs6(struct rtnl_addr6 *v, size_t max);
+
 #endif

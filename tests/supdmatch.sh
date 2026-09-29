@@ -47,8 +47,8 @@ fi
 
 tmp="$(mktemp -d)"
 mkdir -p "$tmp/st"
-D="" SUB="" UP="" WD="" DN5="" Q5="" SL="" CAT=""
-trap 'kill $D $SUB $UP $WD $DN5 $Q5 $SL $CAT 2>/dev/null; rm -rf "$tmp"' EXIT
+D="" SUB="" UP="" WD="" DN5="" Q5="" SL="" CAT="" DO6=""
+trap 'kill $D $SUB $UP $WD $DN5 $Q5 $SL $CAT $DO6 2>/dev/null; rm -rf "$tmp"' EXIT
 # Резолвер без читателя stderr пишет в syslog (src/dnsd/adopt.c, stderr_rescue) — у стенда это
 # свой приёмник, а не /dev/log машины: в системный журнал стенд не пишет ни строки. Шов — на весь
 # стенд, чтобы ни один резолвер отсюда, даже там, где проверка его не ждёт, до /dev/log не дошёл
@@ -383,6 +383,72 @@ wait_for '[ "$(gone "$DN5")" = gone ]' 5
 check "демон без спеки гасит оставшийся резолвер сразу" "gone 1" \
     "$(gone "$DN5") $(grep -c "резолвер прежнего демона (pid $DN5) погашен" "$tmp/d5e.err")"
 kill -TERM "$D"; wait "$D" 2>/dev/null; D="" DN5=""
+
+# ---- помощники не переживают демона (src/daemon/supd.c, «Помощники демона не переживают») -------
+# kill -9 демона: помощник выходит сам не позже чем через секунду (PR_SET_PDEATHSIG, SIGTERM) и
+# нового демона не ждёт. Помощник, который SIGTERM не слышит (trap '' TERM — сирота, которого
+# сигнал не взял), гасит новый демон при старте, SIGTERM и по сроку SIGKILL, — раньше, чем
+# поднимает своего: иначе своему не встать на занятое «устройство». Устройство здесь — flock на
+# файл по имени выхода: как TUNSETIFF на имя vr, второй экземпляр получает отказ («busy») и
+# выходит с кодом 1. Помощник другого, живого демона (свой каталог состояния) не тронут ни
+# смертью соседа, ни уборкой нового.
+cat > "$tmp/h6" <<H
+#!/bin/sh
+echo "\$1 \$2 \$\$" >> "$tmp/log6"
+exec 8>"$tmp/tun6.\$2"
+flock -n 8 || { echo "busy \$2 \$\$" >> "$tmp/log6"; exit 1; }
+if [ -e "$tmp/deaf6.\$2" ]; then trap '' TERM
+else trap 'echo "stop \$2 \$\$" >> "$tmp/log6"; exit 0' TERM; fi
+[ -n "\${STEER_EVENT_FD:-}" ] && eval "exec 9>&\$STEER_EVENT_FD" && printf '{"ev":"up"}\n' >&9
+while :; do sleep 0.1 8>&- 9>&-; done
+H
+chmod +x "$tmp/h6"
+mkdir -p "$tmp/st6" "$tmp/st6o"
+spec6() {   # spec6 ФАЙЛ ВЫХОД ПОРТ — один выход с обфускатором
+    printf '{"schema":2,"from_default":["127.0.0.0/8"],"outputs":{"%s":{"kind":"interface",'\
+'"device":"wg%s","obfs":{"mode":"wg-over-tcp","server":"10.99.0.3:4443","listen":"127.0.0.1:%s"}}}}\n' \
+        "$2" "$2" "$3" > "$1"
+}
+d6() {   # d6 ЖУРНАЛ СПЕКА КАТАЛОГ ПОРТ-РЕЗОЛВЕРА — демон стенда в фоне, pid — в $!
+    STEER_SUPERVISE_EXE="$tmp/h6" "$BIN" daemon --supervise --socket "$3/s.sock" --spec "$2" \
+        --state-dir "$3" \
+        --dnsd-flag --listen-port --dnsd-flag "$4" --dnsd-flag --upstream-port --dnsd-flag "$UPORT" \
+        --dnsd-flag --orphan-timeout --dnsd-flag 2 2>"$tmp/$1" &
+}
+pid6() { grep "^obfs $1 " "$tmp/log6" | tail -1 | cut -d' ' -f3; }
+runs6() { grep -c "^obfs $1 " "$tmp/log6" 2>/dev/null; }
+spec6 "$tmp/spec6.json" v 5106
+spec6 "$tmp/spec6o.json" w 5107
+d6 d6o.err "$tmp/spec6o.json" "$tmp/st6o" 15314; DO6=$!
+d6 d6a.err "$tmp/spec6.json" "$tmp/st6" 15313; D=$!
+wait_for '[ "$(runs6 v)" = 1 ] && [ "$(runs6 w)" = 1 ]' 5
+PV="$(pid6 v)" PW="$(pid6 w)"
+kill -KILL "$D"; wait "$D" 2>/dev/null; D=""
+wait_for '! kill -0 "$PV" 2>/dev/null' 1
+check "kill -9 демона: помощник вышел сам за секунду, по SIGTERM" "gone 1" \
+    "$(gone "$PV") $(grep -c "^stop v $PV\$" "$tmp/log6")"
+check "  помощник соседнего живого демона жив" "alive" "$(gone "$PW")"
+touch "$tmp/deaf6.v"
+d6 d6b.err "$tmp/spec6.json" "$tmp/st6" 15313; D=$!
+wait_for '[ "$(runs6 v)" = 2 ]' 5
+check "  новый демон поднял своего без отказа «занято»" "2 0" "$(runs6 v) $(grep -c '^busy' "$tmp/log6")"
+PV="$(pid6 v)"
+sleep 0.3
+rm -f "$tmp/deaf6.v"
+kill -KILL "$D"; wait "$D" 2>/dev/null; D=""
+sleep 1.5
+check "глухой к SIGTERM помощник пережил kill -9 демона" "alive" "$(gone "$PV")"
+d6 d6c.err "$tmp/spec6.json" "$tmp/st6" 15313; D=$!
+wait_for '[ "$(runs6 v)" = 3 ]' 8
+check "  новый демон погасил его до запуска своего: SIGTERM, по сроку SIGKILL" "gone 1 1" \
+    "$(gone "$PV") $(grep -c "помощник прежнего демона (pid $PV, .*) остался без него — гашу" \
+        "$tmp/d6c.err") $(grep -c "помощник прежнего демона (pid $PV) не вышел по SIGTERM за 3 с — SIGKILL" \
+        "$tmp/d6c.err")"
+check "  свой поднят без отказа «занято», помощника соседа уборка не тронула" "0 alive 0" \
+    "$(grep -c '^busy' "$tmp/log6") $(gone "$PW") $(grep -c "pid $PW" "$tmp/d6c.err")"
+check "  журнал демона — с уровнем" "0" \
+    "$(grep -v '^steer\[\(warn\|info\)\]' "$tmp/d6c.err" | grep -v '^steer dnsd: ' | grep -c .)"
+kill -TERM "$D" "$DO6"; wait "$D" "$DO6" 2>/dev/null; D="" DO6=""
 
 # ---- stderr резолвера без демона — в syslog с заголовком (src/dnsd/adopt.c, stderr_rescue) -------
 # На роутере stderr резолвера — труба журнала procd, и после остановки службы её читателя нет.
