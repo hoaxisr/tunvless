@@ -55,6 +55,9 @@ int tls13_handshake_auth(struct tls13 *t, int fd, const unsigned char *ch, size_
                          const unsigned char *ss, const struct tls13_auth *auth)
     { (void)t; (void)fd; (void)ch; (void)n; (void)ss; (void)auth; return -1; }
 const char *tls13_verify_reason(void) { return ""; }
+/* trsec.c разбирает ключ pqv (reality.c) — до него у стенда дело не доходит. */
+int xc_b64url_decode(const char *in, unsigned char *out, size_t out_n)
+    { (void)in; (void)out; (void)out_n; return -1; }
 int tls13_has_record(const struct tls13 *t) { (void)t; return 0; }
 size_t tls13_buffered(const struct tls13 *t) { (void)t; return 0; }
 size_t tls13_take_pending(struct tls13 *t, unsigned char *out, size_t cap)

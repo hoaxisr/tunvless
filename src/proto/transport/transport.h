@@ -81,6 +81,9 @@ struct tr_node {
     /* Длина набивки xhttp, объявленная узлом (см. vless_node.pad_from в vless.h). 0 в pad_to —
      * не объявлено, тогда умолчание Xray. */
     uint16_t pad_from, pad_to;
+    /* Reality: открытый ключ ML-DSA-65 для проверки подписи сертификата, base64url (1952 байта в
+     * бинарном виде), или NULL. Поле mldsa65Verify конфига Xray, `pqv` ссылки. */
+    const char *pqv;
 };
 
 /* Связь: сокет и безопасность над ним — один защищённый поток байт.

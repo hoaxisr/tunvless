@@ -83,6 +83,7 @@ static time_t det_time(time_t *p) { (void)p; return (time_t)1700000000; }
 #undef time
 
 #include "chello-frozen.h"
+#include "chello-frozen-pq.h"
 
 static const struct reality_cfg CFG = {
     .sni = "www.example.com",
@@ -92,14 +93,28 @@ static const struct reality_cfg CFG = {
     .alpn = "h2",
 };
 
-static size_t build(const char *cipher, unsigned char *out, size_t cap) {
+/* То же с настоящим гибридом X25519MLKEM768 (reality_cfg.pq): облик Chrome 131+. Ключ ML-KEM делается из
+ * seed, взятого у того же детерминированного источника, поэтому байты воспроизводимы. */
+static const struct reality_cfg CFG_PQ = {
+    .sni = "www.example.com",
+    .pbk = "xNlHRs0RY8mJhMhOVWRxg8ykpZmqHrjKQqm3-1lQF3E",
+    .sid = "0123456789abcdef",
+    .fp  = "chrome",
+    .alpn = "h2",
+    .pq = 1,
+};
+
+static size_t build_cfg(const struct reality_cfg *cfg, const char *cipher, unsigned char *out, size_t cap) {
     setenv("STEER_CIPHER", cipher, 1);
     prng = 0x123456789ABCDEFull;
     g_calls = 0;
     struct reality_state st;
     size_t n = 0;
-    if (reality_build_hello(&CFG, &st, out, cap, &n) != 0) return 0;
+    if (reality_build_hello(cfg, &st, out, cap, &n) != 0) return 0;
     return n;
+}
+static size_t build(const char *cipher, unsigned char *out, size_t cap) {
+    return build_cfg(&CFG, cipher, out, cap);
 }
 
 static void emit(const char *name, const unsigned char *b, size_t n) {
@@ -113,6 +128,24 @@ static void emit(const char *name, const unsigned char *b, size_t n) {
 
 int main(int argc, char **argv) {
     unsigned char a[4096], c[4096];
+    if (argc > 2 && !strcmp(argv[1], "--raw-pq")) {           /* для сверки с uTLS (tests/hello-diff.py) */
+        size_t n = build_cfg(&CFG_PQ, "aes", a, sizeof(a));
+        FILE *f = fopen(argv[2], "wb");
+        if (!n || !f) return 2;
+        fwrite(a, 1, n, f);
+        fclose(f);
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--emit-pq")) {
+        size_t pa = build_cfg(&CFG_PQ, "aes", a, sizeof(a)), pc = build_cfg(&CFG_PQ, "chacha", c, sizeof(c));
+        if (!pa || !pc) { puts("сборка Hello с гибридом отказала"); return 2; }
+        puts("/* Сгенерировано tests/hellofreeze.c --emit-pq. Hello с гибридом X25519MLKEM768 (reality_cfg.pq). */");
+        puts("#ifndef STEER_CHELLO_FROZEN_PQ_H\n#define STEER_CHELLO_FROZEN_PQ_H\n");
+        emit("FROZEN_PQ_AES", a, pa);
+        emit("FROZEN_PQ_CHACHA", c, pc);
+        printf("#define FROZEN_PQ_N %zu\n\n#endif\n", pa);
+        return 0;
+    }
     size_t an = build("aes", a, sizeof(a));
     size_t cn = build("chacha", c, sizeof(c));
     if (!an || !cn) { puts("сборка Hello отказала"); return 2; }
@@ -145,6 +178,23 @@ int main(int argc, char **argv) {
         fails++;
     } else {
         printf("%-62s ok\n", "Hello (chacha): байт в байт как в заморозке");
+    }
+    {
+        unsigned char pa[4096], pc[4096];
+        size_t pan = build_cfg(&CFG_PQ, "aes", pa, sizeof(pa)), pcn = build_cfg(&CFG_PQ, "chacha", pc, sizeof(pc));
+        if (pan != FROZEN_PQ_N || memcmp(pa, FROZEN_PQ_AES, pan) != 0) {
+            printf("ПРОВАЛ: Hello с гибридом (aes) отличается от заморозки (%zu против %d байт)\n", pan, FROZEN_PQ_N);
+            fails++;
+        } else printf("%-62s ok\n", "Hello с гибридом (aes): байт в байт как в заморозке");
+        if (pcn != FROZEN_PQ_N || memcmp(pc, FROZEN_PQ_CHACHA, pcn) != 0) {
+            printf("ПРОВАЛ: Hello с гибридом (chacha) отличается от заморозки\n");
+            fails++;
+        } else printf("%-62s ok\n", "Hello с гибридом (chacha): байт в байт как в заморозке");
+        /* Без гибрида Hello короче ровно на 4 (заголовок группы в key_share) + 1216 + 2 (supported_groups). */
+        if (pan != an + 4 + 1216 + 2) {
+            printf("ПРОВАЛ: размер Hello с гибридом %zu, ожидалось %zu\n", pan, an + 4 + 1216 + 2);
+            fails++;
+        } else printf("%-62s ok\n", "гибрид добавляет ровно ключ (1216) и группу");
     }
     /* Порядок наборов ОБЯЗАН различаться: если он одинаков, значит cpu_has_aes перестал
      * влиять на Hello, и роутер на MIPS получит шифр в шесть раз медленнее. */

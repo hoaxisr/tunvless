@@ -330,6 +330,72 @@ int cert_reality_check(const unsigned char *cert_body, size_t cert_n,
     return diff ? CERTV_ENOTREALITY : 0;
 }
 
+/* Значение первого расширения X.509 (extnValue, содержимое OCTET STRING) временного сертификата
+ * Reality с ML-DSA. Обход настоящий: Certificate → tbsCertificate → поле [3] extensions → SEQUENCE →
+ * первое Extension { OID, [BOOLEAN critical], OCTET STRING }. Go читает то же: Extensions[0].Value. */
+static int find_first_ext_value(const unsigned char *der, size_t n,
+                                const unsigned char **val, size_t *val_n) {
+    const unsigned char *p = der, *end = der + n, *v;
+    unsigned char tag;
+    size_t vn;
+    if (der_next(&p, end, &tag, &v, &vn) != 0 || tag != 0x30) return -1;   /* Certificate */
+    const unsigned char *ip = v, *iend = v + vn;
+    if (der_next(&ip, iend, &tag, &v, &vn) != 0 || tag != 0x30) return -1;  /* tbs */
+    const unsigned char *tp = v, *tend = v + vn, *ev = NULL;
+    size_t evn = 0;
+    while (tp < tend) {
+        if (der_next(&tp, tend, &tag, &v, &vn) != 0) return -1;
+        if (tag == 0xA3) { ev = v; evn = vn; break; }                       /* [3] extensions */
+    }
+    if (!ev) return -1;
+    const unsigned char *sp = ev;
+    if (der_next(&sp, ev + evn, &tag, &v, &vn) != 0 || tag != 0x30) return -1;  /* Extensions */
+    const unsigned char *xp = v, *xend = v + vn;
+    if (der_next(&xp, xend, &tag, &v, &vn) != 0 || tag != 0x30) return -1;   /* Extension #0 */
+    const unsigned char *fp = v, *fend = v + vn;
+    if (der_next(&fp, fend, &tag, &v, &vn) != 0 || tag != 0x06) return -1;   /* extnID */
+    if (der_next(&fp, fend, &tag, &v, &vn) != 0) return -1;
+    if (tag == 0x01 && der_next(&fp, fend, &tag, &v, &vn) != 0) return -1;   /* critical */
+    if (tag != 0x04) return -1;                                              /* extnValue */
+    *val = v;
+    *val_n = vn;
+    return 0;
+}
+
+int cert_reality_check_pq(const unsigned char *cert_body, size_t cert_n,
+                          const unsigned char *authkey, const unsigned char *pk,
+                          const unsigned char *ch, size_t ch_n,
+                          const unsigned char *sh, size_t sh_n) {
+    if (!cert_body || !authkey || !pk || !ch || !sh || cert_n < 1) return CERTV_EPARSE;
+    size_t p = 1 + cert_body[0];
+    if (p + 6 > cert_n) return CERTV_EPARSE;
+    p += 3;
+    size_t clen = ((size_t)cert_body[p] << 16) | ((size_t)cert_body[p + 1] << 8) | cert_body[p + 2];
+    p += 3;
+    if (clen == 0 || p + clen > cert_n) return CERTV_EPARSE;
+    const unsigned char *der = cert_body + p;
+    const unsigned char *epub = find_ed25519_pub(der, clen);
+    if (!epub) return CERTV_EPARSE;
+
+    const unsigned char *sig;
+    size_t sig_n;
+    if (find_first_ext_value(der, clen, &sig, &sig_n) != 0 || sig_n != SC_MLDSA65_SIG) return CERTV_EPQ;
+
+    /* HMAC над pub ‖ ClientHello ‖ ServerHello — тремя кусками сразу нельзя (sc_hmac2 принимает два),
+     * поэтому склейка в куче: 32 + около 1,7 КБ + около 1,2 КБ. */
+    size_t tot = 32 + ch_n + sh_n;
+    unsigned char *msg = malloc(tot);
+    if (!msg) return CERTV_EPQ;
+    memcpy(msg, epub, 32);
+    memcpy(msg + 32, ch, ch_n);
+    memcpy(msg + 32 + ch_n, sh, sh_n);
+    unsigned char mac[64];
+    int rc = sc_hmac(SC_SHA512, authkey, 32, msg, tot, mac);
+    free(msg);
+    if (rc != 0) return CERTV_EPQ;
+    return sc_mldsa65_verify(pk, mac, sizeof mac, sig, sig_n) == 0 ? 0 : CERTV_EPQ;
+}
+
 const char *cert_verify_strerror(int rc) {
     switch (rc) {
         case 0:              return "";
@@ -341,6 +407,7 @@ const char *cert_verify_strerror(int rc) {
         /* Формулировка про ключ, а не про сервер: узел жив и отвечает, просто нас на нём не
          * узнали — почти всегда это разошедшиеся pbk/sid или чужая подписка. */
         case CERTV_ENOTREALITY: return "узел не признал ключ (ответил маскировочный сайт)";
+        case CERTV_EPQ:      return "подпись ML-DSA-65 сервера не сошлась с pqv узла";
         default:             return "проверка сертификата не удалась";
     }
 }

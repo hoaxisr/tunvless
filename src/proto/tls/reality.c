@@ -215,6 +215,7 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
         if (sid_n < 0) return REALITY_EBADKEY;
     }
 
+    st->pq = 0;
     if (car && car->priv) {
         /* Пара пришла снаружи: xsteer выводит из неё общий секрет ещё до сборки Hello,
          * потому что этим секретом запечатывается статический ключ в набивке ECH. */
@@ -512,15 +513,25 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
      * тоже выглядит шумом), и именно она делает Hello браузерного размера — см. поле pq в
      * reality.h. */
     { struct buf kb = { b_ks, 0, sizeof(b_ks) };
-      int want_pq = car && car->pq;
+      int want_pq = (car && car->pq) || cfg->pq;
       unsigned body = 2 + 2 + 1;                       /* GREASE */
       if (want_pq) body += 2 + 2 + REALITY_MLKEM_SHARE;
       body += 2 + 2 + 32;                              /* x25519 */
       put16(&kb, body);
       put16(&kb, g_group); put16(&kb, 1); put8(&kb, 0);
       if (want_pq) {
-          if (fill_random(b_pq, REALITY_MLKEM_SHARE) != 0) return REALITY_ECRYPTO;
           put16(&kb, REALITY_GROUP_MLKEM); put16(&kb, REALITY_MLKEM_SHARE);
+          if (cfg->pq) {
+              /* Настоящий гибрид: ключ ML-KEM-768 (1184) и та же X25519-половина, что в отдельном
+               * X25519-share ниже (так делают BoringSSL и Go: один эфемерный ключ на оба). Порядок
+               * полей — draft-ietf-tls-ecdhe-mlkem: ML-KEM первым. Seed (d‖z) берётся у того же
+               * источника случайности, что и весь Hello, поэтому стенд заморозки его подменяет. */
+              unsigned char seed[SC_MLKEM768_SEED];
+              if (fill_random(seed, sizeof seed) != 0) return REALITY_ECRYPTO;
+              if (sc_mlkem768_keygen(b_pq, st->mlkem_dk, seed) != 0) return REALITY_ECRYPTO;
+              memcpy(b_pq + SC_MLKEM768_EK, st->pub, 32);
+              st->pq = 1;
+          } else if (fill_random(b_pq, REALITY_MLKEM_SHARE) != 0) return REALITY_ECRYPTO;
           put(&kb, b_pq, REALITY_MLKEM_SHARE);
       }
       put16(&kb, 0x001D); put16(&kb, 32); put(&kb, st->pub, 32);
@@ -529,7 +540,7 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
     /* supported_groups: GREASE, постквантовая (если предлагаем), X25519, secp256r1, secp384r1 —
      * ровно набор Chrome. Прежние FFDHE 0x0100..0x0104 браузер не предлагает вовсе. */
     { struct buf gb = { b_grp, 0, sizeof(b_grp) };
-      int want_pq = car && car->pq;
+      int want_pq = (car && car->pq) || cfg->pq;
       put16(&gb, want_pq ? 10 : 8);
       put16(&gb, g_group);
       if (want_pq) put16(&gb, REALITY_GROUP_MLKEM);
@@ -682,6 +693,10 @@ int x25519_shared_ext(const unsigned char priv[32], const unsigned char peer[32]
  * объявили» и «чем мы шифруем» стоило бы туннелю шестикратной потери скорости на MIPS. */
 int xc_random(unsigned char *out, size_t n) { return fill_random(out, n); }
 int xc_cpu_has_aes(void) { return cpu_has_aes(); }
+int xc_b64url_decode(const char *in, unsigned char *out, size_t out_n) {
+    return b64url_decode(in, out, out_n);
+}
+
 int xc_x25519_keypair(unsigned char priv[32], unsigned char pub[32]) {
     return x25519_keypair(priv, pub);
 }

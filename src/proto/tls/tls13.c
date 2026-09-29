@@ -21,6 +21,7 @@
  */
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
@@ -358,7 +359,9 @@ static int handshake(struct tls13 *t, int fd,
      * «испорченная TLS-запись», то есть виноватым выглядел сервер. */
     const size_t HS_HDR = 4;
     unsigned char server_pub[32];
-    int have_pub = 0;
+    /* Гибрид X25519MLKEM768: ответ сервера — шифротекст ML-KEM (1088) и его X25519-половина (32). */
+    unsigned char kem_ct[SC_MLKEM768_CT];
+    int have_pub = 0, have_kem = 0;
     {
         size_t p = HS_HDR + 2 + 32;             /* заголовок + version + random */
         if (p >= n) return TLS13_EBADREC;
@@ -376,15 +379,35 @@ static int handshake(struct tls13 *t, int fd,
             size_t elen = ((size_t)rec[p + 2] << 8) | rec[p + 3];
             p += 4;
             if (p + elen > end) break;
-            if (etype == 0x0033 && elen >= 4 + 32) {
-                /* group(2) + length(2) + key */
-                memcpy(server_pub, rec + p + 4, 32);
-                have_pub = 1;
+            if (etype == 0x0033 && elen >= 4) {
+                /* group(2) + length(2) + key. Группу читаем, а не гадаем по длине: X25519 — 32 байта,
+                 * гибрид — 1120, и принять шифротекст за открытый ключ значило бы дойти до Finished
+                 * с чужим секретом (видно как «AEAD не сошёлся»). */
+                unsigned grp = ((unsigned)rec[p] << 8) | rec[p + 1];
+                size_t klen = ((size_t)rec[p + 2] << 8) | rec[p + 3];
+                if (4 + klen > elen) return TLS13_EBADREC;
+                if (grp == 0x001D && klen == 32) {
+                    memcpy(server_pub, rec + p + 4, 32);
+                    have_pub = 1;
+                } else if (grp == 0x11EC && klen == SC_MLKEM768_CT + 32 && auth && auth->mlkem_dk) {
+                    memcpy(kem_ct, rec + p + 4, SC_MLKEM768_CT);
+                    memcpy(server_pub, rec + p + 4 + SC_MLKEM768_CT, 32);
+                    have_pub = have_kem = 1;
+                } else return TLS13_ENOKEYSHARE;
             }
             p += elen;
         }
     }
     if (!have_pub) return TLS13_ENOKEYSHARE;
+    /* Копия ServerHello для проверки ML-DSA: rec ниже переиспользуется под следующие записи, а подпись
+     * считается и над ним тоже. Копируем только когда проверка включена. */
+    unsigned char sh_copy[TLS13_SH_KEEP];
+    size_t sh_copy_n = 0;
+    if (auth && auth->mldsa_pk) {
+        if (n > sizeof(sh_copy)) return TLS13_ETOOBIG;
+        memcpy(sh_copy, rec, n);
+        sh_copy_n = n;
+    }
 
     /* Выбранный шифр определяет AEAD. Берём из ServerHello, а не догадываемся. */
     {
@@ -428,9 +451,17 @@ static int handshake(struct tls13 *t, int fd,
      *
      * Сервер, обслуживая нас как VLESS, всё равно проводит обычный TLS 1.3 со своим
      * эфемерным ключом — иначе поток не был бы неотличим от настоящего HTTPS. */
-    unsigned char ecdhe[32];
-    if (x25519_shared_ext(our_priv, server_pub, ecdhe) != 0) return TLS13_ECRYPTO;
-    if (sc_hkdf_extract(md, derived, H, ecdhe, 32, hs_secret) != 0)
+    /* Секрет гибрида — mlkem_ss ‖ x25519_ss (draft-ietf-tls-ecdhe-mlkem: у X25519MLKEM768 ML-KEM
+     * первый; тот же порядок у Go и BoringSSL). Обычный X25519 — просто 32 байта. */
+    unsigned char ecdhe[SC_MLKEM768_SS + 32];
+    size_t ecdhe_n = 32;
+    if (have_kem) {
+        if (getenv("STEER_PQ_TRACE")) fprintf(stderr, "steer[pq]: сервер выбрал X25519MLKEM768\n");
+        if (sc_mlkem768_decaps(ecdhe, auth->mlkem_dk, kem_ct) != 0) return TLS13_ECRYPTO;
+        if (x25519_shared_ext(our_priv, server_pub, ecdhe + SC_MLKEM768_SS) != 0) return TLS13_ECRYPTO;
+        ecdhe_n = sizeof(ecdhe);
+    } else if (x25519_shared_ext(our_priv, server_pub, ecdhe) != 0) return TLS13_ECRYPTO;
+    if (sc_hkdf_extract(md, derived, H, ecdhe, ecdhe_n, hs_secret) != 0)
         return TLS13_ECRYPTO;
 
     unsigned char th[48];
@@ -612,6 +643,9 @@ static int handshake(struct tls13 *t, int fd,
             return TLS13_ECERT;
         }
         int rrc = cert_reality_check(certbuf, cert_n, rkey);
+        if (rrc == 0 && auth->mldsa_pk)
+            rrc = cert_reality_check_pq(certbuf, cert_n, rkey, auth->mldsa_pk,
+                                        client_hello + 5, hello_n - 5, sh_copy, sh_copy_n);
         if (rrc != 0) {
             snprintf(g_verify_reason, sizeof(g_verify_reason), "%s", cert_verify_strerror(rrc));
             return TLS13_ECERT;
