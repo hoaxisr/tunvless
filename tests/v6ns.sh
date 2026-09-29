@@ -121,8 +121,9 @@ ours6() { ip -6 rule show | grep -c "fwmark 0x$mark/"; }
 check "  ip -6 rule выхода wg (та же метка)" "1" "$(ours6)"
 check "  в таблице IPv6 выхода — default в t0" "1" \
     "$(ip -6 route show table "$tbl" | grep -c '^default dev t0')"
-check "  и запасной запрет" "1" \
-    "$(ip -6 route show table "$tbl" | grep -c '^blackhole default.*metric 65535')"
+# Запрет в таблице IPv6 — prohibit (с 1.10): отказ приходит клиенту сразу, а не по таймауту.
+check "  и запасной запрет (prohibit)" "1" \
+    "$(ip -6 route show table "$tbl" | grep -c '^prohibit default.*metric 65535')"
 check "  у выхода без IPv6 (tgws) правила IPv6 нет" "0" \
     "$(ip -6 rule show | grep -c "fwmark 0x$(awk '$1 == "tg" { print $2 }' "$tmp/st/registry")/")"
 
@@ -174,9 +175,14 @@ sysctl -qw net.ipv6.conf.t0.disable_ipv6=1
 "$BIN" apply $S >"$tmp/apply2.out" 2>&1
 check "IPv6 на устройстве выключен: apply говорит, что IPv6 выхода остановлен" "1" \
     "$(grep -c 'маршрут IPv6 в t0 не встал' "$tmp/apply2.out")"
-check "  в таблице IPv6 — запрет" "1" \
-    "$(ip -6 route show table "$tbl" | grep -c '^blackhole default.*metric 1024')"
+check "  в таблице IPv6 — запрет (prohibit)" "1" \
+    "$(ip -6 route show table "$tbl" | grep -c '^prohibit default.*metric 1024')"
+check "  и прежнего blackhole в таблице IPv6 нет" "0" \
+    "$(ip -6 route show table "$tbl" | grep -c '^blackhole')"
 check "  адрес списка у провайдера по-прежнему недостижим" "нет" "$(ping6c 2001:db8:1::77)"
+# Отказ — сразу: ядро отвечает клиенту «administratively prohibited», а не молчит до таймаута.
+check "  клиент получает отказ сразу (administratively prohibited)" "1" \
+    "$($IC ping -6 -c 1 -W 2 2001:db8:1::77 2>&1 | grep -ci 'prohibited' | head -n 1)"
 sysctl -qw net.ipv6.conf.t0.disable_ipv6=0
 ip addr add fd00:2::1/64 dev t0 nodad
 "$BIN" apply $S >/dev/null 2>&1

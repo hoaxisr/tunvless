@@ -632,6 +632,25 @@ static int rt_line_parse(const char *line, struct rt_line *r) {
  * (IP6_RT_PRIO_USER) — нулевой метрики там не бывает. */
 #define RT6_METRIC_DEFAULT 1024
 
+/* ЗАПРЕТ В ТАБЛИЦЕ IPv6 — `prohibit`, А НЕ `blackhole` (шаг 8 выпуска 1.10, решение владельца).
+ *
+ * blackhole отбрасывает пакет молча: клиент, чей IPv6 стоит на запрете (туннель лёг, IPv6 на
+ * устройстве выключен), ждёт таймаута соединения — у TCP это секунды повторов SYN, и только потом
+ * браузер или приложение идёт по IPv4. prohibit отбрасывает тот же пакет, но ядро сразу отвечает
+ * ICMPv6 «administratively prohibited» (пересылаемому — клиенту, своему — ошибкой сокету), и
+ * клиент с двумя стеками переходит на IPv4 немедленно. Разведка шага 8 мерила это в netns:
+ * blackhole — `nc -6 -w 3` ждёт все три секунды, prohibit — отказ за миллисекунды. Утечки нет ни
+ * в одном случае: оба — маршрут-запрет, дальше по таблицам пакет не идёт.
+ *
+ * Только у IPv6. У IPv4 запрет остаётся blackhole: переходить клиенту с IPv4 некуда, и «сразу или
+ * по таймауту» там ничего не меняет, а смена задела бы запрет каждого выхода на каждом роутере.
+ * Сверка сторожа запрет любого вида читает одинаково (route_facts_of: blackhole, unreachable и
+ * prohibit — «запрет»), а запасной запрет прежней версии (blackhole с той же метрикой) снимает
+ * table_prune_fam ниже: для IPv6 он больше не «свой» запасной, а лишняя запись таблицы. */
+static const char *table_bh_type(int fam) {
+    return fam == 6 ? "prohibit" : "blackhole";
+}
+
 static void table_prune_fam(int fam, int table, const char *dev, int backstop) {
     static char routes[8192];
     char t[16];
@@ -653,9 +672,9 @@ static void table_prune_fam(int fam, int table, const char *dev, int backstop) {
         if (!rt_line_parse(line, &r)) continue;
         int is_main = !strcmp(r.dst, "default") && r.metric == main_metric &&
                       (dev ? (!r.type[0] || !strcmp(r.type, "unicast")) && !strcmp(r.dev, dev)
-                           : !strcmp(r.type, "blackhole"));
+                           : !strcmp(r.type, table_bh_type(fam)));
         if (is_main && !kept) { kept = 1; continue; }
-        int is_backstop = !strcmp(r.dst, "default") && !strcmp(r.type, "blackhole") &&
+        int is_backstop = !strcmp(r.dst, "default") && !strcmp(r.type, table_bh_type(fam)) &&
                           r.metric == STEER_BACKSTOP_METRIC;
         if (is_backstop && backstop) { backstop = 0; continue; }
         char m[24];
@@ -683,8 +702,8 @@ static void backstop_set_fam(int fam, int table) {
     snprintf(m, sizeof(m), "%d", STEER_BACKSTOP_METRIC);
     const char *bs[] = { "ip", "route", "replace", "blackhole", "default", "metric", m,
                          "table", t, NULL };
-    const char *bs6[] = { "ip", "-6", "route", "replace", "blackhole", "default", "metric", m,
-                          "table", t, NULL };
+    const char *bs6[] = { "ip", "-6", "route", "replace", table_bh_type(6), "default", "metric",
+                          m, "table", t, NULL };
     run_quiet(fam == 6 ? bs6 : bs);
 }
 
@@ -728,8 +747,8 @@ static int table_bind6(const struct output *o, const char *dev) {
     backstop_set_fam(6, o->table);
     const char *to_dev[] = { "ip", "-6", "route", "replace", "default", "dev", dev, "table", t,
                              NULL };
-    const char *to_bh[] = { "ip", "-6", "route", "replace", "blackhole", "default", "table", t,
-                            NULL };
+    const char *to_bh[] = { "ip", "-6", "route", "replace", table_bh_type(6), "default", "table",
+                            t, NULL };
     int rc = run_quiet(dev ? to_dev : to_bh);
     if (rc != 0 && dev) {
         /* Устройство IPv6 не несёт (выключен на нём IPv6) или исчезло. Прежний маршрут в
@@ -1110,7 +1129,7 @@ static const char *facts_why(const struct route_facts *f, const char *dev) {
         return f->backstop ? "маршрута в устройство нет — трафик стоял на запасном запрете"
                            : "таблица пуста — помеченный трафик уходил напрямую";
     case TBL_BLACKHOLE:
-        return "в таблице остался запрет (blackhole)";
+        return "в таблице остался запрет (blackhole или prohibit)";
     case TBL_OTHER:
         return "default в таблице без устройства";
     case TBL_DEV:
