@@ -105,6 +105,14 @@ static int fr_busy(const struct transport *t) {
     return t->fr && t->fr->busy && t->fr->busy(t);
 }
 
+/* Шифрование VLESS (encryption узла) — последний ярус: поверх готового транспорта, до запроса VLESS. */
+static int tr_venc_after(struct transport *t, const struct tr_node *n, int timeout_s) {
+    if (!n->encryption || !n->encryption[0]) return 0;
+    int rc = tr_venc_open(t, n, timeout_s);
+    if (rc) transport_close(t);
+    return rc;
+}
+
 /* ---- сборка ярусов -------------------------------------------------------------------- */
 
 int transport_open(struct transport *t, const struct tr_node *n, int timeout_s) {
@@ -114,7 +122,7 @@ int transport_open(struct transport *t, const struct tr_node *n, int timeout_s) 
     t->fr = transport_of(n->type);
     int rc = tr_link_open(&t->link, n, t->fr->alpn, timeout_s);
     if (rc) return rc;
-    if (!t->fr->open) return 0;
+    if (!t->fr->open) return tr_venc_after(t, n, timeout_s);
 
     /* ALPN здесь НЕ обязателен, и это важно понять правильно.
      *
@@ -154,15 +162,17 @@ int transport_open(struct transport *t, const struct tr_node *n, int timeout_s) 
      * безопасности. */
     rc = t->fr->open(t, n, timeout_s);
     if (rc) { transport_close(t); return rc; }
-    return 0;
+    return tr_venc_after(t, n, timeout_s);
 }
 
 int transport_write(struct transport *t, const unsigned char *d, size_t n) {
+    if (t->enc) return tr_venc_write(t, d, n);
     return t->fr->write(t, d, n);
 }
 
 int transport_read(struct transport *t, unsigned char *d, size_t cap, size_t *got) {
     *got = 0;
+    if (t->enc) return tr_venc_read(t, d, cap, got);
     return t->fr->read(t, d, cap, got);
 }
 
@@ -174,7 +184,7 @@ int transport_read_zc(struct transport *t, unsigned char *buf, size_t cap,
      * Прямое копирование (rx_direct) и security=none читают сокет сами. Своё непрочитанное у
      * транспорта (остаток после ответа 101 у httpupgrade) — раньше записей TLS: оно раньше
      * их и приехало. */
-    if (t->fr->zc && !t->link.plain && !t->link.rx_direct && !fr_pending(t) && !fr_busy(t))
+    if (!t->enc && t->fr->zc && !t->link.plain && !t->link.rx_direct && !fr_pending(t) && !fr_busy(t))
         return tls13_read_ref(&t->link.tls, data, got);
     return transport_read(t, buf, cap, got);
 }
@@ -192,6 +202,8 @@ int transport_read_zc(struct transport *t, unsigned char *buf, size_t cap,
  * И четвёртое, раньше всех: своё непрочитанное у транспорта (transport_ops.pending) — остаток
  * после ответа 101 и конец потока ws, о котором сокет уже ничего не скажет. */
 int transport_has_data(const struct transport *t) {
+    /* Шифрованный поток: расшифрованное и целая запись во входе слоя (trvenc.c) — раньше всего. */
+    if (t->enc && tr_venc_pending(t)) return 1;
     if (fr_pending(t)) return 1;
     if (t->link.plain) return 0;
     if (t->link.rx_direct) return tls13_buffered(&t->link.tls) > 0;
@@ -210,6 +222,7 @@ void transport_close(struct transport *t) {
      * ЗДЕСЬ ЖЕ и по тому же доводу (transport_ops.close). Забыть её значило бы утечку ровно вдвое
      * злее обычной: на соединение приходится и лишний дескриптор, и лишний набор контекстов
      * шифра. fr пуст, если открытие не дошло до выбора транспорта — тогда и второй связи не было. */
+    if (t->enc) tr_venc_close(t);
     if (t->fr && t->fr->close) t->fr->close(t);
     tr_link_close(&t->link);
 }
@@ -238,6 +251,13 @@ const char *transport_strerror(int rc) {
         case TR_EUPTIMEOUT: return "сервер не ответил на запрос Upgrade (таймаут)";
         case TR_EUPTOOBIG: return "ответ на запрос Upgrade не разобрался";
         case TR_EWSFRAME: return "кадр WebSocket не по RFC 6455";
+        case TR_EVENC: {
+            static __thread char why[128];
+            snprintf(why, sizeof why, "VLESS encryption: %s", tr_venc_reason());
+            return why;
+        }
+        case TR_EVENCAUTH: return "VLESS encryption: ключи разошлись с сервером (проверьте строку encryption)";
+        case TR_EVENC0RTT: return "VLESS encryption: сервер отклонил билет 0-RTT";
         case H2_EIO: case H2_EPROTO: case H2_ESTATUS:
         case H2_ERESET: case H2_ETOOBIG: case H2_EWINDOW: return h2_strerror(rc);
         case REALITY_EBADKEY: return "pbk или sid не разобрались";

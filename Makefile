@@ -81,7 +81,7 @@ $(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_DEFAULT_PLATFORM=android -o $@ $(CORE_SRC)
 
-test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/hy2match $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool
+test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/hy2match $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool $(BUILD)/b3match $(BUILD)/subpq
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/snapshot.sh
@@ -127,6 +127,8 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@$(BUILD)/h2match
 	@$(BUILD)/xhupmatch
 	@$(BUILD)/wsmatch
+	@$(BUILD)/b3match
+	@$(BUILD)/subpq
 	@$(BUILD)/submatch
 	@$(BUILD)/subfetchmatch
 	@$(BUILD)/hy2match
@@ -426,7 +428,7 @@ XHUPMATCH_SRC = src/proto/tls/h2.c src/proto/transport/transport.c src/proto/tra
 $(BUILD)/xhupmatch: tests/xhupmatch.c src/proto/transport/trxhttp.c src/proto/transport/transport.h \
                     src/proto/tls/h2.h $(XHUPMATCH_SRC)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/xhupmatch.c \
+	$(CC) $(CFLAGS) -o $@ tests/xhupmatch.c tests/trvenc-stub.c \
 		$(XHUPMATCH_SRC) $(PLATFORM_SRC) -lpthread
 
 # Транспорты ws и httpupgrade (trws.c, trupgrade.c, trpath.c; шаг 5 выпуска 1.10): кадры WebSocket
@@ -439,10 +441,15 @@ WSMATCH_SRC = src/proto/transport/trws.c src/proto/transport/trupgrade.c src/pro
               src/proto/transport/transport.c src/proto/transport/trsec.c src/proto/transport/trdial.c \
               src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c src/proto/tls/h2.c \
               src/proto/tls/roots.c
-$(BUILD)/wsmatch: tests/wsmatch.c src/proto/transport/transport.h src/proto/transport/trpath.h \
+# BLAKE3 против Go (lukechampine.com/blake3, как у Xray): src/lib/blake3.h самодостаточен, библиотеки нет.
+$(BUILD)/b3match: tests/b3match.c src/lib/blake3.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/b3match.c
+
+$(BUILD)/wsmatch: tests/wsmatch.c tests/trvenc-stub.c src/proto/transport/transport.h src/proto/transport/trpath.h \
                   src/proto/tls/h2.h $(WSMATCH_SRC)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/wsmatch.c $(WSMATCH_SRC) $(PLATFORM_SRC) -lpthread
+	$(CC) $(CFLAGS) -o $@ tests/wsmatch.c tests/trvenc-stub.c $(WSMATCH_SRC) $(PLATFORM_SRC) -lpthread
 
 # Разбор подписки — единственное место, куда в движок попадает чужой текст из интернета.
 # Ни сети, ни криптобиблиотеки он не требует, поэтому стенд включает исходник напрямую и входит
@@ -462,11 +469,20 @@ $(BUILD)/visionmatch: tests/visionmatch.c src/proto/vless/vision.c src/proto/vle
 #
 # trpath.c — отдельным объектом: путь ws и httpupgrade подписка отбраковывает тем же правилом, по
 # которому транспорт собирает запрос (src/proto/transport/trpath.h), а сам файл — чистые строки.
-$(BUILD)/submatch: tests/submatch.c src/proto/vless/sub.c src/proto/vless/vless.h \
+$(BUILD)/submatch: tests/submatch.c src/proto/vless/sub.c src/proto/vless/vless.h src/proto/transport/vencp.h \
                   src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h \
                   src/proto/transport/trpath.c src/proto/transport/trpath.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/submatch.c src/proto/transport/trpath.c
+
+# Постквантовые поля подписки (encryption, pqv / mldsa65Verify): tests/subpq.c, образцы значений Xray-core
+# 26.9.9 — tests/sub-pq-samples.h. Библиотеки нет; sub.c линкуется объектом, а не включается (предел на
+# стенды с #include .c из src — buildmatch).
+$(BUILD)/subpq: tests/subpq.c tests/sub-pq-samples.h src/proto/vless/sub.c src/proto/vless/vless.h \
+                src/proto/transport/vencp.h src/proto/vless/vless_proto.c src/proto/transport/trpath.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Itests -o $@ tests/subpq.c src/proto/vless/sub.c src/proto/vless/vless_proto.c \
+		src/proto/transport/trpath.c
 
 # Скачивание и обработка подписки. Стенд включает исходник и подставляет две вещи: свой
 # run_quiet и поддельный curl в PATH (SHA-256 идентификатора устройства — свой, в hwid.c).
@@ -598,7 +614,7 @@ $(BUILD)/yamlmatch: tests/yamlmatch.c tests/unit.h $(YAML_SRC) src/lib/ynode.h s
 # только артефакты: то, что здесь же и собирается, плюс упаковка из build.sh.
 clean:
 	rm -rf $(BUILD)/steer $(BUILD)/steerd $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext \
-	       $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/hy2match $(BUILD)/fwmatch $(BUILD)/obfsmatch \
+	       $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/hy2match $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/b3match $(BUILD)/subpq \
 	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
 	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
 	       $(BUILD)/diagsim $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/yamlmatch $(BUILD)/wolfssl-host \

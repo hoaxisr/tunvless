@@ -415,7 +415,9 @@ static int vl_deliver(const void *ctx, void *sess, int udp, const unsigned char 
     /* Сервер объявил прямое копирование — сообщаем об этом связи, чтобы следующее чтение шло
      * мимо расшифровки. Ставится ЗДЕСЬ, потому что команда живёт в кадрах Vision, а про них
      * знает только этот код. */
-    if (s->vis.recv_direct && !s->t.link.rx_direct) {
+    /* Под VLESS encryption прямого копирования не бывает: записи слоя шифрования остаются записями
+     * до конца соединения (у Xray там CanSpliceCopy = 3, и сервер команду не шлёт). */
+    if (s->vis.recv_direct && !s->t.link.rx_direct && !s->t.enc) {
         transport_direct(&s->t);
         TR("сервер перешёл на прямое копирование — читаем сокет как есть\n");
     }

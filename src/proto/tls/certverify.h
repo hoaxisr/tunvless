@@ -40,6 +40,7 @@ int cert_verify_server(const unsigned char *cert_body, size_t cert_n,
                        const char *host, const char *roots);
 
 #define CERTV_ENOTREALITY (-75) /* сервер не доказал, что он Reality: не признал нас */
+#define CERTV_EPQ         (-76) /* Reality признал, но подпись ML-DSA-65 (pqv) отсутствует или неверна */
 
 /* Проверить, что перед нами ТОТ САМЫЙ сервер Reality.
  *
@@ -63,6 +64,21 @@ int cert_reality_check(const unsigned char *cert_body, size_t cert_n,
                        const unsigned char *authkey);
 
 /* Человеческое объяснение кода. Пустая строка для 0. */
+/* Вторая половина доказательства Reality — подпись ML-DSA-65 (`mldsa65Verify`, `pqv` в ссылке).
+ *
+ * Сервер с mldsa65Seed кладёт в единственное расширение временного сертификата подпись (3309
+ * байт) над HMAC-SHA512(authkey, ed25519_pub ‖ ClientHello ‖ ServerHello): оба сообщения — целиком,
+ * с четырёхбайтным заголовком рукопожатия, как отправлены и получены (xtls/reality,
+ * handshake_server_tls13.go). Здесь проверяется ровно это, и ТОЛЬКО после cert_reality_check —
+ * подпись ML-DSA без первой не значит ничего.
+ *
+ * pk — 1952 байта. 0 — верна; CERTV_EPQ — расширения нет, оно не той длины или подпись не сошлась;
+ * CERTV_EPARSE — сертификат не разобрался. */
+int cert_reality_check_pq(const unsigned char *cert_body, size_t cert_n,
+                          const unsigned char *authkey, const unsigned char *pk,
+                          const unsigned char *ch, size_t ch_n,
+                          const unsigned char *sh, size_t sh_n);
+
 const char *cert_verify_strerror(int rc);
 
 #endif

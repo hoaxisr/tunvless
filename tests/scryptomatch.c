@@ -298,6 +298,45 @@ static void test_aesctr(void) {
 
 /* ---- X25519 ---------------------------------------------------------------------------------- */
 
+#include "scrypto-pq.h"
+
+/* ML-KEM-768: ключ из seed совпадает с Go, шифротекст Go декапсулируется в тот же секрет, своя
+ * инкапсуляция сходится со своей декапсуляцией; испорченный ключ отвергается. */
+static void test_mlkem(void) {
+    unsigned char ek[SC_MLKEM768_EK], dk[SC_MLKEM768_DK], ss[32], ct[SC_MLKEM768_CT], ss2[32];
+    check("ML-KEM: keygen", 0, sc_mlkem768_keygen(ek, dk, KEM_SEED));
+    check("ML-KEM: ek совпал с Go", 0, memcmp(ek, KEM_EK, sizeof ek));
+    check("ML-KEM: ek проходит проверку", 0, sc_mlkem768_ek_check(ek));
+    check("ML-KEM: decaps шифротекста Go", 0, sc_mlkem768_decaps(ss, dk, KEM_CT));
+    check("ML-KEM: секрет совпал с Go", 0, memcmp(ss, KEM_SS, 32));
+    unsigned char rnd[32];
+    for (int i = 0; i < 32; i++) rnd[i] = (unsigned char)(i * 5 + 1);
+    check("ML-KEM: encaps", 0, sc_mlkem768_encaps(ct, ss, ek, rnd));
+    check("ML-KEM: decaps своего шифротекста", 0, sc_mlkem768_decaps(ss2, dk, ct));
+    check("ML-KEM: секреты сошлись", 0, memcmp(ss, ss2, 32));
+    /* Неявный отказ: испорченный шифротекст даёт ДРУГОЙ секрет, а не ошибку. */
+    ct[10] ^= 1;
+    check("ML-KEM: испорченный ct — код 0", 0, sc_mlkem768_decaps(ss2, dk, ct));
+    check("ML-KEM: испорченный ct — секрет другой", 1, memcmp(ss, ss2, 32) != 0);
+    /* Коэффициент 0xFFF >= q = 3329: такой ключ Go не принимает (FIPS 203, 7.2). */
+    unsigned char bad[SC_MLKEM768_EK];
+    memcpy(bad, ek, sizeof bad);
+    bad[0] = 0xFF; bad[1] |= 0x0F;
+    check("ML-KEM: ключ с коэффициентом >= q — отказ", SC_EPARSE, sc_mlkem768_ek_check(bad));
+    check("ML-KEM: encaps к такому ключу — отказ", SC_EPARSE, sc_mlkem768_encaps(ct, ss, bad, rnd));
+}
+
+/* ML-DSA-65: подпись circl проходит, любое искажение — нет. */
+static void test_mldsa(void) {
+    check("ML-DSA-65: подпись circl", 0, sc_mldsa65_verify(DSA_PK, DSA_MSG, sizeof DSA_MSG, DSA_SIG, sizeof DSA_SIG));
+    unsigned char m[32], sg[SC_MLDSA65_SIG];
+    memcpy(m, DSA_MSG, 32); m[0] ^= 1;
+    check("ML-DSA-65: другое сообщение — SC_ESIG", SC_ESIG, sc_mldsa65_verify(DSA_PK, m, 32, DSA_SIG, sizeof DSA_SIG));
+    memcpy(sg, DSA_SIG, sizeof sg); sg[100] ^= 1;
+    check("ML-DSA-65: испорченная подпись — SC_ESIG", SC_ESIG, sc_mldsa65_verify(DSA_PK, DSA_MSG, 32, sg, sizeof sg));
+    check("ML-DSA-65: короткая подпись — SC_ESIG", SC_ESIG, sc_mldsa65_verify(DSA_PK, DSA_MSG, 32, DSA_SIG, 100));
+}
+
 static void test_x25519(void) {
     unsigned char k[32], u[32], out[32];
     /* §5.2, первый вектор: скаляр НЕ прижат (a5 в младшем байте) — прижимает сама функция. */
@@ -496,6 +535,8 @@ int main(void) {
     test_aead();
     test_aesctr();
     test_x25519();
+    test_mlkem();
+    test_mldsa();
     test_sig();
     test_chain();
     return unit_done("scryptomatch");

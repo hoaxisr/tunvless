@@ -256,6 +256,7 @@ cc_binary {
         "src/proto/transport/trupgrade.c",
         "src/proto/transport/trws.c",
         "src/proto/transport/trpath.c",
+        "src/proto/transport/trvenc.c",
         "src/proto/tls/roots.c",
         "src/proto/xsteer/xsclient.c",
         "src/proto/vless/subfetch.c",

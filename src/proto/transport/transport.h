@@ -58,6 +58,9 @@
 #define TR_EUPTIMEOUT (-43)  /* ответа на запрос Upgrade нет за срок соединения */
 #define TR_EUPTOOBIG  (-44)  /* ответ на Upgrade не разобрался: длиннее предела или не HTTP */
 #define TR_EWSFRAME   (-45)  /* кадр WebSocket нарушает RFC 6455 */
+#define TR_EVENC      (-46)  /* VLESS encryption: рукопожатие или формат (причина — tr_venc_reason) */
+#define TR_EVENCAUTH  (-47)  /* VLESS encryption: AEAD не сошёлся — ключи разошлись с сервером */
+#define TR_EVENC0RTT  (-48)  /* VLESS encryption: сервер отклонил билет 0-RTT, следующее соединение — полное */
 
 /* Узел глазами транспорта: только то, что касается связи. Указатели — в узел подписки
  * (struct vless_node), без копий: узел живёт дольше любого соединения к нему. */
@@ -81,6 +84,12 @@ struct tr_node {
     /* Длина набивки xhttp, объявленная узлом (см. vless_node.pad_from в vless.h). 0 в pad_to —
      * не объявлено, тогда умолчание Xray. */
     uint16_t pad_from, pad_to;
+    /* Reality: открытый ключ ML-DSA-65 для проверки подписи сертификата, base64url (1952 байта в
+     * бинарном виде), или NULL. Поле mldsa65Verify конфига Xray, `pqv` ссылки. */
+    const char *pqv;
+    /* VLESS encryption: строка `encryption` узла без изменений (mlkem768x25519plus.…) или NULL —
+     * шифрования нет. Разбирает и исполняет vlenc.c поверх готовой связи. */
+    const char *encryption;
 };
 
 /* Связь: сокет и безопасность над ним — один защищённый поток байт.
@@ -277,7 +286,18 @@ struct transport {
     struct grpc_de de;         /* только для grpc */
     struct xh_state xh;        /* только для xhttp */
     struct h1_state h1;        /* только для ws и httpupgrade */
+    struct venc *enc;          /* VLESS encryption поверх транспорта (trvenc.c), или NULL */
 };
+
+/* VLESS encryption (trvenc.c): рукопожатие поверх открытого транспорта и записи AEAD вместо его
+ * transport_write/read. Зовёт transport_open, если у узла задан encryption. */
+struct venc;
+int tr_venc_open(struct transport *t, const struct tr_node *n, int timeout_s);
+int tr_venc_write(struct transport *t, const unsigned char *d, size_t n);
+int tr_venc_read(struct transport *t, unsigned char *d, size_t cap, size_t *got);
+int tr_venc_pending(const struct transport *t);
+void tr_venc_close(struct transport *t);
+const char *tr_venc_reason(void);
 
 /* Полное установление: TCP, рукопожатие безопасности, открытие транспорта. 0 — готово; иначе
  * код отказа, и тогда ни дескриптора, ни ключей в куче за соединением не остаётся. */

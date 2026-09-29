@@ -184,10 +184,25 @@ $CC -O1 -g -w $STEER_INC -Itests $ASAN -DSTEER_HAVE_X509WRITE -o "$BUILD/vlessma
 	src/proto/vless/client.c src/proto/transport/transport.c src/proto/transport/trsec.c \
 	src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c \
 	src/proto/transport/trupgrade.c src/proto/transport/trws.c src/proto/transport/trpath.c \
+	src/proto/transport/trvenc.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
 	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
 	$MODEL_SRC $KINDS_SRC $CERTGEN $CRYPTO -lpthread
 "$BUILD/vlessmatch"
+
+# vencprobe + venc.sh — VLESS encryption и постквантовая часть (гибрид X25519MLKEM768, ML-DSA-65 у Reality)
+# против НАСТОЯЩЕГО Xray-core (XRAY=бинарник или образ в docker; нет — громкий пропуск внутри venc.sh).
+# Клиент тот же, что в работе: vless_connect → transport_open → tr_venc_open.
+echo "ext-test: собираю vencprobe и прогоняю venc.sh (сквозные проверки против Xray-core)..."
+$CC -O1 -g -w $STEER_INC -o "$BUILD/vencprobe" tests/vencprobe.c \
+	src/proto/vless/client.c src/proto/transport/transport.c src/proto/transport/trsec.c \
+	src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c src/proto/transport/trdial.c src/proto/tls/roots.c \
+	src/proto/transport/trupgrade.c src/proto/transport/trws.c src/proto/transport/trpath.c \
+	src/proto/transport/trvenc.c \
+	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
+	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
+	$MODEL_SRC $KINDS_SRC $CRYPTO -lpthread
+BUILD="$BUILD" sh tests/venc.sh
 
 # androidroots — склейка каталога корней Android в файл для certverify (cert_roots в
 # src/proto/tls/roots.c — стенд его включает — на платформе с системным хранилищем корней;
@@ -227,6 +242,7 @@ $CC -O2 -w $STEER_INC -o "$BUILD/devupmatch" tests/devupmatch.c \
 	src/proto/transport/transport.c src/proto/transport/trdial.c src/proto/transport/trsec.c \
 	src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c src/proto/tls/roots.c \
 	src/proto/transport/trupgrade.c src/proto/transport/trws.c src/proto/transport/trpath.c \
+	src/proto/transport/trvenc.c \
 	src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c src/proto/tls/h2.c \
 	src/lib/jsonw.c src/lib/evline.c \
 	$MODEL_SRC $KINDS_SRC $CRYPTO -lpthread

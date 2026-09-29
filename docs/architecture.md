@@ -442,6 +442,15 @@ wolfSSL включает один `src/lib/scrypto.c` (buildmatch). Свои TLS
 рукопожатие и ратчет xsteer и мост tgws стоят на этом слое. В статической базовой сборке
 криптографии нет.
 
+**Постквантовая часть.** Слой отдаёт ML-KEM-768 (`sc_mlkem768_*`: ключ и закрытый ключ — байтами, не
+контекстами; случайность даёт вызывающий), проверку ML-DSA-65 (`sc_mldsa65_verify`, пустой контекст
+FIPS 204) и BLAKE3 (`sc_blake3_*`). Первые два стоят на wolfSSL (`WOLFSSL_WC_MLKEM`, `WOLFSSL_WC_MLDSA` в
+режиме `VERIFY_ONLY`, SHA-3 — все три в `user_settings.h`; ключи wolfSSL создаются в куче на время
+вызова, поэтому их размер не входит в ABI между `libsteer` и `libsteer-wolfssl`). BLAKE3 в wolfSSL нет:
+это `src/lib/blake3.h`, переносимый C без библиотеки, включаемый в `scrypto.c`. Потребители: гибрид
+X25519MLKEM768 в TLS 1.3 и REALITY (`src/proto/tls`), подпись ML-DSA-65 у REALITY
+(`certverify.c`) и VLESS encryption (`src/proto/transport/trvenc.c`), см. [vless.md](vless.md).
+
 **В пакете роутера** библиотека — `libsteer-wolfssl.so.<версия wolfSSL>`, слой `scrypto.c` — в
 `libsteer.so`, и `libsteer.so` зависит от неё (DT_NEEDED). Наружу из `libsteer-wolfssl.so` выходят
 символы `wc_*` и `wolfSSL_*`, которые зовёт слой (`build/wolfssl/libsteer-wolfssl.map`), и

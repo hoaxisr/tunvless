@@ -16,6 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <stdlib.h>
 
 #include "transport.h"
 #include "reality.h"
@@ -58,9 +59,20 @@ static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *
          * остаётся тем самым, который проверен на живых узлах. */
         .alpn = alpn,
         .plain = is_tls,
+        /* Гибрид X25519MLKEM768 в ClientHello — как у Chrome 131+, uTLS HelloChrome_Auto и Go 1.24+,
+         * то есть у любого клиента Xray с fp=chrome и без fp. Без него наш Hello — «Chrome позапрошлого
+         * года» и по размеру (537 байт вместо около 1760), и по составу supported_groups. Выключатель
+         * STEER_NOPQ=1 — для разбора: посредник, роняющий Hello больше одного сегмента. */
+        .pq = !getenv("STEER_NOPQ"),
     };
+    /* pqv: ключ ML-DSA-65, base64url. Разбирается ДО отправки Hello: испорченный ключ — отказ узла, а не
+     * повод отправить Hello и потом молча не проверять подпись. Разбор подписки (sub.c) такой ключ
+     * отсеивает раньше, так что сюда он не доходит; это вторая линия. */
+    unsigned char pqv[SC_MLDSA65_PK];
+    const int have_pqv = !is_tls && n->pqv && n->pqv[0];
+    if (have_pqv && xc_b64url_decode(n->pqv, pqv, sizeof pqv) != SC_MLDSA65_PK) return REALITY_EBADKEY;
     struct reality_state rst;
-    unsigned char hello[2048];
+    unsigned char hello[2560];
     size_t hello_n = 0;
     /* ws и httpupgrade просят в ALPN ТОЛЬКО http/1.1 — как Xray (WebsocketHandshakeContext у
      * uTLS переписывает ALPN отпечатка на один http/1.1) и как сам Chrome на соединении
@@ -91,6 +103,8 @@ static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *
     struct tls13_auth auth = { 0 };
     if (is_tls) { auth.host = verify_host; auth.roots = tls_cert_roots(); }
     else        auth.reality_key = rst.authkey;
+    if (rst.pq) auth.mlkem_dk = rst.mlkem_dk;
+    auth.mldsa_pk = have_pqv ? pqv : NULL;
 
     return tls13_handshake_auth(&l->tls, l->fd, hello, hello_n, rst.priv, &auth);
 }

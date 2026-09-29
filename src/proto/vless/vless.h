@@ -54,6 +54,17 @@ struct vless_node {
      * Ноль в pad_to означает «не объявлено» — тогда берётся умолчание Xray, 100…1000
      * (GetNormalizedXPaddingBytes). */
     uint16_t pad_from, pad_to;
+    /* Постквантовые поля Xray-core. Длинные (ключ ML-DSA-65 — 2603 знака base64url, реле VLESS
+     * encryption с ключом ML-KEM-768 — около 1600), поэтому строки лежат не в узле, а в общей
+     * таблице sub.c (sub_intern): одинаковые значения — один экземпляр, память не освобождается и не
+     * растёт от повторных разборов. NULL — поля нет. Указатель переживает узел и его копии. */
+    const char *pqv;         /* reality: mldsa65Verify / pqv */
+    const char *encryption;  /* vless: encryption=mlkem768x25519plus.… (none не хранится) */
+    /* Настройки, которых клиент не умеет и которые сервер ТРЕБУЕТ (иначе соединение не откроется): узел
+     * объявляется непригодным сразу, с названной причиной, а не тратит попытки сторожа. tcp_http —
+     * заголовок HTTP-маскировки tcp (headerType=http); xh_extra — обфускация запросов xhttp
+     * (xPaddingObfsMode, размещения sessionID/seq/данных, downloadSettings). */
+    uint8_t tcp_http, xh_extra;
     char skip_reason[64];  /* почему узел непригоден — чтобы это можно было показать */
 };
 

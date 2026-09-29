@@ -116,6 +116,20 @@ static void node_json(const struct vless_node *n, int index) {
     printf(",\"security\":"); jsonw_str(stdout, n->security);
     printf(",\"vision\":%s", n->flow[0] ? "true" : "false");
     if (n->mode[0]) { printf(",\"mode\":"); jsonw_str(stdout, n->mode); }
+    /* Постквантовая часть узла: режим шифрования VLESS (первые три токена строки, без ключей — ключи
+     * в списке узлов ни к чему) и наличие проверки подписи ML-DSA-65 у Reality. Поля есть только там,
+     * где заданы, поэтому вывод узлов без них прежний. */
+    if (n->encryption) {
+        char mode[48];
+        size_t dots = 0, i = 0;
+        for (; n->encryption[i] && i + 1 < sizeof(mode); i++) {
+            if (n->encryption[i] == '.' && ++dots == 3) break;
+            mode[i] = n->encryption[i];
+        }
+        mode[i] = '\0';
+        printf(",\"encryption\":"); jsonw_str(stdout, mode);
+    }
+    if (n->pqv) printf(",\"pqv\":true");
     printf("}");
 }
 

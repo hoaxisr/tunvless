@@ -40,6 +40,18 @@ struct reality_cfg {
      * Признак явный, а не «pbk пуст»: опечатка в ключе не должна молча превращать Reality в
      * обычный TLS — это тихое понижение защиты, которое снаружи выглядит как рабочий узел. */
     int plain;
+
+    /* НАСТОЯЩИЙ постквантовый обмен X25519MLKEM768 (паритет с uTLS HelloChrome_131+ и Go 1.24+, которыми
+     * пользуется Xray-core).
+     *
+     * Отличие от carrier.pq: там 1216 байт случайного шума, «для размера», а здесь — ключ ML-KEM-768,
+     * сделанный по-настоящему (sc_mlkem768_keygen), и X25519-половина того же общего ключа, что и отдельный
+     * X25519-share. Сервер Reality на Go ≥ 1.24 выбирает гибрид сам, если клиент его предложил, и тогда в
+     * ServerHello приезжает шифротекст (1088) и его X25519-половина (32), а секрет расписания ключей —
+     * mlkem_ss ‖ x25519_ss (draft-ietf-tls-ecdhe-mlkem: ML-KEM первым). Приватная половина ML-KEM лежит в
+     * reality_state.mlkem_dk и уезжает в tls13_auth.mlkem_dk. С шумом вместо ключа такой сервер отвечал
+     * бы отказом (Go проверяет ключ) — поэтому шум остаётся только у xsteer, чей хаб гибрид не выбирает. */
+    int pq;
 };
 
 struct reality_state {
@@ -54,6 +66,11 @@ struct reality_state {
      * Поэтому он не остаётся внутри сборщика Hello, как раньше, а живёт до конца
      * рукопожатия. Нулевой при plain: у обычного TLS его не существует. */
     unsigned char authkey[32];
+
+    /* Закрытый ключ ML-KEM-768 (FIPS 203, 2400 байт) для декапсуляции ответа сервера; заполнен, только
+     * если cfg.pq. Живёт на стеке соединителя, как и priv, и нужен до конца рукопожатия. */
+    unsigned char mlkem_dk[2400];
+    int pq;
 };
 
 int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
@@ -125,6 +142,8 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
 /* Примитивы этого файла наружу — для xsteer (src/proto/xsteer/xshake.c). Объяснение, почему обёртки,
  * а не копии, стоит у их определений в reality.c. */
 int xc_random(unsigned char *out, size_t n);
+/* base64url (с выравниванием или без) в байты; длина результата либо -1. Для ключей узла (pqv). */
+int xc_b64url_decode(const char *in, unsigned char *out, size_t out_n);
 int xc_cpu_has_aes(void);
 int xc_x25519_keypair(unsigned char priv[32], unsigned char pub[32]);
 int xc_x25519_public(const unsigned char priv[32], unsigned char pub[32]);

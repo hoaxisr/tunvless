@@ -155,6 +155,61 @@ int sc_x25519(unsigned char out[32], const unsigned char scalar[32], const unsig
 /* Публичная половина: X25519(scalar, 9). */
 int sc_x25519_base(unsigned char pub[32], const unsigned char scalar[32]);
 
+/* ---- ML-KEM-768 и ML-DSA-65 (FIPS 203 и 204) ---------------------------------------------- */
+
+/* Постквантовая часть паритета с Xray-core: половина гибрида X25519MLKEM768 в TLS 1.3 (ClientHello
+ * Chrome 131+, ответ сервера REALITY), обмен «mlkem768x25519plus» у VLESS encryption и проверка
+ * подписи ML-DSA-65 в сертификате REALITY (`mldsa65Verify`, `pqv` в ссылке).
+ *
+ * КЛЮЧИ — БАЙТАМИ, а не непрозрачными контекстами. Ключ ML-KEM у wolfSSL занимает несколько
+ * килобайт и разворачивает матрицу; хранить такое значением внутри struct tls13 (как AEAD) значило
+ * бы раздуть каждое соединение ради операции, которая случается один раз на рукопожатие. Поэтому
+ * каждая функция сама заводит ключ в куче на время вызова и освобождает; долгоживёт у вызывающего
+ * только закрытый ключ декапсуляции в закодированном виде (SC_MLKEM768_DK). Раскладка байт — FIPS 203:
+ * ek — как у Go (crypto/mlkem.EncapsulationKey768.Bytes), ct — 1088 байт, ss — 32.
+ *
+ * СЛУЧАЙНОСТЬ ДАЁТ ВЫЗЫВАЮЩИЙ. Так Hello в стенде заморозки (tests/hellofreeze.c) остаётся
+ * воспроизводимым: он подменяет единственный источник случайных байт, а не глубину библиотеки. */
+#define SC_MLKEM768_EK  1184
+#define SC_MLKEM768_DK  2400
+#define SC_MLKEM768_CT  1088
+#define SC_MLKEM768_SS  32
+#define SC_MLKEM768_SEED 64     /* d || z, FIPS 203 ML-KEM.KeyGen_internal */
+#define SC_MLKEM768_RND 32      /* m, FIPS 203 ML-KEM.Encaps_internal */
+
+/* Пара ключей из seed. dk — закодированный закрытый ключ (для sc_mlkem768_decaps). */
+int sc_mlkem768_keygen(unsigned char ek[SC_MLKEM768_EK], unsigned char dk[SC_MLKEM768_DK],
+                       const unsigned char seed[SC_MLKEM768_SEED]);
+/* Проверка ключа, пришедшего от собеседника (FIPS 203, 7.2): коэффициенты меньше q. Go отвергает
+ * такие ключи в NewEncapsulationKey768, и мы тоже. SC_EPARSE — не ключ. */
+int sc_mlkem768_ek_check(const unsigned char ek[SC_MLKEM768_EK]);
+int sc_mlkem768_encaps(unsigned char ct[SC_MLKEM768_CT], unsigned char ss[SC_MLKEM768_SS],
+                       const unsigned char ek[SC_MLKEM768_EK], const unsigned char rnd[SC_MLKEM768_RND]);
+/* Декапсуляция. Неверный шифротекст ML-KEM не отвергает (неявный отказ): вернётся псевдослучайный
+ * секрет, и обнаружит расхождение уже AEAD. */
+int sc_mlkem768_decaps(unsigned char ss[SC_MLKEM768_SS], const unsigned char dk[SC_MLKEM768_DK],
+                       const unsigned char ct[SC_MLKEM768_CT]);
+
+#define SC_MLDSA65_PK   1952
+#define SC_MLDSA65_SIG  3309
+/* Проверить подпись ML-DSA-65 с ПУСТЫМ контекстом (как mldsa65.Verify(pk, msg, nil, sig) в circl).
+ * 0 — верна, SC_ESIG — нет, SC_EPARSE — ключ или длина не те. */
+int sc_mldsa65_verify(const unsigned char pk[SC_MLDSA65_PK], const unsigned char *msg, size_t msg_n,
+                      const unsigned char *sig, size_t sig_n);
+
+/* ---- BLAKE3 (VLESS encryption) ------------------------------------------------------------ */
+
+/* BLAKE3 нужен только VLESS encryption: им Xray выводит ключи AEAD (DeriveKey с контекстом-строкой),
+ * ключи гаммы xorpub/random и хеш ключей реле. В wolfSSL его нет, реализация своя, без библиотеки
+ * (src/lib/blake3.c), и работает на любой длине входа — контекст NewAEAD бывает длиннее
+ * килобайта (1216 байт открытого ключа), то есть больше одного чанка и с деревом. Порт reference
+ * implementation, проверен векторами из репозитория BLAKE3 (tests/scryptomatch.c). */
+void sc_blake3_hash(unsigned char out[32], const void *in, size_t n);
+/* blake3.DeriveKey(out, context, material) из lukechampine.com/blake3: режим derive_key, контекст —
+ * произвольные байты. out_n — до 64. */
+void sc_blake3_derive_key(unsigned char *out, size_t out_n, const void *ctx, size_t ctx_n,
+                          const void *material, size_t material_n);
+
 /* ---- подписи и сертификаты ---------------------------------------------------------------- */
 
 enum sc_sig_alg { SC_SIG_RSA_PKCS1 = 1, SC_SIG_RSA_PSS = 2, SC_SIG_ECDSA = 3 };

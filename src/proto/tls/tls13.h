@@ -9,6 +9,8 @@
 
 #define TLS13_MAX_REC   16640          /* максимум записи по RFC + запас на тег */
 #define TLS13_MAX_PLAIN 16384
+/* Сколько байт ServerHello хранится для проверки ML-DSA (с гибридом он около 1200). */
+#define TLS13_SH_KEEP   2048
 
 #define TLS13_EIO          (-10)
 #define TLS13_ECLOSED      (-11)
@@ -153,6 +155,13 @@ struct tls13_auth {
     const unsigned char *reality_key;
     const char *host;
     const char *roots;
+    /* Закрытый ключ ML-KEM-768 (2400 байт), если в ClientHello ушёл настоящий гибрид X25519MLKEM768
+     * (reality_cfg.pq). NULL — гибрид не предлагали, и ServerHello с ним будет отвергнут. */
+    const unsigned char *mlkem_dk;
+    /* Открытый ключ ML-DSA-65 (1952 байта) из mldsa65Verify узла (`pqv` в ссылке), или NULL. С ним
+     * сертификат Reality обязан нести подпись ML-DSA-65 над HMAC-SHA512(authkey, pub ‖ ClientHello ‖
+     * ServerHello); без подписи или с неверной узел не признан. Только вместе с reality_key. */
+    const unsigned char *mldsa_pk;
 };
 
 /* То же рукопожатие, но с проверкой подлинности сервера.

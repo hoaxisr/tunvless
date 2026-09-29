@@ -21,6 +21,9 @@
  * здесь тем же правилом, по которому транспорт собирает запрос (src/proto/transport/trpath.c —
  * чистые строки, без сети и библиотек). */
 #include "trpath.h"
+/* Разбор строки encryption (VLESS encryption): годность узла решается здесь, до подключения. Только строки,
+ * без криптографии — сюда же входит стенд подписки, у которого библиотеки нет. */
+#include "vencp.h"
 
 /* base64: только декодирование и только то, что встречается в подписках — с переводами
  * строк внутри и, возможно, без выравнивающих '='. URL-safe алфавит тоже принимается:
@@ -225,12 +228,97 @@ static void pad_range(struct vless_node *n, const char *v) {
  * Поиск по имени поля, а не разбор объекта: `extra` приезжает уже раскодированным из
  * процентной формы, вложенность в нём одна, и вытащить одно число дешевле, чем заводить
  * второй разбор JSON рядом с тем, что уже есть в этом файле. */
+/* Признаки того, что сервер включил обфускацию xhttp, которой у клиента нет: поле присутствует с
+ * непустым значением (или true). Ложное срабатывание хуже пропуска не бывает — узел с ними и так не
+ * откроется на сервере, ждущем другого запроса. */
+static int xh_extra_bad(const char *json) {
+    static const char *const keys[] = { "\"downloadSettings\"", "\"sessionIDPlacement\"", "\"seqPlacement\"",
+                                        "\"uplinkDataPlacement\"", "\"xPaddingPlacement\"", "\"xPaddingMethod\"" };
+    for (size_t i = 0; i < sizeof keys / sizeof *keys; i++) {
+        const char *k = strstr(json, keys[i]);
+        if (!k) continue;
+        k = strchr(k, ':');
+        if (!k) continue;
+        k++;
+        while (*k == ' ') k++;
+        if (*k && *k != 'n' && !(k[0] == '"' && k[1] == '"') && *k != '}' && *k != ',') return 1;
+    }
+    const char *o = strstr(json, "\"xPaddingObfsMode\"");
+    if (o && (o = strchr(o, ':'))) { o++; while (*o == ' ') o++; if (!strncmp(o, "true", 4)) return 1; }
+    return 0;
+}
+
 static void parse_extra(struct vless_node *n, const char *extra) {
+    if (xh_extra_bad(extra)) n->xh_extra = 1;
     const char *k = strstr(extra, "\"xPaddingBytes\"");
     if (!k) return;
     k = strchr(k + 15, ':');
     if (!k) return;
     pad_range(n, k + 1);
+}
+
+
+/* ---- длинные значения узла: encryption и pqv ---------------------------------------------------
+ *
+ * Значения длинные (ключ ML-DSA-65 в base64url — 2603 знака, реле VLESS encryption с ключом ML-KEM-768 —
+ * около 1600), а узлов в массиве сотни: по полю в узле это сотни килобайт статической памяти под то,
+ * что бывает у единиц. Поэтому узел держит УКАЗАТЕЛЬ на строку из общей таблицы, где одинаковые
+ * значения хранятся один раз. Строки не освобождаются: указатель обязан пережить и узел, и его копии
+ * (узлы копируются по значению между массивами разбора и стеком туннеля), а повторные разборы той же
+ * подписки находят уже занесённое и памяти не прибавляют. Таблица ограничена — переполнение узла не
+ * теряет, а объявляет непригодным с названной причиной (без неё хостильная подписка со случайными
+ * ключами росла бы в памяти роутера на каждом обновлении). */
+#define SUB_INTERN_MAX 256
+static const char *g_intern[SUB_INTERN_MAX];
+static volatile int g_intern_lock;
+/* Метки непригодных значений: разбор не удался, причина уже названа в node_usable. */
+static const char SUB_BAD_ENC[] = "!encryption";
+static const char SUB_BAD_PQV[] = "!pqv";
+static const char SUB_FULL[] = "!full";
+
+static const char *sub_intern(const char *v, size_t n) {
+    while (__atomic_test_and_set(&g_intern_lock, __ATOMIC_ACQUIRE)) { }
+    const char *r = SUB_FULL;
+    for (int i = 0; i < SUB_INTERN_MAX; i++) {
+        if (!g_intern[i]) {
+            char *c = malloc(n + 1);
+            if (c) { memcpy(c, v, n); c[n] = '\0'; g_intern[i] = c; r = c; }
+            break;
+        }
+        if (strlen(g_intern[i]) == n && !memcmp(g_intern[i], v, n)) { r = g_intern[i]; break; }
+    }
+    __atomic_clear(&g_intern_lock, __ATOMIC_RELEASE);
+    return r;
+}
+
+/* encryption узла. Пусто и «none» — шифрования нет. Остальное обязано разобраться по правилу Xray
+ * (vencp.h): иначе узел помечается меткой и отбраковывается в node_usable. Значение приходит уже
+ * раскодированным, с завершающим нулём. */
+static void set_encryption(struct vless_node *n, const char *v) {
+    n->encryption = NULL;
+    if (!v[0] || !strcmp(v, "none")) return;
+    struct venc_cfg c;
+    if (vencp_parse(v, &c, NULL) != 0) { n->encryption = SUB_BAD_ENC; return; }
+    n->encryption = sub_intern(v, strlen(v));
+}
+
+/* pqv / mldsa65Verify: открытый ключ ML-DSA-65, base64url, ровно 1952 байта. */
+static void set_pqv(struct vless_node *n, const char *v) {
+    n->pqv = NULL;
+    if (!v[0]) return;
+    if (vencp_b64url_len(v, strlen(v)) != 1952) { n->pqv = SUB_BAD_PQV; return; }
+    n->pqv = sub_intern(v, strlen(v));
+}
+
+/* Значение параметра ссылки в куче-буфере: длинные значения (pqv, encryption) не помещаются в
+ * узел, а стек рабочих потоков мал. Процентная форма раскрывается. Возвращает NULL при нехватке памяти. */
+static char *param_dup(const char *v, size_t vlen) {
+    char *c = malloc(vlen + 1);
+    if (!c) return NULL;
+    memcpy(c, v, vlen);
+    c[vlen] = '\0';
+    pct_decode(c);
+    return c;
 }
 
 /* Пригодность разобранного узла — общее правило для обоих путей разбора; тело ниже. */
@@ -310,6 +398,17 @@ int vless_parse_url(const char *url, struct vless_node *n) {
                 else if (klen == 3 && !strncmp(k, "pbk", 3)) set_field(n->pbk, sizeof(n->pbk), v, vlen);
                 else if (klen == 3 && !strncmp(k, "sid", 3)) set_field(n->sid, sizeof(n->sid), v, vlen);
                 else if (klen == 4 && !strncmp(k, "flow", 4)) set_field(n->flow, sizeof(n->flow), v, vlen);
+                /* encryption и pqv — постквантовая часть Xray-core (паритет 26.9): шифрование VLESS и
+                 * проверка подписи ML-DSA-65 сертификата Reality. Значения длинные — см. sub_intern. */
+                else if (klen == 10 && !strncmp(k, "headerType", 10)) { if (vlen == 4 && !strncmp(v, "http", 4)) n->tcp_http = 1; }
+                else if (klen == 10 && !strncmp(k, "encryption", 10)) {
+                    char *d = param_dup(v, vlen);
+                    if (d) { set_encryption(n, d); free(d); } else n->encryption = SUB_BAD_ENC;
+                }
+                else if (klen == 3 && !strncmp(k, "pqv", 3)) {
+                    char *d = param_dup(v, vlen);
+                    if (d) { set_pqv(n, d); free(d); } else n->pqv = SUB_BAD_PQV;
+                }
                 else if (klen == 4 && !strncmp(k, "path", 4)) set_pct(n->path, sizeof(n->path), v, vlen);
                 else if (klen == 11 && !strncmp(k, "serviceName", 11)) { set_field(n->service, sizeof(n->service), v, vlen); pct_decode(n->service); }
                 else if (klen == 4 && !strncmp(k, "mode", 4)) set_field(n->mode, sizeof(n->mode), v, vlen);
@@ -391,6 +490,34 @@ static int upg_node_bad(struct vless_node *n, int ws) {
  * первая же строка. */
 static int node_usable(struct vless_node *n) {
     if (!n->security[0]) snprintf(n->security, sizeof(n->security), "none");
+
+    /* flow=xtls-rprx-vision-udp443 — тот же Vision, но с разрешением UDP/443 в потоке (Xray-core). У нас
+     * UDP идёт отдельной командой и без flow, поэтому разрешение ничего не меняет, а имя приводится к
+     * обычному: в запросе VLESS Xray тоже отправляет flow без суффикса. */
+    if (!strcmp(n->flow, "xtls-rprx-vision-udp443")) snprintf(n->flow, sizeof(n->flow), "xtls-rprx-vision");
+
+    /* Постквантовые поля. Метки ставит разбор (set_encryption, set_pqv): значение не по правилу Xray или
+     * таблица длинных значений полна. Причины короткие — skip_reason всего 64 байта. */
+    if (n->encryption == SUB_BAD_ENC) {
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "encryption не поддержан");
+        return 1;
+    }
+    if (n->pqv == SUB_BAD_PQV) {
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "pqv: не ключ ML-DSA-65");
+        return 1;
+    }
+    if (n->tcp_http && !strcmp(n->type, "tcp")) {
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "tcp headerType=http не поддержан");
+        return 1;
+    }
+    if (n->xh_extra && !strcmp(n->type, "xhttp")) {
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "xhttp: обфускация не поддержана");
+        return 1;
+    }
+    if (n->encryption == SUB_FULL || n->pqv == SUB_FULL) {
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "слишком много разных ключей");
+        return 1;
+    }
 
     /* Идентификатор пользователя. Проверяется ЗДЕСЬ по той же причине, что и всё
      * остальное в этом блоке: непригодный узел не должен попасть в кандидаты.
@@ -744,6 +871,8 @@ static void xray_upg(struct sj *j, struct upg_cfg *u, int hu) {
     }
 }
 
+static int sj_bool(struct sj *j);
+
 /* streamSettings: транспорт, security и всё, что зависит от них. */
 static void xray_stream(struct sj *j, struct vless_node *n) {
     int first = 1;
@@ -759,6 +888,19 @@ static void xray_stream(struct sj *j, struct vless_node *n) {
             /* websocket — второе имя ws у Xray (infra/conf: case "ws", "websocket"). */
             if (!strcmp(n->type, "websocket")) snprintf(n->type, sizeof(n->type), "ws");
         }
+        else if (!strcmp(k, "tcpSettings") || !strcmp(k, "rawSettings")) {
+            int f2 = 1;
+            char k2[64];
+            while (sj_obj_key(j, &f2, k2, sizeof(k2)) == 0) {
+                if (strcmp(k2, "header") != 0) { sj_skip(j); continue; }
+                int f3 = 1;
+                char k3[64], ty[16] = "";
+                while (sj_obj_key(j, &f3, k3, sizeof(k3)) == 0) {
+                    if (!strcmp(k3, "type")) sj_str(j, ty, sizeof ty); else sj_skip(j);
+                }
+                if (!strcmp(ty, "http")) n->tcp_http = 1;
+            }
+        }
         else if (!strcmp(k, "wsSettings")) xray_upg(j, &ws, 0);
         else if (!strcmp(k, "httpupgradeSettings")) xray_upg(j, &hu, 1);
         else if (!strcmp(k, "security")) sj_str(j, n->security, sizeof(n->security));
@@ -773,6 +915,11 @@ static void xray_stream(struct sj *j, struct vless_node *n) {
                 else if (!strcmp(k2, "fingerprint")) sj_str(j, n->fp, sizeof(n->fp));
                 else if (!strcmp(k2, "publicKey")) sj_str(j, n->pbk, sizeof(n->pbk));
                 else if (!strcmp(k2, "shortId")) sj_str(j, n->sid, sizeof(n->sid));
+                else if (!strcmp(k2, "mldsa65Verify") || !strcmp(k2, "pqv")) {
+                    char *pv = malloc(4096);
+                    if (pv) { pv[0] = '\0'; sj_str(j, pv, 4096); set_pqv(n, pv); free(pv); }
+                    else sj_skip(j);
+                }
                 else sj_skip(j);
             }
         } else if (!strcmp(k, "grpcSettings")) {
@@ -796,6 +943,23 @@ static void xray_stream(struct sj *j, struct vless_node *n) {
                     sj_str(j, pb, sizeof(pb));
                     pad_range(n, pb);
                 }
+                else if (!strcmp(k2, "extra")) {
+                    /* Вложенный extra (форма ссылки внутри конфига): тот же просмотр, что у ссылки. */
+                    const char *b = j->p;
+                    sj_skip(j);
+                    size_t l = (size_t)(j->p - b);
+                    char *cp = malloc(l + 1);
+                    if (cp) { memcpy(cp, b, l); cp[l] = 0; parse_extra(n, cp); free(cp); }
+                }
+                else if (!strcmp(k2, "downloadSettings") || !strcmp(k2, "sessionIDPlacement") ||
+                         !strcmp(k2, "seqPlacement") || !strcmp(k2, "uplinkDataPlacement") ||
+                         !strcmp(k2, "xPaddingPlacement") || !strcmp(k2, "xPaddingMethod")) {
+                    sj_ws(j);
+                    if (*j->p == '"' && j->p[1] == '"') { sj_skip(j); }
+                    else if (!strncmp(j->p, "null", 4)) sj_skip(j);
+                    else { n->xh_extra = 1; sj_skip(j); }
+                }
+                else if (!strcmp(k2, "xPaddingObfsMode")) { if (sj_bool(j)) n->xh_extra = 1; }
                 else sj_skip(j);
             }
         } else sj_skip(j);
@@ -814,10 +978,37 @@ static void xray_stream(struct sj *j, struct vless_node *n) {
  * Именно первый и только он: подписка описывает узел для ОДНОГО человека, и второго
  * пользователя в ней не бывает. Появится — возьмём первого и не станем притворяться, что
  * умеем больше. */
+static void json_encryption(struct sj *j, struct vless_node *n) {
+    char *ev = malloc(4096);
+    if (!ev) { sj_skip(j); return; }
+    ev[0] = '\0';
+    if (sj_str(j, ev, 4096) == 0) set_encryption(n, ev);
+    free(ev);
+}
+
 static void xray_settings(struct sj *j, struct vless_node *n) {
     int first = 1;
     char k[64];
     while (sj_obj_key(j, &first, k, sizeof(k)) == 0) {
+        /* Упрощённая форма исходящего (Xray 25+): address, port, id, flow, encryption прямо в settings,
+         * без vnext и users. */
+        if (!strcmp(k, "address")) { sj_str(j, n->host, sizeof(n->host)); continue; }
+        if (!strcmp(k, "id")) { sj_str(j, n->uuid, sizeof(n->uuid)); continue; }
+        if (!strcmp(k, "flow")) { sj_str(j, n->flow, sizeof(n->flow)); continue; }
+        if (!strcmp(k, "encryption")) { json_encryption(j, n); continue; }
+        if (!strcmp(k, "port")) {
+            sj_ws(j);
+            char num[16];
+            if (*j->p == '"') sj_str(j, num, sizeof(num));
+            else {
+                size_t i = 0;
+                while (*j->p >= '0' && *j->p <= '9' && i + 1 < sizeof(num)) num[i++] = *j->p++;
+                num[i] = '\0';
+                if (!i) sj_skip(j);
+            }
+            n->port = port_of(num);
+            continue;
+        }
         if (strcmp(k, "vnext") != 0) { sj_skip(j); continue; }
         int fa = 1, taken = 0;
         while (sj_arr_next(j, &fa) == 0) {
@@ -851,12 +1042,157 @@ static void xray_settings(struct sj *j, struct vless_node *n) {
                         while (sj_obj_key(j, &fu2, k3, sizeof(k3)) == 0) {
                             if (!strcmp(k3, "id")) sj_str(j, n->uuid, sizeof(n->uuid));
                             else if (!strcmp(k3, "flow")) sj_str(j, n->flow, sizeof(n->flow));
+                            else if (!strcmp(k3, "encryption")) json_encryption(j, n);
                             else sj_skip(j);
                         }
                     }
                 } else sj_skip(j);
             }
         }
+    }
+}
+
+/* ---- sing-box: outbounds с type=vless ---------------------------------------------------------
+ *
+ * Панели, отдающие конфиг sing-box (клиент SFI, Hiddify, Karing), кладут узлы в тот же массив
+ * `outbounds`, что и Xray, но плоско: type/tag/server/server_port/uuid/flow и объекты tls и transport.
+ * Отличия от Xray, из-за которых нужен отдельный разбор: имя вида — type, а не protocol; порт — число
+ * server_port; TLS — объект с вложенными utls и reality; в transport заголовок Host — строка или
+ * массив строк. Ранние данные ws: max_early_data + early_data_header_name; при имени
+ * Sec-WebSocket-Protocol это `?ed=N` Xray (наш ws так и умеет), при пустом sing-box кладёт данные в
+ * путь — форма, которой у Xray нет, и мы ранние данные тогда не включаем (соединение сработает и без
+ * них: сервер sing-box принимает обычный запрос). */
+/* Дописать «Имя: значение\n» в буфер заголовков; -1, если не влезло или имя пусто. Без snprintf: он
+ * предупреждает об усечении там, где усечение мы сами исключили проверкой длины. */
+static int hdr_append(char *dst, size_t cap, const char *k, const char *v) {
+    size_t o = strlen(dst), kn = strlen(k), vn = strlen(v);
+    if (!kn || o + kn + vn + 4 >= cap) return -1;
+    memcpy(dst + o, k, kn);
+    dst[o + kn] = ':'; dst[o + kn + 1] = ' ';
+    memcpy(dst + o + kn + 2, v, vn);
+    dst[o + kn + 2 + vn] = '\n'; dst[o + kn + 3 + vn] = '\0';
+    return 0;
+}
+
+static uint16_t port_of_num(long v) { return (v > 0 && v < 65536) ? (uint16_t)v : 0; }
+
+static int sj_bool(struct sj *j) {
+    sj_ws(j);
+    if (!strncmp(j->p, "true", 4)) { j->p += 4; return 1; }
+    if (!strncmp(j->p, "false", 5)) { j->p += 5; return 0; }
+    sj_skip(j);
+    return 0;
+}
+
+/* Число: либо 123, либо "123". */
+static long sj_num(struct sj *j) {
+    sj_ws(j);
+    char b[24] = "";
+    if (*j->p == '"') sj_str(j, b, sizeof b);
+    else { size_t i = 0; while (*j->p >= '0' && *j->p <= '9' && i + 1 < sizeof b) b[i++] = *j->p++; b[i] = 0; if (!i) sj_skip(j); }
+    return atol(b);
+}
+
+struct sb_ws { long ed; char ed_hdr[40]; };
+
+static void sb_tls(struct sj *j, struct vless_node *n, int *enabled, int *reality) {
+    int f = 1;
+    char k[64];
+    while (sj_obj_key(j, &f, k, sizeof k) == 0) {
+        if (!strcmp(k, "enabled")) *enabled = sj_bool(j);
+        else if (!strcmp(k, "server_name")) sj_str(j, n->sni, sizeof n->sni);
+        else if (!strcmp(k, "utls")) {
+            int f2 = 1, on = 1;
+            char k2[64], fp[sizeof n->fp] = "";
+            while (sj_obj_key(j, &f2, k2, sizeof k2) == 0) {
+                if (!strcmp(k2, "enabled")) on = sj_bool(j);
+                else if (!strcmp(k2, "fingerprint")) sj_str(j, fp, sizeof fp);
+                else sj_skip(j);
+            }
+            if (on && fp[0]) snprintf(n->fp, sizeof n->fp, "%s", fp);
+        } else if (!strcmp(k, "reality")) {
+            int f2 = 1;
+            char k2[64];
+            while (sj_obj_key(j, &f2, k2, sizeof k2) == 0) {
+                if (!strcmp(k2, "enabled")) *reality = sj_bool(j);
+                else if (!strcmp(k2, "public_key")) sj_str(j, n->pbk, sizeof n->pbk);
+                else if (!strcmp(k2, "short_id")) sj_str(j, n->sid, sizeof n->sid);
+                else sj_skip(j);
+            }
+        } else sj_skip(j);
+    }
+}
+
+static void sb_transport(struct sj *j, struct vless_node *n, struct sb_ws *w, struct upg_cfg *u) {
+    int f = 1;
+    char k[64];
+    while (sj_obj_key(j, &f, k, sizeof k) == 0) {
+        if (!strcmp(k, "type")) {
+            sj_str(j, n->type, sizeof n->type);
+            if (!strcmp(n->type, "websocket")) snprintf(n->type, sizeof n->type, "ws");
+        }
+        else if (!strcmp(k, "path")) sj_str(j, u->path, sizeof u->path);
+        else if (!strcmp(k, "host")) {
+            sj_ws(j);
+            if (*j->p == '[') { int fa = 1; char h[sizeof u->host]; int got = 0;
+                while (sj_arr_next(j, &fa) == 0) { if (got++) sj_skip(j); else sj_str(j, h, sizeof h); }
+                if (got) snprintf(u->host, sizeof u->host, "%s", h); }
+            else sj_str(j, u->host, sizeof u->host);
+        }
+        else if (!strcmp(k, "service_name")) sj_str(j, n->service, sizeof n->service);
+        else if (!strcmp(k, "max_early_data")) w->ed = sj_num(j);
+        else if (!strcmp(k, "early_data_header_name")) sj_str(j, w->ed_hdr, sizeof w->ed_hdr);
+        else if (!strcmp(k, "headers")) {
+            int f2 = 1;
+            char k2[64];
+            while (sj_obj_key(j, &f2, k2, sizeof k2) == 0) {
+                sj_ws(j);
+                char v[sizeof u->host] = "";
+                if (*j->p == '[') { int fa = 1, got = 0;
+                    while (sj_arr_next(j, &fa) == 0) { if (got++) sj_skip(j); else sj_str(j, v, sizeof v); } }
+                else if (*j->p == '"') sj_str(j, v, sizeof v);
+                else { sj_skip(j); u->bad = 1; continue; }
+                if (ci_eq(k2, "host")) { if (!u->host[0]) snprintf(u->host, sizeof u->host, "%s", v); }
+                else {
+                    if (hdr_append(u->headers, sizeof u->headers, k2, v) != 0) u->bad = 1;
+                }
+            }
+        } else sj_skip(j);
+    }
+}
+
+/* Один outbound sing-box уже прочитан в поля; здесь — свести в узел. Вызывается из xray_outbound,
+ * когда встретился ключ type (у Xray его на этом уровне нет). */
+static void sb_outbound_body(struct sj *j, struct vless_node *n, char *proto, size_t proto_n) {
+    /* Возврат сюда после первого ключа невозможен: разбор идёт единым проходом в xray_outbound,
+     * поэтому функция читает остаток объекта сама. */
+    int first = 1, tls_on = 0, reality = 0;
+    char k[64];
+    struct sb_ws w; struct upg_cfg u;
+    memset(&w, 0, sizeof w); memset(&u, 0, sizeof u);
+    while (sj_obj_key(j, &first, k, sizeof k) == 0) {
+        if (!strcmp(k, "type")) sj_str(j, proto, proto_n);
+        else if (!strcmp(k, "tag")) { sj_str(j, n->name, sizeof n->name); utf8_trim_tail(n->name); }
+        else if (!strcmp(k, "server")) sj_str(j, n->host, sizeof n->host);
+        else if (!strcmp(k, "server_port")) n->port = port_of_num(sj_num(j));
+        else if (!strcmp(k, "uuid")) sj_str(j, n->uuid, sizeof n->uuid);
+        else if (!strcmp(k, "flow")) sj_str(j, n->flow, sizeof n->flow);
+        else if (!strcmp(k, "tls")) sb_tls(j, n, &tls_on, &reality);
+        else if (!strcmp(k, "transport")) sb_transport(j, n, &w, &u);
+        else sj_skip(j);
+    }
+    snprintf(n->security, sizeof n->security, "%s", reality ? "reality" : tls_on ? "tls" : "none");
+    if (!n->type[0]) snprintf(n->type, sizeof n->type, "tcp");
+    if (!strcmp(n->type, "ws") && w.ed > 0 && !strcmp(w.ed_hdr, "Sec-WebSocket-Protocol") && !strchr(u.path, '?')) {
+        size_t o = strlen(u.path);
+        if (!o) { u.path[0] = '/'; u.path[1] = 0; o = 1; }
+        snprintf(u.path + o, sizeof u.path - o, "?ed=%ld", w.ed);
+    }
+    if (!strcmp(n->type, "ws") || !strcmp(n->type, "httpupgrade")) {
+        snprintf(n->path, sizeof n->path, "%s", u.path);
+        snprintf(n->http_host, sizeof n->http_host, "%s", u.host);
+        snprintf(n->headers, sizeof n->headers, "%s", u.headers);
+        n->headers_bad = u.bad;
     }
 }
 
@@ -868,6 +1204,23 @@ static int xray_outbound(struct sj *j, struct vless_node *n) {
     snprintf(n->type, sizeof(n->type), "tcp");
     int first = 1, is_vless = 0;
     char k[64], proto[32] = "";
+    /* Какой это формат — Xray (protocol) или sing-box (type)? Предпросмотр ключей верхнего уровня, как
+     * у remarks: порядок ключей не задан, а разбор идёт единым проходом. */
+    {
+        const char *save = j->p;
+        int f0 = 1, has_protocol = 0, has_type = 0;
+        char k0[64];
+        while (sj_obj_key(j, &f0, k0, sizeof k0) == 0) {
+            if (!strcmp(k0, "protocol")) has_protocol = 1;
+            else if (!strcmp(k0, "type")) has_type = 1;
+            sj_skip(j);
+        }
+        j->p = save;
+        if (has_type && !has_protocol) {
+            sb_outbound_body(j, n, proto, sizeof proto);
+            return !strcmp(proto, "vless");
+        }
+    }
     /* Порядок ключей в JSON не задан, поэтому protocol может оказаться ПОСЛЕ settings.
      * Значит читаем всё, а решаем в конце: разбор чужого исходящего в свободные поля никому
      * не вредит, потому что узел всё равно не будет взят. */
@@ -986,6 +1339,312 @@ static size_t parse_xray(const char *text, struct vless_node *out, size_t max,
     return n;
 }
 
+/* ---- Clash / Mihomo: proxies с type: vless -------------------------------------------------------
+ *
+ * Панели отдают клиентам Clash YAML: список `proxies:`, у каждого узла плоский набор ключей и вложенные
+ * *-opts (ws-opts, reality-opts, grpc-opts, xhttp-opts). Записаны бывают двумя способами — блоком
+ * (`- name: x` и ключи с отступом) и потоком (`- {name: x, type: vless, reality-opts: {public-key: k}}`,
+ * так пишут конвертеры), и разбор обязан уметь оба.
+ *
+ * Общий YAML-разбор (src/lib/ynode.c) здесь не берётся: он отказывает на якорях и алиасах целиком, а
+ * подписка с якорем в блоке proxy-groups не должна терять узлы; и он тянет libyaml в стенд, который
+ * проверяет чужой текст в одиночку. Вместо него — разбор ровно той формы, которую ждём: каждый узел
+ * «сплющивается» в пары путь=значение (`reality-opts.public-key`, `ws-opts.headers.Host`, `alpn.0`), а
+ * узел строится по путям. Что не разобралось (якорь-алиас `*a`, многострочные скаляры) — значение
+ * пропускается, узел получает то, что удалось. Якоря `&a` перед значением отбрасываются. */
+#define YF_MAX 96
+struct yflat {
+    char buf[12288];
+    size_t used, n;
+    struct { const char *k, *v; } kv[YF_MAX];
+};
+
+static void yf_add(struct yflat *f, const char *path, size_t pn, const char *val, size_t vn) {
+    if (f->n >= YF_MAX || f->used + pn + vn + 2 > sizeof f->buf) return;
+    char *k = f->buf + f->used;
+    memcpy(k, path, pn); k[pn] = 0;
+    char *v = k + pn + 1;
+    memcpy(v, val, vn); v[vn] = 0;
+    f->used += pn + vn + 2;
+    f->kv[f->n].k = k; f->kv[f->n].v = v; f->n++;
+}
+
+static const char *yf_get(const struct yflat *f, const char *path) {
+    for (size_t i = 0; i < f->n; i++) if (!strcmp(f->kv[i].k, path)) return f->kv[i].v;
+    return NULL;
+}
+/* Без учёта регистра: Host/host в headers. */
+static const char *yf_geti(const struct yflat *f, const char *path) {
+    for (size_t i = 0; i < f->n; i++) if (ci_eq(f->kv[i].k, path)) return f->kv[i].v;
+    return NULL;
+}
+
+/* Скаляр с p: в кавычках или простой. flow != 0 — простой кончается на , } ]. Возвращает указатель за
+ * скаляром; значение — в out (раскавыченное), длина в *on. */
+static const char *y_scalar(const char *p, const char *end, int flow, char *out, size_t cap, size_t *on) {
+    size_t o = 0;
+    while (p < end && (*p == ' ' || *p == '\t')) p++;
+    /* Якорь/тег перед значением. */
+    while (p < end && (*p == '&' || *p == '!')) { while (p < end && *p != ' ' && *p != '\t') p++; while (p < end && (*p == ' ' || *p == '\t')) p++; }
+    if (p < end && (*p == '"' || *p == '\'')) {
+        char q = *p++;
+        while (p < end && *p != q) {
+            if (q == '"' && *p == '\\' && p + 1 < end) p++;
+            else if (q == '\'' && *p == '\'' && p + 1 < end && p[1] == '\'') p++;
+            if (o + 1 < cap) out[o++] = *p;
+            p++;
+        }
+        if (p < end) p++;
+    } else {
+        const char *st0 = p;
+        while (p < end && *p != '\n' && *p != '\r') {
+            if (flow && (*p == ',' || *p == '}' || *p == ']')) break;
+            /* flow == 2 — ключ: кончается на «:» с пробелом (или концом) следом. */
+            if (flow == 2 && *p == ':' && (p + 1 >= end || p[1] == ' ' || p[1] == '\n' || p[1] == '\r')) break;
+            if (*p == '#' && p > st0 && (p[-1] == ' ' || p[-1] == '\t')) break;
+            if (o + 1 < cap) out[o++] = *p;
+            p++;
+        }
+        while (o && (out[o - 1] == ' ' || out[o - 1] == '\t')) o--;
+    }
+    out[o] = 0;
+    *on = o;
+    return p;
+}
+
+static const char *y_flow(struct yflat *f, const char *p, const char *end, char *path, size_t pn, int depth);
+
+/* Значение в потоковой записи: {…}, […] или скаляр. */
+static const char *y_flow_val(struct yflat *f, const char *p, const char *end, char *path, size_t pn, int depth) {
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+    if (p < end && (*p == '{' || *p == '[')) return y_flow(f, p, end, path, pn, depth + 1);
+    char v[3300];
+    size_t vn;
+    p = y_scalar(p, end, 1, v, sizeof v, &vn);
+    if (v[0] != '*') yf_add(f, path, pn, v, vn);
+    return p;
+}
+
+static const char *y_flow(struct yflat *f, const char *p, const char *end, char *path, size_t pn, int depth) {
+    if (depth > 6 || p >= end) return end;
+    char open = *p++;
+    unsigned idx = 0;
+    for (;;) {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',')) p++;
+        if (p >= end) return end;
+        if (*p == '}' || *p == ']') return p + 1;
+        char np[200];
+        size_t npn;
+        if (open == '{') {
+            char key[96];
+            size_t kn;
+            p = y_scalar(p, end, 2, key, sizeof key, &kn);
+            while (p < end && (*p == ' ' || *p == '\t')) p++;
+            if (p < end && *p == ':') p++;
+            npn = (size_t)snprintf(np, sizeof np, "%.*s%s%s", (int)pn, path, pn ? "." : "", key);
+        } else {
+            npn = (size_t)snprintf(np, sizeof np, "%.*s%s%u", (int)pn, path, pn ? "." : "", idx++);
+        }
+        if (npn >= sizeof np) npn = sizeof np - 1;
+        p = y_flow_val(f, p, end, np, npn, depth);
+    }
+}
+
+/* Строка блока: отступ и текст без него. */
+static const char *y_line(const char *p, const char *end, size_t *ind, const char **e) {
+    size_t i = 0;
+    while (p + i < end && p[i] == ' ') i++;
+    const char *s = p + i, *q = s;
+    while (q < end && *q != '\n') q++;
+    *ind = i;
+    *e = q;
+    return s;
+}
+
+/* Один узел блока: p — начало строки «- …» (отступ dash); результат — начало строки после узла. */
+static const char *y_item(struct yflat *f, const char *p, const char *end, size_t dash) {
+    struct lvl { size_t ind; char path[200]; } st[6];
+    int sp = 1, first = 1;
+    st[0].ind = 0; st[0].path[0] = 0;
+    char lastkey[200] = "";
+    unsigned seq = 0;
+    while (p < end) {
+        size_t ind;
+        const char *e;
+        const char *s = y_line(p, end, &ind, &e);
+        const char *next = e < end ? e + 1 : e;
+        if (e > s && e[-1] == '\r') e--;
+        if (s >= e || *s == '#' || (e - s >= 3 && !strncmp(s, "---", 3))) { p = next; continue; }
+        if (first) {
+            first = 0;
+            s += 1; ind += 1;                                   /* тире */
+            while (s < e && *s == ' ') { s++; ind++; }
+            if (s < e && *s == '{') {
+                char none[1] = "";
+                y_flow(f, s, end, none, 0, 0);
+                int d = 0;
+                const char *q = s;
+                for (; q < end; q++) { if (*q == '{') d++; else if (*q == '}' && --d == 0) break; }
+                while (q < end && *q != '\n') q++;
+                return q < end ? q + 1 : q;
+            }
+        } else if (ind <= dash) {
+            if (!(ind == dash && 0)) return p;
+        }
+        if (!first && ind > dash && (*s == '-' && (e - s == 1 || s[1] == ' '))) {
+            char v[3300];
+            size_t vn;
+            y_scalar(s + 1, e, 0, v, sizeof v, &vn);
+            char np[200];
+            int n2 = snprintf(np, sizeof np, "%s.%u", lastkey, seq++);
+            if (lastkey[0] && n2 > 0 && n2 < (int)sizeof np && v[0] != '*') yf_add(f, np, (size_t)n2, v, vn);
+            p = next;
+            continue;
+        }
+        while (sp > 1 && st[sp - 1].ind >= ind) sp--;
+        char key[96];
+        size_t kn;
+        const char *c = y_scalar(s, e, 2, key, sizeof key, &kn);
+        while (c < e && (*c == ' ' || *c == '\t')) c++;
+        if (c >= e || *c != ':') { p = next; continue; }
+        c++;
+        char np[200];
+        int n2 = snprintf(np, sizeof np, "%s%s%s", st[sp - 1].path, st[sp - 1].path[0] ? "." : "", key);
+        if (n2 <= 0 || n2 >= (int)sizeof np) { p = next; continue; }
+        while (c < e && (*c == ' ' || *c == '\t')) c++;
+        if (c >= e || *c == '#') {
+            snprintf(lastkey, sizeof lastkey, "%s", np);
+            seq = 0;
+            if (sp < 6) { st[sp].ind = ind; snprintf(st[sp].path, sizeof st[sp].path, "%s", np); sp++; }
+        } else if (*c == '{' || *c == '[') {
+            y_flow(f, c, end, np, (size_t)n2, 0);
+        } else {
+            char v[3300];
+            size_t vn;
+            y_scalar(c, e, 0, v, sizeof v, &vn);
+            if (v[0] != '*') yf_add(f, np, (size_t)n2, v, vn);
+        }
+        p = next;
+    }
+    return p;
+}
+
+/* Плоский узел → узел vless. 1 — это vless и он записан в n. */
+static int clash_node(const struct yflat *f, struct vless_node *n) {
+    memset(n, 0, sizeof *n);
+    const char *v;
+    if (!(v = yf_get(f, "type")) || strcmp(v, "vless")) return 0;
+    snprintf(n->type, sizeof n->type, "tcp");
+    if ((v = yf_get(f, "name"))) { set_field(n->name, sizeof n->name, v, strlen(v)); utf8_trim_tail(n->name); }
+    if ((v = yf_get(f, "server"))) set_field(n->host, sizeof n->host, v, strlen(v));
+    if ((v = yf_get(f, "port"))) n->port = port_of(v);
+    if ((v = yf_get(f, "uuid"))) set_field(n->uuid, sizeof n->uuid, v, strlen(v));
+    if ((v = yf_get(f, "flow"))) set_field(n->flow, sizeof n->flow, v, strlen(v));
+    if ((v = yf_get(f, "servername")) || (v = yf_get(f, "sni"))) set_field(n->sni, sizeof n->sni, v, strlen(v));
+    if ((v = yf_get(f, "client-fingerprint"))) set_field(n->fp, sizeof n->fp, v, strlen(v));
+    const char *pbk = yf_get(f, "reality-opts.public-key");
+    if (pbk) {
+        set_field(n->pbk, sizeof n->pbk, pbk, strlen(pbk));
+        if ((v = yf_get(f, "reality-opts.short-id"))) set_field(n->sid, sizeof n->sid, v, strlen(v));
+        if ((v = yf_get(f, "reality-opts.mldsa65-verify")) || (v = yf_get(f, "reality-opts.pqv"))) set_pqv(n, v);
+        snprintf(n->security, sizeof n->security, "reality");
+    } else {
+        v = yf_get(f, "tls");
+        snprintf(n->security, sizeof n->security, "%s", v && (!strcmp(v, "true") || !strcmp(v, "True")) ? "tls" : "none");
+    }
+    if ((v = yf_get(f, "encryption"))) set_encryption(n, v);
+    const char *net = yf_get(f, "network");
+    if (net) {
+        if (!strcmp(net, "raw")) net = "tcp";
+        set_field(n->type, sizeof n->type, net, strlen(net));
+    }
+    const char *upg = yf_get(f, "ws-opts.v2ray-http-upgrade");
+    if (!strcmp(n->type, "ws") && upg && !strcmp(upg, "true")) snprintf(n->type, sizeof n->type, "httpupgrade");
+    if (!strcmp(n->type, "ws") || !strcmp(n->type, "httpupgrade")) {
+        struct upg_cfg u;
+        memset(&u, 0, sizeof u);
+        if ((v = yf_get(f, "ws-opts.path"))) set_field(u.path, sizeof u.path, v, strlen(v));
+        if ((v = yf_geti(f, "ws-opts.headers.host"))) set_field(u.host, sizeof u.host, v, strlen(v));
+        for (size_t i = 0; i < f->n; i++) {
+            const char *k = f->kv[i].k;
+            if (strncmp(k, "ws-opts.headers.", 16) != 0 || ci_eq(k + 16, "host")) continue;
+            if (hdr_append(u.headers, sizeof u.headers, k + 16, f->kv[i].v) != 0) u.bad = 1;
+        }
+        const char *ed = yf_get(f, "ws-opts.max-early-data"), *eh = yf_get(f, "ws-opts.early-data-header-name");
+        if (ed && atol(ed) > 0 && eh && !strcmp(eh, "Sec-WebSocket-Protocol") && !strchr(u.path, '?')) {
+            size_t o = strlen(u.path);
+            if (!o) { u.path[0] = '/'; u.path[1] = 0; o = 1; }
+            snprintf(u.path + o, sizeof u.path - o, "?ed=%ld", atol(ed));
+        }
+        snprintf(n->path, sizeof n->path, "%s", u.path);
+        snprintf(n->http_host, sizeof n->http_host, "%s", u.host);
+        snprintf(n->headers, sizeof n->headers, "%s", u.headers);
+        n->headers_bad = u.bad;
+    } else if (!strcmp(n->type, "grpc")) {
+        if ((v = yf_get(f, "grpc-opts.grpc-service-name"))) set_field(n->service, sizeof n->service, v, strlen(v));
+    } else if (!strcmp(n->type, "xhttp")) {
+        if ((v = yf_get(f, "xhttp-opts.path"))) set_field(n->path, sizeof n->path, v, strlen(v));
+        if ((v = yf_get(f, "xhttp-opts.mode"))) set_field(n->mode, sizeof n->mode, v, strlen(v));
+        if ((v = yf_get(f, "xhttp-opts.x-padding-bytes"))) pad_range(n, v);
+    }
+    return 1;
+}
+
+/* Clash YAML целиком. Возвращает число пригодных узлов; foreign — узлы других протоколов (в st). */
+static size_t parse_clash(const char *text, struct vless_node *out, size_t max, struct vless_sub_stats *st) {
+    const char *end = text + strlen(text), *p = text;
+    size_t n = 0, dash = 0;
+    int in_list = 0;
+    struct yflat *f = malloc(sizeof *f);
+    if (!f) return 0;
+    while (p < end) {
+        size_t ind;
+        const char *e;
+        const char *s = y_line(p, end, &ind, &e);
+        const char *next = e < end ? e + 1 : e;
+        if (!in_list) {
+            if (ind == 0 && (!strncmp(s, "proxies:", 8) || !strncmp(s, "Proxy:", 6))) {
+                const char *c = s + (s[0] == 'p' ? 8 : 6);
+                while (c < e && *c == ' ') c++;
+                if (c < e && *c != '#') break;                 /* «proxies: []» и т.п.: узлов нет */
+                in_list = 1;
+                dash = (size_t)-1;
+            }
+            p = next;
+            continue;
+        }
+        if (s >= e || *s == '#') { p = next; continue; }
+        if (ind == 0 && *s != '-') break;                     /* следующий ключ верхнего уровня */
+        if (*s == '-' && (s + 1 == e || s[1] == ' ')) {
+            if (dash == (size_t)-1) dash = ind;
+            if (ind != dash) { p = next; continue; }
+            f->n = 0; f->used = 0;
+            p = y_item(f, p, end, dash);
+            struct vless_node node;
+            if (!clash_node(f, &node)) { if (st) st->foreign++; continue; }
+            if (n >= max) { skip_note(st, &node, "узлов больше, чем помещается"); continue; }
+            if (node_usable(&node) == 0) out[n++] = node;
+            else skip_note(st, &node, node.skip_reason);
+            continue;
+        }
+        p = next;
+    }
+    free(f);
+    return n;
+}
+
+/* Это Clash YAML? В любой строке верхнего уровня стоит «proxies:» (или «Proxy:» — прежнее имя). Список
+ * ссылок и base64 такой строки не содержат: в base64 нет двоеточия. */
+static int looks_clash(const char *t) {
+    for (const char *p = t; *p; ) {
+        if (!strncmp(p, "proxies:", 8) || !strncmp(p, "Proxy:", 6)) return 1;
+        const char *nl = strchr(p, '\n');
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return 0;
+}
+
 /* Предел длины ОДНОЙ ссылки подписки.
  *
  * Было 2048, и этого перестало хватать. Reality с постквантовой подписью (Xray-core 25.9+)
@@ -998,7 +1657,8 @@ static size_t parse_xray(const char *text, struct vless_node *out, size_t max,
  * ЭТО ПОДПИСЬ, А НЕ ОБМЕН КЛЮЧАМИ, и путать их дорого: постквантовый обмен у Reality идёт
  * группой X25519MLKEM768 в key_share (см. reality.h), а `pqv` — совсем про другое: им
  * сервер дополнительно подписывает свой временный сертификат, и проверяет эту подпись
- * клиент. Мы её пока не проверяем, поэтому параметр только разбирается и хранится.
+ * клиент: reality.c включает проверку, когда параметр задан (tls13.c → cert_reality_check_pq). Ключ
+ * хранится в общей таблице (sub_intern).
  *
  * 8192, а не 4096: запас взят на вырост ключа (у ML-DSA-87 он 2592 байта, то есть 3456
  * знаков), а буфер живёт на стеке ОДНОЙ подкоманды CLI, рядом с которой уже стоят два
@@ -1093,6 +1753,7 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
      * появится ровно тогда, когда панель уберёт одну строчку из своего конфига. */
     while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
     if (*p == '[' || *p == '{') return parse_xray(p, out, max, st);
+    if (looks_clash(p)) return parse_clash(p, out, max, st);
     while (*p) {
         while (*p == '\n' || *p == '\r' || *p == ' ' || *p == '\t') p++;
         if (!*p) break;
@@ -1241,6 +1902,7 @@ const char *vless_sub_text(const char *raw, size_t raw_n, char *dec, size_t dec_
     const char *p = raw;
     while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
     if (*p == '[' || *p == '{') return raw;
+    if (looks_clash(p)) return raw;
     if (strstr(raw, "://")) return raw;
     b64_decode(raw, raw_n, dec, dec_n);
     return dec;
