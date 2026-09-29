@@ -486,8 +486,12 @@ check "файл keep.d есть в репозитории" "yes" "$([ -f "$KEEP"
 #
 # select — выбор члена группы pick: manual командой select (1.9): лежит рядом со спекой, чтобы
 # пережить перезагрузку (каталог состояния — tmpfs), и обязан пережить и обновление прошивки.
+#
+# awg — файлы выходов kind: awg по умолчанию (<etc>/awg/<выход>.conf, src/kinds/awg.c): ключи
+# туннеля, которые человек положил сам; без каталога в списке обновление прошивки оставляло выход
+# без конфига.
 for f in /etc/steer/spec.json /etc/steer/spec.yaml /etc/steer/select /etc/steer/sub.txt /etc/steer/sub.userinfo \
-         /etc/steer/subs /etc/steer/lists/custom /etc/steer/xsteer /etc/steer/zapret; do
+         /etc/steer/subs /etc/steer/lists/custom /etc/steer/awg /etc/steer/xsteer /etc/steer/zapret; do
     check "keep.d объявляет $f" "1" "$(grep -cx "$f" "$KEEP")"
 done
 # Ни комментариев, ни пустых строк, ни относительных путей: файл читает не человек, а
