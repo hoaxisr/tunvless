@@ -77,8 +77,8 @@ WVER=$(sh build/wolfssl/fetch.sh version)
 CCTAG=$(printf '%s' "$CC" | tr -c 'a-zA-Z0-9' '_')
 WLIB="$BUILD/wolfssl-host/libwolfssl-$CCTAG.a"
 case "$CC" in zig*) WAR="zig ar" ;; *) WAR="${AR:-ar}" ;; esac
-echo "ext-test: wolfSSL $WVER, опции build/wolfssl/user_settings.h (+ выпуск сертификатов для стендов)"
-CC="$CC" AR="$WAR" CFLAGS="-O2 -g" STEER_WOLFSSL_DEFS="-DWOLFSSL_CERT_GEN -DWOLFSSL_CERT_EXT" \
+echo "ext-test: wolfSSL $WVER, опции build/wolfssl/user_settings.h (+ выпуск сертификатов и сервер TLS для стендов)"
+CC="$CC" AR="$WAR" CFLAGS="-O2 -g" STEER_WOLFSSL_DEFS="-DWOLFSSL_CERT_GEN -DWOLFSSL_CERT_EXT -DSTEER_WOLFSSL_SERVER" \
 	sh build/wolfssl/build.sh "$WSRC" "$WLIB" asm
 WCFLAGS=$(cat "$WLIB.cflags")
 
@@ -254,6 +254,56 @@ SERVER_SRC="$(for f in $(profile_src server); do
 $CC -O1 -w $STEER_INC -o "$BUILD/steer-hub-native" $SERVER_SRC $CRYPTO -lpthread
 echo "ext-test: прогоняю probe (зондирование порта хаба)..."
 BUILD="$BUILD" sh tests/probe.sh
+
+# ---- QUIC: ngtcp2 с патчем Brutal, обёртка src/proto/quic (шаг 7 выпуска 1.10) --------------------
+# Исходники ngtcp2 — скачиваются и патчатся build/ngtcp2/fetch.sh (версия и сумма — там), либо
+# STEER_NGTCP2 — готовый каталог. Нет ни сети, ни каталога — громкий пропуск стендов QUIC, как
+# выше у wolfSSL; libs-test ниже тогда тоже пропускается, потому что libsteer без ngtcp2 не собрать.
+NSRC="${STEER_NGTCP2:-$BUILD/ngtcp2-host/src}"
+# fetch.sh сам ничего не делает, если каталог уже с той же версией и теми же патчами (метка), так
+# что правка патча подхватывается без ручной очистки.
+if [ -z "${STEER_NGTCP2:-}" ]; then
+	sh build/ngtcp2/fetch.sh "$NSRC" >/dev/null || NSRC=""
+elif [ ! -f "$NSRC/lib/ngtcp2_brutal.c" ]; then
+	NSRC=""
+fi
+if [ -z "$NSRC" ]; then
+	echo "ext-test: исходников ngtcp2 нет — стенды QUIC ПРОПУЩЕНЫ (это не падение)."
+	echo "ext-test:   STEER_NGTCP2=/путь к дереву после build/ngtcp2/fetch.sh, либо сеть для него."
+fi
+if [ -n "$NSRC" ]; then
+	NGLIB="$BUILD/ngtcp2-host/libngtcp2-$CCTAG.a"
+	echo "ext-test: ngtcp2 $(sh build/ngtcp2/fetch.sh version) с патчем Brutal, криптобэкенд wolfSSL..."
+	CC="$CC" AR="$WAR" CFLAGS="-O2 -g" sh build/ngtcp2/build.sh "$NSRC" "$WSRC" "$NGLIB"
+	NGC=$(cat "$NGLIB.cflags")
+	# Обёртка и сервер стенда: quic.c — с ключом QC_WITH_SERVER (в libsteer его нет), qcssl.c — то же и
+	# с ключами wolfSSL; стенды собираются одной строкой, без промежуточных объектов.
+	QCSRC="src/proto/quic/quic.c src/proto/quic/qcssl.c"
+	# shellcheck disable=SC2086
+	QCF="-O2 -g -w -DQC_WITH_SERVER $STEER_INC $NGC $WCFLAGS -Itests"
+
+	# qcbrutal — сам алгоритм на модели (внутренние заголовки ngtcp2 нужны ради ngtcp2_conn_stat).
+	echo "ext-test: собираю и прогоняю qcbrutal..."
+	# shellcheck disable=SC2086
+	$CC -O2 -g -w -DHAVE_CONFIG_H -Ibuild/ngtcp2 -I"$NSRC/lib" -I"$NSRC/lib/includes" -DNGTCP2_STATICLIB -Itests \
+		-o "$BUILD/qcbrutal" tests/qcbrutal.c "$NGLIB"
+	"$BUILD/qcbrutal"
+
+	# qcloop — клиент и сервер в одном процессе по настоящему UDP: рукопожатие, потоки, датаграммы.
+	echo "ext-test: собираю и прогоняю qcloop..."
+	# shellcheck disable=SC2086
+	$CC $QCF -o "$BUILD/qcloop" tests/qcloop.c $QCSRC "$NGLIB" "$WLIB" -lpthread -lm
+	"$BUILD/qcloop"
+
+	# qcserver и qcbench — пара замера; сам замер (сетевые пространства имён и netem, нужен root) —
+	# tests/qcbench.sh, здесь его короткая проверка «Brutal держит заданное, CUBIC проседает».
+	# shellcheck disable=SC2086
+	$CC $QCF -o "$BUILD/qcserver" tests/qcserver.c $QCSRC "$NGLIB" "$WLIB" -lpthread -lm
+	# shellcheck disable=SC2086
+	$CC $QCF -o "$BUILD/qcbench" tests/qcbench.c $QCSRC "$NGLIB" "$WLIB" -lpthread -lm
+	echo "ext-test: замер Brutal против CUBIC на канале с потерями (tests/qcbench.sh check)..."
+	BUILD="$BUILD" sh tests/qcbench.sh check
+fi
 
 # Разделяемая раскладка роутера (шаг 4 выпуска 1.10): те же исходники wolfSSL, тот же рецепт, что у
 # пакетов, — libsteer, libsteer-wolfssl, steerd и модули собираются и проверяются как целое.

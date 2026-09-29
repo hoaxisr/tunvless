@@ -69,7 +69,12 @@
 #define WOLFSSL_TLS13
 #define WOLFSSL_NO_TLS12
 #define NO_OLD_TLS
+/* Сервера TLS в поставляемой библиотеке нет. Ключ STEER_WOLFSSL_SERVER даёт его стендам
+ * (tests/ext-test.sh: эхо-сервер QUIC для проверки клиента), как WOLFSSL_CERT_GEN — выпуск
+ * сертификатов; сборки движка его не задают никогда. */
+#ifndef STEER_WOLFSSL_SERVER
 #define NO_WOLFSSL_SERVER
+#endif
 #define HAVE_TLS_EXTENSIONS
 #define HAVE_SUPPORTED_CURVES
 #define HAVE_SNI
@@ -98,6 +103,10 @@
  * установке ключа без режима (wc_AesSetKeyDirect) и прямому шифрованию блока. */
 #define WOLFSSL_AES_COUNTER
 #define WOLFSSL_AES_DIRECT
+/* AES-ECB — защита заголовка пакета QUIC (RFC 9001, раздел 5.4.3): ngtcp2 берёт маску из
+ * одного блока AES-128/256-ECB через слой EVP (wolfSSL_EVP_aes_{128,256}_ecb). ChaCha20 для
+ * той же цели (TLS_CHACHA20_POLY1305_SHA256) — HAVE_CHACHA ниже. */
+#define HAVE_AES_ECB
 #define NO_AES_192
 #define NO_AES_CBC
 /* NO_AES_DECRYPT (без таблицы Td и обратного блока — GCM и CTR им не пользуются) здесь был бы

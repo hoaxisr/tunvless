@@ -26,6 +26,16 @@ if [ ! -f "$WSRC/wolfssl/wolfcrypt/settings.h" ]; then
     echo "libs-test: исходников wolfSSL нет ($WSRC) — ПРОПУСК (это не падение)."
     exit 0
 fi
+# ngtcp2 с патчем — тем же деревом, что у ext-test (STEER_NGTCP2 или $BUILD/ngtcp2-host/src); не
+# нашлось — пробуем скачать, как ext-test, и без него libsteer не собрать: тот же громкий пропуск.
+NSRC="${STEER_NGTCP2:-$BUILD/ngtcp2-host/src}"
+if [ ! -f "$NSRC/lib/ngtcp2_brutal.c" ] && [ -z "${STEER_NGTCP2:-}" ]; then
+    sh build/ngtcp2/fetch.sh "$NSRC" >/dev/null 2>&1
+fi
+if [ ! -f "$NSRC/lib/ngtcp2_brutal.c" ]; then
+    echo "libs-test: исходников ngtcp2 нет ($NSRC) — ПРОПУСК (это не падение)."
+    exit 0
+fi
 VER="$(cat VERSION)"
 WVER="$(sh build/wolfssl/fetch.sh version)"
 L="$BUILD/libs-host"
@@ -42,7 +52,7 @@ rm -rf "$L"
 # В образе сборщика компилятор — zig: у его драйвера свои ограничения на флаги компоновщика
 # (ZIG=1 в build/build-libs.sh).
 case "$CC" in zig*) ZIG=1; AR="zig ar"; export ZIG AR ;; esac
-if ! CC="$CC" LIBS="-lpthread -ldl -lm" WOLFSSL_DIR="$WSRC" JOBS="$(nproc 2>/dev/null || echo 4)" \
+if ! CC="$CC" LIBS="-lpthread -ldl -lm" WOLFSSL_DIR="$WSRC" NGTCP2_DIR="$NSRC" JOBS="$(nproc 2>/dev/null || echo 4)" \
         sh build/build-libs.sh "$L" "$VER" "libs-test" > "$L.log" 2>&1; then
     echo "libs-test: сборка не удалась:"; grep -m10 -i "error\|undefined" "$L.log"
     exit 1
@@ -52,7 +62,7 @@ SO="$L/libsteer.so.$VER"; WSO="$L/libsteer-wolfssl.so.$WVER"
 
 # ---- списки экспорта и таблица символов -----------------------------------------------------
 if command -v nm >/dev/null 2>&1; then
-    STEER_WOLFSSL="$WSRC" BUILD="$BUILD" CC="$CC" sh build/libs-exports.sh check > "$L.exp" 2>&1
+    STEER_WOLFSSL="$WSRC" STEER_NGTCP2="$NSRC" BUILD="$BUILD" CC="$CC" sh build/libs-exports.sh check > "$L.exp" 2>&1
     check "списки экспорта сходятся с кодом" "0" "$?"
     want="$(sed -n 's/^ *\([A-Za-z_0-9]*\);$/\1/p' build/libsteer.map | sort)"
     # nm -D печатает версию символа (имя@@LIBSTEER_1) — её отрезаем.
@@ -138,6 +148,31 @@ check "  и строка называет причину и лечение" "1" 
 o="$("$L/steer-vless" vless x --spec /nonexistent 2>&1)"
 check "настоящая libsteer-wolfssl: сверка молчит" "0" "$(printf '%s' "$o" | grep -c 'другой сборки')"
 
+# ---- QUIC в раскладке пакета (шаг 7) ---------------------------------------------------------------
+# Клиент замера (tests/qcbench.c — он же «потребитель», чьи символы дали qc_* в списке экспорта)
+# линкуется с настоящей libsteer.so и ходит через настоящую libsteer-wolfssl.so, то есть на ту
+# wolfSSL, что поедет в пакет — без сервера TLS, с QUIC и AES-ECB. Сервер — build/qcserver из
+# ext-test (собран на статической wolfSSL стенда, с сервером TLS): две разные сборки wolfSSL по
+# разные стороны провода — как в жизни.
+if [ -x "$BUILD/qcserver" ]; then
+    $CC -O2 -w -Isrc/proto/quic -Itests -o "$L/qcbench" tests/qcbench.c "$SO" -Wl,-rpath,"$L" -lpthread
+    check "стенд-потребитель QUIC слинковался с libsteer.so" "0" "$?"
+    for mode in "cubic" "brutal 6250000"; do
+        "$BUILD/qcserver" --port 0 --idle 15 > "$L/qcsrv.out" 2>/dev/null &
+        spid=$!
+        n=0
+        while ! grep -q '^listening' "$L/qcsrv.out" 2>/dev/null && [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
+        port="$(sed -n 's/^listening //p' "$L/qcsrv.out")"
+        o="$("$L/qcbench" 127.0.0.1 "${port:-1}" 1 $mode 2>&1)"
+        check "QUIC через libsteer.so и libsteer-wolfssl.so ($mode): рукопожатие и передача, сервер ответил" "1" \
+            "$(printf '%s' "$o" | grep -c 'replied=1')"
+        kill "$spid" 2>/dev/null
+        wait "$spid" 2>/dev/null
+    done
+else
+    echo "libs-test: нет $BUILD/qcserver (его собирает make ext-test) — QUIC через раскладку пакета пропущен"
+fi
+
 # ---- снимок генератора динамическим steerd ---------------------------------------------------------
 # Клиент, steerd и библиотеки — в отдельном каталоге БЕЗ модулей (клиент берёт движок рядом с
 # собой, а модули ищутся рядом с движком): это пакет ядра без модулей, то есть та же база, что у
@@ -149,7 +184,7 @@ if [ -x "$BUILD/steer" ] && [ -x "$BUILD/steer-android" ] && [ -x "$BUILD/tgwssi
     cp "$L/steerd" "$L"/libsteer.so.* "$L"/libsteer-wolfssl.so.* "$core/"
     cp "$BUILD/steer" "$core/steer"
     # env -u: STEER_WOLFSSL (путь к исходникам библиотеки) — тоже STEER_*, и снимок записал бы его.
-    o="$(env -u STEER_WOLFSSL LD_LIBRARY_PATH="$core" STEER="$core/steer" sh tests/snapshot.sh 2>&1 | tail -1)"
+    o="$(env -u STEER_WOLFSSL -u STEER_NGTCP2 LD_LIBRARY_PATH="$core" STEER="$core/steer" sh tests/snapshot.sh 2>&1 | tail -1)"
     check "снимок генератора динамическим steerd: совпал" "1" "$(printf '%s' "$o" | grep -c 'снимков совпали')"
 else
     echo "libs-test: нет build/steer, steer-android или tgwssim — снимок динамическим steerd пропущен (make)"

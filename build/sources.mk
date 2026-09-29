@@ -29,7 +29,7 @@ CORE_DIRS := src/lib src/model src/platform src/compile src/daemon src/kinds src
 # PLATFORM_SRC); остальные — по одному на профиль, у base своего файла нет. Отдельно от ядра и
 # от расширенной части, потому что файл профиля не входит ни в одну сборку, кроме своей.
 PROFILE_DIRS := src/profile
-EXT_DIRS  := src/tunnel src/proto/tls src/proto/transport src/proto/vless src/proto/xsteer src/proto/tgws src/modules
+EXT_DIRS  := src/tunnel src/proto/tls src/proto/transport src/proto/vless src/proto/xsteer src/proto/tgws src/proto/quic src/modules
 # Клиент сокета `steer` (src/client) — отдельный бинарник, не профиль движка: CLIENT_SRC ниже.
 CLIENT_DIRS := src/client
 # Сторонний код (src/third_party) — не слой движка: файлы в нём не правятся (см. UPSTREAM в
@@ -247,9 +247,28 @@ PROFILE_android  := $(PROFILE_extended)
 # разбор команд, тот же вывод и код выхода, `steer vless-nodes` для splify2 не меняется.
 # Состав двух бинарных половин сверяет tests/buildmatch.sh: в модуле нет failover.c и модели —
 # они в libsteer/steerd; маршрут выхода ставит демон по up (шаг 3).
+#
+# QUIC (шаг 7 выпуска 1.10, docs/architecture.md, «Туннели»): обёртка над ngtcp2 — в libsteer, чтобы
+# её взяли и DoQ в dnsd (1.11), и модуль hysteria2 без второй копии библиотеки. Сама ngtcp2 (с патчем
+# Brutal) собирается отдельным рецептом (build/ngtcp2/build.sh) в статический архив и линкуется в
+# libsteer.so; wolfSSL для неё — та же libsteer-wolfssl.so. Обёртка — два файла:
+#   quic.c   сокет, потоки, датаграммы, таймер; видит только заголовки ngtcp2;
+#   qcssl.c  единственный, кроме слоя примитивов (CRYPTO_SRC), файл с заголовками wolfSSL.
+# Ключи сборки им нужны разные (build/build-libs.sh): ngtcp2 — обоим, wolfSSL — только qcssl.c,
+# поэтому списки два. Потребителей у слоя пока нет: в steerd и модули он не идёт. Единственный
+# «потребитель» — стенд QUIC_STAND_SRC (клиент замера; tests/libs-test.sh линкует его с
+# библиотекой и гоняет против сервера): его неопределённые символы попадают в список экспорта
+# (build/libs-exports.sh), поэтому программный интерфейс qc_* торчит из libsteer.so, а код ngtcp2
+# и QUIC-часть wolfSSL остаются в обеих библиотеках и собираются, слинковываются и проверяются на
+# каждой архитектуре. Без стенда сборщик выбросил бы их как недостижимые. Когда придёт настоящий
+# потребитель (DoQ, hysteria2), стенд из списка экспорта уйдёт, а символы останутся его же.
+QUIC_SRC := src/proto/quic/quic.c src/proto/quic/qcssl.c
+QUIC_SSL_SRC := src/proto/quic/qcssl.c
+QUIC_STAND_SRC := tests/qcbench.c
 LIBSTEER_SRC := $(LIBSTEER_BASE_SRC) $(KINDS_EXT_SRC) $(STACK_SRC) $(TRANSPORT_SRC) \
                 src/tunnel/tun.c src/proto/tls/chello.c src/proto/tls/tls13.c \
-                src/proto/tls/certverify.c src/proto/tls/reality.c src/proto/tls/h2.c $(CRYPTO_SRC)
+                src/proto/tls/certverify.c src/proto/tls/reality.c src/proto/tls/h2.c $(CRYPTO_SRC) \
+                $(QUIC_SRC)
 STEERD_DYN_SRC := $(DAEMON_SRC) src/proto/tls/urltls.c
 VLESS_MODULE_SRC := $(VLESS_MOD_SRC) src/proto/vless/sub.c src/proto/vless/subfetch.c \
                     src/proto/tls/tlsprobe.c $(MODCMD_SRC) src/modules/main_vless.c

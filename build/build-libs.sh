@@ -60,7 +60,8 @@ mkdir -p "$OBJ/lib" "$OBJ/steerd" "$OBJ/mod"
 # Архив собирает тот же рецепт, что для статических бинарников (build/wolfssl/build.sh), но -fPIC
 # и в свой каталог: объекты без PIC в общую библиотеку не влезают. -ffunction-sections и
 # --gc-sections оставляют в .so только достижимое от экспортируемых символов: TLS-стек и QUIC
-# wolfSSL, включённые опциями заранее, весят там ровно столько, сколько их зовут (пока никто).
+# wolfSSL, включённые опциями заранее, весят там ровно столько, сколько их зовут (с шага 7 — обёртка
+# QUIC и ngtcp2, ниже).
 WTAG="$(echo "$CC" | tr -c 'a-zA-Z0-9' '_')"
 WLIB="$OUT/wolfssl-pic/$WTAG/libwolfssl.a"
 env CC="$CC" AR="$AR" CFLAGS="-O2 -fPIC -ffunction-sections -fdata-sections" \
@@ -76,6 +77,18 @@ $CC -O2 -fPIC -fvisibility=hidden -ffunction-sections -fdata-sections -Wall -Wex
 # libsteer.so не слинкуется (-z defs). Список — файлом, а не вычисляется здесь, потому что nm в
 # образе сборщика нет (там только zig), а состав символов от архитектуры не зависит.
 WMAP="build/wolfssl/libsteer-wolfssl.map"
+
+# ---- ngtcp2: статический архив с -fPIC (шаг 7) ----------------------------------------------------
+# Исходники — с нашим патчем Brutal (build/ngtcp2/fetch.sh; в образе сборщика — /opt/ngtcp2), рецепт —
+# build/ngtcp2/build.sh: те же флаги, что у архива wolfSSL. Архив идёт в libsteer.so, а не в
+# отдельную библиотеку: у неё один потребитель за раз, а пакет с ещё одной .so на флеше 7 МБ —
+# лишний (docs/architecture.md, «Туннели»). Криптобэкенд ngtcp2 зовёт wolfSSL_*, они берутся из
+# libsteer-wolfssl.so (список экспорта — build/libs-exports.sh).
+NGTCP2_DIR="${NGTCP2_DIR:-/opt/ngtcp2}"
+NGLIB="$OUT/ngtcp2-pic/$WTAG/libngtcp2.a"
+env CC="$CC" AR="$AR" CFLAGS="-Os -fPIC -ffunction-sections -fdata-sections" \
+    sh build/ngtcp2/build.sh "$NGTCP2_DIR" "$WOLFSSL_DIR" "$NGLIB"
+NGCFLAGS="$(cat "$NGLIB.cflags")"
 
 # ---- libsteer.so ---------------------------------------------------------------------------------
 # -O2: через эти файлы идёт весь трафик туннеля (шифр, стек, транспорты), и -Os тут стоил бы
@@ -105,15 +118,23 @@ compile() {
 }
 
 CRYPTO="$(profile_var CRYPTO_SRC)"
+QUIC_ALL="$(profile_var QUIC_SRC)"
+QUIC_SSL="$(profile_var QUIC_SSL_SRC)"
 LIB_SRC=""
 for f in $(profile_var PROFILE_libsteer); do
-    [ "$f" = "$CRYPTO" ] || LIB_SRC="$LIB_SRC $f"
+    case " $CRYPTO $QUIC_ALL " in *" $f "*) ;; *) LIB_SRC="$LIB_SRC $f" ;; esac
 done
 # shellcheck disable=SC2086
 compile "$LIBF" "$OBJ/lib" $LIB_SRC
 # Слой примитивов — с ключами wolfSSL, остальным они ничего не значат.
 # shellcheck disable=SC2086
 $CC $LIBF $WCFLAGS -c "$CRYPTO" -o "$OBJ/lib/$(echo "$CRYPTO" | tr / _).o"
+# Обёртка QUIC: заголовки ngtcp2 — обоим файлам, wolfSSL — только тому, что ему положено (QUIC_SSL_SRC).
+for f in $QUIC_ALL; do
+    case " $QUIC_SSL " in *" $f "*) _wc="$WCFLAGS" ;; *) _wc="" ;; esac
+    # shellcheck disable=SC2086
+    $CC $LIBF $NGCFLAGS $_wc -c "$f" -o "$OBJ/lib/$(echo "$f" | tr / _).o"
+done
 
 # -z defs (библиотека не оставляет неопределённых символов) по умолчанию включён: он превращает
 # забытый экспорт или файл, выпавший из списка, в ошибку сборки, а не в падение на роутере. Но
@@ -143,7 +164,7 @@ $CC -shared -o "$WSO" "$OBJ/abi.o" -Wl,--whole-archive "$WLIB" -Wl,--no-whole-ar
 
 SO="$OUT/libsteer.so.$VERSION"
 # shellcheck disable=SC2086
-$CC -shared -o "$SO" "$OBJ"/lib/*.o "$WSO" \
+$CC -shared -o "$SO" "$OBJ"/lib/*.o "$NGLIB" "$WSO" \
     -Wl,-soname,"libsteer.so.$VERSION" -Wl,--version-script=build/libsteer.map \
     -Wl,-Bsymbolic -Wl,--gc-sections $ZDEFS -Wl,-z,relro -s $LIBS
 

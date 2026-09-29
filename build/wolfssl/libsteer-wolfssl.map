@@ -1,7 +1,7 @@
 /* Экспорт libsteer-wolfssl.so — ЭТОТ ФАЙЛ ПОРОЖДАЕТ build/libs-exports.sh (gen), руками не правится.
- * Символы wolfSSL, которые зовёт слой src/lib/scrypto.c, и отпечаток сборки steer_wolfssl_abi
- * (build/wolfssl/abi.c). Остальное скрыто: наружу торчит не библиотека, а нужное. Когда
- * появится потребитель QUIC (ngtcp2, шаг 7), его символы добавятся тем же способом. */
+ * Символы wolfSSL, которые зовут слой src/lib/scrypto.c, обёртка QUIC src/proto/quic/qcssl.c и
+ * криптобэкенд ngtcp2 (crypto/wolfssl), и отпечаток сборки steer_wolfssl_abi (build/wolfssl/
+ * abi.c). Остальное скрыто: наружу торчит не библиотека, а нужное. */
 {
   global:
     steer_wolfssl_abi;
@@ -55,10 +55,60 @@
     wc_Sha512Free;
     wc_Sha512Update;
     wolfSSL_CertManagerLoadCABuffer_ex;
+    wolfSSL_check_domain_name;
+    wolfSSL_CTX_free;
+    wolfSSL_CTX_load_verify_buffer;
+    wolfSSL_CTX_new;
+    wolfSSL_CTX_set_max_proto_version;
+    wolfSSL_CTX_set_min_proto_version;
+    wolfSSL_CTX_set_quic_method;
+    wolfSSL_CTX_set_verify;
+    wolfSSL_CTX_UseSessionTicket;
+    wolfSSL_EVP_aes_128_ecb;
+    wolfSSL_EVP_aes_128_gcm;
+    wolfSSL_EVP_aes_256_ecb;
+    wolfSSL_EVP_chacha20;
+    wolfSSL_EVP_CIPHER_CTX_free;
+    wolfSSL_EVP_CIPHER_CTX_nid;
+    wolfSSL_EVP_CIPHER_iv_length;
+    wolfSSL_EVP_Cipher_key_length;
+    wolfSSL_EVP_CIPHER_nid;
+    wolfSSL_EVP_CipherUpdate;
+    wolfSSL_EVP_EncryptFinal_ex;
+    wolfSSL_EVP_EncryptInit_ex;
+    wolfSSL_EVP_MD_size;
+    wolfSSL_EVP_sha256;
+    wolfSSL_free;
+    wolfSSL_get_app_data;
+    wolfSSL_get_error;
+    wolfSSL_get_peer_quic_transport_params;
     wolfSSL_Init;
+    wolfSSL_new;
+    wolfSSL_process_quic_post_handshake;
+    wolfSSL_provide_quic_data;
+    wolfSSL_quic_aead_decrypt;
+    wolfSSL_quic_aead_encrypt;
+    wolfSSL_quic_aead_is_ccm;
+    wolfSSL_quic_aead_is_chacha20;
+    wolfSSL_quic_aead_is_gcm;
+    wolfSSL_quic_crypt_new;
+    wolfSSL_quic_do_handshake;
+    wolfSSL_quic_get_aead;
+    wolfSSL_quic_get_aead_tag_len;
+    wolfSSL_quic_get_md;
+    wolfSSL_quic_hkdf;
+    wolfSSL_quic_hkdf_expand;
+    wolfSSL_quic_hkdf_extract;
+    wolfSSL_RAND_bytes;
+    wolfSSL_set_accept_state;
+    wolfSSL_set_app_data;
+    wolfSSL_set_connect_state;
+    wolfSSL_set_quic_transport_params;
     wolfSSL_sk_X509_new_null;
     wolfSSL_sk_X509_pop_free;
     wolfSSL_sk_X509_push;
+    wolfSSL_UseALPN;
+    wolfSSL_UseSNI;
     wolfSSL_X509_d2i;
     wolfSSL_X509_free;
     wolfSSL_X509_STORE_CTX_free;
@@ -70,6 +120,7 @@
     wolfSSL_X509_verify_cert;
     wolfSSL_X509_VERIFY_PARAM_set1_host;
     wolfSSL_X509_VERIFY_PARAM_set1_ip_asc;
+    wolfTLSv1_3_client_method;
   local:
     *;
 };
