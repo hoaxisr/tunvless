@@ -20,6 +20,7 @@ LIBSTEER_1 {
     ctlcall_forward;
     ctlcall_socket;
     die;
+    dnsurl_parse;
     dom6_ok;
     err_die;
     err_set;

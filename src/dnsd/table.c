@@ -4,6 +4,12 @@
 struct dchan g_dch[MAX_RULES];
 size_t g_dch_n;
 
+/* Апстримы и кэш из таблицы (dup.h). Здесь, а не в dup.c: демон линкует только table.c и
+ * tabfmt.c (DNSD_TABLE_SRC), без транспортов резолвера. */
+struct dup_cfg g_dup_cfg[MAX_DNS_UP];
+size_t g_dup_cfg_n;
+struct dcache_cfg g_dcache_cfg;
+
 /* Все доменные каналы, которым принадлежит имя, — по биту на канал.
  *
  * ВСЕ, а не первый: одно имя законно названо в нескольких правилах (правило на
@@ -245,8 +251,16 @@ static const char *cl_source(const struct l4match *l4, const char *path) {
  *
  * Доменный кандидат — обычный канал с domains_files или часть канала с наборами, в которой
  * есть имена (unit_name). */
+/* Апстрим правила в нумерации спеки (номер в sp->dns.up плюс один): свой (`dns:` правила), иначе
+ * общий (`dns.upstream`), иначе 0 — прежний путь наверх. dch_build в конце переводит эти номера в
+ * номера таблицы (только использованные апстримы). */
+static int rule_up(const struct spec *sp, const struct spec_rule *r) {
+    return r->dns ? r->dns : sp->dns.general;
+}
+
 static int dch_join_domain_group(const struct spec *sp, const struct spec_rule *c,
-                                 const struct srs_part *cp, char *set, size_t n, int *realip) {
+                                 const struct srs_part *cp, char *set, size_t n, int *realip,
+                                 int *up) {
     for (int pass = 0; pass < 2; pass++)
         for (size_t j = 0; j < sp->rule_n; j++) {
             const struct spec_rule *d = &sp->rule[j];
@@ -263,6 +277,8 @@ static int dch_join_domain_group(const struct spec *sp, const struct spec_rule *
                 if (strcmp(want, mine)) continue;
                 snprintf(set, n, "%s", want);
                 *realip = d->realip;
+                /* Адресное правило вливается в группу доменного и спрашивает тем же сервером. */
+                *up = rule_up(sp, d);
                 return 1;
             }
         }
@@ -289,15 +305,21 @@ static int dch_fam(const struct spec *sp, const struct spec_rule *r, int realip,
 }
 
 /* Найти или завести канал резолвера под набор set. */
-static struct dchan *dch_slot(const char *set, int realip, const char *out, int fam) {
+/* Канал — это набор nft, режим И апстрим: правила с одним набором (тот же выход, клиенты и режим),
+ * но разными серверами DNS остаются двумя каналами с одним именем набора. Резолверу это безразлично
+ * (канал для него — списки имён и место, куда класть адрес), а имя, названное в обоих, достаётся
+ * старшему по порядку. Слить их значило бы спрашивать имена второго сервером первого. */
+static struct dchan *dch_slot(const char *set, int realip, int up, const char *out, int fam) {
     size_t k = 0;
     for (; k < g_dch_n; k++)
-        if (!strcmp(g_dch[k].set, set) && g_dch[k].realip == realip) return &g_dch[k];
+        if (!strcmp(g_dch[k].set, set) && g_dch[k].realip == realip && g_dch[k].up == up)
+            return &g_dch[k];
     if (g_dch_n >= MAX_RULES) return NULL;
     memset(&g_dch[g_dch_n], 0, sizeof(g_dch[g_dch_n]));
     snprintf(g_dch[g_dch_n].set, sizeof(g_dch[g_dch_n].set), "%s", set);
     snprintf(g_dch[g_dch_n].out, sizeof(g_dch[g_dch_n].out), "%.31s", out);
     g_dch[g_dch_n].realip = realip;
+    g_dch[g_dch_n].up = up;
     g_dch[g_dch_n].fam = fam;
     return &g_dch[g_dch_n++];
 }
@@ -323,11 +345,12 @@ static void dch_add_srs_channel(const struct spec *sp, size_t ci) {
         const struct srs_part *p = &g_plans[ci].p[pi];
         char set[64];
         int realip = c->realip;
+        int up = rule_up(sp, c);
         if (p->has_dom) unit_name(sp, c, p, realip, set, sizeof(set));
         else if (!(p->own && l->prefixes_n && p->kind != SP_EXTRA) ||
-                 !dch_join_domain_group(sp, c, p, set, sizeof(set), &realip))
+                 !dch_join_domain_group(sp, c, p, set, sizeof(set), &realip, &up))
             continue;
-        struct dchan *d = dch_slot(set, realip, rule_out(sp, c)->name,
+        struct dchan *d = dch_slot(set, realip, up, rule_out(sp, c)->name,
                                    dch_fam(sp, c, realip, p->kind == SP_EXTRA));
         if (!d) return;
         dch_name_rule(d, c, p->has_dom);
@@ -341,6 +364,54 @@ static void dch_add_srs_channel(const struct spec *sp, size_t ci) {
         for (size_t k = 0; k < p->sel_n; k++)
             if (p->sel[k].has_dom) dch_src(d, srs_source(&p->sel[k], composite));
     }
+}
+
+/* Апстримы, которыми пользуются каналы, — в g_dup_cfg (то, что пойдёт в таблицу), а номера в
+ * каналах — из нумерации спеки в нумерацию таблицы. Апстрим, на который не ссылается ни один
+ * канал, в таблицу не идёт: резолверу незачем держать соединение, которым никто не спросит.
+ *
+ * ПУТЬ ЗАПРОСА. Метка сокета апстрима «через выход» — метка выхода-подложки (marks.h,
+ * out_underlay_mark): ip rule ведёт её в таблицу устройства выхода, а postrouting_guard не
+ * выпускает такой пакет в другое устройство. На телефоне к ней добавлен бит собственного трафика
+ * туннеля (STEER_TUNNEL_BIT), по которому заворот DNS на output не возвращает запрос на 53-й порт
+ * к нам самим. «Напрямую» — без метки на роутере и с меткой «сам движок» на телефоне. Метка выхода
+ * появляется в реестре (registry_assign) у демона; резолвер без демона её не имеет, и тогда
+ * mark == 0 при need_mark: dup_ask такой апстрим не использует (dup.c) — «через туннель» без
+ * метки означало бы «напрямую». */
+static void dch_up_finalize(const struct spec *sp) {
+    int map[MAX_DNS_UP + 1];
+    memset(map, 0, sizeof(map));
+    memset(g_dup_cfg, 0, sizeof(g_dup_cfg));
+    g_dup_cfg_n = 0;
+    for (size_t i = 0; i < g_dch_n; i++) {
+        int u = g_dch[i].up;
+        if (!u) continue;
+        if ((size_t)u > sp->dns.up_n) { g_dch[i].up = 0; continue; }
+        if (!map[u]) {
+            const struct spec_dns_up *s = &sp->dns.up[u - 1];
+            struct dup_cfg *c = &g_dup_cfg[g_dup_cfg_n];
+            c->u = *s;
+            if (!c->u.boot_n) {
+                for (size_t k = 0; k < sp->dns.boot_n && k < MAX_DNS_IPS; k++)
+                    snprintf(c->u.boot[k], sizeof(c->u.boot[k]), "%s", sp->dns.boot[k]);
+                c->u.boot_n = sp->dns.boot_n;
+            }
+            if (s->out >= 0 && (size_t)s->out < sp->out_n) {
+                const struct output *o = &sp->out[s->out];
+                snprintf(c->via, sizeof(c->via), "%s", o->name);
+                c->need_mark = 1;
+                c->mark = o->mark ? (o->mark | STEER_TUNNEL_BIT) : 0;
+            } else {
+                c->mark = STEER_SELF_MARK;
+            }
+            map[u] = (int)++g_dup_cfg_n;
+        }
+        g_dch[i].up = map[u];
+    }
+    g_dcache_cfg.entries = sp->dns.cache;
+    g_dcache_cfg.ttl_min = sp->dns.ttl_min;
+    g_dcache_cfg.ttl_max = sp->dns.ttl_max;
+    g_dcache_cfg.ttl_neg = sp->dns.ttl_neg;
 }
 
 void dch_build(const struct spec *sp) {
@@ -409,17 +480,19 @@ void dch_build(const struct spec *sp) {
          *
          * Канал без доменных списков доменной части не получает, если только компилятор не
          * положил его в доменную группу соседа, — см. dch_join_domain_group. */
+        int up = rule_up(sp, r);
         if (l->domains_n) dch_name(sp, set, sizeof(set), r, realip);
-        else if (!dch_join_domain_group(sp, r, NULL, set, sizeof(set), &realip)) continue;
+        else if (!dch_join_domain_group(sp, r, NULL, set, sizeof(set), &realip, &up)) continue;
         size_t k = 0;
         for (; k < g_dch_n; k++)
-            if (!strcmp(g_dch[k].set, set) && g_dch[k].realip == realip) break;
+            if (!strcmp(g_dch[k].set, set) && g_dch[k].realip == realip && g_dch[k].up == up) break;
         if (k == g_dch_n) {
             if (g_dch_n >= MAX_RULES) break;
             memset(&g_dch[g_dch_n], 0, sizeof(g_dch[g_dch_n]));
             snprintf(g_dch[g_dch_n].set, sizeof(g_dch[g_dch_n].set), "%s", set);
             snprintf(g_dch[g_dch_n].out, sizeof(g_dch[g_dch_n].out), "%.31s", rule_out(sp, r)->name);
             g_dch[g_dch_n].realip = realip;
+            g_dch[g_dch_n].up = up;
             g_dch[g_dch_n].fam = dch_fam(sp, r, realip, 0);
             k = g_dch_n++;
         }
@@ -435,4 +508,5 @@ void dch_build(const struct spec *sp) {
         for (size_t f = 0; f < l->prefixes_n && g_dch[k].rules_n < MAX_FILES; f++)
             g_dch[k].rules_path[g_dch[k].rules_n++] = l->prefixes_files[f];
     }
+    dch_up_finalize(sp);
 }

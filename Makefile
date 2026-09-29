@@ -81,7 +81,7 @@ $(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_DEFAULT_PLATFORM=android -o $@ $(CORE_SRC)
 
-test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool
+test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/snapshot.sh
@@ -115,6 +115,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@sh tests/srsnft.sh
 	@sh tests/vpsfetch.sh
 	@$(BUILD)/dnsmatch
+	@$(BUILD)/dupmatch
 	@$(BUILD)/specmatch
 	@$(BUILD)/specmatch-ext
 	@$(BUILD)/failovermatch
@@ -257,6 +258,12 @@ $(BUILD)/dnsmatch: tests/dnsmatch.c $(DNSD_SRC) src/lib/sindex.h src/lib/nftnl.h
                    src/lib/jsonw.c src/dnsd/dnsd_int.h src/dnsd/tabfmt.h $(MODEL_KINDS) src/model/spec.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/dnsmatch.c $(DNSD_SRC) src/lib/jsonw.c $(MODEL_KINDS)
+
+# Апстримы резолвера без сети (разбор адреса, спека, таблица, кэш): tests/dupmatch.c.
+$(BUILD)/dupmatch: tests/dupmatch.c $(DNSD_SRC) src/dnsd/dup.h src/dnsd/dnsd_int.h src/dnsd/tabfmt.h \
+                   src/lib/jsonw.c $(MODEL_KINDS) src/model/spec.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/dupmatch.c $(DNSD_SRC) src/lib/jsonw.c $(MODEL_KINDS) -lpthread
 
 # Парсер конфигурации проверяется отдельной программой по той же причине: load_spec
 # читает файл и зовёт die()/exit(2) на неверной спеке — перехватить это через подкоманду

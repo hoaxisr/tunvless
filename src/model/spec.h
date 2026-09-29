@@ -541,21 +541,49 @@ struct spec_rule {
     unsigned char dns;
 };
 
-/* DNS спеки v2 (раздел `dns`, docs/spec-v2.md): кэш ответов и апстримы у правил через выход.
- * Разбор v2 их читает и хранит, но резолвер их ещё не умеет (выпуск 1.11; docs/architecture.md,
- * раздел 2, «DNS»),
- * поэтому спека с ними сейчас отвергается «ещё не поддерживается» — не молча. Режим по умолчанию
- * (`dns.mode`) в модель отдельным полем не идёт: он уже разложен в realip каждого правила. */
+/* DNS спеки v2 (раздел `dns`, docs/spec-v2.md): кэш ответов, апстримы и путь запроса к ним.
+ * Режим по умолчанию (`dns.mode`) в модель отдельным полем не идёт: он уже разложен в realip
+ * каждого правила. Резолвер спеку не читает: эти поля демон кладёт в таблицу для резолвера
+ * (src/dnsd/tabfmt.h), а тот разбирает адрес апстрима тем же dnsurl_parse.
+ *
+ * Апстрим — это ОДИН сервер и путь до него. Транспорт выводится из схемы адреса: udp://, tcp://,
+ * tls:// (DoT), https:// (DoH), quic:// (DoQ — схема зарезервирована, разбор её отвергает).
+ * Имя сервера в tls:// и https:// разрешается не системным резолвером, а bootstrap: адресами
+ * `ips` апстрима либо серверами `bootstrap` (свои у апстрима, иначе общие из `dns`). Запрос к
+ * апстриму уходит напрямую (out == -1) или с меткой выхода out: это метка выхода-подложки, та же,
+ * что у сокета туннеля `over` (out_underlay_mark), и та же цепочка postrouting_guard не даёт ему
+ * уйти мимо устройства выхода. */
 #define MAX_DNS_UP 8
+#define MAX_DNS_IPS 4
+enum dns_proto { DNSP_NONE = 0, DNSP_UDP, DNSP_TCP, DNSP_DOT, DNSP_DOH, DNSP_QUIC };
 struct spec_dns_up {
     char name[32];
     char url[256];
     int out;                        /* выход запроса — номер в sp->out; -1 — напрямую */
+    /* Разбор url (dnsurl_parse): протокол, имя или адрес сервера, порт, путь DoH. */
+    unsigned char proto;
+    unsigned short port;
+    char host[128];
+    char path[128];
+    /* Адреса сервера, записанные в спеке (минуют bootstrap), и серверы bootstrap апстрима. */
+    char ips[MAX_DNS_IPS][46];
+    unsigned char ips_n;
+    char boot[MAX_DNS_IPS][46];
+    unsigned char boot_n;
+    unsigned char inl;              /* задан в самом правиле (`dns: { url: … }`), а не в dns.upstreams */
 };
 struct spec_dns {
     long cache;                     /* записей кэша; 0 — кэша нет */
+    /* Пределы срока жизни записи кэша, секунд: ответ живёт не меньше ttl_min и не дольше
+     * ttl_max, отрицательный (NXDOMAIN, пустой ответ) — ttl_neg. Умолчания ставит разбор. */
+    long ttl_min, ttl_max, ttl_neg;
     struct spec_dns_up up[MAX_DNS_UP];
     size_t up_n;
+    /* Общий апстрим доменных правил без своего: номер в up плюс один; 0 — нет (имена спрашивают
+     * прежним путём: dnsmasq на роутере, исходный сервер запроса на телефоне). */
+    unsigned char general;
+    char boot[MAX_DNS_IPS][46];     /* общие серверы bootstrap */
+    unsigned char boot_n;
     /* ИМЕНА ПРАВИЛ — ТОЛЬКО IPv4: на AAAA имени под доменным правилом резолвер отвечает пустым
      * ответом, какой бы ни был выход. Ставит перевод v1 (spec_parse_v1, src/model/v1.c) и больше
      * никто; у спеки v2 поле нулевое.
@@ -583,6 +611,10 @@ struct spec_dns {
      * зависят — речь только об ответах на AAAA. */
     int names_v4;
 };
+
+/* Разобрать адрес апстрима в u (proto, host, port, path). 0 — разобрано; -1 — нет, why — причина
+ * человеческими словами. Один разбор на спеку и на резолвер (src/model/parse.c). */
+int dnsurl_parse(const char *url, struct spec_dns_up *u, char *why, size_t why_n);
 
 /* СПЕКА — ЗНАЧЕНИЕ, А НЕ ГЛОБАЛЫ (docs/architecture.md, раздел 2, правило 6).
  *

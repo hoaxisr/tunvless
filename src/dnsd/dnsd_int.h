@@ -32,6 +32,7 @@
 #include <unistd.h>
 
 #include "sindex.h"
+#include "dup.h"
 
 #define MAX_HOSTNAME 256
 
@@ -241,6 +242,10 @@ struct dchan {
      * парный набор «<set>6» и ответы AAAA (fake-IP v6 или настоящие адреса). Без DCH_V6 AAAA имён
      * канала гасится пустым ответом: у правила нет половины IPv6 (dom6_ok, spec.h). */
     int fam;
+    /* Апстрим доменных правил канала: номер в g_dup_cfg плюс один (dup.h); 0 — прежний путь наверх
+     * (петля на dnsmasq или исходный сервер запроса). Его задаёт правило, давшее каналу имя, а
+     * правила с разными апстримами в один канал не сливаются (dch_slot, table.c). */
+    int up;
 };
 #define DCH_V4 1
 #define DCH_V6 2
@@ -490,6 +495,15 @@ struct pending {
     struct dnsd_local local;
     int have_local;
     time_t expire;
+    /* Запрос ушёл на апстрим со своим транспортом (dup.h): его порядковый номер (0 — нет), чтобы
+     * запоздалый ответ на прежнее содержимое слота не принять за ответ на нынешнее; соединение
+     * клиента TCP (номер и поколение), которому ответ уйдёт; и признак «ответ положить в кэш» с
+     * апстримом ключа (номер настройки плюс один, 0 — прежний путь наверх). */
+    uint32_t sec;
+    int sconn;
+    uint32_t sgen;
+    uint8_t cput;
+    unsigned cup;
 };
 
 extern struct pending g_pending[MAX_PENDING];

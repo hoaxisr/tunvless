@@ -185,6 +185,8 @@ void dnsd_usage_flags(FILE *out) {
           "                           демона, docs/architecture.md, раздел 4а), а не читать\n"
           "                           спеку самому; следующая полная таблица в той же трубе\n"
           "                           заменяет текущую без перезапуска\n"
+          "  --ca-file ФАЙЛ           корни для проверки сертификата апстримов DoT и DoH вместо\n"
+          "                           системных (для стендов)\n"
           "  --orphan-timeout СЕК     труба таблицы закрылась (демона нет) — отвечать по\n"
           "                           последней таблице и ждать нового демона СЕК секунд\n"
           "                           (по умолчанию 60; 0 — выйти сразу)\n"
@@ -230,6 +232,8 @@ int dnsd_main(int argc, char **argv) {
             g_table_fd = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--orphan-timeout") == 0 && i + 1 < argc) {
             g_orphan_sec = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--ca-file") == 0 && i + 1 < argc) {
+            g_dup_ca_file = argv[++i];
         } else if (strcmp(argv[i], "--fakeip-state") == 0 && i + 1 < argc) {
             g_fakeip_state_path = argv[++i];
         } else if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc) {

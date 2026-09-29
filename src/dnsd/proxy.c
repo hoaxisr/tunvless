@@ -359,6 +359,16 @@ static void reload_rules(void) {
     }
 }
 
+/* Апстримы и кэш из свежей таблицы (dup.h, dcache.c). Кэш сбрасывается всегда: номера апстримов в
+ * ключе — номера этой таблицы, и в новой они могли означать другие серверы. */
+static void apply_upstreams(void) {
+    dup_apply(g_dup_cfg, g_dup_cfg_n);
+    dcache_config(&g_dcache_cfg);
+    if (g_dup_cfg_n || g_dcache_cfg.entries)
+        fprintf(stderr, "steer dnsd: апстримов со своим транспортом: %zu, кэш: %ld запис(ей)\n",
+                g_dup_cfg_n, g_dcache_cfg.entries);
+}
+
 /* Длинный сокет nf_tables (nftlk_open в run_proxy): 0 — открыт. */
 static int g_nk_open = -1;
 
@@ -429,6 +439,7 @@ static int table_pipe_readable(void) {
         while (rc == 1) {
             fprintf(stderr, "steer dnsd: таблица от демона: %zu доменных канал(ов)\n", g_dch_n);
             reload_rules();
+            apply_upstreams();
             got = 1;
             rc = tabfmt_feed(&g_table_feed, NULL, 0);
         }
@@ -536,6 +547,36 @@ static struct pending *pending_alloc(void) {
     for (int i = 0; i < MAX_PENDING; i++)
         if (!g_pending[i].in_use) return &g_pending[i];
     return NULL;
+}
+
+/* Ожидание, которое отвечает клиенту без похода по сети сокетом резолвера: из кэша или от апстрима
+ * со своим транспортом (dup.h). Те же поля, что dns_query кладёт в слот после отправки. */
+static uint32_t g_sec_seq;
+static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n);
+static void sec_bind(struct pending *p);
+static void sec_done(void *ctx, const uint8_t *ans, size_t n, const uint8_t *q, size_t qn);
+
+static void pending_arm(struct pending *p, const struct sockaddr_storage *from, socklen_t fromlen,
+                        const struct dnsd_local *local, int have_local, int hit, uint64_t sets,
+                        int quiet) {
+    p->in_use = 1;
+    g_live = 1;
+    p->tcp_up = -1;
+    p->sec = 0;
+    p->sconn = -1;
+    p->cput = 0;
+    p->cup = 0;
+    p->qfp = 0;
+    p->qsec_end = 0;
+    p->quiet = quiet;
+    p->hit = hit;
+    p->sets = sets;
+    p->rules_gen = g_rules_gen;
+    p->client = *from;
+    p->client_len = fromlen;
+    p->local = *local;
+    p->have_local = have_local;
+    p->expire = time(NULL) + PENDING_TTL_SEC;
 }
 
 /* Каналы, которым принадлежит вопрос. Для A — только каналы с IPv4 (DCH_V4): канал «6» из
@@ -733,6 +774,41 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
     p->cli_id = (uint16_t)((buf[0] << 8) | buf[1]);
     p->gen = pending_next_gen();
     uint16_t tag = pending_tag(p);
+
+    /* ИМЯ ПОД ПРАВИЛОМ: КЭШ И СВОЙ АПСТРИМ КАНАЛА (dup.h, dcache.c). Обе ветки заканчиваются в
+     * upstream_answer — том же месте, куда приходит ответ по сети, — поэтому fake-IP остаётся
+     * строгим: подмена в ядре ставится там и раньше ответа клиенту, откуда бы ответ ни взялся. */
+    unsigned cup = hit >= 0 ? (unsigned)g_dch[hit].up : 0;
+    int cacheable = hit >= 0 && dcache_on();
+    if (cacheable) {
+        uint8_t cbuf[MAX_PKT];
+        size_t cn = dcache_get(cup, buf, (size_t)n, cbuf, sizeof(cbuf), (long)mono_sec());
+        if (cn) {
+            pending_arm(p, &from, fromlen, &local, have_local, hit, sets, quiet);
+            p->cput = 0;
+            upstream_answer(p, cbuf, (ssize_t)cn);
+            return 1;
+        }
+    }
+    if (cup) {
+        /* У канала свой сервер: вопрос уходит туда, и только туда. Не принят (нет метки выхода,
+         * нет TLS, очередь полна, пауза после неудачи) — SERVFAIL клиенту, а не прежний путь:
+         * он вёл бы имя мимо выхода, который человек выбрал для DNS. */
+        pending_arm(p, &from, fromlen, &local, have_local, hit, sets, quiet);
+        p->qfp = (qend > 12 && qend <= (size_t)n) ? question_fp(buf, qend) : 0;
+        p->qsec_end = (uint16_t)((p->qfp) ? qend : 0);
+        p->cput = (uint8_t)cacheable;
+        p->cup = cup;
+        g_sec_seq = (g_sec_seq + 1) & 0x3FFFFF;
+        if (!g_sec_seq) g_sec_seq = 1;
+        p->sec = g_sec_seq;
+        sec_bind(p);
+        g_live = 1;
+        void *sctx = (void *)(((uintptr_t)p->sec << PENDING_IDX_BITS) | (uintptr_t)(p - g_pending));
+        if (dup_ask(cup - 1, buf, (size_t)n, sec_done, sctx) != 0)
+            sec_done(sctx, NULL, 0, buf, (size_t)n);
+        return 1;
+    }
     int ufd = g_up_fd;
     union dnsd_sa up;
     uint32_t ctmark = 0;
@@ -792,6 +868,10 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
     p->in_use = 1;
     g_live = 1;
     p->tcp_up = tcpu;
+    p->sec = 0;
+    p->sconn = -1;
+    p->cput = (uint8_t)cacheable;
+    p->cup = cup;
     p->quiet = quiet;
     p->hit = hit;
     p->sets = sets;
@@ -869,6 +949,9 @@ static int handle_upstream_response(int ufd) {
 /* Ответ сверху, уже сверенный со своим ожиданием, — один путь для UDP и TCP: доменные каналы,
  * fakeip, наборы, ответ клиенту. Кому отвечать, решает g_tcp_cur (см. reply_client). */
 static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
+    /* Настоящий ответ апстрима — в кэш (dcache.c), пока он ещё не переписан. Из кэша выданный ответ
+     * сюда приходит с cput == 0 и заново не кладётся. */
+    if (p->cput && n > 0) dcache_put(p->cup, buf, (size_t)n, (long)mono_sec());
     /* Номер клиента возвращается на место ДО любой отправки вниз: клиент сопоставляет
      * ответ с запросом именно по нему, а дальше буфер уходит клиенту и как есть, и
      * переписанным. */
@@ -1582,6 +1665,65 @@ static void tcpu_poke(struct tcpu *u) {
     tcpu_close(u);
 }
 
+/* ---- вопросы к апстримам со своим транспортом (dup.h) ---------------------------------------- */
+
+/* Запомнить, кому из клиентов TCP уйдёт ответ (если вопрос пришёл по TCP), и не давать закрыть его
+ * соединение, пока ответ в пути: тот же счётчик inflight, что у запроса наверх по TCP (tcpu). */
+static void sec_bind(struct pending *p) {
+    p->sconn = -1;
+    if (!g_tcp_cur) return;
+    p->sconn = (int)(g_tcp_cur - g_tcpc);
+    p->sgen = g_tcp_cur->gen;
+    g_tcp_cur->inflight++;
+}
+
+/* SERVFAIL клиенту вместо ответа: заголовок и вопрос его же запроса. */
+static void sec_servfail(struct pending *p, const uint8_t *q, size_t qn) {
+    if (p->quiet) return;
+    uint8_t out[512];
+    size_t qe = p->qsec_end;
+    size_t use = (qe >= 12 && qe <= qn && qe <= sizeof(out)) ? qe : 12;
+    size_t len = build_rewritten_response(q, use, out, sizeof(out), 0, 0);
+    if (!len) return;
+    if (use == 12) { out[4] = 0; out[5] = 0; }
+    out[0] = (uint8_t)(p->cli_id >> 8);
+    out[1] = (uint8_t)p->cli_id;
+    out[3] = (uint8_t)((out[3] & 0xf0) | 0x02);                 /* RCODE 2 — SERVFAIL */
+    reply_client(out, len, &p->client, p->client_len, &p->local, p->have_local);
+}
+
+/* Ответ апстрима (или отказ, ans == NULL). ctx — слот ожидания и порядковый номер вопроса: слот
+ * мог тем временем протухнуть (pending_reap) и достаться другому вопросу. */
+static void sec_done(void *ctx, const uint8_t *ans, size_t n, const uint8_t *q, size_t qn) {
+    uintptr_t v = (uintptr_t)ctx;
+    struct pending *p = &g_pending[v & PENDING_IDX_MASK];
+    if (!p->in_use || p->sec != (uint32_t)(v >> PENDING_IDX_BITS)) return;
+    struct tcpc *tc = NULL;
+    if (p->sconn >= 0) {
+        tc = &g_tcpc[p->sconn];
+        if (tc->fd < 0 || tc->gen != p->sgen) tc = &g_tcp_dead;
+    }
+    g_tcp_cur = tc;
+    /* Ответ обязан отвечать на НАШ вопрос (как у ответа по UDP, handle_upstream_response). */
+    int ok = ans && !(p->qfp && (n < p->qsec_end || question_fp(ans, p->qsec_end) != p->qfp));
+    if (ok) {
+        p->sec = 0;
+        upstream_answer(p, (uint8_t *)(uintptr_t)ans, (ssize_t)n);
+    } else {
+        p->in_use = 0;
+        p->sec = 0;
+        static time_t said;
+        if (warn_due(&said, time(NULL)))
+            fprintf(stderr, "steer dnsd: апстрим канала не ответил — клиенту SERVFAIL\n");
+        sec_servfail(p, q, qn);
+    }
+    g_tcp_cur = NULL;
+    if (tc && tc != &g_tcp_dead && tc->fd >= 0) {
+        if (tc->inflight > 0) tc->inflight--;
+        tcpc_maybe_close(tc);
+    }
+}
+
 /* Место под новое соединение: свободное, иначе — давно молчащее без запросов в пути и без
  * начатого запроса в буфере (см. «ЛИМИТЫ» выше); NULL — вытеснить некого. Само место не
  * освобождается: вытеснять стоит, только когда соединение и правда принято. */
@@ -1938,6 +2080,7 @@ int run_proxy(int listen_port, int upstream_port) {
     g_nk_open = nk_open;
 
     reload_rules();
+    apply_upstreams();
     if (g_fakeip_state_path) fakeip_state_load(g_fakeip_state_path);
 
     /* Rehydrate the DNAT map AND the channel sets after a (re)start. fw4 reload /
@@ -1970,6 +2113,7 @@ int run_proxy(int listen_port, int upstream_port) {
     while (g_running) {
         if (g_reload_pending) { g_reload_pending = 0; reload_rules(); reassert_routes(); }
         time_t now = time(NULL);
+        dup_tick();
         if (now != last_reap) {
             /* Секундный тик: снять протухшие ожидания (см. pending_reap). */
             g_live = pending_reap(now) | tcp_reap(now);
@@ -1994,6 +2138,9 @@ int run_proxy(int listen_port, int upstream_port) {
             time_t left = g_fakeip_last_rewrite + FAKEIP_ANSWER_TTL - now;
             timeout = left > 0 ? (int)left * 1000 : 0;
         }
+        /* Вопросы к апстримам со своим транспортом: проснуться к ближайшему сроку (dup.h). */
+        int dw = dup_wait_ms();
+        if (dw >= 0 && (timeout < 0 || timeout > dw)) timeout = dw ? dw : 1;
         /* Без демона — проснуться к концу срока ожидания нового (table_pipe_lost). */
         if (g_orphan_since) {
             time_t left = g_orphan_since + g_orphan_sec - mono_sec();
@@ -2036,6 +2183,8 @@ int run_proxy(int listen_port, int upstream_port) {
                 if (g_slog_rd >= 0) slog_pump();
             } else if (tcp_event(events[i].data.ptr, events[i].events)) {
                 /* соединение TCP — клиента или наверх; всё сделано внутри */
+            } else if (dup_event(events[i].data.ptr, events[i].events)) {
+                /* сокет апстрима со своим транспортом (dup.c) */
             } else {
                 /* Ответы всех ожиданий приходят на один сокет, поэтому очередь тоже
                  * дочитывается до конца пачкой — иначе на всплеске за один виток цикла
@@ -2052,6 +2201,7 @@ int run_proxy(int listen_port, int upstream_port) {
      * имена последней минуты иначе терялись бы (fakeip_state_flush, fakeip.c). */
     fakeip_state_flush();
     tcp_close_all();
+    dup_close_all();
     dlog_close();
     adopt_close();
     if (g_nlk_fd >= 0) close(g_nlk_fd);
