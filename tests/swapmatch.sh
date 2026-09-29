@@ -39,6 +39,19 @@
 #  6. real-ip: сразу после загрузки набора правил демоном загрузчик просит резолвер вернуть
 #     элементы (в журнале — строка «right after the ruleset load»), элемент на месте; поддельный
 #     адрес в наборе канала — сразу после ответа apply, без ожидания резолвера.
+#  7. Засев не отстаёт от памяти резолвера (проверка на QEMU 98b7964, 2026-09-28): файл состояния
+#     резолвер переписывал не чаще раза в минуту и при SIGTERM не дописывал, а засев при замене
+#     набора правил брался из него. Демон с резолвером (--supervise), клиент с поддельным адресом в
+#     кэше DNS:
+#     B1 — новое имя и сразу замена набора (снятое правило канала + apply), три раза: пара в карте
+#          сразу после ответа apply, туннель получил каждый пакет клиента, у провайдера ноль;
+#     B2 — два новых имени (A и AAAA), через секунду `steer restart` (SIGTERM демону, down, старт):
+#          после старта карта и fakeip6 — с ними, пять пакетов к поддельному адресу из кэша — все в
+#          туннель;
+#     B3 — апстрим сменил адрес имени (в памяти и карте новый, файл ещё прежний), затем замена
+#          набора: в карте — новый адрес; и отдельно — адрес в карте ядра испорчен руками, SIGHUP
+#          резолверу: он сверяет карту с памятью и ставит свой (строка «заменён на тот, что знает
+#          резолвер»), а не верит EEXIST.
 #
 # Нужны root, unshare -nm, nsenter, ip, nft и python3. Чего-то нет — стенд пропускается вслух.
 set -u
@@ -499,6 +512,172 @@ check "  адрес real-ip — снова в наборе со сроком" "1
 kill "$D" 2>/dev/null
 wait "$D" 2>/dev/null
 "$BIN" down --state-dir "$tmp/rst" >/dev/null 2>&1
+
+# ---- 7. засев не отстаёт от памяти резолвера ------------------------------------------------
+# Апстрим отвечает по файлу «имя адрес-IPv4 адрес-IPv6» (перечитывает на каждый вопрос: B3 меняет
+# адрес на ходу); имени нет в файле — 203.0.113.10 и 2001:db8:77::10.
+cat > "$tmp/up2.py" <<'PY'
+import socket, struct, sys
+port, mapf = int(sys.argv[1]), sys.argv[2]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", port))
+def lookup(name):
+    try:
+        for ln in open(mapf):
+            f = ln.split()
+            if len(f) >= 2 and f[0] == name:
+                return f[1:] + ["2001:db8:77::10"]
+    except OSError:
+        pass
+    return ["203.0.113.10", "2001:db8:77::10"]
+while True:
+    data, addr = s.recvfrom(2048)
+    qend, labels = 12, []
+    while data[qend]:
+        l = data[qend]
+        labels.append(data[qend + 1:qend + 1 + l].decode().lower())
+        qend += 1 + l
+    qtype = struct.unpack('>H', data[qend + 1:qend + 3])[0]
+    qend += 5
+    a = lookup(".".join(labels))
+    rd = None
+    if qtype == 1:
+        rd = socket.inet_pton(socket.AF_INET, a[0])
+    elif qtype == 28:
+        rd = socket.inet_pton(socket.AF_INET6, a[1])
+    hdr = data[:2] + b'\x81\x80' + data[4:6] + (b'\x00\x01' if rd else b'\x00\x00') + b'\x00' * 4
+    ans = struct.pack('>HHHIH', 0xc00c, qtype, 1, 300, len(rd)) + rd if rd else b''
+    s.sendto(hdr + data[12:qend] + ans, addr)
+PY
+cat > "$tmp/qa2.py" <<'PY'
+import socket, struct, sys
+port, name = int(sys.argv[1]), sys.argv[2]
+t = 28 if len(sys.argv) > 3 and sys.argv[3] == "AAAA" else 1
+q = struct.pack('>HHHHHH', 0x4243, 0x0100, 1, 0, 0, 0)
+for l in name.split('.'): q += bytes([len(l)]) + l.encode()
+q += b'\x00' + struct.pack('>HH', t, 1)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
+s.sendto(q, ('127.0.0.1', port))
+try:
+    d, _ = s.recvfrom(2048)
+    if not struct.unpack('>H', d[6:8])[0]:
+        print("none")
+    elif t == 28:
+        print(socket.inet_ntop(socket.AF_INET6, d[-16:]))
+    else:
+        print(".".join(str(b) for b in d[-4:]))
+except socket.timeout:
+    print("timeout")
+PY
+: > "$tmp/up2.map"
+python3 "$tmp/up2.py" 15595 "$tmp/up2.map" & UP2=$!
+pids="$pids $UP2"
+cat > "$tmp/f7.yaml" <<EOF
+version: 2
+lan: { devices: [r0] }
+lists:
+  f: { domains_file: $tmp/d.lst }
+outputs:
+  wg: { kind: interface, device: t0, on_fail: drop }
+rules:
+  - { name: f, to: f, out: wg }
+EOF
+mkdir -p "$tmp/fst"
+F7="--spec $tmp/f7.yaml --state-dir $tmp/fst"
+start7() {   # start7 ЖУРНАЛ
+    "$BIN" daemon --supervise --apply --socket "$tmp/f.sock" $F7 --dnsd-flag --listen-port \
+        --dnsd-flag 15591 --dnsd-flag --upstream-port --dnsd-flag 15595 >/dev/null 2>"$1" &
+    D=$!
+    pids="$pids $D"
+    wait_for "grep -q 'спека применена при старте' '$1'" 15
+    wait_for "grep -q 'listening on' '$1'" 5
+}
+qa7() { python3 "$tmp/qa2.py" 15591 "$@"; }
+apply7() { STEER_SOCKET="$tmp/f.sock" "$BIN" apply $F7 >/dev/null 2>&1; }
+# Пара «поддельный : настоящий» в карте ядра: элементы — по одному на строку, сравнение целиком.
+inmap() {   # inmap КАРТА ПОДДЕЛЬНЫЙ НАСТОЯЩИЙ
+    "$real_nft" list map inet steer "$1" 2>/dev/null | tr -d '\n\t' | tr ',{}' '\n\n\n' |
+        sed 's/^ *//; s/ *$//' | grep -cxF "$2 : $3"
+}
+del_chan7() {
+    h="$("$real_nft" -a list chain inet steer prerouting_mark | grep 'comment "steer:' | head -n 1 |
+         sed -n 's/.*# handle \([0-9]*\).*/\1/p')"
+    "$real_nft" delete rule inet steer prerouting_mark handle "$h"
+}
+start7 "$tmp/fd1.err"
+check "7: демон с резолвером поднялся" "1" "$(grep -c 'спека применена при старте' "$tmp/fd1.err")"
+
+# B1. Новое имя — и сразу замена набора: клиент получил поддельный адрес и шлёт на него, а таблицу
+# в этот миг ставят заново (правило канала снято снаружи, apply чинит заменой).
+lost=0 leak=0 inm=0 tot=0
+for k in 1 2 3; do
+    F="$(qa7 "b1n$k.s19.test")"
+    T0="$(cnt "$IT" real)" W0="$(cnt "$IW" real)"
+    send_start "$F"
+    sleep 0.1
+    del_chan7
+    apply7
+    inm=$((inm + $(inmap fakeip "$F" 203.0.113.10)))
+    sleep 0.5
+    sent="$(send_stop)"
+    got=$(($(cnt "$IT" real) - T0))
+    tot=$((tot + sent))
+    [ "$got" -lt "$sent" ] && lost=$((lost + sent - got))
+    leak=$((leak + $(cnt "$IW" real) - W0))
+done
+check "  B1: новое имя, сразу замена набора (×3): пара в карте сразу после apply" "3" "$inm"
+check "  клиент с кэшем DNS не потерял ни одного пакета (отправлено $tot), у провайдера ноль" "0 0" \
+    "$lost $leak"
+
+# B2. Два новых имени, через секунду — перезапуск службы: SIGTERM демону (он гасит резолвер), down,
+# старт. Имена последних секунд обязаны дожить до карты нового набора.
+F5="$(qa7 b2n5.s19.test)"
+F6="$(qa7 b2n6.s19.test)"
+F56="$(qa7 b2n5.s19.test AAAA)"
+check "  B2: у имён поддельные адреса (A, A, AAAA)" "yes" \
+    "$(case "$F5$F6$F56" in 198.18.*198.18.*fdfe:dcba:9876::*) echo yes ;; *) echo "no:$F5 $F6 $F56" ;; esac)"
+sleep 1
+kill "$D" 2>/dev/null
+wait "$D" 2>/dev/null
+"$BIN" down --state-dir "$tmp/fst" >/dev/null 2>&1
+start7 "$tmp/fd2.err"
+check "  после перезапуска карта — с обоими именами, fakeip6 — с IPv6 имени" "1 1 1" \
+    "$(inmap fakeip "$F5" 203.0.113.10) $(inmap fakeip "$F6" 203.0.113.10) $(inmap fakeip6 "$F56" 2001:db8:77::10)"
+T0="$(cnt "$IT" real)" W0="$(cnt "$IW" real)"
+burst "$F5" 5
+check "  клиент с поддельным адресом из кэша: 5 из 5 — в туннель, у провайдера ноль" "5 0" \
+    "$(($(cnt "$IT" real) - T0)) $(($(cnt "$IW" real) - W0))"
+
+# B3. Апстрим сменил адрес имени: в памяти резолвера и в карте новый, в файле — ещё прежний
+# (перезапись по сроку — раз в минуту). Замена набора засевает карту из файла.
+printf 'b3n1.s19.test 203.0.113.11\n' > "$tmp/up2.map"
+F="$(qa7 b3n1.s19.test)"
+wait_for "grep -q '^b3n1.s19.test	$F	203.0.113.11$' '$tmp/fst/fakeip.state'" 3
+check "  B3: n1 = .11 — в карте и в файле" "1 1" \
+    "$(inmap fakeip "$F" 203.0.113.11) $(grep -c "^b3n1.s19.test	$F	203.0.113.11$" "$tmp/fst/fakeip.state")"
+printf 'b3n1.s19.test 203.0.113.12\n' > "$tmp/up2.map"
+qa7 b3n1.s19.test >/dev/null
+wait_for "[ \"\$(inmap fakeip '$F' 203.0.113.12)\" = 1 ]" 3
+check "  апстрим сменил адрес: карта .12, файл ещё .11" "1 1" \
+    "$(inmap fakeip "$F" 203.0.113.12) $(grep -c "^b3n1.s19.test	$F	203.0.113.11$" "$tmp/fst/fakeip.state")"
+del_chan7
+apply7
+now12="$(inmap fakeip "$F" 203.0.113.12)"
+sleep 1
+check "  замена набора: в карте .12 сразу после apply и через секунду, .11 нет" "1 1 0" \
+    "$now12 $(inmap fakeip "$F" 203.0.113.12) $(inmap fakeip "$F" 203.0.113.11)"
+# Карта испорчена руками — резолвер на SIGHUP сверяет её с памятью, а не верит EEXIST.
+"$real_nft" delete element inet steer fakeip "{ $F }"
+"$real_nft" add element inet steer fakeip "{ $F : 203.0.113.99 }"
+DN="$(pgrep -P "$D" -f dnsd | head -n 1)"
+n0="$(grep -c 'заменён на тот, что знает резолвер' "$tmp/fd2.err")"
+kill -HUP "$DN" 2>/dev/null
+wait_for "[ \"\$(grep -c 'заменён на тот, что знает резолвер' '$tmp/fd2.err')\" -gt $n0 ]" 5
+check "  карта испорчена руками, SIGHUP: резолвер вернул свой адрес и сказал об этом" "1 0 yes" \
+    "$(inmap fakeip "$F" 203.0.113.12) $(inmap fakeip "$F" 203.0.113.99) $([ "$(grep -c 'заменён на тот, что знает резолвер' "$tmp/fd2.err")" -gt "$n0" ] && echo yes || echo no)"
+kill "$D" 2>/dev/null
+wait "$D" 2>/dev/null
+"$BIN" down --state-dir "$tmp/fst" >/dev/null 2>&1
 
 echo "swapmatch: $pass ok, $fail fail"
 [ "$fail" = 0 ]

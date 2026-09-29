@@ -259,6 +259,24 @@ void fakeip_state_rewrite(void) {
         unlink(tmp);
 }
 
+/* ФАЙЛ НЕ ОТСТАЁТ ОТ ПАМЯТИ ТАМ, ГДЕ ИЗ НЕГО ЧИТАЮТ (проверка на QEMU 98b7964, 2026-09-28,
+ * docs/architecture.md, раздел 5). Перезапись по сроку — не чаще раза в FAKEIP_ANSWER_TTL (цикл в
+ * proxy.c: носитель телефона — флеш, и молотить его на каждый переезд адреса незачем). Но из файла
+ * читают двое, и обоим минутное отставание стоило связи: засев карты и наборов при замене набора
+ * правил (fpseed.c) — новое имя без подмены, старый адрес вместо нового; и новый резолвер после
+ * `steer restart` — SIGTERM прежнего выход из цикла ничего не дописывал, и имена последних секунд
+ * терялись вовсе, пока их не спросят заново. Поэтому файл пишется ещё в два мига, и оба — редкие
+ * события, а не трафик: по просьбе загрузчика прямо перед засевом («flush», adopt.c) и при выходе
+ * резолвера (proxy.c, после цикла). Писать при каждой новой паре было бы проще, но на телефоне
+ * файл лежит на флеше, а новых имён в сети — сотни в час; здесь же запись одна на apply. Ничего
+ * не менялось — ничего и не пишется. */
+void fakeip_state_flush(void) {
+    if (!g_fakeip_dirty) return;
+    fakeip_state_rewrite();
+    g_fakeip_dirty = 0;
+    g_fakeip_last_rewrite = time(NULL);
+}
+
 /* Looks up domain's existing fake IP, or allocates the next free one and
  * persists it. Returns 0 and fills *out_addr (host order) on success; -1 if
  * the pool is exhausted (caller falls back to relaying the real answer
@@ -617,19 +635,35 @@ static void route_reassert6(struct fakeip_entry *e, uint64_t want) {
  * (real_host, has_real6), а «знаем» (real_saved, has_real6_saved) остаётся: файл пишет его, а
  * подмену ставит этот же проход, как только таблица появится, — его зовут и после каждой новой
  * таблицы (reassert после загрузки набора правил демоном, SIGHUP без демона). Ставится именно
- * «знаем»: в ядре после замены набора лежит засев из файла — то же значение, и ответ ядра EEXIST. */
+ * «знаем».
+ *
+ * ПО ЯДРУ, А НЕ ПО EEXIST (проверка на QEMU 98b7964, docs/architecture.md, раздел 5). В ядре после
+ * замены набора лежит засев из файла, и прежде здесь считалось, что это то же значение: простой
+ * add, EEXIST — «желаемое состояние». Файл же отставал от памяти до минуты (перезапись раз в
+ * FAKEIP_ANSWER_TTL): dnsmasq отдал n1 = .10, карта и память — .10, в файле ещё .11; замена набора
+ * засеяла .11, add ответил EEXIST, память осталась при .10, а повторный вопрос n1 шёл быстрым
+ * путём по real_host и ничего не менял — клиенты n1 ходили на .11 до перезапуска резолвера. Теперь
+ * загрузчик перед засевом просит резолвер записать файл (просьба «flush», adopt.c), и засев с
+ * памятью совпадает, но окно между записью и nft -f остаётся, а резолвер может и не ответить
+ * вовремя. Поэтому подмена ставится по тому, что стоит в ядре (nft_map_ensure_element: спросить
+ * элемент, другое значение — заменить одной транзакцией), и real_host после этого прохода значит
+ * ровно то, что обещает быстрому пути: в карте ядра стоит этот адрес. Исправленные — в
+ * g_fakeip_fixed (строка журнала у reassert_routes). */
 /* ПОРЯДОК В ЗАПИСИ — СНАЧАЛА НАБОРЫ КАНАЛОВ, ПОТОМ КАРТА. Подмена без метки — это утечка: пакет
  * клиента с поддельным адресом в кэше разворачивается картой в настоящий адрес и, не найдя себя в
  * наборе канала, уходит по таблице main в WAN (перепроверка на QEMU, 2026-09-28,
  * docs/architecture.md, раздел 5). Метка без подмены — нет: помеченный пакет к поддельному адресу
  * подмены не находит и дальше правила за dnat не идёт (generate.c, fakeip_nomap_drop). Поэтому
  * между двумя транзакциями одной записи наборы уже стоят, а карта — ещё нет, а не наоборот. После
- * замены набора правил оба уже засеяны текстом (src/dnsd/fpseed.c), и здесь всё — EEXIST; порядок
+ * замены набора правил оба уже засеяны текстом (src/dnsd/fpseed.c), и здесь всё уже стоит; порядок
  * решает там, где засева не было: первый запуск резолвера, старый набор правил, засев не
  * собрался. Не встала карта IPv6 — элементы IPv6 снимаются обратно (адресом AAAA на такое имя
  * больше не отвечают, как и прежде). */
+size_t g_fakeip_fixed;
+
 size_t fakeip_rehydrate(int nk_open, size_t *routed_out) {
     size_t restored = 0, routed = 0;
+    g_fakeip_fixed = 0;
     for (size_t i = 0; i < g_fakeip.n; i++) {
         struct fakeip_entry *e = &g_fakeip.entries[i];
         uint64_t all = 0, m = 0;
@@ -645,12 +679,14 @@ size_t fakeip_rehydrate(int nk_open, size_t *routed_out) {
         }
         uint32_t want = e->real_host ? e->real_host : e->real_saved;
         if (want) {
-            /* known_real = 0: after a restart the kernel map is empty as far as we know, so
-             * this is a plain add (and an EEXIST just means the map survived). Отказ гасит только
-             * «стоит в ядре»; real_saved остаётся (см. выше). */
-            if (nk_open == 0 && nft_map_set_element(g_fakeip_map, e->addr, want, 0) == 0) {
+            /* Что стоит в ядре, память не знает (засев из файла, карта, пережившая резолвер) —
+             * спрашивается само ядро (см. выше, «ПО ЯДРУ»). Отказ гасит только «стоит в ядре»;
+             * real_saved остаётся. */
+            int mrc = nk_open == 0 ? nft_map_ensure_element(g_fakeip_map, e->addr, want) : -1;
+            if (mrc >= 0) {
                 e->real_host = e->real_saved = want;
                 restored++;
+                if (mrc > 0) g_fakeip_fixed++;
             } else {
                 e->real_saved = want;
                 e->real_host = 0;
@@ -671,11 +707,13 @@ size_t fakeip_rehydrate(int nk_open, size_t *routed_out) {
         if (e->has_real6_saved) {
             uint8_t f6[16];
             fakeip6_of(e->addr, f6);
-            if (nft_map_set_element6(g_fakeip6_map, f6, e->real6, NULL) != 0) {
+            int mrc = nft_map_ensure_element6(g_fakeip6_map, f6, e->real6);
+            if (mrc < 0) {
                 e->has_real6 = 0;             /* «знаем» (has_real6_saved) остаётся */
                 if (e->sets6) route_reassert6(e, 0);
             } else {
                 e->has_real6 = 1;
+                if (mrc > 0) g_fakeip_fixed++;
             }
         }
     }

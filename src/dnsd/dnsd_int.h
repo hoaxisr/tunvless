@@ -328,6 +328,11 @@ long fakeip_find(const char *domain);
 int fakeip_lookup_or_alloc(const char *domain_in, uint32_t *out_addr);
 void fakeip_state_load(const char *path);
 void fakeip_state_rewrite(void);
+/* Файл состояния — сейчас, если в памяти есть незаписанное (g_fakeip_dirty): просьба «flush»
+ * загрузчика набора правил (adopt.c), выход резолвера и срок перезаписи в цикле (proxy.c). */
+void fakeip_state_flush(void);
+/* Сколько подмен последний fakeip_rehydrate нашёл в ядре с другим значением и заменил. */
+extern size_t g_fakeip_fixed;
 uint32_t fakeip_entry_get_real(const char *domain);
 /* Настоящий адрес, который знаем: стоящий в ядре, а если не стоит — из файла или прошлого ответа
  * (real_saved). 0 — не знаем. Им сверяется новый ответ и смена значения в карте. */
