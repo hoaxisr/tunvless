@@ -48,6 +48,17 @@ COPY wolfssl/fetch.sh /opt/steer-wolfssl-fetch.sh
 RUN sh /opt/steer-wolfssl-fetch.sh /opt/wolfssl \
  && ls /opt/wolfssl/wolfssl/wolfcrypt/settings.h
 
+# ngtcp2 (QUIC, шаг 7 выпуска 1.10) — тем же способом: версия и сумма записаны в build/ngtcp2/fetch.sh,
+# образ копирует скрипт вместе с нашими патчами (Brutal) и зовёт его; скрипт сверяет sha256 и накладывает
+# патчи. Другая версия или другой патч — другой слой, образ пересобирается сам. Утилита patch в
+# базовом Alpine отсутствует (busybox собран без неё), поэтому ставится пакетом. Готовых .a нет
+# по той же причине, что у wolfSSL: рецепт build/ngtcp2/build.sh собирает под нужную цель.
+RUN apk add --no-cache patch
+COPY ngtcp2/fetch.sh /opt/steer-ngtcp2/fetch.sh
+COPY ngtcp2/patches /opt/steer-ngtcp2/patches
+RUN sh /opt/steer-ngtcp2/fetch.sh /opt/ngtcp2 \
+ && ls /opt/ngtcp2/lib/ngtcp2_brutal.c
+
 # ЗАПЛАТКА ЗАГЛУШКИ libc.so ДЛЯ 32-БИТНЫХ ЦЕЛЕЙ (шаг 4 выпуска 1.10, разделяемая раскладка).
 #
 # Статический бинарник zig собирает с настоящим musl (libc.a из исходников), и там всё на месте. Но
@@ -68,5 +79,6 @@ RUN f="/opt/zig-linux-x86_64-${ZIG_VERSION}/lib/libc/musl/libc.S" \
  && test "$(grep -c '^#ifdef PTR32$' "$f")" = 0
 
 ENV WOLFSSL_DIR=/opt/wolfssl
+ENV NGTCP2_DIR=/opt/ngtcp2
 WORKDIR /src
 ENTRYPOINT ["/usr/local/bin/zig"]

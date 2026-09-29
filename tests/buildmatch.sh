@@ -782,7 +782,8 @@ check "Android.bp: движок компонуется с libsteer_wolfssl" "1" 
 # заголовках нет, и сменить её — правка одного файла. Обещание держится только проверкой: один
 # #include <wolfssl/...> в tls13.c вернул бы и зависимость стендов `make test` от библиотеки, и
 # второе место, где живёт её API.
-check "заголовки wolfSSL включает только src/lib/scrypto.c" "src/lib/scrypto.c " \
+# Второй файл — src/proto/quic/qcssl.c: ngtcp2 берёт не примитивы, а сам TLS-стек (см. шапку qcssl.h).
+check "заголовки wolfSSL включают только scrypto.c и qcssl.c" "src/lib/scrypto.c src/proto/quic/qcssl.c " \
     "$(grep -rlE '#include [<"]wolfssl/' src | sort | tr '\n' ' ')"
 check "в src не осталось вызовов mbedtls" "" \
     "$(grep -rhoE '\<mbedtls_[a-z0-9_]+\(' src | sort -u | tr '\n' ' ')"
@@ -847,7 +848,8 @@ check "раскладка: libsteer не несёт демона, компиля
 cat "$sd/libsteer" "$sd/steerd" "$sd/mod_vless" "$sd/mod_xsteer" "$sd/mod_obfs" "$sd/mod_tgws" | sort -u > "$sd/all"
 check "раскладка покрывает расширенный профиль (кроме файла профиля)" "src/profile/extended.c " \
     "$(comm -23 "$sd/extended" "$sd/all" | tr '\n' ' ')"
-check "  и добавляет только точки входа модулей" "src/modules/main_obfs.c src/modules/main_tgws.c src/modules/main_vless.c src/modules/main_xsteer.c " \
+# (Обёртка QUIC src/proto/quic — в libsteer, в статическом профиле её нет: потребителя нет, телефону — шаг 6.)
+check "  и добавляет только точки входа модулей и обёртку QUIC" "src/modules/main_obfs.c src/modules/main_tgws.c src/modules/main_vless.c src/modules/main_xsteer.c src/proto/quic/qcssl.c src/proto/quic/quic.c " \
     "$(comm -13 "$sd/extended" "$sd/all" | tr '\n' ' ')"
 # Точка входа — единственный main() модуля; steerd свой main держит в daemon/main.c.
 for a in vless xsteer obfs tgws; do
@@ -992,6 +994,18 @@ check "ни один стенд не включает .c из model/compile/lib/
 c_inc_n=$(grep -lE '#include "\.\./src/[^"]*\.c"' tests/*.c | wc -l | tr -d ' ')
 check "стендов с #include .c из src не больше 27 (было 34 до unit.h/линковки, 30 до стека 1.10)" "1" \
     "$([ "$c_inc_n" -le 27 ] && echo 1 || echo 0)"
+
+# ---- ngtcp2 (шаг 7 выпуска 1.10) ---------------------------------------------------------------
+# Версия и сумма записаны только в build/ngtcp2/fetch.sh; образ берёт исходники им же вместе с патчами,
+# а список файлов рецепта не должен расходиться с тем, что собирают build-libs.sh и libs-exports.sh.
+check "ngtcp2: сумма sha256 записана в fetch.sh" "1" \
+    "$(grep -cE '^NGTCP2_SHA256=[0-9a-f]{64}$' build/ngtcp2/fetch.sh)"
+check "ngtcp2: образ сборщика берёт исходники через fetch.sh с патчами" "1 1" \
+    "$(grep -c 'COPY ngtcp2/patches' build/Dockerfile) $(grep -c 'ngtcp2/fetch.sh /opt/ngtcp2' build/Dockerfile)"
+check "ngtcp2: build-libs.sh и libs-exports.sh собирают её рецептом build/ngtcp2/build.sh" "2" \
+    "$(grep -l 'build/ngtcp2/build.sh' build/build-libs.sh build/libs-exports.sh | wc -l | tr -d ' ')"
+check "ngtcp2: патчи Brutal — в build/ngtcp2/patches" "1" \
+    "$(ls build/ngtcp2/patches/*.patch | wc -l | tr -d ' ')"
 
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi

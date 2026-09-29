@@ -31,7 +31,7 @@ xsteer — [docs/xsteer.md](xsteer.md).
 
 | Файл | Список | Что в нём |
 |---|---|---|
-| `libsteer-wolfssl.so.<версия wolfSSL>` | `build/wolfssl/build.sh` | наша сборка wolfSSL (`build/wolfssl/user_settings.h`, QUIC включён) — только достижимое от экспорта |
+| `libsteer-wolfssl.so.<версия wolfSSL>` | `build/wolfssl/build.sh` | наша сборка wolfSSL (`build/wolfssl/user_settings.h`, QUIC включён) — только достижимое от экспорта; в `libsteer.so` — ещё ngtcp2 с патчем Brutal и обёртка `src/proto/quic` |
 | `libsteer.so.<версия движка>` | `LIBSTEER_SRC` | модель спеки с libyaml, платформа, реестр и файлы видов, разбор командной строки, линия событий, обфускатор (`obfs.c`), слой примитивов, TLS 1.3, REALITY, h2, транспорты, стек TUN и `tun.c` |
 | `steerd` | `STEERD_DYN_SRC` = `DAEMON_SRC` + `urltls.c` | демон, компилятор правил, apply, сторож, супервизор, резолвер, заглушки команд модулей (`src/cli/modcmd.c`) |
 | `steer-vless` | `VLESS_MODULE_SRC` | клиент VLESS: `vlmain`, `vldial`, `vlwatch`, `client`, `vless_proto`, `vision`, разбор и скачивание подписки, проба TLS |
@@ -452,6 +452,22 @@ wolfSSL включает один `src/lib/scrypto.c` (buildmatch). Свои TLS
 массивом `steer_wolfssl_abi` загруженной библиотеки; расхождение — строка в stderr и выход с кодом
 3). На роутере wolfSSL пакета `libwolfssl` не используется: в нём нет QUIC, а его SONAME несёт
 хеш опций.
+
+**QUIC как слой.** QUIC-соединение для DoQ и hysteria2 даёт `src/proto/quic` — тонкая обёртка над
+ngtcp2, целиком в `libsteer.so`. Сама ngtcp2 — выпуск с закреплёнными версией и суммой
+(`build/ngtcp2/fetch.sh`, лицензия MIT), в дереве не лежит: скрипт скачивает архив, сверяет sha256 и
+накладывает наши патчи (`build/ngtcp2/patches`). Собирается она своим рецептом `build/ngtcp2/build.sh`
+(все файлы `lib/` и криптобэкенд `crypto/wolfssl`, `build/ngtcp2/config.h` вместо порождаемого
+configure) в статический архив с `-fPIC`; nghttp3 не берётся. Криптобэкенд зовёт TLS-стек и
+`wolfSSL_quic_*` из `libsteer-wolfssl.so`, поэтому опции wolfSSL включают QUIC, слой EVP и AES-ECB
+(защита заголовка пакета). Заголовки wolfSSL видят два файла: `scrypto.c` и `src/proto/quic/qcssl.c`
+(ngtcp2 нужен сам TLS-стек, а не примитивы); `quic.c` держит сокет, потоки, датаграммы RFC 9221 и
+таймер и wolfSSL не видит. Модель выполнения — внешняя линия событий: соединение отдаёт дескриптор
+UDP-сокета и срок таймера (`qc_fd`, `qc_timeout_ms`), потребитель зовёт `qc_on_readable` и
+`qc_on_timer`. Перегрузка по умолчанию — CUBIC; при `brutal_bps` — Brutal из hysteria2, патч к
+ngtcp2: заданная скорость в байтах в секунду, окно `bps × RTT × 2 / доля подтверждённых пакетов`,
+без снижения при потерях. Потребителей в движке пока нет; из `libsteer.so` торчит интерфейс `qc_*`
+ради стенда `tests/qcbench.c` (`build/libs-exports.sh`).
 
 ### DNS
 

@@ -1,6 +1,7 @@
 /* Экспорт libsteer.so — ЭТОТ ФАЙЛ ПОРОЖДАЕТ build/libs-exports.sh (gen), руками не правится.
  * Символы, которые steerd и модули (steer-vless, steer-xsteer, steer-obfs, steer-tgws) берут
- * из библиотеки; остальное скрыто (-fvisibility=hidden + local: *). Проверка: check. */
+ * из библиотеки, и программный интерфейс QUIC (qc_*), который берёт стенд QUIC_STAND_SRC, пока
+ * настоящих потребителей нет; остальное скрыто (local: *). Проверка: check. */
 LIBSTEER_1 {
   global:
     awg_apply_all;
@@ -149,6 +150,13 @@ LIBSTEER_1 {
     probe_source;
     proc_cmdline_find;
     prof;
+    qc_close;
+    qc_free;
+    qc_open;
+    qc_run;
+    qc_stats_get;
+    qc_stream_open;
+    qc_stream_send;
     reality_build_hello;
     reality_build_hello_carry;
     registry_assign;

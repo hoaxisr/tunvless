@@ -471,8 +471,9 @@ aarch64 — статические.
 ## Лицензия
 
 steer распространяется под [GNU GPL v3](LICENSE). Сторонний код: libyaml
-(`src/third_party/libyaml`, лицензия MIT) и wolfSSL, который в дереве не лежит, а собирается в
-расширенный пакет из исходников (GPLv3).
+(`src/third_party/libyaml`, лицензия MIT), wolfSSL и ngtcp2 (лицензия MIT, с нашим патчем Brutal),
+которые в дереве не лежат, а скачиваются и собираются в расширенный пакет из исходников
+(wolfSSL — GPLv3; версии и суммы — `build/wolfssl/fetch.sh`, `build/ngtcp2/fetch.sh`).
 
 ## Документация
 

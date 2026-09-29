@@ -146,6 +146,10 @@ cc_defaults {
         "src/proto/vless",
         "src/proto/xsteer",
         "src/proto/tgws",
+        // QUIC (step 7 of 1.10) lives in libsteer on the router only. TODO(step 6): a
+        // libsteer_ngtcp2 module from a fork external/der-ngtcp2 (upstream + build/ngtcp2/patches,
+        // build/ngtcp2/config.h) once the phone gets a QUIC consumer; nothing here uses it yet.
+        "src/proto/quic",
         "src/modules",
         "src/client",
         "src/third_party/libyaml",
