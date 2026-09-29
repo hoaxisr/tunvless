@@ -68,9 +68,13 @@ filegroup {
         "wolfcrypt/src/rsa.c",
         "wolfcrypt/src/sha.c",
         "wolfcrypt/src/sha256.c",
+        "wolfcrypt/src/sha3.c",
         "wolfcrypt/src/sha512.c",
         "wolfcrypt/src/sp_int.c",
         "wolfcrypt/src/wc_encrypt.c",
+        "wolfcrypt/src/wc_mldsa.c",
+        "wolfcrypt/src/wc_mlkem.c",
+        "wolfcrypt/src/wc_mlkem_poly.c",
         "wolfcrypt/src/wc_port.c",
         "wolfcrypt/src/wolfmath.c",
         // Встроенный ассемблер aarch64 (WOLFSSL_ARMASM_INLINE в user_settings.h); на x86_64 эти
@@ -81,5 +85,6 @@ filegroup {
         "wolfcrypt/src/port/arm/armv8-sha256-asm_c.c",
         "wolfcrypt/src/port/arm/armv8-sha512-asm_c.c",
         "wolfcrypt/src/port/arm/armv8-curve25519_c.c",
+        "wolfcrypt/src/port/arm/armv8-sha3-asm_c.c",
     ],
 }

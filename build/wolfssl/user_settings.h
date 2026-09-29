@@ -126,6 +126,40 @@
 #define ECC_SHAMIR
 #define ECC_TIMING_RESISTANT
 
+/* ---- постквантовая часть (паритет с Xray-core) ------------------------------------------ */
+/* ML-KEM-768 - половина гибрида X25519MLKEM768 в TLS 1.3 (ClientHello Chrome 131+, ответ
+ * сервера REALITY) и обмен «mlkem768x25519plus» у VLESS encryption. ML-KEM-512 и -1024 не
+ * нужны никому из тех, кого клиент встречает (Xray и Go используют ровно 768), и без них
+ * снимается треть таблиц и кода.
+ *
+ * SHA-3 (SHAKE128/256, SHA3-256/512) - то, на чём стоит ML-KEM: матрица A разворачивается из seed
+ * SHAKE128, шум - SHAKE256, хеши ключа и шифротекста - SHA3.
+ *
+ * ML-DSA-65 нужна ТОЛЬКО ДЛЯ ПРОВЕРКИ: REALITY кладёт подпись в расширение поддельного
+ * сертификата, и клиент, у которого в узле задан mldsa65Verify (`pqv` в ссылке), обязан её
+ * проверить. Подписывать и выпускать ключи мы не будем никогда, поэтому VERIFY_ONLY снимает
+ * подпись, генерацию и разбор закрытого ключа; ASN.1-разбор не нужен (ключ приходит сырым 1952
+ * байта). Экономящих память вариантов (SMALL_MEM) не берём: проверка редкая, но скорость не
+ * режем ради килобайт (решение владельца: скорость важнее веса). */
+/* ML-KEM — переносимым C, без ассемблера aarch64 (WOLFSSL_ARMASM у wolfSSL включает armv8-mlkem-asm, а тот
+ * требует SQRDMLAH из ARMv8.1 (`rdm`): на Cortex-A53 роутеров и в базовой цели NDK его нет, ассемблер
+ * отказывает в сборке). Скорость: рукопожатие делает по одному keygen и decaps на соединение, это доли
+ * миллисекунды у x86 и единицы у слабых ядер; узким местом оно не бывает. */
+#define WC_MLKEM_NO_ASM
+#define WOLFSSL_HAVE_MLKEM
+#define WOLFSSL_WC_MLKEM
+#define WOLFSSL_NO_ML_KEM_512
+#define WOLFSSL_NO_ML_KEM_1024
+#define WOLFSSL_SHA3
+#define WOLFSSL_SHAKE128
+#define WOLFSSL_SHAKE256
+#define WOLFSSL_HAVE_MLDSA
+#define WOLFSSL_WC_MLDSA
+#define WOLFSSL_MLDSA_VERIFY_ONLY
+#define WOLFSSL_MLDSA_NO_ASN1
+#define WOLFSSL_NO_ML_DSA_44
+#define WOLFSSL_NO_ML_DSA_87
+
 #define WC_RSA_PSS
 /* Соль PSS любой длины — как MBEDTLS_RSA_SALT_LEN_ANY прежде: RFC 8446 требует соль длиной с
  * хеш, но встречаются серверы (и переподписывающие посредники), у которых она другая, и

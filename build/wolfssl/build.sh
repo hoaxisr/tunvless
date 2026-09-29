@@ -46,14 +46,14 @@ wolfssl_c_files() {
     # ge_operations.c — групповая математика Ed25519: X25519 берёт её для открытого ключа там, где
     # у кривой свой ассемблер (aarch64, CURVED25519_ASM_64BIT); на остальных целях файл пуст.
     for f in aes asn chacha chacha20_poly1305 coding cpuid curve25519 ecc error fe_operations \
-             ge_operations hash hmac kdf logging memory poly1305 random rsa sha sha256 sha512 \
-             sp_int wc_encrypt wc_port wolfmath; do
+             ge_operations hash hmac kdf logging memory poly1305 random rsa sha sha256 sha3 sha512 \
+             sp_int wc_encrypt wc_mldsa wc_mlkem wc_mlkem_poly wc_port wolfmath; do
         echo "wolfcrypt/src/$f.c"
     done
     # Встроенный ассемблер aarch64 (WOLFSSL_ARMASM_INLINE в user_settings.h). Файлы в каждом
     # списке, а не только у aarch64: вне его они компилируются в пустоту (#ifdef __aarch64__
     # внутри), и список остаётся одним на все цели и на Android.bp.
-    for f in aes-asm_c chacha-asm_c poly1305-asm_c sha256-asm_c sha512-asm_c curve25519_c; do
+    for f in aes-asm_c chacha-asm_c poly1305-asm_c sha256-asm_c sha512-asm_c curve25519_c sha3-asm_c; do
         echo "wolfcrypt/src/port/arm/armv8-$f.c"
     done
 }

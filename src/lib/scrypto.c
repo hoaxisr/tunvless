@@ -36,8 +36,11 @@
 #include <wolfssl/wolfcrypt/asn_public.h>
 #include <wolfssl/wolfcrypt/hash.h>
 #include <wolfssl/wolfcrypt/memory.h>
+#include <wolfssl/wolfcrypt/wc_mlkem.h>
+#include <wolfssl/wolfcrypt/wc_mldsa.h>
 
 #include "scrypto.h"
+#include "blake3.h"
 
 /* ---- хранилища против настоящих размеров --------------------------------------------------
  *
@@ -381,6 +384,86 @@ static int ct_equal(const unsigned char *a, const unsigned char *b, size_t n) {
     return d == 0;
 }
 
+/* ---- ML-KEM-768 ------------------------------------------------------------------------------ */
+
+/* Ключ заводится на время вызова через wc_MlKemKey_New (куча), а не значением в структуре вызывающего:
+ * так его размер не входит в ABI между libsteer и libsteer-wolfssl (sc_abi_check) и не раздувает
+ * struct tls13. Цена — один malloc на рукопожатие, ничто по сравнению с самим ML-KEM. */
+static MlKemKey *kem_new(void) {
+    return wc_MlKemKey_New(WC_ML_KEM_768, NULL, INVALID_DEVID);
+}
+
+int sc_mlkem768_keygen(unsigned char ek[SC_MLKEM768_EK], unsigned char dk[SC_MLKEM768_DK],
+                       const unsigned char seed[SC_MLKEM768_SEED]) {
+    MlKemKey *k = kem_new();
+    if (!k) return SC_ENOMEM;
+    int rc = SC_ECRYPTO;
+    if (wc_MlKemKey_MakeKeyWithRandom(k, seed, SC_MLKEM768_SEED) == 0 &&
+        wc_MlKemKey_EncodePublicKey(k, ek, SC_MLKEM768_EK) == 0 &&
+        wc_MlKemKey_EncodePrivateKey(k, dk, SC_MLKEM768_DK) == 0)
+        rc = 0;
+    wc_MlKemKey_Delete(k, &k);
+    return rc;
+}
+
+int sc_mlkem768_ek_check(const unsigned char ek[SC_MLKEM768_EK]) {
+    MlKemKey *k = kem_new();
+    if (!k) return SC_ENOMEM;
+    unsigned char back[SC_MLKEM768_EK];
+    int rc = SC_EPARSE;
+    /* DecodePublicKey у wolfSSL проверяет коэффициенты (< q), но проверку подтверждаем круговым
+     * кодированием: Go сверяет ровно так (FIPS 203, 7.2), и расхождение здесь означало бы, что
+     * ключ, отвергнутый сервером, мы принимаем. */
+    if (wc_MlKemKey_DecodePublicKey(k, ek, SC_MLKEM768_EK) == 0 &&
+        wc_MlKemKey_EncodePublicKey(k, back, sizeof back) == 0 &&
+        ct_equal(ek, back, sizeof back))
+        rc = 0;
+    wc_MlKemKey_Delete(k, &k);
+    return rc;
+}
+
+int sc_mlkem768_encaps(unsigned char ct[SC_MLKEM768_CT], unsigned char ss[SC_MLKEM768_SS],
+                       const unsigned char ek[SC_MLKEM768_EK], const unsigned char rnd[SC_MLKEM768_RND]) {
+    MlKemKey *k = kem_new();
+    if (!k) return SC_ENOMEM;
+    int rc = SC_EPARSE;
+    unsigned char back[SC_MLKEM768_EK];
+    if (wc_MlKemKey_DecodePublicKey(k, ek, SC_MLKEM768_EK) == 0 &&
+        wc_MlKemKey_EncodePublicKey(k, back, sizeof back) == 0 && ct_equal(ek, back, sizeof back))
+        rc = wc_MlKemKey_EncapsulateWithRandom(k, ct, ss, rnd, SC_MLKEM768_RND) == 0 ? 0 : SC_ECRYPTO;
+    wc_MlKemKey_Delete(k, &k);
+    return rc;
+}
+
+int sc_mlkem768_decaps(unsigned char ss[SC_MLKEM768_SS], const unsigned char dk[SC_MLKEM768_DK],
+                       const unsigned char ct[SC_MLKEM768_CT]) {
+    MlKemKey *k = kem_new();
+    if (!k) return SC_ENOMEM;
+    int rc = SC_EPARSE;
+    if (wc_MlKemKey_DecodePrivateKey(k, dk, SC_MLKEM768_DK) == 0)
+        rc = wc_MlKemKey_Decapsulate(k, ss, ct, SC_MLKEM768_CT) == 0 ? 0 : SC_ECRYPTO;
+    wc_MlKemKey_Delete(k, &k);
+    return rc;
+}
+
+/* ---- ML-DSA-65: только проверка --------------------------------------------------------------- */
+
+int sc_mldsa65_verify(const unsigned char pk[SC_MLDSA65_PK], const unsigned char *msg, size_t msg_n,
+                      const unsigned char *sig, size_t sig_n) {
+    if (sig_n != SC_MLDSA65_SIG) return SC_ESIG;
+    wc_MlDsaKey *k = wc_MlDsaKey_New(NULL, INVALID_DEVID);
+    if (!k) return SC_ENOMEM;
+    int rc = SC_EPARSE, res = 0;
+    if (wc_MlDsaKey_SetParams(k, WC_ML_DSA_65) == 0 &&
+        wc_MlDsaKey_ImportPubRaw(k, pk, SC_MLDSA65_PK) == 0) {
+        int vr = wc_MlDsaKey_VerifyCtx(k, sig, (word32)sig_n, NULL, 0, msg, (word32)msg_n, &res);
+        rc = (vr == 0 && res == 1) ? 0 : SC_ESIG;
+    }
+    wc_MlDsaKey_Delete(k, &k);
+    return rc;
+}
+
+
 static int mgf_of(enum sc_hash h) {
     switch (h) {
         case SC_SHA256: return WC_MGF1SHA256;
@@ -591,4 +674,13 @@ out:
     if (sk) wolfSSL_sk_X509_pop_free(sk, wolfSSL_X509_free);
     wolfSSL_X509_free(leaf);
     return rc;
+}
+
+/* ---- BLAKE3 --------------------------------------------------------------------------------- */
+
+void sc_blake3_hash(unsigned char out[32], const void *in, size_t n) { b3_hash(out, in, n); }
+
+void sc_blake3_derive_key(unsigned char *out, size_t out_n, const void *ctx, size_t ctx_n,
+                          const void *material, size_t material_n) {
+    b3_derive_key(out, out_n, ctx, ctx_n, material, material_n);
 }
