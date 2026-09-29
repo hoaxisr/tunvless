@@ -1742,7 +1742,7 @@ void awg_status_json(FILE *out, const struct output *o) {
  * таблица, masquerade. Отличие — чья жизнь устройства: его заводит apply и снимает down, поэтому
  * out_engine_managed про него правда (ifdown/ifup netifd бесполезны), а out_self_natting — ложь:
  * адреса клиентов уходят в туннель как есть и переводятся в адрес туннеля, ровно как у
- * wireguard под netifd. В базовой сборке, а не в extended: ни TLS, ни mbedtls ему не нужны,
+ * wireguard под netifd. В базовой сборке, а не в extended: ни TLS, ни криптобиблиотека ему не нужны,
  * только netlink. */
 static int awg_parse(struct output *o, const struct out_keys *k, struct err *e) {
     snprintf(o->awg.conf, sizeof(o->awg.conf), "%s", k->conf);

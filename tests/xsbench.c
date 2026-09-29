@@ -26,10 +26,12 @@
  * потоков и посмотреть, растёт ли сумма линейно. Если не растёт, значит состояние всё-таки
  * общее, и это надо знать до того, как оно проявится под нагрузкой.
  *
- * Нужен настоящий mbedtls (здесь СЧИТАЕТСЯ шифр), поэтому в make test стенд не входит.
- * Собрать и запустить:
- *     cc -O2 -w $(make -s print-inc) -I<mbedtls>/include -o build/xsbench tests/xsbench.c \
- *        src/proto/xsteer/xswire.c src/proto/tls/reality.c -lpthread <mbedtls>/library/libmbedcrypto.a
+ * Нужна настоящая криптобиблиотека (здесь СЧИТАЕТСЯ шифр), поэтому в make test стенд не входит.
+ * Собрать и запустить — после `make ext-test`, который собирает wolfSSL и слой под хост
+ * (build/wolfssl-host), либо под цель рецептом build/bench.sh:
+ *     cc -O2 -w $(make -s print-inc) -o build/xsbench tests/xsbench.c src/proto/xsteer/xswire.c \
+ *        src/proto/tls/reality.c src/proto/tls/certverify.c \
+ *        build/wolfssl-host/scrypto-cc.o build/wolfssl-host/libwolfssl-cc.a -lpthread
  *     ./build/xsbench [размер_нагрузки] [секунд_на_замер] [потоков]
  */
 #define _GNU_SOURCE

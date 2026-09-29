@@ -1,4 +1,4 @@
-/* xsteer: разбор конфигурации в стиле WireGuard. Почему строго и почему без mbedtls —
+/* xsteer: разбор конфигурации в стиле WireGuard. Почему строго и почему без криптографии —
  * в xsconf.h. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>

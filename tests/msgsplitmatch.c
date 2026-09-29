@@ -36,14 +36,11 @@ int tls13_read(struct tls13 *t, unsigned char *o, size_t c, size_t *g)
 void tls13_free(struct tls13 *t) { (void)t; }
 int tls12_handshake(struct tls13 *t, int fd, const char *sni)
 { (void)t; (void)fd; (void)sni; return -1; }
-void mbedtls_aes_init(mbedtls_aes_context *c) { (void)c; }
-void mbedtls_aes_free(mbedtls_aes_context *c) { (void)c; }
-int mbedtls_aes_setkey_enc(mbedtls_aes_context *c, const unsigned char *k, unsigned int b)
-                                        { (void)c; (void)k; (void)b; return 0; }
-int mbedtls_aes_crypt_ctr(mbedtls_aes_context *c, size_t n, size_t *off, unsigned char *nc,
-                          unsigned char *sb, const unsigned char *in, unsigned char *out)
-                                        { (void)c; (void)off; (void)nc; (void)sb;
-                                          memcpy(out, in, n); return 0; }
+int sc_aesctr_init(struct sc_aesctr *c, const unsigned char key[32], const unsigned char iv[16])
+                                        { (void)key; (void)iv; c->ready = 1; return 0; }
+int sc_aesctr_xor(struct sc_aesctr *c, const unsigned char *in, unsigned char *out, size_t n)
+                                        { (void)c; memmove(out, in, n); return 0; }
+void sc_aesctr_free(struct sc_aesctr *c) { c->ready = 0; }
 /* Мосту (cmd_tgws) эти две функции нужны на этапе разбора спеки — этот стенд его не зовёт, но
  * символы обязаны разрешиться на линковке: спека — значение, а не глобалы (правило 6,
  * docs/architecture.md, раздел 2), поэтому здесь больше нет и мока g_out/g_out_n — cmd_tgws с

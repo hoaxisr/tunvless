@@ -8,13 +8,14 @@
  * корней не прочиталось», а на роутере этого не видно никогда — там путь другой.
  *
  * ЧТО ПРОВЕРЯЕТСЯ. Первый каталог списка отсутствует, второй пуст — берётся третий; в нём файлы в формате
- * Android (текст перед PEM), и из склейки mbedtls разбирает ровно столько сертификатов,
- * сколько файлов; скрытые файлы пропускаются; повторный вызов отдаёт тот же путь, не
+ * Android (текст перед PEM), и из склейки разбирается ровно столько сертификатов, сколько
+ * файлов, а хранилище корней слоя (sc_roots_load — тем же путём его грузит certverify.c)
+ * склейку принимает; скрытые файлы пропускаются; повторный вызов отдаёт тот же путь, не
  * пересобирая; в каталоге состояния не остаётся времянок; заданный шов стенда (g_cert_roots)
  * главнее склейки.
  *
- * Сертификаты стенд выпускает сам (mbedtls_x509write), поэтому нужен mbedtls с
- * MBEDTLS_X509_CRT_WRITE_C — как у vlessmatch; без него стенд — громкий пропуск.
+ * Сертификаты стенд выпускает сам (tests/certgen.c, wolfCrypt с WOLFSSL_CERT_GEN) — как
+ * vlessmatch; собранный без STEER_HAVE_X509WRITE стенд — громкий пропуск.
  *
  * Сборка — tests/ext-test.sh. */
 #include <stdio.h>
@@ -31,11 +32,7 @@
 #include "../src/proto/tls/roots.c"
 #include <sys/random.h>
 
-#include "mbedtls/x509_crt.h"
-#include "mbedtls/pk.h"
-#include "mbedtls/ecp.h"
-#include "mbedtls/ctr_drbg.h"
-#include "mbedtls/entropy.h"
+#include "scrypto.h"
 
 static int g_fail, g_pass;
 static void check(const char *what, long want, long got) {
@@ -44,42 +41,24 @@ static void check(const char *what, long want, long got) {
 }
 
 #ifdef STEER_HAVE_X509WRITE
-#include "mbedtls/x509_csr.h"
-
-static int rng(void *ctx, unsigned char *out, size_t n) {
-    (void)ctx;
-    return getrandom(out, n, 0) == (ssize_t)n ? 0 : -1;
-}
+#include "certgen.h"
 
 /* Самоподписанный сертификат в PEM — корень, как в хранилище Android. */
 static int make_root(const char *cn, char *pem, size_t cap) {
-    mbedtls_pk_context key;
-    mbedtls_x509write_cert crt;
-    mbedtls_pk_init(&key);
-    mbedtls_x509write_crt_init(&crt);
-    int rc = mbedtls_pk_setup(&key, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
-    if (!rc) rc = mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(key), rng, NULL);
-    char name[128];
-    snprintf(name, sizeof name, "CN=%s,O=steer", cn);
-    if (!rc) rc = mbedtls_x509write_crt_set_subject_name(&crt, name);
-    if (!rc) rc = mbedtls_x509write_crt_set_issuer_name(&crt, name);
-    mbedtls_x509write_crt_set_subject_key(&crt, &key);
-    mbedtls_x509write_crt_set_issuer_key(&crt, &key);
-    mbedtls_x509write_crt_set_md_alg(&crt, MBEDTLS_MD_SHA256);
-    unsigned char serial[] = { 1 };
-    if (!rc) rc = mbedtls_x509write_crt_set_serial_raw(&crt, serial, sizeof serial);
-    if (!rc) rc = mbedtls_x509write_crt_set_validity(&crt, "20250101000000", "20450101000000");
-    if (!rc) rc = mbedtls_x509write_crt_set_basic_constraints(&crt, 1, -1);
-    if (!rc) rc = mbedtls_x509write_crt_pem(&crt, (unsigned char *)pem, cap, rng, NULL);
-    mbedtls_x509write_crt_free(&crt);
-    mbedtls_pk_free(&key);
+    struct tcg_key *key = tcg_key_new();
+    if (!key) return -1;
+    unsigned char der[2048];
+    size_t dn = 0;
+    int rc = tcg_issue(key, cn, "steer", 1, NULL, NULL, 0, der, sizeof(der), &dn);
+    if (rc == 0) rc = tcg_der_to_pem(der, dn, pem, cap);
+    tcg_key_free(key);
     return rc;
 }
 #endif
 
 int main(void) {
 #ifndef STEER_HAVE_X509WRITE
-    printf("androidroots: в этой mbedtls нет выпуска X.509 — ПРОПУСК\n");
+    printf("androidroots: собрано без выпуска X.509 (STEER_HAVE_X509WRITE) — ПРОПУСК\n");
     return 0;
 #else
     (void)system("rm -rf /tmp/steer-androidroots");
@@ -114,14 +93,17 @@ int main(void) {
     check("склейка: из третьего каталога (первого нет, второй пуст), в каталоге состояния", 0,
           p ? strcmp(p, "/tmp/steer-androidroots/state/ca-roots.pem") : -1);
 
-    mbedtls_x509_crt roots;
-    mbedtls_x509_crt_init(&roots);
-    int rc = p ? mbedtls_x509_crt_parse_file(&roots, p) : -1;
-    int n = 0;
-    for (mbedtls_x509_crt *c = &roots; c && c->version; c = c->next) n++;
-    check("склейка: разбор без ошибок (текст между PEM не мешает)", 0, rc);
-    check("склейка: сертификатов столько же, сколько файлов", N, n);
-    mbedtls_x509_crt_free(&roots);
+    static char glued[65536];
+    size_t gn = 0;
+    FILE *g = p ? fopen(p, "rb") : NULL;
+    if (g) { gn = fread(glued, 1, sizeof(glued) - 1, g); fclose(g); }
+    glued[gn] = '\0';
+    struct sc_roots *roots = NULL;
+    int rc = gn ? sc_roots_load(&roots, (const unsigned char *)glued, gn) : -1;
+    check("склейка: хранилище корней её принимает (текст между PEM не мешает)", 0, rc);
+    check("склейка: сертификатов столько же, сколько файлов", N,
+          tcg_count_pem_certs(glued, gn));
+    sc_roots_free(roots);
 
     check("повторный вызов: тот же путь", 1, cert_roots() == p);
 

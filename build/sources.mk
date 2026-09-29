@@ -136,6 +136,16 @@ CORE_SRC := src/lib/run.c src/lib/jsonw.c src/lib/evline.c src/compile/groups.c 
             src/daemon/folat.c src/lib/ctlcall.c \
             $(KINDS_BASE_SRC)
 
+# Слой криптографических примитивов (src/lib/scrypto.h, docs/architecture.md, «1.10 — решения
+# владельца», шаг 1): единственный файл движка, который видит wolfSSL. Лежит в src/lib, потому
+# что это кирпич библиотеки (в 1.10 он уходит в libsteer.so вместе с TLS и стеком), но в профиль
+# base не входит: базовому движку криптография не нужна, и библиотеки в его сборке нет. Поэтому
+# отдельной переменной — как KINDS_EXT_SRC, у которых тот же расклад: каталог ядра, профили
+# полного пакета (tests/buildmatch.sh сверяет каталоги ядра с base вместе с обеими). Собирается
+# с опциями wolfSSL (-DWOLFSSL_USER_SETTINGS, -I на build/wolfssl и исходники библиотеки) —
+# остальным файлам движка они ничего не значат.
+CRYPTO_SRC := src/lib/scrypto.c
+
 # Общее для обеих ролей: формат кадра, конфигурация, маршрутизация, рукопожатие, соединение
 # и то, на чём они стоят (TLS-записи, примитивы Reality, TUN). Расходиться на проводе этим
 # половинам негде — кода формата ровно один экземпляр, и это ровно та гарантия, которая
@@ -154,7 +164,7 @@ XS_COMMON_SRC := src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/x
                  src/proto/xsteer/xsstream.c src/proto/xsteer/xsepoch.c \
                  src/proto/tls/tls13.c src/proto/tls/certverify.c \
                  src/proto/tls/reality.c src/tunnel/tun.c src/proto/tls/h2.c \
-                 src/proto/xsteer/xsadmin.c
+                 src/proto/xsteer/xsadmin.c $(CRYPTO_SRC)
 # Туннель VLESS — стек отдельно от протокола (шаг 2 выпуска 1.10, docs/architecture.md, «Туннели:
 # стек, дайлер, транспорт»). Три списка — по тому, куда файлы уйдут на шаге 4, когда появятся
 # libsteer.so и бинарники модулей; пока все три входят в расширенный профиль целиком:
@@ -176,7 +186,7 @@ EXT_ROUTER_SRC := src/proto/vless/sub.c $(VLESS_MOD_SRC) $(STACK_SRC) $(TRANSPOR
                   src/proto/tls/urltls.c
 EXT_SERVER_SRC := src/proto/xsteer/xshub.c
 EXT_TGWS_SRC := src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c \
-                src/proto/tls/chello.c src/proto/tgws/tgws.c src/proto/tls/tlsprobe.c
+                src/proto/tls/chello.c src/proto/tgws/tgws.c src/proto/tls/tlsprobe.c $(CRYPTO_SRC)
 
 PROFILE_base     := $(CORE_SRC)
 PROFILE_extended := $(CORE_SRC) $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(KINDS_EXT_SRC) src/profile/extended.c

@@ -11,15 +11,19 @@
  * Стенду не нужны ни сеть, ни хаб: проверяется ровно закрытие сессии, а не рукопожатие.
  * Целиком протокол проверяет tests/xsloop.c.
  *
- * Нужен настоящий mbedtls (контекст AES в куче — это и есть утекающее), поэтому в make test
- * стенд не входит, как и xsloop. Сборка (mbedtls 2.x требует заглушку MBEDTLS_PRIVATE,
- * в 3.x макрос свой):
+ * Утекало при mbedtls именно выделенное в куче: контекст AES внутри GCM библиотека держала там,
+ * и потерянный указатель на него и был I-067. У wolfCrypt за слоем src/lib/scrypto.h контексты
+ * шифра лежат внутри самой структуры ключа (struct sc_aead), и потерять их указателем уже
+ * нельзя, — но стенд по-прежнему проверяет, что ключи освобождаются и затираются (ctx_ready
+ * снят) и что куча не течёт: путь рукопожатия выделяет память и сейчас, и утечка на нём
+ * повторялась бы так же, раз в 5 секунд.
  *
- *     cc -O1 -g -w $(make -s print-inc) -fsanitize=address -o build/spokematch tests/spokematch.c \
- *        src/proto/xsteer/xsconn.c src/proto/xsteer/xswire.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xsroute.c \
- *        src/proto/xsteer/xsconf.c src/proto/xsteer/xsstream.c src/proto/xsteer/xshake.c src/proto/tls/chello.c \
- *        src/proto/tls/reality.c src/proto/tls/tls13.c src/proto/tls/h2.c src/tunnel/tun.c src/proto/obfs/obfs.c \
- *        src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c src/model/probe.c src/compile/nftcompat.c -lmbedcrypto -lpthread
+ * Нужна настоящая криптобиблиотека (ключи разворачиваются настоящим tls13_keys_setup), поэтому
+ * в make test стенд не входит, как и xsloop; собирает и прогоняет его tests/ext-test.sh
+ * (make ext-test), под AddressSanitizer, когда тот на месте. Список исходников живёт там, а не
+ * здесь: модель и виды выхода он берёт из манифеста сборки (build/sources.mk), и копия списка в
+ * этой шапке отставала бы от него молча. Криптография — build/wolfssl-host/scrypto-cc.o и
+ * build/wolfssl-host/libwolfssl-cc.a, которые ext-test.sh собирает перед стендами.
  */
 /* До любого include: xsclient.c просит расширения GNU (sendmmsg), а первый
  * подключённый заголовок фиксирует набор. */
@@ -35,7 +39,8 @@ int run_quiet(const char *const argv[]) { (void)argv; return 0; }
 void bind_device(struct output *o, const char *dev) { (void)o; (void)dev; }
 
 /* Ключи в том виде, в каком их оставляет split_keys: AES-128, контекст развёрнут.
- * Именно AES, а не ChaCha: в куче лежит контекст только у AES внутри GCM. */
+ * Именно AES, а не ChaCha: при mbedtls в куче лежал контекст только у AES внутри GCM, и на нём
+ * I-067 и был пойман; стенд держится того же ключа, чтобы проверять ровно тот путь. */
 static int keys_up(struct tls13_keys *k) {
     memset(k, 0, sizeof(*k));
     k->aead = TLS13_AEAD_AES128;

@@ -14,12 +14,14 @@
  * ниже — из noise/epoch.go той же реализации, снятые после трёх шагов ратчета на известном
  * корне; теперь та же ошибка стоит одного прогона make.
  *
- * Нужен настоящий mbedtls (здесь считается криптография), поэтому в make test стенд не входит —
- * как tests/crypto.c и tests/xsloop.c:
+ * Нужна настоящая криптобиблиотека (здесь считается криптография), поэтому в make test стенд не
+ * входит — как tests/scryptomatch.c и tests/xsloop.c; собирает и прогоняет его tests/ext-test.sh
+ * (make ext-test). Библиотеку и слой он собирает сам, после этого стенд руками:
  *
- *     cc -O2 -w $(make -s print-inc) -I<mbedtls>/include -DMBEDTLS_CONFIG_FILE='"steer_mbedtls_config.h"' \
- *        $(make -s print-inc) -o build/xsepochmatch tests/xsepochmatch.c src/proto/xsteer/xsepoch.c \
- *        src/proto/tls/tls13.c src/proto/tls/reality.c src/proto/tls/h2.c <mbedtls>/library/libmbedcrypto.a
+ *     cc -O2 -w $(make -s print-inc) -o build/xsepochmatch tests/xsepochmatch.c \
+ *        src/proto/xsteer/xsepoch.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
+ *        src/proto/tls/reality.c src/proto/tls/h2.c build/wolfssl-host/scrypto-cc.o \
+ *        build/wolfssl-host/libwolfssl-cc.a -lpthread
  */
 #include <stdio.h>
 #include <string.h>

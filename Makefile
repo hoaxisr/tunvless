@@ -61,8 +61,8 @@ $(BUILD)/steer: $(CLIENT_SRC) src/platform/platform.h | $(BUILD)/steerd
 # Демон базовой сборки с видами vless и xsteer — только для стенда tests/supdmatch.sh: сторож демона
 # берёт здоровье выходов, чьё устройство создаёт наш процесс, у супервизора (--watch вместе с
 # --supervise), а такие виды есть только в расширенной сборке, которая собирается docker'ом с
-# mbedtls. Помощников стенд подменяет швом STEER_SUPERVISE_EXE, поэтому клиенты туннелей (и
-# mbedtls) демону не нужны: хватает файлов видов — реестр видов (kind.c) ссылается на них слабо.
+# wolfSSL. Помощников стенд подменяет швом STEER_SUPERVISE_EXE, поэтому клиенты туннелей (и
+# криптобиблиотека) демону не нужны: хватает файлов видов — реестр видов (kind.c) ссылается на них слабо.
 # Не пакет и не профиль: в build/sources.mk его нет нарочно.
 $(BUILD)/steer-xk: $(CORE_SRC) $(KINDS_EXT_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
@@ -161,15 +161,23 @@ snapshot-record: all $(BUILD)/steer-android $(BUILD)/tgwssim
 
 # Сборка под Android тем же NDK, что прошивка (Android.bp, bionic): ни стенды на хосте, ни
 # QEMU-роутер (musl) не видят, чего нет в bionic, — так в origin/main однажды ушёл fopencookie.
-# Гонять перед пушем. Скрипт и mbedtls живут в деревьях работы над Android-портом; нет их на
-# машине — цель пропускается, а не падает.
+# Гонять перед пушем. Скрипт живёт в дереве работы над Android-портом; нет его на машине — цель
+# пропускается, а не падает.
+#
+# wolfSSL для телефона. В дереве прошивки она будет своим репозиторием (external/der-wolfssl, форк
+# в der-exp — шаг 6 выпуска 1.10, docs/architecture.md) с Android.bp из build/wolfssl/Android.bp.
+# Пока форка нет, цель собирает ровно его: исходники того же выпуска, что у роутера (скачивание со
+# сверкой суммы — build/wolfssl/fetch.sh, NDK_WOLFSSL переопределяет каталог готовых исходников),
+# и тот Android.bp рядом с ними. Так проверяется то, что потом соберёт Soong, а не заменитель.
 NDK_BPBUILD ?= /root/der-exp/android_vendor_der/tools/ndk-check/bpbuild.py
-NDK_MBEDTLS ?= /root/der-exp/android_external_mbedtls
+NDK_WOLFSSL ?= $(BUILD)/ndk/wolfssl-src
 ndk-check:
-	@if [ ! -f "$(NDK_BPBUILD)" ] || [ ! -d "$(NDK_MBEDTLS)" ]; then \
-		echo "ndk-check: нет $(NDK_BPBUILD) или $(NDK_MBEDTLS) — пропуск"; exit 0; fi; \
+	@if [ ! -f "$(NDK_BPBUILD)" ]; then echo "ndk-check: нет $(NDK_BPBUILD) — пропуск"; exit 0; fi; \
+	if [ ! -f "$(NDK_WOLFSSL)/wolfssl/wolfcrypt/settings.h" ] && ! sh build/wolfssl/fetch.sh "$(NDK_WOLFSSL)"; then \
+		echo "ndk-check: нет исходников wolfSSL (не скачались, см. выше) — пропуск"; exit 0; fi; \
+	cp build/wolfssl/Android.bp "$(NDK_WOLFSSL)/Android.bp"; \
 	for a in aarch64 x86_64; do \
-		python3 "$(NDK_BPBUILD)" --static --arch $$a --out $(BUILD)/ndk/$$a . "$(NDK_MBEDTLS)" \
+		python3 "$(NDK_BPBUILD)" --static --arch $$a --out $(BUILD)/ndk/$$a . "$(NDK_WOLFSSL)" \
 			-- steerd steer > $(BUILD)/ndk-$$a.log 2>&1 || \
 			{ echo "ndk-check: $$a не собирается:"; grep -m5 'error:' $(BUILD)/ndk-$$a.log; exit 1; }; \
 		echo "ndk-check: $$a — steerd и steer собираются"; \
@@ -193,30 +201,34 @@ $(BUILD)/diagsim: $(CORE_SRC) $(KINDS_EXT_SRC) $(CORE_HDR) src/profile/extended.
 
 # SHA-256 движка против sha256sum оболочки. Отдельная цель, потому что стенду нужен ПОЛНЫЙ
 # хеш: в самом идентификаторе он обрезан до двадцати знаков, и расхождение в старших байтах
-# такой проверкой не поймать. Ни сети, ни mbedtls — файл вложенный и самодостаточный.
+# такой проверкой не поймать. Ни сети, ни криптобиблиотеки — файл вложенный и самодостаточный.
 $(BUILD)/hwidsum: tests/hwidsum.c src/tools/hwid.c src/tools/hwid.h src/lib/jsonw.c src/lib/jsonw.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/hwidsum.c src/tools/hwid.c src/lib/jsonw.c $(PLATFORM_SRC)
 
 # Синтаксическая проверка расширенного движка (R-014/I-024). Полная сборка расширенной части идёт
-# только в build.sh через docker с mbedtls, поэтому локальный make test оставался зелёным,
+# только в build.sh через docker с wolfSSL, поэтому локальный make test оставался зелёным,
 # даже когда ext не компилировался вовсе — так в main пролез 654e4e6. -fsyntax-only ловит
-# ровно тот класс ошибок (несуществующее имя, снесённое объявление), заглушки mbedtls уже
-# лежат в tests/stub — их завёл стенд h2match. Компоновку по-прежнему проверяет build.sh.
+# ровно тот класс ошибок (несуществующее имя, снесённое объявление). Заглушки заголовков
+# библиотеки больше не нужны: протоколы видят только src/lib/scrypto.h, где её типов нет.
+# Сам scrypto.c — единственный файл, который включает заголовки wolfSSL, — отсюда исключён:
+# в `make test` библиотеки нет по построению, а компилирует его ext-test вместе с ней.
+# Компоновку по-прежнему проверяет build.sh.
 ext-syntax:
-	@for f in $(EXT_ALL_SRC); do \
-		$(CC) $(CFLAGS) -fsyntax-only -Itests/stub $$f || exit 1; \
+	@for f in $(filter-out $(CRYPTO_SRC),$(EXT_ALL_SRC)); do \
+		$(CC) $(CFLAGS) -fsyntax-only $$f || exit 1; \
 	done
 	@echo "ext-syntax: расширенная часть компилируется"
 
-# Стенды расширенной части, которым нужен НАСТОЯЩИЙ mbedtls: xsloop (рукопожатие целиком), spokematch
-# (освобождение ключей под ASan) и hubmatch (арифметика записи в хабе, I-070). В `make test`
-# они не входят — там mbedtls нет по построению (R-014, см. ext-syntax), а роутерная сборка ext
-# идёт только docker'ом (build.sh), поэтому первые два до запуска 42 не прогонялись ни разу и
-# дали I-066/I-067 первым же прогоном. Цель закрывает
-# разрыв (R-058): библиотека ищется через STEER_MBEDTLS, pkg-config или системные пути; не
-# нашлась — ГРОМКИЙ пропуск, а не падение; версия печатается (docker собирает 3.x, зелёное на
-# 2.28 не равно зелёному в релизе). Вся логика — в tests/ext-test.sh, как у прочих *.sh-стендов.
+# Стенды расширенной части, которым нужна НАСТОЯЩАЯ криптобиблиотека: векторы слоя примитивов
+# (scryptomatch), xsloop (рукопожатие целиком), spokematch (освобождение ключей под ASan),
+# hubmatch (арифметика записи в хабе, I-070) и остальные — список в tests/ext-test.sh. В `make
+# test` они не входят — там библиотеки нет по построению (R-014, см. ext-syntax), а роутерная
+# сборка ext идёт только docker'ом (build.sh), поэтому первые до запуска 42 не прогонялись ни
+# разу и дали I-066/I-067 первым же прогоном. Цель закрывает разрыв (R-058): wolfSSL собирается
+# из исходников той же версии и с теми же опциями, что у роутера (build/wolfssl), исходники —
+# STEER_WOLFSSL или скачивание со сверкой суммы; не нашлись — ГРОМКИЙ пропуск, а не падение.
+# Вся логика — в tests/ext-test.sh, как у прочих *.sh-стендов.
 ext-test:
 	@BUILD=$(BUILD) CC="$(CC)" sh tests/ext-test.sh
 
@@ -233,21 +245,21 @@ $(BUILD)/dnsmatch: tests/dnsmatch.c $(DNSD_SRC) src/lib/sindex.h src/lib/nftnl.h
 # читает файл и зовёт die()/exit(2) на неверной спеке — перехватить это через подкоманду
 # движка нельзя. load_spec ошибку возвращает (правило 5, docs/architecture.md, раздел 2), и
 # стенд линкуется с парсером отдельным объектом (MODEL_SRC) — см. tests/specmatch.c.
-# Таблица дата-центров Telegram — см. пояснение в самом стенде. Собирается с заглушками
-# mbedtls (-Itests/stub) по той же причине, что и ext-syntax: настоящей библиотеки в `make
-# test` нет по построению.
-$(BUILD)/dcmatch: tests/dcmatch.c src/proto/tgws/tgws.c src/lib/jsonw.c src/lib/evline.c
+# Таблица дата-центров Telegram — см. пояснение в самом стенде. Криптографию моста (гамму
+# AES-CTR через src/lib/scrypto.h) стенд подменяет своими функциями sc_aesctr_*: настоящей
+# библиотеки в `make test` нет по построению (см. ext-syntax).
+$(BUILD)/dcmatch: tests/dcmatch.c src/proto/tgws/tgws.c src/lib/jsonw.c src/lib/evline.c src/lib/scrypto.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/dcmatch.c src/lib/jsonw.c src/lib/evline.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) -o $@ tests/dcmatch.c src/lib/jsonw.c src/lib/evline.c $(PLATFORM_SRC)
 
-$(BUILD)/msgsplitmatch: tests/msgsplitmatch.c src/proto/tgws/tgws.c src/lib/jsonw.c src/lib/evline.c
+$(BUILD)/msgsplitmatch: tests/msgsplitmatch.c src/proto/tgws/tgws.c src/lib/jsonw.c src/lib/evline.c src/lib/scrypto.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/msgsplitmatch.c src/lib/jsonw.c src/lib/evline.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) -o $@ tests/msgsplitmatch.c src/lib/jsonw.c src/lib/evline.c $(PLATFORM_SRC)
 
 # Запас поднятых соединений — там же и по той же причине: warm_* статические.
-$(BUILD)/warmmatch: tests/warmmatch.c src/proto/tgws/tgws.c src/lib/jsonw.c src/lib/evline.c
+$(BUILD)/warmmatch: tests/warmmatch.c src/proto/tgws/tgws.c src/lib/jsonw.c src/lib/evline.c src/lib/scrypto.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/warmmatch.c src/lib/jsonw.c src/lib/evline.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) -o $@ tests/warmmatch.c src/lib/jsonw.c src/lib/evline.c $(PLATFORM_SRC)
 
 # Исходы пробы браузерным рукопожатием и то, как она их называет (I-272). Там же и по той же
 # причине: bind_local и hello12_build статические. Срок пробы подменён секундой — с шестью
@@ -255,21 +267,21 @@ $(BUILD)/warmmatch: tests/warmmatch.c src/proto/tgws/tgws.c src/lib/jsonw.c src/
 # срока, а на то, чем он кончается.
 $(BUILD)/tlsprobematch: tests/tlsprobematch.c src/proto/tls/tlsprobe.c src/proto/tls/reality.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -DPROBE_TIMEOUT_S=1 -o $@ tests/tlsprobematch.c
+	$(CC) $(CFLAGS) -DPROBE_TIMEOUT_S=1 -o $@ tests/tlsprobematch.c
 
 # Освобождение соединения наверх: чем обозначено «дескриптора нет» (I-204). Там же и по той
 # же причине: up_drop статическая.
-$(BUILD)/upmatch: tests/upmatch.c src/proto/tgws/tgws.c src/lib/jsonw.c src/lib/evline.c
+$(BUILD)/upmatch: tests/upmatch.c src/proto/tgws/tgws.c src/lib/jsonw.c src/lib/evline.c src/lib/scrypto.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/upmatch.c src/lib/jsonw.c src/lib/evline.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) -o $@ tests/upmatch.c src/lib/jsonw.c src/lib/evline.c $(PLATFORM_SRC)
 
 # Пути отказа моста, которых прогон настоящего бинаря не достаёт: длинная строка списка
 # запасных доменов, отказ источника случайности, отказ рукопожатия после разворота ключа
 # (I-155, I-196, I-197), срок затишья сессии через веб-сокет и причины её конца. Там же и по
 # той же причине: alt_init, ws_upgrade, tls_start и pump статические.
-$(BUILD)/tgwsfailmatch: tests/tgwsfailmatch.c src/proto/tgws/tgws.c src/lib/jsonw.c src/lib/evline.c
+$(BUILD)/tgwsfailmatch: tests/tgwsfailmatch.c src/proto/tgws/tgws.c src/lib/jsonw.c src/lib/evline.c src/lib/scrypto.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/tgwsfailmatch.c src/lib/jsonw.c src/lib/evline.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) -o $@ tests/tgwsfailmatch.c src/lib/jsonw.c src/lib/evline.c $(PLATFORM_SRC)
 
 $(BUILD)/specmatch: tests/specmatch.c $(MODEL_KINDS) src/kinds/awg.c src/model/spec.h
 	@mkdir -p $(BUILD)
@@ -371,11 +383,11 @@ $(BUILD)/fwmatch: tests/fwmatch.c $(CORE_SRC) $(CORE_HDR)
 		$(filter-out src/daemon/main.c,$(CORE_SRC))
 
 # Управление потоком HTTP/2 проверяется в памяти: h2.c общается с сетью только через
-# struct h2_io, поэтому стенд подменяет его целиком. -Itests/stub нужен, чтобы не тянуть
-# mbedtls ради типов, которые тест не трогает — см. tests/stub/mbedtls/sha256.h.
+# struct h2_io, поэтому стенд подменяет его целиком. tls13.h, который h2.c тянет ради одной
+# константы, криптобиблиотеки не требует: её типов в нём нет (src/lib/scrypto.h).
 $(BUILD)/h2match: tests/h2match.c src/proto/tls/h2.c src/proto/tls/h2.h src/proto/tls/tls13.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/h2match.c
+	$(CC) $(CFLAGS) -o $@ tests/h2match.c
 
 # Отказ сервера на выгрузку xhttp (stream-up, packet-up) обязан дойти до отправки (I-219):
 # транспорт xhttp (trxhttp.c) включается целиком (up_drain статическая), остальные ярусы
@@ -386,14 +398,14 @@ XHUPMATCH_SRC = src/proto/tls/h2.c src/proto/transport/transport.c src/proto/tra
 $(BUILD)/xhupmatch: tests/xhupmatch.c src/proto/transport/trxhttp.c src/proto/transport/transport.h \
                     src/proto/tls/h2.h $(XHUPMATCH_SRC)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/xhupmatch.c \
+	$(CC) $(CFLAGS) -o $@ tests/xhupmatch.c \
 		$(XHUPMATCH_SRC) $(PLATFORM_SRC) -lpthread
 
 # Разбор подписки — единственное место, куда в движок попадает чужой текст из интернета.
-# Ни сети, ни mbedtls он не требует, поэтому стенд включает исходник напрямую и входит
+# Ни сети, ни криптобиблиотеки он не требует, поэтому стенд включает исходник напрямую и входит
 # в обычный make test, в отличие от остальной расширенной части (см. ext-syntax).
 # Разбор потока Vision — вторая точка, куда в движок попадают недоверенные байты от
-# сервера. Ни сети, ни mbedtls он не требует, поэтому входит в обычный make test, как и
+# сервера. Ни сети, ни криптобиблиотеки он не требует, поэтому входит в обычный make test, как и
 # разбор подписки; остальная расширенная часть доходит только до ext-syntax.
 $(BUILD)/visionmatch: tests/visionmatch.c src/proto/vless/vision.c src/proto/vless/vision.h
 	@mkdir -p $(BUILD)
@@ -402,35 +414,34 @@ $(BUILD)/visionmatch: tests/visionmatch.c src/proto/vless/vision.c src/proto/vle
 # vless_proto.c — в предпосылках и в стенде: разбор подписки решает, ПРИГОДЕН ли
 # идентификатор, а превращает его в 16 байт vless_proto.c, и правило у них одно (правило
 # Xray по длине строки). Без этой строки правка вывода UUID не пересобирала стенд, то есть
-# зелёный прогон ничего не значил бы. Библиотек файл не тянет — mbedtls здесь нет
+# зелёный прогон ничего не значил бы. Библиотек файл не тянет — криптобиблиотеки здесь нет
 # по построению (см. ext-syntax).
 $(BUILD)/submatch: tests/submatch.c src/proto/vless/sub.c src/proto/vless/vless.h \
                   src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/submatch.c
 
-# Скачивание и обработка подписки. Стенд включает исходник и подставляет три вещи: свой
-# SHA-256 (проверяется РЕЦЕПТУРА идентификатора устройства, а не значение хеша — библиотека
-# считает его сама), свой run_quiet и поддельный curl в PATH. Поэтому ни сети, ни mbedtls, ни
-# docker он не требует и входит в обычный make test — при том что до переноса вся эта работа
-# жила в оболочке объекта rpcd и не проверялась ничем.
+# Скачивание и обработка подписки. Стенд включает исходник и подставляет две вещи: свой
+# run_quiet и поддельный curl в PATH (SHA-256 идентификатора устройства — свой, в hwid.c).
+# Поэтому ни сети, ни криптобиблиотеки, ни docker он не требует и входит в обычный make test —
+# при том что до переноса вся эта работа жила в оболочке объекта rpcd и не проверялась ничем.
 $(BUILD)/subfetchmatch: tests/subfetchmatch.c src/proto/vless/subfetch.c src/proto/vless/subfetch.h \
                   src/tools/hwid.c src/tools/hwid.h src/lib/jsonw.c src/lib/jsonw.h \
                   src/proto/vless/sub.c src/proto/vless/vless.h src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/subfetchmatch.c src/lib/jsonw.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) -o $@ tests/subfetchmatch.c src/lib/jsonw.c $(PLATFORM_SRC)
 
 # Арифметика провода xsteer: заголовок записи, вывод nonce, окно приёма, пределы
 # соединения. Всё, что она считает, ломается МОЛЧА — пакет отбрасывается стеком той
 # стороны, или не расшифровывается, или отвергается как повтор, и ни одного сообщения об
-# этом нет. Ни сети, ни mbedtls стенд не требует (xswire.c намеренно без библиотеки),
+# этом нет. Ни сети, ни криптобиблиотеки стенд не требует (xswire.c намеренно без неё),
 # поэтому он входит в обычный make test, как submatch и visionmatch.
 $(BUILD)/xswirematch: tests/xswirematch.c src/proto/xsteer/xswire.c src/proto/xsteer/xswire.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/xswirematch.c
 
 # Стенд поддельного соединения: порог мёртвого пути и учёт своей незанятости. Входит в обычный
-# make test по той же причине, что xswirematch: ни сети, ни mbedtls — время приходит аргументом,
+# make test по той же причине, что xswirematch: ни сети, ни криптобиблиотеки — время приходит аргументом,
 # а сокета у соединения в стенде нет вовсе.
 $(BUILD)/xsconnmatch: tests/xsconnmatch.c src/proto/xsteer/xsconn.c src/proto/xsteer/xsconn.h src/proto/obfs/obfs.c src/proto/obfs/obfs.h src/lib/jsonw.c src/lib/evline.c
 	@mkdir -p $(BUILD)
@@ -438,14 +449,14 @@ $(BUILD)/xsconnmatch: tests/xsconnmatch.c src/proto/xsteer/xsconn.c src/proto/xs
 
 # Рамка записей по настоящему потоку TCP: границы записей, смещения (они же nonce) и досылка
 # недописанного хвоста. Стенд входит в обычный make test по той же причине, что xswirematch:
-# xsstream.c не требует ни mbedtls, ни сети — обстановка делается из socketpair. Проверять это
+# xsstream.c не требует ни криптобиблиотеки, ни сети — обстановка делается из socketpair. Проверять это
 # на живом туннеле пришлось бы гигабайтом трафика, а ломается всё здесь молча.
 $(BUILD)/xsstreammatch: tests/xsstreammatch.c src/proto/xsteer/xsstream.c src/proto/xsteer/xsstream.h src/proto/xsteer/xswire.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/xsstreammatch.c
 
 # Склейка соседних сегментов в одну запись в устройство: что склеивается, что нет и какими
-# байтами уезжает. В make test входит потому, что tun.c не требует ни mbedtls, ни сети, а
+# байтами уезжает. В make test входит потому, что tun.c не требует ни криптобиблиотеки, ни сети, а
 # обстановка делается из socketpair датаграммами — по одной на writev, поэтому видно и число
 # записей, и их содержимое. Ошибка здесь либо портит поток клиента (склеили лишнее), либо тихо
 # отключает выигрыш (не склеили ничего) — второе тут и случилось на живом прогоне.
@@ -455,14 +466,14 @@ $(BUILD)/tungromatch: tests/tungromatch.c src/tunnel/tun.c src/tunnel/tun.h
 
 # Разбор пакетов туннеля VLESS на подменённом транспорте (I-320, I-321, I-322): стек
 # (stack.c) включается целиком, дайлер VLESS (vldial.c) настоящий и компонуется отдельно, а
-# соединение с узлом (vless_connect и transport_*) подменено, поэтому mbedtls не нужна —
-# заголовки из tests/stub, как у ext-syntax. Подробности — в шапке стенда.
+# соединение с узлом (vless_connect и transport_*) подменено, поэтому криптобиблиотека не нужна —
+# её типов в заголовках нет (src/lib/scrypto.h), как у ext-syntax. Подробности — в шапке стенда.
 TUNNELMATCH_SRC = src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/vless_proto.c src/proto/vless/vision.c \
                   src/proto/vless/vldial.c src/proto/vless/vlwatch.c \
                   src/lib/jsonw.c src/lib/evline.c $(MODEL_KINDS) $(KINDS_EXT_SRC)
 $(BUILD)/tunnelmatch: tests/tunnelmatch.c src/tunnel/stack.c src/tunnel/dialer.h $(TUNNELMATCH_SRC)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/tunnelmatch.c \
+	$(CC) $(CFLAGS) -o $@ tests/tunnelmatch.c \
 		$(TUNNELMATCH_SRC) -lpthread -ldl
 
 # Имя устройства: движок работает ровно с тем именем, о котором просил, — иначе отказ. Ядро
@@ -478,7 +489,7 @@ $(BUILD)/tunnamematch: tests/tunnamematch.c src/tunnel/tun.c src/tunnel/tun.h
 # Разбор конфигурации xsteer — единственное место, куда в движок попадает текст, который
 # человек написал руками, поэтому разбор строгий, а стенд перечисляет каждый отказ.
 # Отдельно проверяется, что приватный ключ не попадает в вывод: обещание держится на том,
-# что печатающая функция не имеет к нему доступа по построению. Без mbedtls — это же
+# что печатающая функция не имеет к нему доступа по построению. Без криптобиблиотеки — это же
 # требуется для build/diagsim, который линкует этот файл ради проверок diag.
 $(BUILD)/xsconfmatch: tests/xsconfmatch.c src/proto/xsteer/xsconf.c src/proto/xsteer/xsconf.h src/proto/xsteer/xswire.h
 	@mkdir -p $(BUILD)
@@ -504,8 +515,8 @@ $(BUILD)/xsroutematch: tests/xsroutematch.c src/proto/xsteer/xsroute.c src/proto
 # Разбор ClientHello — граница доверия хаба: это первый код, который смотрит на байты от
 # кого угодно из интернета, и ошибка здесь означает чтение за буфером по длине, которой
 # доверились. Разбирается НАСТОЯЩИЙ Hello из заморозки (tests/chello-frozen.h), поэтому
-# mbedtls не нужен. Байтовую неизменность самого сборщика проверяет tests/hellofreeze.c,
-# которому библиотека нужна и который поэтому в make test не входит.
+# криптобиблиотека не нужна. Байтовую неизменность самого сборщика проверяет tests/hellofreeze.c,
+# которому библиотека нужна и который поэтому идёт в make ext-test.
 $(BUILD)/chellomatch: tests/chellomatch.c tests/chello-frozen.h src/proto/tls/chello.c src/proto/tls/chello.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/chellomatch.c
@@ -534,6 +545,8 @@ clean:
 	       $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch \
 	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
 	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
-	       $(BUILD)/diagsim $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/yamlmatch $(BUILD)/libmbed-*.a \
+	       $(BUILD)/diagsim $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/yamlmatch $(BUILD)/wolfssl-host \
+	       $(BUILD)/scryptomatch $(BUILD)/vlessmatch $(BUILD)/androidroots $(BUILD)/hubmatch $(BUILD)/spokematch \
+	       $(BUILD)/devupmatch $(BUILD)/ndk \
 	       $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool \
 	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out

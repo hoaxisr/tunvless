@@ -17,11 +17,12 @@
  * Отсюда же растёт стенд для самого цикла, когда до него дойдёт очередь: включение .c уже
  * даёт доступ к struct worker, g_sess и статическим функциям.
  *
- *     cc -O2 -w $(make -s print-inc) -I<mbedtls>/include -o build/hubmatch tests/hubmatch.c \
- *        src/proto/xsteer/xsconn.c src/proto/xsteer/xswire.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xsroute.c \
- *        src/proto/xsteer/xsconf.c src/proto/xsteer/xsstream.c src/proto/xsteer/xshake.c src/proto/tls/chello.c \
- *        src/proto/tls/reality.c src/proto/tls/tls13.c src/proto/tls/h2.c src/tunnel/tun.c src/proto/obfs/obfs.c \
- *        src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c src/model/probe.c src/compile/nftcompat.c <mbedtls>/library/libmbedcrypto.a -lpthread
+ * Нужна настоящая криптобиблиотека: xshub.c тянет за собой рукопожатие, TLS 1.3 и reality, и
+ * без библиотеки стенд не компонуется. Поэтому в make test стенд не входит; собирает и
+ * прогоняет его tests/ext-test.sh (make ext-test). Список исходников живёт там, а не здесь:
+ * модель и виды выхода он берёт из манифеста сборки (build/sources.mk), и копия списка в этой
+ * шапке отставала бы от него молча. Криптография — build/wolfssl-host/scrypto-cc.o и
+ * build/wolfssl-host/libwolfssl-cc.a, которые ext-test.sh собирает перед стендами.
  */
 #define _GNU_SOURCE
 #include <stdio.h>

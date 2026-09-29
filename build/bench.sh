@@ -1,75 +1,52 @@
 #!/bin/sh
-# Собрать замер AEAD под цель в трёх вариантах конфигурации mbedtls.
+# Собрать замер шифров (tests/xsbench.c) и векторы слоя (tests/scryptomatch.c) под цель — тем же
+# zig, той же wolfSSL и с теми же опциями, что расширенная сборка (build/build-ext.sh). Запускается
+# в образе сборки:
 #
-# Три, а не один, потому что вопрос стоит именно так: что даёт включение инструкций AES,
-# что даёт большая таблица GHASH, и не оказывается ли ChaCha20 быстрее обоих. Ответ
-# зависит от железа, и на Cortex-A53 он не тот же, что на x86.
+#     docker run --rm -v "$PWD:/src" -w /src --entrypoint sh steer-builder:wolfssl \
+#         /src/build/bench.sh aarch64-linux-musl cortex_a53 /src/build/bench
+#
+# Получится <выход>-xsbench-* и <выход>-scryptomatch-* — статические бинарники, которые копируются
+# на роутер (или гоняются под qemu-user) как есть. Векторы едут вместе с замером нарочно: скорость
+# ассемблерного пути, который на этом процессоре считает неверно, ничего не стоит, а проверить
+# ответ можно только на том же железе, где мерили.
+#
+# ДВА ВАРИАНТА на aarch64 и x86_64 — с ускорением (ассемблер wolfSSL) и без него (переносимый C,
+# STEER_WOLFSSL_NO_ARMASM / без STEER_WOLFSSL_ASM): вопрос стоит именно так — что даёт ускорение
+# на этом железе. Прежде здесь было три варианта конфигурации mbedtls (без AES-NI/AESCE, с ним, с
+# большой таблицей GHASH); вместе с mbedtls сняты и они.
 set -eu
 TARGET="${1:-aarch64-linux-musl}"
 MCPU="${2:-cortex_a53}"
 OUT="${3:-/src/build/bench}"
+WOLFSSL_DIR="${WOLFSSL_DIR:-/opt/wolfssl}"
 
-MBED_INC=/opt/mbedtls/include
-EXT_INC=/src/src/proto/tls
+export SOURCES_MK=/src/build/sources.mk
+. /src/build/sources.sh
+STEER_INC="$(for d in $(profile_var INC_DIRS); do printf -- '-I/src/%s ' "$d"; done)"
 
-build() {  # СУФФИКС ДОП_ФЛАГИ
-    suffix="$1"; extra="$2"
-    work="/tmp/bench-$suffix"
-    mkdir -p "$work"
-    cd "$work"
-    # Ошибка компиляции модуля называется на месте — см. пояснение в build/build-ext.sh.
-    for f in /opt/mbedtls/library/*.c; do
-        m=$(basename "$f" .c)
-        case "$m" in net_sockets|debug|timing) continue ;; esac
-        # shellcheck disable=SC2086
-        if ! zig cc -target "$TARGET" -mcpu="$MCPU" -O2 -c \
-            -I"$MBED_INC" -I"$EXT_INC" \
-            -DMBEDTLS_CONFIG_FILE='"steer_mbedtls_config.h"' $extra \
-            "$f" -o "$m.o" 2>"$m.err"; then
-            echo "mbedtls: сборка модуля $m не удалась ($suffix):" >&2
-            sed 's/^/    /' "$m.err" >&2
-        fi
-        rm -f "$m.err"
-    done
+build() {  # СУФФИКС asm|noasm ДОП_КЛЮЧИ_БИБЛИОТЕКИ
+    suffix="$1"; asm="$2"; defs="$3"
+    tag=$(echo "$TARGET$MCPU$suffix" | tr -c 'a-zA-Z0-9' '_')
+    lib="/src/build/wolfssl-obj/bench-$tag/libwolfssl.a"
     # shellcheck disable=SC2086
-    zig cc -target "$TARGET" -mcpu="$MCPU" -static -O2 \
-        -I"$MBED_INC" -I"$EXT_INC" \
-        -DMBEDTLS_CONFIG_FILE='"steer_mbedtls_config.h"' $extra \
-        -o "$OUT-$suffix" /src/tests/crypto-bench.c "$work"/*.o
+    CC="zig cc -target $TARGET ${MCPU:+-mcpu=$MCPU}" AR="zig ar" CFLAGS="-O2 -ffunction-sections -fdata-sections" \
+        STEER_WOLFSSL_DEFS="$defs" sh /src/build/wolfssl/build.sh "$WOLFSSL_DIR" "$lib" "$asm"
+    wcf=$(cat "$lib.cflags")
+    # shellcheck disable=SC2086
+    zig cc -target "$TARGET" ${MCPU:+-mcpu=$MCPU} -static -O2 -s -Wl,--gc-sections $STEER_INC $wcf \
+        -o "$OUT-xsbench-$suffix" /src/tests/xsbench.c /src/src/proto/xsteer/xswire.c \
+        /src/src/proto/tls/reality.c /src/src/proto/tls/certverify.c /src/src/lib/evline.c \
+        /src/src/lib/jsonw.c /src/src/lib/scrypto.c "$lib"
+    # shellcheck disable=SC2086
+    zig cc -target "$TARGET" ${MCPU:+-mcpu=$MCPU} -static -O2 -s -Wl,--gc-sections $STEER_INC \
+        -I/src/tests $wcf -o "$OUT-scryptomatch-$suffix" /src/tests/scryptomatch.c \
+        /src/src/lib/scrypto.c "$lib"
 }
 
-# Ускорение теперь включается самой конфигурацией (см. steer_mbedtls_config.h), поэтому
-# «без ускорения» задаётся его ОТКЛЮЧЕНИЕМ, а не включением: иначе первый вариант перестал
-# бы быть базой сравнения и три числа означали бы одно и то же.
-# Замерено на x86_64: большая таблица GHASH не даёт ничего (331,9 против 328,5 МБ/с) —
-# при аппаратном AES библиотека считает GHASH инструкциями и таблицу не открывает. Вариант
-# оставлен, чтобы это можно было перепроверить на другом железе, а не поверить на слово.
-build plain "-DSTEER_NO_AES_ACCEL"
-build aesce ""
-build aesce-big "-DMBEDTLS_GCM_LARGE_TABLE"
-
-# Разложение выбранного шифра на составляющие — отдельным бинарником и одним вариантом
-# конфигурации: он отвечает не «какой шифр», а «что внутри дорого», и три сборки ему ни к
-# чему. Нужен там, где потолок ставит ChaCha20: на MT7621 замерено 26,1 МБ/с у потока шифра
-# против 60,6 у Poly1305, то есть ускорять имело бы смысл первое, а не второе.
-work=/tmp/bench-split
-mkdir -p "$work"
-cd "$work"
-for f in /opt/mbedtls/library/*.c; do
-    m=$(basename "$f" .c)
-    case "$m" in net_sockets|debug|timing) continue ;; esac
-    if ! zig cc -target "$TARGET" -mcpu="$MCPU" -O2 -c \
-        -I"$MBED_INC" -I"$EXT_INC" \
-        -DMBEDTLS_CONFIG_FILE='"steer_mbedtls_config.h"' \
-        "$f" -o "$m.o" 2>"$m.err"; then
-        echo "mbedtls: сборка модуля $m не удалась (split):" >&2
-        sed 's/^/    /' "$m.err" >&2
-    fi
-    rm -f "$m.err"
-done
-zig cc -target "$TARGET" -mcpu="$MCPU" -static -O2 \
-    -I"$MBED_INC" -I"$EXT_INC" \
-    -DMBEDTLS_CONFIG_FILE='"steer_mbedtls_config.h"' \
-    -o "$OUT-split" /src/tests/aead-split.c "$work"/*.o
-
+build asm asm ""
+case "$TARGET" in
+    aarch64-*) build noasm asm "-DSTEER_WOLFSSL_NO_ARMASM" ;;
+    x86_64-*) build noasm noasm "" ;;
+esac
 ls -la "$OUT"-*

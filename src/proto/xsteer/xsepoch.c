@@ -20,9 +20,7 @@
 #define _GNU_SOURCE
 #include <string.h>
 
-#include "mbedtls/hkdf.h"
-#include "mbedtls/md.h"
-
+#include "scrypto.h"
 #include "xsepoch.h"
 
 #define EP_LABEL_ADV  "xsteer epoch advance"
@@ -52,21 +50,19 @@ void xs_epoch_stop(struct xs_epoch *e) {
  * корень СТИРАЕТСЯ — в этом весь смысл: назад по хешу не пройти, и вскрытая память не выдаёт
  * прошлые эпохи. */
 static int ep_advance(struct xs_epoch *e, struct tls13_keys *k) {
-    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    if (!md) return TLS13_ECRYPTO;
     uint8_t next[32], prk[32], out[44];
     int rc = TLS13_ECRYPTO;
-    if (mbedtls_hkdf_extract(md, e->root, 32, (const uint8_t *)EP_LABEL_ADV,
-                             sizeof(EP_LABEL_ADV) - 1, next) != 0) goto done;
+    if (sc_hkdf_extract(SC_SHA256, e->root, 32, (const uint8_t *)EP_LABEL_ADV,
+                        sizeof(EP_LABEL_ADV) - 1, next) != 0) goto done;
     /* СОЛЬ — это next, а ikm пустой, а не наоборот. Порядок аргументов здесь стоил живого
      * стенда: hkdf.Extract(hash, secret, salt) в Go принимает ikm ПЕРВЫМ, а соль второй, и
      * `Extract(sha256.New, nil, next)` означает HMAC(ключ = next, данные = пусто). Перепутав
      * их, я получил тот же корень (он выводится другим вызовом) и ДРУГИЕ ключи — то есть
      * туннель, который исправно работает и умирает ровно на 64-м мегабайте. Ровно так же
      * устроен и первый Extract в split_keys: соль это ck, ikm пустой. */
-    if (mbedtls_hkdf_extract(md, next, 32, (const uint8_t *)"", 0, prk) != 0) goto done;
-    if (mbedtls_hkdf_expand(md, prk, 32, (const uint8_t *)EP_LABEL_KEYS,
-                            sizeof(EP_LABEL_KEYS) - 1, out, sizeof(out)) != 0) goto done;
+    if (sc_hkdf_extract(SC_SHA256, next, 32, (const uint8_t *)"", 0, prk) != 0) goto done;
+    if (sc_hkdf_expand(SC_SHA256, prk, 32, (const uint8_t *)EP_LABEL_KEYS,
+                       sizeof(EP_LABEL_KEYS) - 1, out, sizeof(out)) != 0) goto done;
 
     /* Новый контекст шифра разворачивается ДО того, как тронуто что-либо ещё: отказ разворота
      * на полпути оставил бы направление без рабочих ключей вовсе. */

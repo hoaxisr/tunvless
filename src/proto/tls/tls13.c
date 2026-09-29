@@ -7,11 +7,12 @@
  * обычный обмен по RFC 8446: ServerHello приносит серверную половину key_share, из
  * общего секрета выводятся ключи трафика, дальше записи шифруются AEAD.
  *
- * Сертификат сервера мы НЕ проверяем, и это не небрежность: сертификат подлинный, но
- * принадлежит чужому сайту, которым сервер прикрывается. Проверять его бессмысленно —
- * подлинность уже доказана иначе. Именно поэтому здесь нет mbedtls_ssl_*: полный
- * TLS-стек библиотеки настаивал бы на проверке цепочки и тянул бы X.509 с корневым
- * хранилищем, которого на роутере нет.
+ * Сертификат сервера Reality мы НЕ проверяем цепочкой, и это не небрежность: сертификат
+ * подлинный, но принадлежит чужому сайту, которым сервер прикрывается. Проверять его
+ * бессмысленно — подлинность уже доказана иначе (аутентификатор и HMAC в поле подписи, см.
+ * certverify.h). Именно поэтому здесь нет TLS-стека библиотеки: он настаивал бы на проверке
+ * цепочки, собирал бы свой ClientHello, а облик Hello у нас — браузерный и свой (reality.c).
+ * От криптобиблиотеки здесь нужны только примитивы, и берутся они через слой scrypto.
  *
  * Реализована только та часть рукопожатия, которая нужна: разобрать ServerHello, вывести
  * ключи, проверить Finished. Возобновление сессий, client cert, HelloRetryRequest и
@@ -27,13 +28,7 @@
 #include <sys/socket.h>
 #include <poll.h>
 
-#include "mbedtls/sha256.h"
-#include "mbedtls/sha512.h"
-#include "mbedtls/hkdf.h"
-#include "mbedtls/md.h"
-#include "mbedtls/gcm.h"
-#include "mbedtls/chachapoly.h"
-
+#include "scrypto.h"
 #include "certverify.h"
 #include "tls13.h"
 
@@ -47,7 +42,7 @@ int x25519_shared_ext(const unsigned char priv[32], const unsigned char peer[32]
 /* Своя обёртка, потому что метка склеивается по строгому формату: длина вывода,
  * "tls13 "+label, контекст. Ошибка в одном байте здесь даёт ключи, отличные от
  * серверных, и проявляется как «расшифровка не выходит» уже после рукопожатия. */
-static int expand_label(const mbedtls_md_info_t *md,
+static int expand_label(enum sc_hash md,
                         const unsigned char *secret, size_t secret_n,
                         const char *label,
                         const unsigned char *ctx, size_t ctx_n,
@@ -63,10 +58,10 @@ static int expand_label(const mbedtls_md_info_t *md,
     memcpy(info + i, label, llen); i += llen;
     info[i++] = (unsigned char)ctx_n;
     if (ctx_n) { memcpy(info + i, ctx, ctx_n); i += ctx_n; }
-    return mbedtls_hkdf_expand(md, secret, secret_n, info, i, out, out_n);
+    return sc_hkdf_expand(md, secret, secret_n, info, i, out, out_n);
 }
 
-static int derive_secret(const mbedtls_md_info_t *md, const unsigned char *secret,
+static int derive_secret(enum sc_hash md, const unsigned char *secret,
                          const char *label, const unsigned char *thash, size_t hash_n,
                          unsigned char *out) {
     return expand_label(md, secret, hash_n, label, thash, hash_n, out, hash_n);
@@ -76,32 +71,28 @@ static int derive_secret(const mbedtls_md_info_t *md, const unsigned char *secre
 /* Хеш всех сообщений рукопожатия по порядку. Он входит в вывод каждого ключа, поэтому
  * любое расхождение с сервером (лишний байт, пропущенное сообщение) ломает не транскрипт,
  * а ключи — и обнаруживается как неверный Finished. */
+/* Отказ хеша здесь не возвращается, а ломает транскрипт: у заведённого контекста SHA-2 отказать
+ * нечему (ни выделений, ни устройств), а если это всё-таки случилось, хеш выйдет не тем, и
+ * Finished не сойдётся — рукопожатие упадёт с TLS13_EFINISHED, а не пройдёт с чужими ключами.
+ * Отказ init оставляет контекст незаведённым (alg == 0), и остальные вызовы на нём — тоже отказ. */
 static void tr_init(struct tls13 *t) {
-    mbedtls_sha256_init(&t->tr);
-    mbedtls_sha256_starts(&t->tr, 0);
-    mbedtls_sha512_init(&t->tr384);
-    mbedtls_sha512_starts(&t->tr384, 1);        /* 1 = SHA-384 */
+    sc_hash_init(&t->tr, SC_SHA256);
+    sc_hash_init(&t->tr384, SC_SHA384);
 }
 static void tr_add(struct tls13 *t, const unsigned char *d, size_t n) {
-    mbedtls_sha256_update(&t->tr, d, n);
-    mbedtls_sha512_update(&t->tr384, d, n);
+    sc_hash_update(&t->tr, d, n);
+    sc_hash_update(&t->tr384, d, n);
 }
 /* Хеш транскрипта тем алгоритмом, который выбрал сервер. Копия контекста: транскрипт
  * продолжается после каждого вывода ключей. */
 static void tr_hash(const struct tls13 *t, unsigned char *out) {
-    if (t->hash_n == 48) {
-        mbedtls_sha512_context c;
-        mbedtls_sha512_init(&c);
-        mbedtls_sha512_clone(&c, &t->tr384);
-        mbedtls_sha512_finish(&c, out);
-        mbedtls_sha512_free(&c);
+    struct sc_hash_ctx c;
+    if (sc_hash_clone(&c, t->hash_n == 48 ? &t->tr384 : &t->tr) != 0) {
+        memset(out, 0, t->hash_n == 48 ? 48 : 32);
         return;
     }
-    mbedtls_sha256_context c;
-    mbedtls_sha256_init(&c);
-    mbedtls_sha256_clone(&c, &t->tr);
-    mbedtls_sha256_finish(&c, out);
-    mbedtls_sha256_free(&c);
+    sc_hash_final(&c, out);
+    sc_hash_free(&c);
 }
 
 /* ---- чтение записей -------------------------------------------------------- */
@@ -221,31 +212,37 @@ static void aead_nonce(const unsigned char iv[12], uint64_t seq, unsigned char o
  * трафика готовы; дальше каждая запись пользуется готовым контекстом. */
 int tls13_keys_setup(struct tls13_keys *k) {
     if (k->ctx_ready) return 0;
-    if (k->aead == TLS13_AEAD_CHACHA) {
-        mbedtls_chachapoly_init(&k->chacha);
-        if (mbedtls_chachapoly_setkey(&k->chacha, k->key) != 0) return TLS13_ECRYPTO;
-    } else {
-        mbedtls_gcm_init(&k->gcm);
-        if (mbedtls_gcm_setkey(&k->gcm, MBEDTLS_CIPHER_ID_AES, k->key,
-                               (unsigned)k->key_n * 8) != 0)
-            return TLS13_ECRYPTO;
+    enum sc_aead_alg a;
+    /* Длина ключа сверяется с алгоритмом: key_n заполняет вызывающий (рукопожатие, xsteer), и
+     * расхождение означало бы ключ AES-256, развёрнутый из шестнадцати байт с мусором. */
+    switch (k->aead) {
+        case TLS13_AEAD_AES128: a = SC_AES128_GCM; break;
+        case TLS13_AEAD_AES256: a = SC_AES256_GCM; break;
+        case TLS13_AEAD_CHACHA: a = SC_CHACHA20_POLY1305; break;
+        default: return TLS13_ECRYPTO;
     }
+    if (k->key_n != sc_aead_key_len(a)) return TLS13_ECRYPTO;
+    if (sc_aead_setkey(&k->ctx, a, k->key) != 0) return TLS13_ECRYPTO;
     k->ctx_ready = 1;
     return 0;
 }
 
 void tls13_keys_free(struct tls13_keys *k) {
     if (!k->ctx_ready) return;
-    if (k->aead == TLS13_AEAD_CHACHA) mbedtls_chachapoly_free(&k->chacha);
-    else mbedtls_gcm_free(&k->gcm);
+    sc_aead_free(&k->ctx);
     k->ctx_ready = 0;
 }
 
+/* Безопасна на ОБНУЛЁННОЙ структуре и при повторном вызове — это контракт, а не удобство: с шага 2
+ * выпуска 1.10 её зовёт transport_close на любой связи, в том числе при security=none, где
+ * tls13_init не звали вовсе. Держится на том, что у каждого контекста слоя нулевой «алгоритм» или
+ * флаг готовности значит «пусто» (sc_hash_free, sc_aead_free ничего не делают), а освобождение
+ * этот признак снова обнуляет. */
 void tls13_free(struct tls13 *t) {
     tls13_keys_free(&t->rd);
     tls13_keys_free(&t->wr);
-    mbedtls_sha256_free(&t->tr);
-    mbedtls_sha512_free(&t->tr384);
+    sc_hash_free(&t->tr);
+    sc_hash_free(&t->tr384);
     t->ready = 0;
 }
 
@@ -259,16 +256,12 @@ int tls13_aead_open(struct tls13_keys *k, uint64_t seq,
     size_t ct = n - 16;
     /* Тег КОПИРУЕТСЯ, а не читается из того же буфера. Расшифровка идёт на месте, и тег
      * лежит сразу за шифротекстом — то есть в области, которую реализация вправе задеть,
-     * дописывая последний неполный блок. Проверено отдельным тестом (tests/gcm-size.c),
-     * что эта mbedtls так не делает ни на одном размере записи, — но зависеть от её
-     * внутреннего устройства незачем, а копия в шестнадцать байт стоит ничего. */
+     * дописывая последний неполный блок. tests/scryptomatch.c проверяет, что wolfCrypt так не
+     * делает ни на одном размере записи, — но зависеть от внутреннего устройства библиотеки
+     * незачем, а копия в шестнадцать байт стоит ничего. */
     unsigned char tag[16];
     memcpy(tag, buf + ct, 16);
-    int rc;
-    if (k->aead == TLS13_AEAD_CHACHA)
-        rc = mbedtls_chachapoly_auth_decrypt(&k->chacha, ct, nonce, aad, aad_n, tag, buf, buf);
-    else
-        rc = mbedtls_gcm_auth_decrypt(&k->gcm, ct, nonce, 12, aad, aad_n, tag, 16, buf, buf);
+    int rc = sc_aead_open(&k->ctx, nonce, aad, aad_n, buf, ct, tag);
     return rc == 0 ? 0 : TLS13_EAUTH;
 }
 
@@ -278,12 +271,7 @@ int tls13_aead_seal(struct tls13_keys *k, uint64_t seq,
     if (!k->ctx_ready) return TLS13_ESTATE;
     unsigned char nonce[12];
     aead_nonce(k->iv, seq, nonce);
-    int rc;
-    if (k->aead == TLS13_AEAD_CHACHA)
-        rc = mbedtls_chachapoly_encrypt_and_tag(&k->chacha, n, nonce, aad, aad_n, buf, buf, tag);
-    else
-        rc = mbedtls_gcm_crypt_and_tag(&k->gcm, MBEDTLS_GCM_ENCRYPT, n, nonce, 12,
-                                       aad, aad_n, buf, buf, 16, tag);
+    int rc = sc_aead_seal(&k->ctx, nonce, aad, aad_n, buf, n, tag);
     return rc == 0 ? 0 : TLS13_ECRYPTO;
 }
 
@@ -344,7 +332,7 @@ static int handshake(struct tls13 *t, int fd,
     memset(t, 0, sizeof(*t));
     t->fd = fd;
     /* md и H заполняются после разбора ServerHello: они зависят от набора шифров. */
-    const mbedtls_md_info_t *md = NULL;
+    enum sc_hash md = SC_SHA256;
     size_t H = 0;
 
     tr_init(t);
@@ -416,17 +404,15 @@ static int handshake(struct tls13 *t, int fd,
     }
     /* Только теперь известно, на каком хеше стоит всё расписание ключей. */
     H = t->hash_n;
-    md = mbedtls_md_info_from_type(H == 48 ? MBEDTLS_MD_SHA384 : MBEDTLS_MD_SHA256);
-    if (!md) return TLS13_ECRYPTO;
+    md = H == 48 ? SC_SHA384 : SC_SHA256;
 
     /* Расписание ключей RFC 8446 §7.1. Каждый шаг обязателен и порядок его строг:
      * early -> handshake -> master, с derive-secret между ними. */
     unsigned char zeros[48] = {0};
     unsigned char early[48], derived[48], hs_secret[48], empty_hash[48];
-    if (H == 48) mbedtls_sha512(zeros, 0, empty_hash, 1);
-    else mbedtls_sha256(zeros, 0, empty_hash, 0);
+    if (sc_hash(md, zeros, 0, empty_hash) != 0) return TLS13_ECRYPTO;
 
-    if (mbedtls_hkdf_extract(md, NULL, 0, zeros, H, early) != 0) return TLS13_ECRYPTO;
+    if (sc_hkdf_extract(md, NULL, 0, zeros, H, early) != 0) return TLS13_ECRYPTO;
     if (expand_label(md, early, H, "derived", empty_hash, H, derived, H) != 0) return TLS13_ECRYPTO;
 
     /* ECDHE-вход расписания — секрет с ЭФЕМЕРНЫМ ключом сервера из ServerHello, а не
@@ -444,7 +430,7 @@ static int handshake(struct tls13 *t, int fd,
      * эфемерным ключом — иначе поток не был бы неотличим от настоящего HTTPS. */
     unsigned char ecdhe[32];
     if (x25519_shared_ext(our_priv, server_pub, ecdhe) != 0) return TLS13_ECRYPTO;
-    if (mbedtls_hkdf_extract(md, derived, H, ecdhe, 32, hs_secret) != 0)
+    if (sc_hkdf_extract(md, derived, H, ecdhe, 32, hs_secret) != 0)
         return TLS13_ECRYPTO;
 
     unsigned char th[48];
@@ -593,7 +579,7 @@ static int handshake(struct tls13 *t, int fd,
                 tr_hash(t, hash);
                 if (expand_label(md, s_hs, H, "finished", NULL, 0, fkey, H) != 0)
                     return TLS13_ECRYPTO;
-                if (mbedtls_md_hmac(md, fkey, H, hash, H, want) != 0) return TLS13_ECRYPTO;
+                if (sc_hmac(md, fkey, H, hash, H, want) != 0) return TLS13_ECRYPTO;
                 if (mlen != H || memcmp(hsbuf + p + 4, want, H) != 0) return TLS13_EFINISHED;
                 memcpy(server_finished, want, H);
                 got_finished = 1;
@@ -656,7 +642,7 @@ static int handshake(struct tls13 *t, int fd,
     tr_hash(t, th2);
     if (expand_label(md, c_hs, H, "finished", NULL, 0, cfkey, H) != 0) return TLS13_ECRYPTO;
     memcpy(chash, th2, H);
-    if (mbedtls_md_hmac(md, cfkey, H, chash, H, cfin) != 0) return TLS13_ECRYPTO;
+    if (sc_hmac(md, cfkey, H, chash, H, cfin) != 0) return TLS13_ECRYPTO;
 
     /* Отправляем: ChangeCipherSpec (совместимость с middlebox, как браузер) и
      * зашифрованный Finished. */
@@ -684,7 +670,7 @@ static int handshake(struct tls13 *t, int fd,
     unsigned char master[48], c_ap[48], s_ap[48];
     if (expand_label(md, hs_secret, H, "derived", empty_hash, H, derived, H) != 0)
         return TLS13_ECRYPTO;
-    if (mbedtls_hkdf_extract(md, derived, H, zeros, H, master) != 0) return TLS13_ECRYPTO;
+    if (sc_hkdf_extract(md, derived, H, zeros, H, master) != 0) return TLS13_ECRYPTO;
     tr_hash(t, th2);
     if (derive_secret(md, master, "c ap traffic", th2, H, c_ap) != 0) return TLS13_ECRYPTO;
     if (derive_secret(md, master, "s ap traffic", th2, H, s_ap) != 0) return TLS13_ECRYPTO;
@@ -871,27 +857,22 @@ int xc_x25519_keypair(unsigned char priv[32], unsigned char pub[32]);
 /* PRF TLS 1.2 (RFC 5246 §5): P_SHA256(secret, label || seed). */
 static int tls12_prf(const unsigned char *secret, size_t secret_n, const char *label,
                      const unsigned char *seed, size_t seed_n, unsigned char *out, size_t out_n) {
-    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
     unsigned char ls[128], a[32], tmp[32];
     size_t ll = strlen(label);
-    if (!md || ll + seed_n > sizeof(ls)) return TLS13_ECRYPTO;
+    if (ll + seed_n > sizeof(ls)) return TLS13_ECRYPTO;
     memcpy(ls, label, ll);
     memcpy(ls + ll, seed, seed_n);
     size_t lsn = ll + seed_n;
     /* A(1) = HMAC(secret, label||seed), дальше A(i) = HMAC(secret, A(i-1)). */
-    if (mbedtls_md_hmac(md, secret, secret_n, ls, lsn, a)) return TLS13_ECRYPTO;
+    if (sc_hmac(SC_SHA256, secret, secret_n, ls, lsn, a)) return TLS13_ECRYPTO;
     size_t off = 0;
     while (off < out_n) {
-        mbedtls_md_context_t c;
-        mbedtls_md_init(&c);
-        if (mbedtls_md_setup(&c, md, 1) || mbedtls_md_hmac_starts(&c, secret, secret_n) ||
-            mbedtls_md_hmac_update(&c, a, 32) || mbedtls_md_hmac_update(&c, ls, lsn) ||
-            mbedtls_md_hmac_finish(&c, tmp)) { mbedtls_md_free(&c); return TLS13_ECRYPTO; }
-        mbedtls_md_free(&c);
+        /* HMAC(secret, A(i) || label || seed) — двумя кусками, без склейки в буфер. */
+        if (sc_hmac2(SC_SHA256, secret, secret_n, a, 32, ls, lsn, tmp)) return TLS13_ECRYPTO;
         size_t take = out_n - off < 32 ? out_n - off : 32;
         memcpy(out + off, tmp, take);
         off += take;
-        if (mbedtls_md_hmac(md, secret, secret_n, a, 32, a)) return TLS13_ECRYPTO;
+        if (sc_hmac(SC_SHA256, secret, secret_n, a, 32, a)) return TLS13_ECRYPTO;
     }
     return 0;
 }
@@ -992,9 +973,8 @@ int tls12_handshake(struct tls13 *t, int fd, const char *sni) {
     memset(t, 0, sizeof(*t));
     t->fd = fd;
     t->v12 = 1;
-    mbedtls_sha256_context tr;
-    mbedtls_sha256_init(&tr);
-    mbedtls_sha256_starts(&tr, 0);
+    struct sc_hash_ctx tr;
+    if (sc_hash_init(&tr, SC_SHA256) != 0) return TLS13_ECRYPTO;
     int rc = TLS13_ESTATE;
 
     unsigned char cr[32], sr[32], priv[32], pub[32], sid[32];
@@ -1036,7 +1016,7 @@ int tls12_handshake(struct tls13 *t, int fd, const char *sni) {
     size_t hl = (size_t)(p - h);
     h[0] = 0x01; put24(h + 1, hl - 4);
     buf[0] = 0x16; buf[1] = 0x03; buf[2] = 0x01; put16(buf + 3, hl);
-    mbedtls_sha256_update(&tr, h, hl);
+    sc_hash_update(&tr, h, hl);
     if ((rc = write_all_fd(fd, buf, 5 + hl))) goto out;
 
     /* ---- ответ сервера: ServerHello … ServerHelloDone ---- */
@@ -1078,7 +1058,7 @@ int tls12_handshake(struct tls13 *t, int fd, const char *sni) {
                 done = 1;
             }
             /* Certificate (0x0b) и прочее — только в транскрипт. */
-            mbedtls_sha256_update(&tr, hs + off, 4 + ml);
+            sc_hash_update(&tr, hs + off, 4 + ml);
             off += 4 + ml;
             if (done) break;
         }
@@ -1105,7 +1085,7 @@ int tls12_handshake(struct tls13 *t, int fd, const char *sni) {
     /* ---- ClientKeyExchange, ChangeCipherSpec, Finished ---- */
     unsigned char cke[4 + 33];
     cke[0] = 0x10; put24(cke + 1, 33); cke[4] = 32; memcpy(cke + 5, pub, 32);
-    mbedtls_sha256_update(&tr, cke, sizeof(cke));
+    sc_hash_update(&tr, cke, sizeof(cke));
     buf[0] = 0x16; buf[1] = 0x03; buf[2] = 0x03; put16(buf + 3, sizeof(cke));
     memcpy(buf + 5, cke, sizeof(cke));
     size_t bn = 5 + sizeof(cke);
@@ -1113,12 +1093,13 @@ int tls12_handshake(struct tls13 *t, int fd, const char *sni) {
     memcpy(buf + bn, ccs, 6); bn += 6;
 
     unsigned char th[32], fin[16];
-    mbedtls_sha256_context tc;
-    mbedtls_sha256_init(&tc); mbedtls_sha256_clone(&tc, &tr); mbedtls_sha256_finish(&tc, th);
-    mbedtls_sha256_free(&tc);
+    struct sc_hash_ctx tc;
+    if (sc_hash_clone(&tc, &tr) != 0) { rc = TLS13_ECRYPTO; goto out; }
+    sc_hash_final(&tc, th);
+    sc_hash_free(&tc);
     fin[0] = 0x14; put24(fin + 1, 12);
     if ((rc = tls12_prf(ms, 48, "client finished", th, 32, fin + 4, 12))) goto out;
-    mbedtls_sha256_update(&tr, fin, 16);
+    sc_hash_update(&tr, fin, 16);
     size_t fn = 0;
     if ((rc = tls12_seal_rec(t, 0x16, fin, 16, buf + bn, &fn))) goto out;
     bn += fn;
@@ -1126,8 +1107,9 @@ int tls12_handshake(struct tls13 *t, int fd, const char *sni) {
 
     /* ---- ChangeCipherSpec и Finished сервера ---- */
     unsigned char want[12];
-    mbedtls_sha256_init(&tc); mbedtls_sha256_clone(&tc, &tr); mbedtls_sha256_finish(&tc, th);
-    mbedtls_sha256_free(&tc);
+    if (sc_hash_clone(&tc, &tr) != 0) { rc = TLS13_ECRYPTO; goto out; }
+    sc_hash_final(&tc, th);
+    sc_hash_free(&tc);
     if ((rc = tls12_prf(ms, 48, "server finished", th, 32, want, 12))) goto out;
     int got_ccs = 0;
     for (int guard = 0; guard < 8; guard++) {
@@ -1148,7 +1130,7 @@ int tls12_handshake(struct tls13 *t, int fd, const char *sni) {
     }
     rc = TLS13_EBADREC;
 out:
-    mbedtls_sha256_free(&tr);
+    sc_hash_free(&tr);
     if (rc) { tls13_keys_free(&t->wr); tls13_keys_free(&t->rd); t->ready = 0; }
     return rc;
 }
