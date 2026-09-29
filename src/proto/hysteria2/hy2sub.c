@@ -101,7 +101,11 @@ int hy2_parse_ports(const char *s, uint16_t *first, uint16_t *hop, unsigned *hop
         if (*e && *e != ',') return -1;
         if (!parts) *first = (uint16_t)a;
         parts++;
-        if (ranges >= HY2_HOP_RANGES) return -1;
+        /* Диапазонов в списке портов — не больше HY2_HOP_RANGES (8): они лежат в самой записи
+         * узла и в настройках соединения QUIC (QC_HOP_RANGES), а порт прыжка выбирается по
+         * случайному числу из всех. У панелей и эталона — один-два диапазона. -2 — «слишком
+         * много», вызывающий называет число. */
+        if (ranges >= HY2_HOP_RANGES) return -2;
         hop[2 * ranges] = (uint16_t)a;
         hop[2 * ranges + 1] = (uint16_t)b;
         ranges++;
@@ -155,6 +159,10 @@ static int node_check(struct hy2_node *n) {
 
 /* ---- ссылка ---------------------------------------------------------------------------------- */
 
+static int parse_url_buf(char *buf, struct hy2_node *n);
+
+/* Длина ссылки не ограничена: рабочая копия (её режут разбором на части) — на стеке, если
+ * короткая, иначе в куче по длине. Поля узла свои и режутся по ширине. */
 int hy2_parse_url(const char *url, struct hy2_node *n) {
     static const char *const schemes[] = { "hysteria2://", "hy2://" };
     size_t sl = 0;
@@ -164,12 +172,18 @@ int hy2_parse_url(const char *url, struct hy2_node *n) {
     memset(n, 0, sizeof *n);
     n->hop_s = 30;
 
-    char buf[1536];
+    char sbuf[1536];
     size_t ul = strcspn(url + sl, " \t\r\n");
-    if (ul >= sizeof buf) { snprintf(n->skip_reason, sizeof n->skip_reason, "ссылка слишком длинная"); return 1; }
+    char *buf = ul < sizeof sbuf ? sbuf : malloc(ul + 1);
+    if (!buf) { snprintf(n->skip_reason, sizeof n->skip_reason, "нет памяти под ссылку"); return 1; }
     memcpy(buf, url + sl, ul);
     buf[ul] = '\0';
+    int rc = parse_url_buf(buf, n);
+    if (buf != sbuf) free(buf);
+    return rc;
+}
 
+static int parse_url_buf(char *buf, struct hy2_node *n) {
     char *frag = strchr(buf, '#');
     if (frag) { *frag++ = '\0'; pct_decode(frag); set_str(n->name, sizeof n->name, frag, strlen(frag)); }
     char *query = strchr(buf, '?');
@@ -199,8 +213,10 @@ int hy2_parse_url(const char *url, struct hy2_node *n) {
         set_str(n->host, sizeof n->host, host, strlen(host));
     }
     if (ports && *ports) {
-        if (hy2_parse_ports(ports, &n->port, n->hop, &n->hop_n) != 0) {
-            snprintf(n->skip_reason, sizeof n->skip_reason, "порт не разбирается");
+        int prc = hy2_parse_ports(ports, &n->port, n->hop, &n->hop_n);
+        if (prc != 0) {
+            snprintf(n->skip_reason, sizeof n->skip_reason, prc == -2 ?
+                     "порты: диапазонов больше %d" : "порт не разбирается", HY2_HOP_RANGES);
             return 1;
         }
     } else {
@@ -234,8 +250,10 @@ int hy2_parse_url(const char *url, struct hy2_node *n) {
         else if (!strcasecmp(k, "down")) n->down_bps = hy2_parse_bandwidth(val);
         else if (!strcasecmp(k, "mport")) {
             uint16_t first;
-            if (hy2_parse_ports(val, &first, n->hop, &n->hop_n) != 0) {
-                snprintf(n->skip_reason, sizeof n->skip_reason, "mport не разбирается");
+            int prc = hy2_parse_ports(val, &first, n->hop, &n->hop_n);
+            if (prc != 0) {
+                snprintf(n->skip_reason, sizeof n->skip_reason, prc == -2 ?
+                         "mport: диапазонов больше %d" : "mport не разбирается", HY2_HOP_RANGES);
                 return 1;
             }
         } else if (!strcasecmp(k, "hop-interval") || !strcasecmp(k, "hop_interval") ||
@@ -439,8 +457,11 @@ static int xray_outbound(const struct js *j, int ob, struct hy2_node *n) {
                 char pl[128];
                 j_get_str(j, set, "remotePorts", pl, sizeof pl);
                 uint16_t first;
-                if (pl[0] && hy2_parse_ports(pl, &first, n->hop, &n->hop_n) != 0) {
-                    snprintf(n->skip_reason, sizeof n->skip_reason, "remotePorts не разбирается");
+                int prc = pl[0] ? hy2_parse_ports(pl, &first, n->hop, &n->hop_n) : 0;
+                if (prc != 0) {
+                    snprintf(n->skip_reason, sizeof n->skip_reason, prc == -2 ?
+                             "remotePorts: диапазонов больше %d" : "remotePorts не разбирается",
+                             HY2_HOP_RANGES);
                     return 1;
                 }
                 j_get_str(j, set, "interval", pl, sizeof pl);
@@ -516,15 +537,19 @@ size_t hy2_parse_sub(const char *text, struct hy2_node *out, size_t max, struct 
         while (*s && isspace((unsigned char)*s)) s++;
         const char *e = s + strcspn(s, " \t\r\n");
         if (e > s) {
-            char line[1600];
+            /* Короткая ссылка — в стековый буфер, длинная — в кучу по длине: предела длины ссылки
+             * нет (поля узла режет по ширине hy2_parse_url). */
+            char sbuf[1600];
             size_t l = (size_t)(e - s);
-            if (l < sizeof line) {
+            char *line = l < sizeof sbuf ? sbuf : malloc(l + 1);
+            if (line) {
                 memcpy(line, s, l);
                 line[l] = '\0';
                 struct hy2_node nd;
                 int rc = hy2_parse_url(line, &nd);
                 if (rc < 0) { if (strstr(line, "://")) st->foreign++; }
                 else take(out, max, &cnt, &nd, rc, st);
+                if (line != sbuf) free(line);
             } else if (strstr(s, "://") && strstr(s, "://") < e) {
                 st->foreign++;
             }
@@ -570,4 +595,38 @@ const char *hy2_sub_text(const char *raw, size_t raw_n, char *dec, size_t dec_n)
     size_t o = b64(raw, strlen(raw), dec, dec_n);
     if (o && (strstr(dec, "://") || dec[0] == '{' || dec[0] == '[')) return dec;
     return raw;
+}
+
+/* Подписка из файла целиком: буферы и массив узлов — в куче по размеру файла и числу узлов в нём
+ * (как vless_load_sub). Мест под узлы — по числу «://» и объектов Xray («"protocol"») в тексте:
+ * верхняя граница числа узлов. Потолок файла — 64 МиБ: защита от файла-не-подписки под этим
+ * именем, а не размер подписки (тысяча узлов — сотни килобайт). NULL — файл не открылся, слишком
+ * велик или нет памяти; иначе массив (free), *cnt — пригодных узлов. */
+#define HY2_SUB_FILE_MAX ((size_t)64 << 20)
+struct hy2_node *hy2_load_sub(const char *path, size_t *cnt, struct hy2_sub_stats *st) {
+    *cnt = 0;
+    if (st) memset(st, 0, sizeof(*st));
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long fl = ftell(f);
+    rewind(f);
+    if (fl < 0 || (size_t)fl > HY2_SUB_FILE_MAX) { fclose(f); return NULL; }
+    size_t sz = (size_t)fl;
+    char *raw = malloc(sz + 1), *dec = malloc(sz + 16);
+    if (!raw || !dec) { fclose(f); free(raw); free(dec); return NULL; }
+    size_t n = fread(raw, 1, sz, f);
+    fclose(f);
+    raw[n] = '\0';
+    dec[0] = '\0';
+    const char *text = hy2_sub_text(raw, n, dec, sz + 16);
+    size_t hint = 1;
+    for (const char *q = text; (q = strstr(q, "://")); q += 3) hint++;
+    for (const char *q = text; (q = strstr(q, "\"protocol\"")); q += 10) hint++;
+    struct hy2_node *nodes = calloc(hint, sizeof(*nodes));
+    struct hy2_sub_stats tmp;
+    if (nodes) *cnt = hy2_parse_sub(text, nodes, hint, st ? st : &tmp);
+    free(raw);
+    free(dec);
+    return nodes;
 }

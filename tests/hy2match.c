@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "hy2.h"
 
@@ -360,7 +361,38 @@ static void test_sub(void) {
     CHECK(hy2_sub_text(txt, strlen(txt), dec, sizeof dec) == txt);
 }
 
+/* Пределы: подписка на 500 узлов из файла, ссылка длиннее стекового буфера, диапазонов портов
+ * больше предела с числом в причине. */
+static void test_limits(void) {
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/hy2match-500.%d", (int)getpid());
+    FILE *f = fopen(path, "w");
+    for (int i = 0; f && i < 500; i++) fprintf(f, "hysteria2://p@h%d.example:443/#node%d\n", i, i);
+    if (f) fclose(f);
+    struct hy2_sub_stats st;
+    size_t n = 0;
+    struct hy2_node *nodes = hy2_load_sub(path, &n, &st);
+    unlink(path);
+    CHECK(nodes && n == 500 && st.skipped == 0);
+    if (nodes && n == 500) CHECK(!strcmp(nodes[499].name, "node499") && !strcmp(nodes[0].host, "h0.example"));
+    free(nodes);
+    CHECK(hy2_load_sub("/tmp/hy2match-нет-такого-файла", &n, &st) == NULL && n == 0);
+
+    static char big[6000];
+    int k = snprintf(big, sizeof big, "hysteria2://p@long.example:443/?sni=long.example&pad=");
+    memset(big + k, 'x', 3000);
+    snprintf(big + k + 3000, sizeof big - (size_t)k - 3000, "#long\n");
+    struct hy2_node one[2];
+    CHECK(hy2_parse_sub(big, one, 2, &st) == 1 && !strcmp(one[0].name, "long"));
+
+    struct hy2_node nd;
+    CHECK(hy2_parse_url("hysteria2://p@h:1000,2000-3000,4000,5000,6000,7000,8000,9000/", &nd) == 0 && nd.hop_n == 8);
+    CHECK(hy2_parse_url("hysteria2://p@h:1000,2000,3000,4000,5000,6000,7000,8000,9000/", &nd) == 1);
+    CHECK(strstr(nd.skip_reason, "диапазонов больше 8") != NULL);
+}
+
 int main(void) {
+    test_limits();
     test_varint();
     test_blake2b();
     test_udp();

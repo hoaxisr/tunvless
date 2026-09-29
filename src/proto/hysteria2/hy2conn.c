@@ -62,11 +62,17 @@
 #error "диапазонов прыжков в узле и в обёртке QUIC должно быть поровну"
 #endif
 
-#define MAXF        1024        /* потоков клиента одновременно */
-#define CHUNK       16000       /* сообщение клиентской стороне: меньше буфера стека (TUNNEL_BUF) */
+/* Потоков клиента одновременно — не константа: массив потоков растёт (E.fl), а пределом служит
+ * сам QUIC — сколько двунаправленных потоков разрешил сервер (qc_stream_open отвечает отказом,
+ * запрос получает HY2E_BUSY) — и память. Раньше стояло 1024 «по умолчанию эталона», и клиент
+ * отказывал раньше сервера, у которого лимит выше. */
+#define CHUNK      16000       /* сообщение клиентской стороне: меньше буфера стека (TUNNEL_BUF) */
 #define RXB         65536
 #define PEND_MAX    (12u << 20) /* очередь к медленному клиенту: окно потока + запас */
 #define RSLOT       1400        /* место под фрагмент UDP при сборке */
+/* Фрагментов одной датаграммы UDP от сервера — не больше 64: датаграмма UDP не длиннее 65535
+ * байт, а фрагмент несёт до RSLOT байт, так что 64 покрывают протокол целиком; заявленное
+ * сервером большее число — испорченный кадр, он отбрасывается (on_datagram). Свойство протокола. */
 #define RFRAG_MAX   64
 #define AUTH_S      10          /* срок ответа на авторизацию */
 #define REQ_S       15          /* срок ответа на запрос TCP */
@@ -120,6 +126,9 @@ struct flow {
     uint16_t rlen[RFRAG_MAX];
     uint8_t rseen[RFRAG_MAX];
     uint8_t *rbuf;
+    /* Цепочки корзин индексов по номеру потока и по идентификатору сессии UDP (E.by_sid,
+     * E.by_usid): коллизия корзины — не отказ, а следующий в цепочке. */
+    struct flow *hn_sid, *hn_usid;
 };
 
 enum { S_IDLE, S_HS, S_AUTH, S_UP };
@@ -154,9 +163,9 @@ static struct {
     uint8_t abuf[4096];
     size_t an;
     uint64_t hs_start_ms;
-    struct flow *fl[MAXF];
-    unsigned nfl;
-    struct flow *by_sid[4096];      /* индекс по номеру потока (sid / 4) */
+    struct flow **fl;               /* растущий массив потоков (flow_new), nfl — занято, flcap — место */
+    unsigned nfl, flcap;
+    struct flow *by_sid[4096];      /* корзины цепочек по номеру потока (sid / 4) */
     struct flow *by_usid[1024];     /* по идентификатору сессии UDP */
     char ip_used[64];
 } E = { .mu = PTHREAD_MUTEX_INITIALIZER };
@@ -461,6 +470,28 @@ static void req_finish(struct req *r, int rc, const char *msg) {
     pthread_mutex_unlock(&E.mu);
 }
 
+/* Индексы потоков — корзины с цепочками: число одновременных потоков от размера таблицы не
+ * зависит. Вставка — в голову цепочки, снятие — по указателю (снять нестоящего безвредно). */
+static struct flow **sid_bucket(int64_t sid) { return &E.by_sid[(uint64_t)(sid / 4) & 4095]; }
+static struct flow **usid_bucket(uint32_t u) { return &E.by_usid[u & 1023]; }
+static void sid_add(struct flow *f) { struct flow **b = sid_bucket(f->sid); f->hn_sid = *b; *b = f; }
+static void usid_add(struct flow *f) { struct flow **b = usid_bucket(f->usid); f->hn_usid = *b; *b = f; }
+static void sid_del(struct flow *f) {
+    for (struct flow **p = sid_bucket(f->sid); *p; p = &(*p)->hn_sid)
+        if (*p == f) { *p = f->hn_sid; break; }
+    f->hn_sid = NULL;
+}
+static void usid_del(struct flow *f) {
+    for (struct flow **p = usid_bucket(f->usid); *p; p = &(*p)->hn_usid)
+        if (*p == f) { *p = f->hn_usid; break; }
+    f->hn_usid = NULL;
+}
+static struct flow *usid_find(uint32_t u) {
+    for (struct flow *f = *usid_bucket(u); f; f = f->hn_usid)
+        if (f->usid == u) return f;
+    return NULL;
+}
+
 static void flow_free(struct flow *f, int rc, const char *msg) {
     if (f->req) {
         req_finish(f->req, rc ? rc : HY2E_DOWN, msg ? msg : "поток закрыт");
@@ -469,8 +500,8 @@ static void flow_free(struct flow *f, int rc, const char *msg) {
     /* Окно соединения возвращаем и за то, что так и не отдали клиенту. */
     if (f->pend_n > f->pend_off && E.qc) qc_stream_consumed(E.qc, f->udp ? 0 : f->sid, f->pend_n - f->pend_off);
     if (f->fd >= 0) close(f->fd);
-    if (!f->udp && E.by_sid[(f->sid / 4) & 4095] == f) E.by_sid[(f->sid / 4) & 4095] = NULL;
-    if (f->udp && E.by_usid[f->usid & 1023] == f) E.by_usid[f->usid & 1023] = NULL;
+    if (!f->udp) sid_del(f);
+    else usid_del(f);
     for (unsigned i = 0; i < E.nfl; i++)
         if (E.fl[i] == f) { E.fl[i] = E.fl[--E.nfl]; break; }
     free(f->hbuf);
@@ -669,7 +700,13 @@ static void flow_event(struct flow *f, uint32_t ev) {
 /* ---- начало потока по запросу ----------------------------------------------------------------- */
 
 static struct flow *flow_new(struct req *r) {
-    if (E.nfl >= MAXF) return NULL;
+    if (E.nfl == E.flcap) {
+        unsigned nc = E.flcap ? E.flcap * 2 : 64;
+        struct flow **nf = realloc(E.fl, nc * sizeof *nf);
+        if (!nf) return NULL;
+        E.fl = nf;
+        E.flcap = nc;
+    }
     struct flow *f = calloc(1, sizeof *f);
     if (!f) return NULL;
     f->fd = r->efd;
@@ -717,9 +754,9 @@ static void start_flow(struct req *r) {
         for (int tries = 0; tries < 16; tries++) {
             uint32_t u;
             if (getrandom(&u, sizeof u, 0) != sizeof u) u = (uint32_t)now_ms() * 2654435761u;
-            if (!u || E.by_usid[u & 1023]) continue;
+            if (!u || usid_find(u)) continue;
             f->usid = u;
-            E.by_usid[u & 1023] = f;
+            usid_add(f);
             break;
         }
         if (!f->usid) { f->fd = -1; close(r->efd); f->req = NULL; flow_free(f, 0, NULL); req_finish(r, HY2E_BUSY, NULL); return; }
@@ -728,17 +765,15 @@ static void start_flow(struct req *r) {
     }
     int64_t sid;
     int rc = qc_stream_open(E.qc, &sid);
-    struct flow *clash = rc == 0 ? E.by_sid[(sid / 4) & 4095] : NULL;
-    if (rc != 0 || clash) {
+    if (rc != 0) {                      /* потоков больше нет: лимит сервера (MAX_STREAMS) */
         struct req *rq = f->req;
         f->req = NULL;
-        if (rc == 0) qc_stream_reset(E.qc, sid, 0);
         flow_free(f, 0, NULL);          /* закроет efd */
         req_finish(rq, HY2E_BUSY, NULL);
         return;
     }
     f->sid = sid;
-    E.by_sid[(sid / 4) & 4095] = f;
+    sid_add(f);
     uint8_t pad;
     if (getrandom(&pad, 1, 0) != 1) pad = 16;
     uint8_t b[600];
@@ -774,8 +809,9 @@ static void on_handshake(void *u) {
 
 static struct flow *flow_by_sid(int64_t sid) {
     if (sid < 0 || (sid & 3) != 0) return NULL;
-    struct flow *f = E.by_sid[(sid / 4) & 4095];
-    return f && f->sid == sid ? f : NULL;
+    for (struct flow *f = *sid_bucket(sid); f; f = f->hn_sid)
+        if (f->sid == sid) return f;
+    return NULL;
 }
 
 static void auth_data(const uint8_t *d, size_t n) {
@@ -887,8 +923,8 @@ static void on_datagram(void *u, const uint8_t *d, size_t n) {
     (void)u;
     struct hy2_udp_msg m;
     if (hy2_udp_parse(d, n, &m) != 0) return;
-    struct flow *f = E.by_usid[m.sid & 1023];
-    if (!f || f->usid != m.sid || f->state != FL_OPEN) return;
+    struct flow *f = usid_find(m.sid);
+    if (!f || f->state != FL_OPEN) return;
     if (m.nfrag == 1) { (void)local_put(f, m.data, m.n); return; }
     if (m.nfrag > RFRAG_MAX || m.n > RSLOT) return;
     if (f->rn != m.nfrag || f->rpkt != m.pkt || !f->rbuf) {
