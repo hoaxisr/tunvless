@@ -18,6 +18,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <ifaddrs.h>
+#include <net/if.h>
 
 #include "spec.h"
 #include "awg.h"
@@ -319,27 +320,52 @@ static int uci_find(const char *cfg, const char *type, const char *key, const ch
 }
 
 /* Адреса IPv6 устройств раздачи: глобальные (не ULA) и ULA — сколько каких, и первый глобальный
- * внутри префикса p (если p задан) — в in_p. */
+ * внутри префикса p (если p задан) — в in_p.
+ *
+ * УСТАРЕВШИЕ АДРЕСА НЕ В СЧЁТ (проверка на QEMU-роутере 4192267). Человек снял ip6prefix, netifd
+ * снял префикс, а адрес LAN из него остаётся на br-lan устаревшим (preferred_lft 0, `deprecated`
+ * у `ip -6 addr`), пока не истечёт срок действия. Считался он глобальным адресом, и diag молчал
+ * про ra_default («у LAN только ULA»), хотя клиентам этот адрес уже не раздаётся и маршрута по
+ * умолчанию в RA без него нет. Поэтому адреса берутся rtnetlink (у getifaddrs признака нет), и
+ * устаревший не считается ни глобальным, ни адресом из префикса хоста: с него ядро новых
+ * соединений не заводит, и проба с него сказала бы о префиксе, которого уже нет. Прочитать не
+ * вышло — прежний getifaddrs, без признака. */
 struct lan6 { int gua, ula; int in_p; uint8_t a_in_p[16]; };
+
+static void lan6_note(struct lan6 *r, const struct v6pfx *p, const uint8_t *x) {
+    if ((x[0] == 0xfe && (x[1] & 0xc0) == 0x80) || x[0] == 0xff) return;
+    if ((x[0] & 0xfe) == 0xfc) r->ula++;
+    else r->gua++;
+    if (p && p->len && !r->in_p && v6pfx_has(p, x)) {
+        r->in_p = 1;
+        memcpy(r->a_in_p, x, 16);
+    }
+}
 
 static struct lan6 lan6_scan(const struct spec *sp, const struct v6pfx *p) {
     struct lan6 r;
     memset(&r, 0, sizeof(r));
+    static struct rtnl_addr6 av[256];
+    int an = rtnl_addrs6(av, sizeof(av) / sizeof(av[0]));
+    if (an >= 0) {
+        int idx[8];
+        size_t ni = 0;
+        for (size_t i = 0; i < sp->lan_dev_n && ni < 8; i++)
+            if ((idx[ni] = (int)if_nametoindex(sp->lan_dev[i])) > 0) ni++;
+        for (int k = 0; k < an; k++) {
+            int ours = 0;
+            for (size_t i = 0; i < ni && !ours; i++) ours = av[k].ifindex == idx[i];
+            if (ours && !(av[k].flags & IFA_F_DEPRECATED)) lan6_note(&r, p, av[k].a);
+        }
+        return r;
+    }
     struct ifaddrs *ifa = NULL;
     if (getifaddrs(&ifa) != 0) return r;
     for (struct ifaddrs *a = ifa; a; a = a->ifa_next) {
         if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET6 || !a->ifa_name) continue;
         int ours = 0;
         for (size_t i = 0; i < sp->lan_dev_n && !ours; i++) ours = !strcmp(a->ifa_name, sp->lan_dev[i]);
-        if (!ours) continue;
-        const uint8_t *x = ((const struct sockaddr_in6 *)a->ifa_addr)->sin6_addr.s6_addr;
-        if ((x[0] == 0xfe && (x[1] & 0xc0) == 0x80) || x[0] == 0xff) continue;
-        if ((x[0] & 0xfe) == 0xfc) r.ula++;
-        else r.gua++;
-        if (p && p->len && !r.in_p && v6pfx_has(p, x)) {
-            r.in_p = 1;
-            memcpy(r.a_in_p, x, 16);
-        }
+        if (ours) lan6_note(&r, p, ((const struct sockaddr_in6 *)a->ifa_addr)->sin6_addr.s6_addr);
     }
     freeifaddrs(ifa);
     return r;
@@ -437,6 +463,37 @@ static int lan_ifname(const struct spec *sp, char *name, size_t n, char *assign,
     return 0;
 }
 
+/* Раздаёт ли netifd префикс: нуль-маршрут `unreachable P` в main, которым он объявляет каждый
+ * раздаваемый префикс (приметы и доводы — у v6donor_derive в failover.c): не длиннее /64, не ULA,
+ * не префикс провайдера (маршрут `default from P` через чужое устройство). p задан — только
+ * накрывающий его или лежащий в нём. В отличие от v6donor_derive адрес LAN из префикса здесь не
+ * нужен: вопрос как раз о том, почему его нет. 1 — есть, 0 — нет, -1 — маршруты не прочитать. */
+static int v6_announced(const struct output *o, const struct v6pfx *p) {
+    static struct rtnl_route6 rt[256];
+    int n = rtnl_main6_routes(rt, sizeof(rt) / sizeof(rt[0]));
+    if (n < 0) return -1;
+    int donor_if = o->device[0] ? (int)if_nametoindex(o->device) : 0;
+    for (int i = 0; i < n; i++) {
+        if (rt[i].type != RTN_UNREACHABLE || !rt[i].dst_len || rt[i].dst_len > 64) continue;
+        if ((rt[i].dst[0] & 0xfe) == 0xfc) continue;
+        struct v6pfx c;
+        memcpy(c.a, rt[i].dst, 16);
+        c.len = rt[i].dst_len;
+        if (p && p->len && !v6pfx_has(p, c.a) && !v6pfx_has(&c, p->a)) continue;
+        int isp = 0;
+        for (int j = 0; j < n && !isp; j++) {
+            if (!rt[j].src_len || rt[j].dst_len) continue;
+            struct v6pfx s;
+            memcpy(s.a, rt[j].src, 16);
+            s.len = rt[j].src_len;
+            if ((v6pfx_has(&s, c.a) || v6pfx_has(&c, s.a)) && rt[j].oif && rt[j].oif != donor_if)
+                isp = 1;
+        }
+        if (!isp) return 1;
+    }
+    return 0;
+}
+
 static void diag_v6_host(const struct spec *sp, const struct groups *gr) {
     char what[200], why[400];
     int ra_said = 0;
@@ -476,15 +533,37 @@ static void diag_v6_host(const struct spec *sp, const struct groups *gr) {
                 continue;
             }
             if (!p.len || !l.in_p) {
-                if (p.len)
+                /* Чего не хватает — ip6prefix или ip6assign, — прежде было одной строкой «задайте
+                 * ip6prefix … и ip6assign …», и человек правил обе, не зная, какой нет. Различает
+                 * нуль-маршрут netifd (v6_announced): его нет — префикс не раздаётся никем, нет
+                 * ip6prefix; есть, а у LAN адреса из него нет — не хватает ip6assign (или он
+                 * задан, но кусок LAN не достался: ip6class). Маршруты не прочитать — прежняя
+                 * строка про обе. */
+                int ann = v6_announced(o, p.len ? &p : NULL);
+                const char *pn = p.len ? ps : "хоста";
+                if (ann == 0) {
+                    snprintf(what, sizeof(what), "выход %.40s: префикс %.48s не раздаётся — нет "
+                             "ip6prefix", o->name, pn);
+                    snprintf(why, sizeof(why), "клиенты не получат IPv6 от хоста — задайте "
+                             "ip6prefix у интерфейса %.24s%s", o->device,
+                             o->v6pfx_given ? "" : " (или prefix: у выхода)");
+                } else if (ann == 1 && have_uci && assign[0]) {
+                    snprintf(what, sizeof(what), "выход %.40s: у LAN нет адреса из префикса %.48s, "
+                             "хотя ip6assign %.8s задан", o->name, pn, assign);
+                    snprintf(why, sizeof(why), "клиенты не получат IPv6 от хоста — проверьте "
+                             "ip6class у LAN");
+                } else if (ann == 1) {
+                    snprintf(what, sizeof(what), "выход %.40s: у LAN нет адреса из префикса %.48s — "
+                             "нет ip6assign", o->name, pn);
+                    snprintf(why, sizeof(why), "клиенты не получат IPv6 от хоста — задайте "
+                             "ip6assign у LAN");
+                } else {
                     snprintf(what, sizeof(what), "выход %.40s: у LAN нет адреса из префикса %.48s",
-                             o->name, ps);
-                else
-                    snprintf(what, sizeof(what), "выход %.40s: у LAN нет адреса из префикса хоста",
-                             o->name);
-                snprintf(why, sizeof(why), "клиенты не получат IPv6 от хоста — задайте ip6prefix "
-                         "у интерфейса %.24s и ip6assign у LAN%s", o->device,
-                         o->v6pfx_given ? "" : " (или prefix: у выхода)");
+                             o->name, pn);
+                    snprintf(why, sizeof(why), "клиенты не получат IPv6 от хоста — задайте "
+                             "ip6prefix у интерфейса %.24s и ip6assign у LAN%s", o->device,
+                             o->v6pfx_given ? "" : " (или prefix: у выхода)");
+                }
                 diag("ipv6_host", "warn", what, why);
             } else {
                 snprintf(what, sizeof(what), "выход %.40s: префикс хоста %.48s, у LAN адрес из него",
@@ -994,7 +1073,10 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
         /* С ключом ipv6 (шаг 8) вопрос другой: у nat подмену ставит сам движок (своя таблица, её
          * fw_check не читает), у routed её не нужно вовсе — хост маршрутизует префикс, а masq6
          * зоны подменил бы адреса префикса адресом туннеля. */
-        enum out_ipv6 m6 = out_ipv6_mode(&sp->out[i]);
+        /* Ключ — устройства, а не выхода (out_ipv6_mode_dev, fwcheck.c): у группы, чей нынешний
+         * член `ipv6: nat`, подмену на его устройство ставит движок, и «нет masquerade IPv6» там
+         * было ложной тревогой. */
+        int m6 = out_ipv6_mode_dev(sp, &sp->out[i], sp->out[i].device);
         if (c.in_firewall && out_route6(&sp->out[i]) && !out_self_natting(nat_o) && !c.masq6 &&
             m6 == OUT_V6_KIND && lan_has_global_v6(sp)) {
             snprintf(what, sizeof(what), "выход %.40s: у %.24s нет masquerade IPv6",
@@ -1003,12 +1085,32 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
                  "IPv6 клиентов уйдёт в туннель с их адресами, и ответ не вернётся — включите "
                  "masq6 у зоны выхода");
         }
+        /* Называется зона fw4, в которой masq6 (fwcheck.zone6), а не устройство: wg0 бывает в зоне
+         * wan, и «у зоны wg0» посылало бы искать зону, которой нет. Зону не назвать (подмена
+         * правилом на самом устройстве) — называется устройство. */
         if (c.masq6 && m6 == OUT_V6_ROUTED) {
-            snprintf(what, sizeof(what), "выход %.40s: у зоны %.24s включён masq6", sp->out[i].name,
-                     sp->out[i].device);
-            diag("ipv6_host", "warn", what,
-                 "адреса из префикса хоста подменяются адресом туннеля, и снаружи клиентов не видно "
-                 "по их адресам — для ipv6: routed снимите masq6 у зоны выхода");
+            if (c.zone6[0])
+                snprintf(what, sizeof(what), "выход %.40s: у зоны %.24s (в ней %.24s) включён masq6",
+                         sp->out[i].name, c.zone6, sp->out[i].device);
+            else
+                snprintf(what, sizeof(what), "выход %.40s: IPv6 на %.24s подменяется (masquerade)",
+                         sp->out[i].name, sp->out[i].device);
+            /* Зона названа не по устройству (wg0 в зоне wan) — masq6 там нужен остальным её
+             * интерфейсам, и совет «снимите masq6» сломал бы им IPv6: советуется своя зона. */
+            char why6[300];
+            if (!c.zone6[0])
+                snprintf(why6, sizeof(why6), "адреса из префикса хоста подменяются адресом "
+                         "туннеля, и снаружи клиентов не видно по их адресам — для ipv6: routed "
+                         "снимите это правило masquerade");
+            else if (!strcmp(c.zone6, sp->out[i].device))
+                snprintf(why6, sizeof(why6), "адреса из префикса хоста подменяются адресом "
+                         "туннеля, и снаружи клиентов не видно по их адресам — для ipv6: routed "
+                         "снимите masq6 у зоны %.24s", c.zone6);
+            else
+                snprintf(why6, sizeof(why6), "адреса из префикса хоста подменяются адресом "
+                         "туннеля, и снаружи клиентов не видно по их адресам — для ipv6: routed "
+                         "перенесите %.24s в свою зону без masq6", sp->out[i].device);
+            diag("ipv6_host", "warn", what, why6);
         }
     }
 

@@ -525,3 +525,49 @@ int rtnl_main6_routes(struct rtnl_route6 *v, size_t max) {
     if (rtnl_talk(buf, msg_end(&b, nh), main6_cb, &c) != 0) return -1;
     return (int)c.n;
 }
+
+/* ---- адреса IPv6 с признаками (rtnl.h) ------------------------------------------------------ */
+
+struct addr6_ctx { struct rtnl_addr6 *v; size_t n, max; };
+
+static void addr6_cb(const struct nlmsghdr *h, void *ctx) {
+    struct addr6_ctx *c = ctx;
+    if (h->nlmsg_type != RTM_NEWADDR || c->n >= c->max) return;
+    const struct ifaddrmsg *ia = NLMSG_DATA(h);
+    size_t hl = NLMSG_ALIGN(sizeof(*ia));
+    if (h->nlmsg_len < NLMSG_HDRLEN + hl || ia->ifa_family != AF_INET6) return;
+    const struct rtattr *tb[IFA_MAX + 1];
+    attrs_parse((const uint8_t *)ia + hl, h->nlmsg_len - NLMSG_HDRLEN - hl, tb, IFA_MAX);
+    /* У IPv6 IFA_ADDRESS — сам адрес (IFA_LOCAL у него бывает только у точка-точка). */
+    const struct rtattr *a = tb[IFA_LOCAL] ? tb[IFA_LOCAL] : tb[IFA_ADDRESS];
+    if (!a || RTA_PAYLOAD(a) < 16) return;
+    struct rtnl_addr6 *r = &c->v[c->n];
+    memset(r, 0, sizeof(*r));
+    memcpy(r->a, RTA_DATA(a), 16);
+    r->plen = ia->ifa_prefixlen;
+    r->ifindex = (int)ia->ifa_index;
+    /* Флаги — 32-битным IFA_FLAGS (с 3.14), иначе байтом заголовка: DEPRECATED в обоих. Срок
+     * предпочтения 0 — тот же «устаревший»: ядро ставит флаг по нему, но на миг их расхождения
+     * смотрим и на срок. */
+    r->flags = tb[IFA_FLAGS] && RTA_PAYLOAD(tb[IFA_FLAGS]) >= 4 ? rta_u32(tb[IFA_FLAGS])
+                                                                : ia->ifa_flags;
+    if (tb[IFA_CACHEINFO] && RTA_PAYLOAD(tb[IFA_CACHEINFO]) >= sizeof(struct ifa_cacheinfo)) {
+        struct ifa_cacheinfo ci;
+        memcpy(&ci, RTA_DATA(tb[IFA_CACHEINFO]), sizeof(ci));
+        if (ci.ifa_prefered == 0) r->flags |= IFA_F_DEPRECATED;
+    }
+    c->n++;
+}
+
+int rtnl_addrs6(struct rtnl_addr6 *v, size_t max) {
+    uint8_t buf[64];
+    struct nlbuf b;
+    struct ifaddrmsg ia;
+    memset(&ia, 0, sizeof(ia));
+    ia.ifa_family = AF_INET6;
+    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_GETADDR,
+                                    NLM_F_REQUEST | NLM_F_DUMP, &ia, sizeof(ia));
+    struct addr6_ctx c = { v, 0, max };
+    if (rtnl_talk(buf, msg_end(&b, nh), addr6_cb, &c) != 0) return -1;
+    return (int)c.n;
+}

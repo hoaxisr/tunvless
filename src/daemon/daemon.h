@@ -19,10 +19,24 @@ struct groups;
  * это два разных ключа зоны (masq и masq6) и два правила `meta nfproto ipv4|ipv6 masquerade`, а
  * прежде любое правило masquerade засчитывалось за оба семейства — зона с одним masq6 выглядела
  * «NAT есть» для IPv4. Правило без семейства (`oifname "wg0" masquerade` в таблице inet) — оба;
- * в таблице ip — только IPv4, в ip6 — только IPv6. */
-struct fwcheck { int in_firewall, masqueraded, masq6; };
+ * в таблице ip — только IPv4, в ip6 — только IPv6.
+ *
+ * zone6 — зона fw4, чей masq6 подменяет IPv6 на устройстве: имя цепочки srcnat_<зона>, куда
+ * устройство уходит переходом `oifname … jump srcnat_<зона>` (fw4 собирает её из UCI firewall:
+ * зона, в `network` которой есть интерфейс устройства). Пусто — masq6 не найден или подмена стоит
+ * правилом на самом устройстве, не в цепочке зоны. Устройство и зона называются по-разному
+ * (wg0 в зоне wan), и предупреждение «у зоны wg0 включён masq6» называло бы не то, что править. */
+struct fwcheck { int in_firewall, masqueraded, masq6; char zone6[32]; };
 
 struct fwcheck fw_check(const char *device);
+/* Каким ключом ipv6 судить IPv6 устройства dev выхода o: записанным у самого выхода, а если его
+ * нет (OUT_V6_KIND) — у члена группы с этим устройством (вглубь вложенных групп) или у
+ * владельца устройства (out_for_device). У группы, чей член `ipv6: nat`,
+ * подмену на устройство члена ставит движок (postrouting_nat6 — по выходу-члену), и судить
+ * устройство по ключу группы значило бы жаловаться «нет masquerade IPv6» на исправной настройке.
+ * Возврат — значение enum out_ipv6 (spec.h; здесь int: заголовок спеки сюда не включается). */
+struct output;
+int out_ipv6_mode_dev(const struct spec *sp, const struct output *o, const char *dev);
 /* То же по готовому тексту набора правил в форме `nft -t list ruleset` — разбор, которым fw_check
  * судит текст от ядра (fwcheck.c); отдельно ради стенда tests/fwmatch.c (дампы с живого fw4). */
 struct fwcheck fw_check_dump(const char *dump, const char *device);

@@ -377,10 +377,25 @@ wg set wg1 peer "$(cat "$tmp/s1.pub")" allowed-ips 0.0.0.0/0,::/0
 uci_net 48
 check "diag: ip6assign больше префикса — сказано" "1" "$(diagv | grep -c 'ip6assign 48 у lan больше префикса хоста /56')"
 uci_net 64
-# У LAN нет адреса из префикса.
+# У LAN нет адреса из префикса. Чего не хватает, diag различает по нуль-маршруту netifd
+# (`unreachable P`, им netifd объявляет каждый раздаваемый префикс): его нет — нет ip6prefix; есть —
+# LAN не получил куска: нет ip6assign или, если он задан, дело в ip6class.
 ip addr del 2001:db8:1:10::1/64 dev r0
-check "diag: у LAN нет адреса из префикса — сказано, что задать" "1" \
-    "$(diagv | grep -c 'у LAN нет адреса из префикса 2001:db8:1::/56","why":"клиенты не получат IPv6 от хоста — задайте ip6prefix у интерфейса wg1 и ip6assign у LAN"')"
+check "diag: префикс не раздаётся — сказано, что нет ip6prefix" "1" \
+    "$(diagv | grep -c 'префикс 2001:db8:1::/56 не раздаётся — нет ip6prefix","why":"клиенты не получат IPv6 от хоста — задайте ip6prefix у интерфейса wg1"')"
+ip -6 route add unreachable 2001:db8:1::/56 metric 2147483647
+check "diag: префикс раздаётся, у LAN адреса нет, ip6assign задан — проверить ip6class" "1" \
+    "$(diagv | grep -c 'у LAN нет адреса из префикса 2001:db8:1::/56, хотя ip6assign 64 задан","why":"клиенты не получат IPv6 от хоста — проверьте ip6class у LAN"')"
+uci_net ''
+check "  ip6assign не задан — сказано, что его нет" "1" \
+    "$(diagv | grep -c 'у LAN нет адреса из префикса 2001:db8:1::/56 — нет ip6assign","why":"клиенты не получат IPv6 от хоста — задайте ip6assign у LAN"')"
+uci_net 64
+# Префикс сняли, а адрес из него остался на LAN устаревшим (preferred_lft 0): он не в счёт.
+ip addr add 2001:db8:1:10::1/64 dev r0 nodad preferred_lft 0
+check "diag: устаревший адрес LAN — не адрес из префикса" "0 1" \
+    "$(diagv | grep -c 'у LAN адрес из него') $(diagv | grep -c 'у LAN нет адреса из префикса 2001:db8:1::/56, хотя')"
+ip addr del 2001:db8:1:10::1/64 dev r0
+ip -6 route del unreachable 2001:db8:1::/56
 ip addr add 2001:db8:1:10::1/64 dev r0 nodad
 sleep 0.5
 
@@ -463,6 +478,12 @@ check "  IPv6 правила во второй выход доходит" "ok" "
 check "  цель видит адрес выхода wg2" "yes" "$([ "$(seen exit2)" -gt 0 ] && echo yes || echo no)"
 check "diag nat: у LAN только ULA и ra_default нет — сказано" "1" \
     "$(diagv | grep -c 'задайте ra_default=1 в dhcp.lan')"
+# Глобальный адрес на LAN есть, но устаревший (ip6prefix сняли): клиентам он не раздаётся, и про
+# ra_default сказать всё равно надо.
+ip addr add 2001:db8:1:10::1/64 dev r0 nodad preferred_lft 0
+check "  и при устаревшем глобальном адресе на LAN — тоже" "1" \
+    "$(diagv | grep -c 'задайте ra_default=1 в dhcp.lan')"
+ip addr del 2001:db8:1:10::1/64 dev r0
 printf '\toption ra_default %s\n' "'1'" >> "$tmp/uci/dhcp"
 check "  ra_default=1 — молчит" "0" "$(diagv | grep -c 'ra_default')"
 check "diag nat: хост отвечает по IPv6" "2" "$(diagv | grep -c 'отвечает')"
@@ -470,7 +491,30 @@ ip addr del 2001:db8:2:ff::2/128 dev wg2
 check "diag nat: у устройства нет адреса IPv6 — сказано" "1" \
     "$(diagv | grep -c '"fail","what":"выход other: у wg2 нет адреса IPv6"')"
 ip addr add 2001:db8:2:ff::2/128 dev wg2 nodad
+check "status nat: nat6 — подменяет движок" "2" \
+    "$("$BIN" status $S 2>/dev/null | grep -o '"nat6":true,"nat6_by":"steer"' | wc -l | tr -d ' ')"
 
+# Группа из выходов с `ipv6: nat`, у самой группы ключа нет: IPv6 её нынешнего члена маскирует
+# цепочка движка (правило — на выход-член), и status группы говорит nat6: true, кем — steer.
+cat > "$tmp/g.yaml" <<EOF
+version: 2
+lan: { devices: [r0] }
+lists:
+  a:  { prefixes_file: $tmp/a.lst }
+  b:  { prefixes_file: $tmp/b.lst }
+outputs:
+  host:  { kind: interface, device: wg1, ipv6: nat }
+  other: { kind: interface, device: wg2, ipv6: nat }
+  man:   { kind: group, pick: manual, members: [host, other], default: host }
+rules:
+  - { name: a, to: a, out: man }
+  - { name: b, to: b, out: other }
+EOF
+S="--spec $tmp/g.yaml --state-dir $tmp/st"
+"$BIN" apply $S >"$tmp/apply-g.out" 2>&1
+check "группа из членов с ipv6: nat — apply проходит" "0" "$?"
+check "  status группы: nat6 — подменяет движок" "1" \
+    "$("$BIN" status $S 2>/dev/null | grep -o '"man":{[^}]*' | grep -c '"nat6":true,"nat6_by":"steer"')"
 "$BIN" down --state-dir "$tmp/st" >/dev/null 2>&1
 check "steer down: набор правил снят" "1" "$(nft list table inet steer >/dev/null 2>&1; echo $?)"
 check "  правил IPv6 выходов нет" "0" "$(ip -6 rule show | grep -c 'fwmark 0x')"

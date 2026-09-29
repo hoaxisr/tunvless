@@ -241,9 +241,20 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
             /* С 1.10 `nat` — подмена IPv4 (masq зоны), а `nat6` — IPv6 (masq6), отдельно
              * (fw_check по семействам, fwcheck.c): прежде одно поле засчитывало любое правило
              * masquerade за оба. `nat6` — только у выхода, который несёт IPv6 (out_route6): у
-             * остальных IPv6 его правил отвергается, и вопрос о подмене не стоит. */
-            if (out_route6(&sp->out[i]))
-                fprintf(out, ",\"nat6\":%s", c.masq6 ? "true" : "false");
+             * остальных IPv6 его правил отвергается, и вопрос о подмене не стоит.
+             *
+             * `nat6` — «IPv6 на устройстве подменяется», кем бы ни было: masq6 зоны fw4 или наш
+             * postrouting_nat6 (ключ `ipv6: nat` у выхода или у владельца устройства —
+             * out_ipv6_mode_dev). Прежде поле смотрело только на fw4, и у wg1 с `ipv6: nat`
+             * было `nat6: false` при работающей подмене (проверка на QEMU-роутере 4192267) —
+             * интерфейсу это читалось как поломка. Кем — отдельным полем `nat6_by` («steer» —
+             * своя цепочка, она ставится всегда, когда ключ есть; иначе «fw4»), только при
+             * `nat6: true`. */
+            if (out_route6(&sp->out[i])) {
+                int ours = out_ipv6_mode_dev(sp, &sp->out[i], sp->out[i].device) == OUT_V6_NAT;
+                fprintf(out, ",\"nat6\":%s", ours || c.masq6 ? "true" : "false");
+                if (ours || c.masq6) fprintf(out, ",\"nat6_by\":\"%s\"", ours ? "steer" : "fw4");
+            }
             /* Ключ ipv6 спеки v2 (шаг 8 выпуска 1.10) — как записан; `ipv6_applied: false` —
              * записан, но на этой платформе не действует (телефон, out_ipv6_mode). У донора —
              * `prefix`: записанный или выведенный по ядру сейчас (v6donor_derive), null — не
