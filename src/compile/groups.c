@@ -67,10 +67,36 @@ void groups_free(struct groups *gr) {
         free(gr->g[i].files);
         free(gr->g[i].files_l4);
         free(gr->g[i].srs);
+        free(gr->g[i].members);
     }
     gr->n = 0;
     for (size_t i = 0; i < gr->plans_n; i++) srs_plan_free(&gr->plans[i]);
     gr->plans_n = 0;
+    /* Сами массивы остаются на повторный разбор (build_groups зовёт groups_free первым и тут же
+     * наполняет заново): реаллокаций меньше. Насовсем отдаёт groups_release. */
+}
+
+void groups_release(struct groups *gr) {
+    groups_free(gr);
+    free(gr->g);
+    free(gr->plans);
+    gr->g = NULL;
+    gr->plans = NULL;
+    gr->cap = gr->plans_cap = 0;
+}
+
+/* Новая обнулённая группа в конце: массив растёт вдвое. NULL — нехватка памяти (err заполнен). */
+static struct group *group_new(struct groups *gr, struct err *e) {
+    if (gr->n == gr->cap) {
+        size_t nc = gr->cap ? gr->cap * 2 : 16;
+        struct group *p = realloc(gr->g, nc * sizeof(*p));
+        if (!p) { err_set(e, "out of memory building channel groups", NULL); return NULL; }
+        gr->g = p;
+        gr->cap = nc;
+    }
+    struct group *g = &gr->g[gr->n++];
+    memset(g, 0, sizeof(*g));
+    return g;
 }
 
 static int same_from(const struct spec *sp, const struct spec_rule *c, const struct group *g) {
@@ -101,7 +127,14 @@ static const struct l4match L4_NONE;
 
 static void member_add(struct group *g, const char *name) {
     for (size_t i = 0; i < g->members_n; i++) if (g->members[i] == name) return;
-    if (g->members_n < MAX_RULES) g->members[g->members_n++] = name;
+    if (g->members_n == g->members_cap) {
+        size_t nc = g->members_cap ? g->members_cap * 2 : 4;
+        const char **p = realloc(g->members, nc * sizeof(*p));
+        if (!p) return;                 /* список имён — подпись счётчика, потеря не страшна */
+        g->members = p;
+        g->members_cap = nc;
+    }
+    g->members[g->members_n++] = name;
 }
 
 /* Правило с наборами sing-box: группы — по его раскладке (src/model/srsplan.c). Части раскладки
@@ -110,7 +143,13 @@ static void member_add(struct group *g, const char *name) {
  * составная — к составной с тем же выходом и клиентами; доп. часть — своей группой всегда. */
 static int add_srs_channel(const struct spec *sp, struct groups *gr, const struct spec_rule *c,
                            struct err *e) {
-    if (gr->plans_n >= MAX_RULES) return err_set(e, "too many channels", NULL);
+    if (gr->plans_n == gr->plans_cap) {
+        size_t nc = gr->plans_cap ? gr->plans_cap * 2 : 8;
+        struct srs_plan *np = realloc(gr->plans, nc * sizeof(*np));
+        if (!np) return err_set(e, "out of memory building channel groups", NULL);
+        gr->plans = np;
+        gr->plans_cap = nc;
+    }
     struct srs_plan *pl = &gr->plans[gr->plans_n];
     if (srs_plan_rule(sp, c, -1, pl, e) != 0) return -1;
     gr->plans_n++;
@@ -138,9 +177,8 @@ static int add_srs_channel(const struct spec *sp, struct groups *gr, const struc
                 g = h;
             }
         if (!g) {
-            if (gr->n >= MAX_RULES) return err_set(e, "too many channels", NULL);
-            g = &gr->g[gr->n++];
-            memset(g, 0, sizeof(*g));
+            g = group_new(gr, e);
+            if (!g) return -1;
             g->out = out;
             g->realip = c->realip;
             g->from = from;
@@ -242,8 +280,8 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
             break;
         }
         if (k == gr->n) {
-            struct group *g = &gr->g[gr->n++];
-            memset(g, 0, sizeof(*g));
+            struct group *g = group_new(gr, e);
+            if (!g) return -1;
             g->out = out;
             g->domains = 0;
             g->all = all;
@@ -267,7 +305,7 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
         }
         for (size_t f = 0; f < l->prefixes_n; f++)
             if (group_add_file(g, l->prefixes_files[f], e) != 0) return -1;
-        if (g->members_n < MAX_RULES) g->members[g->members_n++] = c->name;
+        member_add(g, c->name);
     }
     /* Окончательные имена. Группа с доменами — всегда _dom, потому что имя набора резолвер
      * вычисляет тем же правилом и по-другому его не найдёт. Группы `any` не трогаем: у них

@@ -51,7 +51,7 @@ struct srs_part {
 struct srs_plan {
     struct srs_part *p;
     size_t n;
-    const struct srs_set *held[MAX_FILES];   /* открытые разборы — отпускаются srs_plan_free */
+    const struct srs_set **held;   /* открытые разборы (по файлу списка) — отпускаются srs_plan_free */
     size_t held_n;
     char warn[1024];            /* что снято при раскладке — печатает apply (check_address_lists) */
 };

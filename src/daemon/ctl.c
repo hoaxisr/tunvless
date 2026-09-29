@@ -168,6 +168,10 @@
 #define STEER_CTL_PROP "persist.der.steer.enabled"
 
 #define CTL_LINE_MAX    512
+/* ТЕЛО СПЕКИ (check, apply) — защита демона от запроса, который просит памяти без меры (тело
+ * читается в память целиком до разбора). Мегабайта хватает на спеку с сотнями правил и
+ * выходов: длинные списки в спеку кладут файлами (domains_files, put-file), а не строками. Это
+ * предел запроса, а не спеки: загрузчик с диска принимает спеку до 16 МиБ (SPEC_TEXT_MAX). */
 #define CTL_BODY_MAX    (1024 * 1024)
 /* ФАЙЛЫ СПИСКОВ (put-file) — свой предел тела, в шестнадцать раз больше спеки. Спека — это
  * настройки человека, и мегабайта ей хватает с многократным запасом; списки же бывают
@@ -178,12 +182,16 @@
  * телефона сколько угодно памяти. 16 МиБ — с запасом больше самого крупного списка каталога
  * splify2-lists и всё ещё мелочь для памяти телефона на время одного запроса.
  *
- * К пределу одного файла — пределы каталога: не больше 256 файлов и 128 МиБ всего. Каталог
+ * К пределу одного файла — пределы каталога: не больше 4096 файлов и 128 МиБ всего. Каталог
  * лежит в /data, и приложение, которое заливает и забывает убирать (ошибка в его логике), не
  * должно понемногу съедать память телефона: упереться в предел и получить отказ лучше, чем
- * узнать о переполнении /data по отказу всех приложений сразу. */
+ * узнать о переполнении /data по отказу всех приложений сразу. Главный предел — 128 МиБ (это
+ * ресурс: место в /data); число файлов ограничено отдельно только от бесконечной заливки
+ * пустышек (и от каталога, который list-files придётся читать целиком), а не от больших спек:
+ * четыре тысячи файлов — на порядок больше, чем списков в самой большой спеке. Раньше — 256, и
+ * спека на триста списков из каталога splify2-lists в него не помещалась. */
 #define CTL_FILE_MAX    (16 * 1024 * 1024)
-#define CTL_FILES_MAX   256
+#define CTL_FILES_MAX   4096
 #define CTL_FILES_TOTAL (128LL * 1024 * 1024)
 #define CTL_FNAME_MAX   64
 #define CTL_OUT_MAX     (1024 * 1024)
@@ -1338,6 +1346,7 @@ static void srv_spec_changed(struct ctl_srv *s, const char *by, int enabled,
     }
     if (changed && cj.p) cb_put(changed, cj.p, cj.n);
     free(cj.p);
+    supd_changes_free(&ch);
     /* После watchd_spec_changed: включённый сейчас сторож проходит сразу, а не через успокоение. */
     srv_set_enabled(s, enabled);
 }
@@ -1446,11 +1455,13 @@ static void commit_start(struct conn *c, job_done_fn done) {
     if (c->diff.watch) c->watch = 1;
     c->committed = 0;
     if (!recon_diff_any(&c->diff)) { done(c, 0); return; }
-    char buf[1024], *av[24];
-    recon_commit_argv(&c->diff, s->cf.exe, s->cf.spec, s->cf.state_dir, s->rec.nftc, buf,
-                      sizeof(buf), av);
+    char *av[24];
+    char *abuf = recon_commit_argv(&c->diff, s->cf.exe, s->cf.spec, s->cf.state_dir, s->rec.nftc, av);
+    if (!abuf) { done(c, -1); return; }
     c->committed = 1;
-    if (job_start(c, av, 300, CTL_OUT_MAX, CTL_ERR_MAX, done) != 0) {
+    int jrc = job_start(c, av, 300, CTL_OUT_MAX, CTL_ERR_MAX, done);
+    free(abuf);                     /* строки argv нужны до запуска ребёнка — job_start уже вернулся */
+    if (jrc != 0) {
         c->committed = 0;
         done(c, -1);
     }
@@ -1521,7 +1532,7 @@ static void apply_planned(struct conn *c, int code) {
         /* Правила снимет и поставит init, когда движок выключат и включат: что будет в ядре
          * потом, демон не знает. */
         recon_forget(&s->rec);
-        memset(&c->diff, 0, sizeof(c->diff));
+        recon_diff_free(&c->diff);
         resp_run(&c->resp, 0, &none, &c->perr);
         resp_bool(&c->resp, "saved", 1);
         resp_bool(&c->resp, "applied", 0);
@@ -1789,7 +1800,7 @@ static void reload_committed(struct conn *c, int code) {
          * что успело встать до срока — не знаем. Остальное reload делает, как прежде. */
         recon_forget(&c->srv->rec);
         c->rcode = code < 0 ? 127 : code;
-        memset(&c->diff, 0, sizeof(c->diff));
+        recon_diff_free(&c->diff);
         fprintf(stderr, LOG_W "reload: применение не прошло (код %d)\n", code);
     } else {
         recon_applied(&c->srv->rec, &c->plan, &c->diff, &c->kern);
@@ -1806,7 +1817,7 @@ static void reload_planned(struct conn *c, int code) {
          * прежде (перечитывание само скажет spec-error, если спека не читается). */
         c->rcode = code > 0 ? code : 127;
         c->watch = 1;
-        memset(&c->diff, 0, sizeof(c->diff));
+        recon_diff_free(&c->diff);
         reload_head(c, 1, &j->err);
         return;
     }
@@ -1821,7 +1832,7 @@ static void st_reload(struct conn *c) {
     if (!ctl_enabled()) {
         recon_forget(&c->srv->rec);
         c->watch = 1;
-        memset(&c->diff, 0, sizeof(c->diff));
+        recon_diff_free(&c->diff);
         reload_head(c, 0, NULL);
         return;
     }
@@ -1830,7 +1841,7 @@ static void st_reload(struct conn *c) {
         cb_str(&e, LOG_W "не удалось запустить движок\n");
         c->rcode = 127;
         c->watch = 1;
-        memset(&c->diff, 0, sizeof(c->diff));
+        recon_diff_free(&c->diff);
         reload_head(c, 1, &e);
         free(e.p);
     }
@@ -1914,7 +1925,10 @@ static void ctl_do_put_file(struct conn *c, struct cbuf *r) {
     long long bytes;
     ctl_lists_usage(dir, name, &files, &bytes);
     if (files >= CTL_FILES_MAX) {
-        resp_error(r, "too-large", "в каталоге списков уже 256 файлов — уберите ненужные (rm-file)");
+        char why[256];
+        snprintf(why, sizeof(why), "в каталоге списков уже %d файлов — предел от бесконечной заливки; "
+                 "уберите ненужные (rm-file)", CTL_FILES_MAX);
+        resp_error(r, "too-large", why);
         return;
     }
     if (bytes + (long long)q->body_n > CTL_FILES_TOTAL) {
@@ -1961,17 +1975,24 @@ static void ctl_do_list_files(struct conn *c, struct cbuf *r) {
     cb_jstr(r, dir);
     cb_str(r, ",\"files\":[");
     DIR *d = opendir(dir);
-    char *names[CTL_FILES_MAX * 2];
-    size_t n = 0;
+    char **names = NULL;                    /* по числу файлов в каталоге */
+    size_t n = 0, ncap = 0;
     if (d) {
         struct dirent *e;
-        while ((e = readdir(d)) && n < sizeof(names) / sizeof(names[0])) {
+        while ((e = readdir(d))) {
             if (e->d_name[0] == '.') continue;
+            if (n == ncap) {
+                size_t nc = ncap ? ncap * 2 : 64;
+                char **nn = realloc(names, nc * sizeof(*nn));
+                if (!nn) break;
+                names = nn;
+                ncap = nc;
+            }
             names[n] = strdup(e->d_name);
             if (names[n]) n++;
         }
     }
-    qsort(names, n, sizeof(names[0]), ctl_name_cmp);
+    if (n) qsort(names, n, sizeof(names[0]), ctl_name_cmp);
     int first = 1;
     for (size_t i = 0; i < n; i++) {
         struct stat sb;
@@ -1984,6 +2005,7 @@ static void ctl_do_list_files(struct conn *c, struct cbuf *r) {
         }
         free(names[i]);
     }
+    free(names);
     if (d) closedir(d);
     cb_str(r, "]");
 }
@@ -2356,6 +2378,8 @@ static void conn_free(struct conn *c) {
     free(c->resp.p);
     free(c->old.p);
     free(c->perr.p);
+    recon_plan_free(&c->plan);      /* массивы плана и решения растут по числу выходов (recon.h) */
+    recon_diff_free(&c->diff);
     free(c->body);
     free(c);
 }

@@ -62,18 +62,16 @@ const char *out_kind_name(const struct output *o) {
     return out_kind_shown(o)->name;
 }
 
-size_t out_members(const struct spec *sp, const struct output *o, const struct output **dst,
-                   size_t max) {
+size_t out_members_n(const struct spec *sp, const struct output *o) {
+    (void)sp;
     const struct group_cfg *g = out_group(o);
-    if (g) {
-        size_t n = 0;
-        for (size_t i = 0; i < g->members_n && n < max; i++)
-            dst[n++] = &sp->out[g->members[i]];
-        return n;
-    }
-    if (!out_has_device(o) || !max) return 0;
-    dst[0] = o;
-    return 1;
+    if (g) return g->members_n;
+    return out_has_device(o) ? 1 : 0;
+}
+
+const struct output *out_member(const struct spec *sp, const struct output *o, size_t i) {
+    const struct group_cfg *g = out_group(o);
+    return g ? spec_out(sp, g->members[i]) : o;
 }
 
 void group_cfg_init(struct group_cfg *g) {
@@ -82,28 +80,53 @@ void group_cfg_init(struct group_cfg *g) {
     g->idle_timeout_s = -1;
     g->cur = -1;
     g->sel = -1;
-    for (size_t i = 0; i < MAX_MEMBERS; i++) {
+}
+
+int group_members_alloc(struct spec *sp, struct group_cfg *g, size_t n) {
+    g->members_n = 0;
+    g->members = NULL;
+    g->weight = g->alive = NULL;
+    g->lat_ms = g->lat4_ms = g->lat6_ms = NULL;
+    if (!n) return 0;
+    g->members = (unsigned *)spec_alloc(sp, n * sizeof(*g->members));
+    g->weight = (unsigned char *)spec_alloc(sp, n);
+    g->alive = (unsigned char *)spec_alloc(sp, n);
+    g->lat_ms = (int *)spec_alloc(sp, n * sizeof(int));
+    g->lat4_ms = (int *)spec_alloc(sp, n * sizeof(int));
+    g->lat6_ms = (int *)spec_alloc(sp, n * sizeof(int));
+    if (!g->members || !g->weight || !g->alive || !g->lat_ms || !g->lat4_ms || !g->lat6_ms) return -1;
+    for (size_t i = 0; i < n; i++) {
         g->lat_ms[i] = -1;
         g->lat4_ms[i] = g->lat6_ms[i] = -2;
     }
+    return 0;
 }
 
 int group_named(const struct group_cfg *g) {
-    return g && g->members_n && g->members[0] < MAX_OUTPUTS;
+    return g && g->members_n && spec_is_named(g->members[0]);
 }
 
 int group_seal(struct spec *sp, struct output *go, struct err *e) {
     struct group_cfg *g = &go->grp;
     if (!g->members_n) return err_set(e, "outputs.%s: у группы нет членов", go->name);
+    /* Единственный предел числа членов, и он — свойство карты balance (kind.h, GROUP_BAL_SLOTS):
+     * у члена без слота доли нет. Остальные pick пределов по числу членов не имеют. */
+    if (g->pick == PICK_BALANCE && g->members_n > GROUP_BAL_SLOTS) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "outputs.%.31s: у группы pick: balance членов не больше %d "
+                 "(в карте ядра %d слотов, у каждого члена нужен хотя бы один), а их %zu",
+                 go->name, GROUP_BAL_SLOTS, GROUP_BAL_SLOTS, g->members_n);
+        return err_set(e, "%s", msg);
+    }
     unsigned caps = ~0u;
     for (size_t i = 0; i < g->members_n; i++) {
-        const struct output *m = &sp->out[g->members[i]];
+        const struct output *m = spec_out(sp, g->members[i]);
         /* Вложенная группа замыкается раньше внешней (разбор v2 идёт по вложенности), и её
          * свойства уже посчитаны. balance внутри группы с одной таблицей — отказ: выбрать ей
          * одно устройство нечем (см. шапку, «ВЛОЖЕННОСТЬ»). */
         const struct group_cfg *mg = out_group(m);
         if (mg && mg->pick == PICK_BALANCE && g->pick != PICK_BALANCE) {
-            char msg[320];
+            char msg[400];
             snprintf(msg, sizeof(msg), "outputs.%s: %s — группа pick: balance, а членом группы pick: %s "
                      "она быть не может: у такой группы трафик идёт в одно устройство, а у balance "
                      "устройство на каждое соединение своё", go->name, m->name,
@@ -122,13 +145,8 @@ int group_seal(struct spec *sp, struct output *go, struct err *e) {
 
 int group_of_devices(struct spec *sp, struct output *o, const char (*devs)[32], size_t n,
                      struct err *e) {
-    if (n > MAX_MEMBERS) return err_set(e, "outputs.%s: too many devices", o->name);
-    if (sp->anon_n + n > MAX_ANON) {
-        char msg[160];
-        snprintf(msg, sizeof(msg), "outputs.%.31s: устройств в пулах больше %d на спеку", o->name,
-                 MAX_ANON);
-        return err_set(e, "%s", msg);
-    }
+    if (spec_grow((void **)&sp->anon, &sp->anon_cap, sp->anon_n + n, sizeof(*sp->anon)) != 0)
+        return err_set(e, "%s", "недостаточно памяти для спеки");
     /* Члены — того же вида, каким был выход: пул `devices` у interface — это интерфейсы. Своих
      * настроек вида (obfs) у безымянного члена нет: их нёс выход, а не его устройства. */
     const struct kind_ops *k = kind_of(o);
@@ -142,14 +160,15 @@ int group_of_devices(struct spec *sp, struct output *o, const char (*devs)[32], 
     g.kind = &kind_group;
     group_cfg_init(&g.grp);
     g.grp.shown = k;
+    if (group_members_alloc(sp, &g.grp, n) != 0) return err_set(e, "%s", "недостаточно памяти для спеки");
     for (size_t i = 0; i < n; i++) {
-        size_t idx = MAX_OUTPUTS + sp->anon_n++;
-        struct output *m = &sp->out[idx];
+        size_t idx = SPEC_ANON_BASE + sp->anon_n++;
+        struct output *m = spec_out(sp, idx);
         memset(m, 0, sizeof(*m));
         m->kind = k;
         snprintf(m->device, sizeof(m->device), "%s", devs[i]);
         m->on_fail = o->on_fail;
-        g.grp.members[g.grp.members_n++] = (unsigned short)idx;
+        g.grp.members[g.grp.members_n++] = (unsigned)idx;
     }
     /* Активное устройство до первого прохода сторожа — первое по предпочтению, если выход не
      * назвал своё (так делал разбор interface: device выводится из devices[0]). */
@@ -207,17 +226,21 @@ const char *group_pick_name(int p) {
  * Доля — по весам живых членов методом наибольшего остатка; слоты раздаются подряд, по порядку
  * членов (порядок внутри карты для случайного numgen ничего не значит). Чистая функция: её зовут
  * компилятор (карта при apply — все члены живы) и сторож (карта по живым), а сверяет стенд. */
-void group_balance_slots(const struct group_cfg *g, unsigned alive,
+void group_balance_slots(const struct group_cfg *g, const unsigned char *alive,
                          unsigned char owner[GROUP_BAL_SLOTS]) {
-    unsigned w[MAX_MEMBERS], total = 0;
     size_t n = g->members_n;
+    memset(owner, 0xff, GROUP_BAL_SLOTS);
+    /* Рабочие массивы — по числу членов, одним куском (w, cnt, rem). Членов больше слотов у
+     * balance не бывает (group_seal), но функция чистая и от этого не зависит. */
+    unsigned *buf = n ? (unsigned *)calloc(3 * n, sizeof(unsigned)) : NULL;
+    if (!buf) return;
+    unsigned *w = buf, *cnt = buf + n, *rem = buf + 2 * n, total = 0;
     for (size_t k = 0; k < n; k++) {
-        w[k] = (alive >> k) & 1u ? (g->weight[k] ? g->weight[k] : 1u) : 0u;
+        w[k] = !alive || alive[k] ? (g->weight[k] ? g->weight[k] : 1u) : 0u;
         total += w[k];
     }
-    memset(owner, 0xff, GROUP_BAL_SLOTS);
-    if (!total) return;
-    unsigned cnt[MAX_MEMBERS], rem[MAX_MEMBERS], used = 0;
+    if (!total) { free(buf); return; }
+    unsigned used = 0;
     for (size_t k = 0; k < n; k++) {
         cnt[k] = GROUP_BAL_SLOTS * w[k] / total;
         rem[k] = GROUP_BAL_SLOTS * w[k] % total;
@@ -235,6 +258,7 @@ void group_balance_slots(const struct group_cfg *g, unsigned alive,
     size_t s = 0;
     for (size_t k = 0; k < n; k++)
         for (unsigned c = 0; c < cnt[k] && s < GROUP_BAL_SLOTS; c++) owner[s++] = (unsigned char)k;
+    free(buf);
 }
 
 /* Имена объектов balance в таблице движка — по номеру таблицы выхода из реестра, а не по имени:

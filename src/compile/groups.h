@@ -78,8 +78,8 @@ struct group {
      * сроком ответа). */
     int dom6;
     /* Which channels fed it — reported so a counter still has names behind it. */
-    const char *members[MAX_RULES];
-    size_t members_n;
+    const char **members;       /* куча, растёт по числу каналов группы (member_add) */
+    size_t members_n, members_cap;
 
     /* ---- наборы sing-box (srs_files, раскладка — src/model/srsplan.c) ---------------------
      *
@@ -134,23 +134,28 @@ static inline void group_set6_name(const struct group *g, char *dst, size_t n) {
 /* Группы одного разбора спеки — результат build_groups. До 1.7 они лежали в глобале
  * g_grp/g_grp_n, и любой, кто читал группы (генератор, status, diag, explain), читал то, что
  * оставил последний build_groups в процессе, — долг пересборки ядра. Теперь
- * это значение: точка входа держит свой экземпляр (static — он около 45 КБ) и передаёт его
- * параметром, как struct spec. Векторы files выделены в куче — groups_free их отдаёт;
- * build_groups сам отдаёт прежние, поэтому экземпляр до первого вызова обязан быть нулевым
- * (static или `= {0}`). */
+ * это значение: точка входа держит свой экземпляр (static) и передаёт его параметром, как
+ * struct spec. Массивы групп и раскладок растут по надобности (было g[64] и plans[64], то есть
+ * около 45 КБ bss на любом роутере и «too many channels» на 65-й группе) и, как векторы files,
+ * отдаются groups_free; build_groups сам отдаёт прежние, поэтому экземпляр до первого вызова
+ * обязан быть нулевым (static или `= {0}`). Указатель на элемент g живёт до следующего
+ * group_new: кто добавляет группу, держит индекс. */
 struct groups {
-    struct group g[MAX_RULES];
-    size_t n;
+    struct group *g;
+    size_t n, cap;
     /* Раскладки каналов с наборами sing-box: группы указывают в них (l4, srs), поэтому они
-     * живут столько же, сколько группы, и отдаются groups_free. */
-    struct srs_plan plans[MAX_RULES];
-    size_t plans_n;
+     * живут столько же, сколько группы, и отдаются groups_free. Группы указывают внутрь
+     * pl->p / pl->p[].sel — отдельных куч, не в сам массив plans, поэтому его рост им не вредит. */
+    struct srs_plan *plans;
+    size_t plans_n, plans_cap;
 };
 
 /* build_groups/check_address_lists возвращают код ошибки, а не завершают процесс — правило 5,
  * docs/architecture.md, раздел 2. 0 — успех; -1 — отказ, текст в e->msg. Читают спеку sp — правило 6. */
 int build_groups(const struct spec *sp, struct groups *gr, struct err *e);
 void groups_free(struct groups *gr);
+/* Отдать и сами массивы групп и раскладок (groups_free оставляет их на повторный разбор). */
+void groups_release(struct groups *gr);
 int has_domains(const struct groups *gr);
 /* Есть ли в спеке выход zapret/tgws — вопросы к видам (kind.h: zapret_present, tgws_present),
  * не к группам; здесь не живут (общий код кроме src/kinds вид не сравнивает). */

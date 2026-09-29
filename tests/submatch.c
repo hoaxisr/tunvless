@@ -1158,6 +1158,24 @@ int main(void) {
         check_n("чужая ссылка за пределом мест посчитана", 1, (long)st.foreign);
     }
 
+    /* ---- подписка на пятьсот узлов из файла: места растут по числу ссылок -------- */
+    {
+        char path[64];
+        snprintf(path, sizeof(path), "/tmp/submatch-500.%d", (int)getpid());
+        FILE *f = fopen(path, "w");
+        for (int i = 0; f && i < 500; i++)
+            fprintf(f, "vless://a@h%d:443#node%d\n", i, i);
+        if (f) fclose(f);
+        struct vless_sub_stats st;
+        size_t n = 0;
+        struct vless_node *nodes = vless_load_sub(path, &n, &st);
+        unlink(path);
+        check_n("500 узлов из файла: взяты все", 500, (long)n);
+        check_n("  пропущенных нет", 0, (long)st.skipped);
+        if (nodes && n == 500) check("  последний — со своим именем", "node499", nodes[499].name);
+        free(nodes);
+    }
+
     printf("\nвсе проверки прошли\n");
     return 0;
 }

@@ -100,4 +100,8 @@ const char *vless_sub_text(const char *raw, size_t raw_n, char *dec, size_t dec_
 size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
                        struct vless_sub_stats *st);
 
+/* Файл подписки → массив узлов в куче (free вызывающему), *cnt — сколько пригодных. NULL — файл
+ * не открылся или больше 64 МиБ. Ни число узлов, ни размер подписки константой не ограничены. */
+struct vless_node *vless_load_sub(const char *path, size_t *cnt, struct vless_sub_stats *st);
+
 #endif

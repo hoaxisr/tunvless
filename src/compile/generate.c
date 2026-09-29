@@ -25,21 +25,40 @@
 #include "nftcompat.h"
 #include "balance.h"
 
-/* Короткий строковый буфер для выражений-перечней («ip saddr { a, b }», «th dport { … }»).
- * 4 КБ с запасом: самый длинный перечень — MAX_FROM (32) адресов или устройств по 63 символа,
- * это около 2,2 КБ; порты — MAX_PORTS (16) диапазонов по 11 символов. */
-struct sbuf { char s[4096]; size_t n; };
+/* Строковый буфер для выражений-перечней («ip saddr { a, b }», «th dport { … }»). Растёт по
+ * надобности: раньше это было 4 КБ «с запасом на 32 адреса», и клиент с сотней адресов терял хвост
+ * перечня МОЛЧА — правило применялось, а часть устройств оно не касалось. Освобождается
+ * sb_emit (вместе с выдачей выражения в правило) или sb_free. */
+struct sbuf { char *s; size_t n, cap; };
 
 static void sb_add(struct sbuf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void sb_add(struct sbuf *b, const char *fmt, ...) {
-    if (b->n >= sizeof(b->s) - 1) return;
     va_list ap;
     va_start(ap, fmt);
-    int k = vsnprintf(b->s + b->n, sizeof(b->s) - b->n, fmt, ap);
+    char probe[1];
+    va_list cp;
+    va_copy(cp, ap);
+    int k = vsnprintf(probe, sizeof(probe), fmt, cp);
+    va_end(cp);
+    if (k < 0) { va_end(ap); return; }
+    if (b->n + (size_t)k + 1 > b->cap) {
+        size_t nc = b->cap ? b->cap : 256;
+        while (nc < b->n + (size_t)k + 1) nc *= 2;
+        char *p = realloc(b->s, nc);
+        if (!p) { va_end(ap); return; }
+        b->s = p;
+        b->cap = nc;
+    }
+    vsnprintf(b->s + b->n, b->cap - b->n, fmt, ap);
     va_end(ap);
-    if (k < 0) return;
     b->n += (size_t)k;
-    if (b->n > sizeof(b->s) - 1) b->n = sizeof(b->s) - 1;
+}
+static const char *sb_str(const struct sbuf *b) { return b->s ? b->s : ""; }
+static void sb_free(struct sbuf *b) { free(b->s); b->s = NULL; b->n = b->cap = 0; }
+/* Выражение — в правило, буфер — обратно. */
+static void sb_emit(struct nft_rule *r, struct sbuf *b) {
+    ir_x(r, "%s", sb_str(b));
+    sb_free(b);
 }
 
 /* Единственные оставшиеся в этом файле пользователи — построители цепочек output для каналов
@@ -87,7 +106,7 @@ static void x_who(struct nft_rule *r, const struct group *g, int reverse) {
         sb_add(&b, "%s%s", k++ ? ", " : "", g->from[i]);
     }
     sb_add(&b, " }");
-    ir_x(r, "%s", b.s);
+    sb_emit(r, &b);
 }
 
 static void x_who6(struct nft_rule *r, const struct group *g, int reverse) {
@@ -99,7 +118,7 @@ static void x_who6(struct nft_rule *r, const struct group *g, int reverse) {
         sb_add(&b, "%s%s", k++ ? ", " : "", g->from[i]);
     }
     sb_add(&b, " }");
-    ir_x(r, "%s", b.s);
+    sb_emit(r, &b);
 }
 
 /* «Кто» по устройству: клиенты, которых мы узнаём по интерфейсу, а не по адресу.
@@ -121,7 +140,7 @@ static void x_ifs(struct nft_rule *r, const struct spec *sp, int reverse) {
     for (size_t i = 0; i < sp->lan_dev_n; i++)
         sb_add(&b, "%s\"%s\"", i ? ", " : "", sp->lan_dev[i]);
     sb_add(&b, " }");
-    ir_x(r, "%s", b.s);
+    sb_emit(r, &b);
 }
 
 /* «Кто» у правила группы. Способ ровно один, и это принципиально: адреса ИЛИ устройства, а
@@ -266,7 +285,7 @@ static void x_l4(struct nft_rule *r, const struct l4match *m, int reverse) {
         else sb_add(&b, "%u-%u", m->ports[i].lo, m->ports[i].hi);
     }
     if (!one) sb_add(&b, " }");
-    ir_x(r, "%s", b.s);
+    sb_emit(r, &b);
 }
 
 /* Сужение словами, для explain. Отдельно от x_l4, потому что там формат nftables, а
@@ -277,7 +296,7 @@ static void x_l4(struct nft_rule *r, const struct l4match *m, int reverse) {
  * педантизм: snprintf возвращает длину, которая ПОЛУЧИЛАСЬ БЫ, а не записанную. Сложение
  * таких возвратов уводит смещение за буфер, и следующий `n - k` уходит в подпол size_t,
  * превращая ограничение длины в «сколько угодно». Шестнадцать диапазонов по «50000-65535» —
- * это 217 байт, то есть предел MAX_PORTS переполняет любой разумный буфер, и случай не
+ * это 217 байт, то есть предел L4_PORTS_MAX переполняет любой разумный буфер, и случай не
  * гипотетический. Не влезло — обрываем на границе куска: обрезанный перечень портов в
  * ПОЯСНЕНИИ безобиден, порванная память — нет. */
 void l4_describe(const struct l4match *m, char *dst, size_t n) {
@@ -320,10 +339,11 @@ void l4_describe(const struct l4match *m, char *dst, size_t n) {
  * правке спеки, и перенос по позиции приписал бы чужой трафик. Канал, которого в новой спеке
  * нет, свой счётчик теряет — это и правильно, его больше не существует.
  */
-#define CTR_MAX MAX_RULES
+/* Счётчики растут по числу каналов в ядре (раньше — массивы на 64: у 65-го канала счётчик при
+ * каждом apply обнулялся МОЛЧА, и «объём канала» врал). */
 struct ctr { char name[32]; unsigned long pkts, bytes; };
-static struct ctr g_ctr_up[CTR_MAX], g_ctr_down[CTR_MAX];
-static size_t g_ctr_up_n, g_ctr_down_n;
+static struct ctr *g_ctr_up, *g_ctr_down;
+static size_t g_ctr_up_n, g_ctr_down_n, g_ctr_up_cap, g_ctr_down_cap;
 
 /* Чтение счётчиков — ОДНО на apply и status. Раздельные разошлись бы в понимании одного и того
  * же, а расхождение здесь означало бы, что перенесённое и показанное — разные числа.
@@ -343,8 +363,10 @@ static void ctr_take(void *arg, const char *comment, int has_counter,
     else return;
     unsigned long p = has_counter ? (unsigned long)packets : 0;
     unsigned long b = has_counter ? (unsigned long)bytes : 0;
-    struct ctr *arr = down ? g_ctr_down : g_ctr_up;
+    struct ctr **arrp = down ? &g_ctr_down : &g_ctr_up;
+    struct ctr *arr = *arrp;
     size_t *n = down ? &g_ctr_down_n : &g_ctr_up_n;
+    size_t *cap = down ? &g_ctr_down_cap : &g_ctr_up_cap;
     /* Одно имя — одно число. С 1.9 у правила группы бывает v6-двойник под тем же именем
      * (docs/architecture.md, «4б»), а в старой раскладке у доменной группы с префиксами правил
      * два (по одному на половину набора, см. legacy.c): объём канала — их сумма. */
@@ -355,7 +377,14 @@ static void ctr_take(void *arg, const char *comment, int has_counter,
         arr[k].bytes += b;
         return;
     }
-    if (*n < CTR_MAX) {
+    if (*n == *cap) {
+        size_t nc = *cap ? *cap * 2 : 32;
+        struct ctr *na = realloc(arr, nc * sizeof(*na));
+        if (!na) return;                /* нет памяти — счётчик этого канала не переносится */
+        *arrp = arr = na;
+        *cap = nc;
+    }
+    {
         snprintf(arr[*n].name, sizeof(arr[*n].name), "%s", c);
         arr[*n].pkts = p;
         arr[*n].bytes = b;
@@ -586,7 +615,7 @@ static void x_dest(struct nft_rule *r, const struct group *g, int reverse, int l
                    (a >> 8) & 255, a & 255, g->xsrc[i].plen);
         }
         sb_add(&b, " }");
-        ir_x(r, "%s", b.s);
+        sb_emit(r, &b);
     }
     if (g->composite) {
         if (lookup)
@@ -873,7 +902,7 @@ static size_t ingress_devs(const struct spec *sp, const struct groups *gr, const
     for (size_t i = 0; i < gr->n && !any; i++) any = !group_is_local(&gr->g[i]);
     if (!any) return 0;
     size_t n = 0;
-    for (size_t i = 0; i < sp->lan_dev_n && n < MAX_LAN_DEV; i++)
+    for (size_t i = 0; i < sp->lan_dev_n; i++)
         if (nft_ingress_all_devs() || if_nametoindex(sp->lan_dev[i]))
             devs[n++] = sp->lan_dev[i];
     return n;
@@ -895,7 +924,9 @@ static void ingress_trust(struct nft_table *t, struct nft_chain *pm, const struc
     struct sbuf b = { .n = 0 };
     sb_add(&b, "meta mark and 0x%08x vmap { 0x%08x : goto ingress_seen", STEER_MARK_MASK,
            STEER_INGRESS_SEEN);
-    uint32_t keys[MAX_OUTPUTS];
+    /* Различных меток — не больше, чем выходов в спеке (плюс донор IPv6, который тоже выход). */
+    uint32_t *keys = malloc((sp->out_n + 1) * sizeof(*keys));
+    if (!keys) { sb_free(&b); return; }
     size_t nk = 0;
     int ct = 0;
     /* Последним — донор IPv6: его метку ставит и правило «всё несовпавшее из префикса»
@@ -912,7 +943,7 @@ static void ingress_trust(struct nft_table *t, struct nft_chain *pm, const struc
         if (!o || (!out_balanced(o) && !out_needs_mark(o))) continue;
         size_t k = 0;
         while (k < nk && keys[k] != o->mark) k++;
-        if (k < nk || nk >= MAX_OUTPUTS) continue;
+        if (k < nk || nk >= sp->out_n + 1) continue;
         keys[nk++] = o->mark;
         char bc[32];
         if (out_balanced(o)) {
@@ -926,6 +957,7 @@ static void ingress_trust(struct nft_table *t, struct nft_chain *pm, const struc
         }
     }
     sb_add(&b, " }");
+    free(keys);
     struct nft_rule *r = ir_rule(pm);
     struct sbuf d = { .n = 0 };
     if (nd == 1) sb_add(&d, "iifname \"%s\"", devs[0]);
@@ -934,8 +966,8 @@ static void ingress_trust(struct nft_table *t, struct nft_chain *pm, const struc
         for (size_t i = 0; i < nd; i++) sb_add(&d, "%s\"%s\"", i ? ", " : "", devs[i]);
         sb_add(&d, " }");
     }
-    ir_x(r, "%s", d.s);
-    ir_x(r, "%s", b.s);
+    sb_emit(r, &d);
+    sb_emit(r, &b);
     ir_comment(r, "steer-ingress");
     /* «Разобран, выхода нет» — снять значение: дальше пакет идёт с тем же пустым полем, что без
      * ingress (его видят чужие правила postrouting, сторож, очередь zapret). */
@@ -947,30 +979,37 @@ static void ingress_trust(struct nft_table *t, struct nft_chain *pm, const struc
 /* Разметка каналов раздачи: prerouting_mark, а где можно — ingress_mark перед ним. */
 static int build_mark(struct nft_table *t, const struct spec *sp, const struct groups *gr,
                       struct err *e) {
-    const char *devs[MAX_LAN_DEV];
+    /* Устройства ingress — не больше устройств спеки, массив по их числу (раньше 32 на стеке). */
+    const char **devs = malloc((sp->lan_dev_n ? sp->lan_dev_n : 1) * sizeof(*devs));
+    if (!devs) return err_set(e, "%s", "недостаточно памяти для разметки ingress");
     size_t nd = ingress_devs(sp, gr, devs);
+    int rc = 0;
     if (nd) {
         struct nft_chain *ic = ir_base_chain_add(t, "ingress_mark", "filter", "ingress",
                                                  "filter", 10);
         struct sbuf d = { .n = 0 };
         devs_text(&d, devs, nd);
-        ir_chain_devices(ic, d.s);
+        ir_chain_devices(ic, sb_str(&d));
+        sb_free(&d);
         struct nft_rule *r = ir_rule(ic);
         ir_x(r, "meta mark and 0x%08x == 0x00000000", STEER_MARK_MASK);
         ir_markset(r, "meta mark set mark and 0x%08x or 0x%08x", ~STEER_MARK_MASK,
                    STEER_INGRESS_SEEN);
         ir_comment(r, "steer-ingress");
-        if (build_mark_rules(ic, sp, gr, MH_INGRESS, e) != 0) return -1;
+        if (build_mark_rules(ic, sp, gr, MH_INGRESS, e) != 0) { rc = -1; goto out; }
     }
     struct nft_chain *pm = ir_base_chain_add(t, "prerouting_mark", "filter", "prerouting",
                                              "mangle", 1);
-    if (!nd) return build_mark_rules(pm, sp, gr, MH_PREROUTING, e);
+    if (!nd) { rc = build_mark_rules(pm, sp, gr, MH_PREROUTING, e); goto out; }
     /* Правило ingress_trust — первым в prerouting_mark, запасные правила каналов — за ним.
      * Цепочки ingress_seen и ingress_ct ingress_trust заводит сразу, и в тексте они встают прямо
      * за prerouting_mark (порядок объектов дерева — порядок печати, а правила принадлежат своей
      * цепочке, где бы ни стояли объекты после неё). */
     ingress_trust(t, pm, sp, gr, devs, nd);
-    return build_mark_rules(pm, sp, gr, MH_FALLBACK, e);
+    rc = build_mark_rules(pm, sp, gr, MH_FALLBACK, e);
+out:
+    free(devs);
+    return rc;
 }
 
 /* ВЫХОД УПАЛ И ПУЩЕН НАПРЯМУЮ — бит «не для zapret» снимается. Правило разметки выше
@@ -1099,7 +1138,7 @@ static void v6donor_guard(struct nft_chain *c, const struct spec *sp, const stru
     ir_rule_fam(r, 6);
     ir_setref(r, "ip6 saddr", V6DONOR_SET);
     ir_setref(r, "ip6 daddr !=", V6DONOR_SET);
-    ir_x(r, "%s", b.s);
+    sb_emit(r, &b);
     ir_counter(r, 0, 0);
     ir_x(r, "reject with icmpx type admin-prohibited");
     ir_comment(r, "steer-v6src:%s", d->name);
@@ -1114,9 +1153,11 @@ static void v6donor_guard(struct nft_chain *c, const struct spec *sp, const stru
 }
 
 static void build_forward_v6(struct nft_table *t, const struct spec *sp, const struct groups *gr) {
-    uint32_t marks[MAX_OUTPUTS];
-    const char *names[MAX_OUTPUTS];
+    /* Различных меток не больше, чем выходов спеки. */
+    uint32_t *marks = malloc((sp->out_n ? sp->out_n : 1) * sizeof(*marks));
+    const char **names = malloc((sp->out_n ? sp->out_n : 1) * sizeof(*names));
     size_t n = 0;
+    if (!marks || !names) { free(marks); free(names); return; }
     for (size_t i = 0; i < gr->n; i++) {
         const struct group *g = &gr->g[i];
         if (group_is_local(g)) continue;
@@ -1125,7 +1166,7 @@ static void build_forward_v6(struct nft_table *t, const struct spec *sp, const s
         if (!group_v4_agn(g) && !group_needs6(sp, g)) continue;
         size_t k = 0;
         while (k < n && marks[k] != o->mark) k++;
-        if (k == n && n < MAX_OUTPUTS) {
+        if (k == n && n < sp->out_n) {
             marks[n] = o->mark;
             names[n] = o->name;
             n++;
@@ -1133,7 +1174,7 @@ static void build_forward_v6(struct nft_table *t, const struct spec *sp, const s
     }
     const struct output *d = spec_v6_donor(sp);
     if (d && !d->device[0]) d = NULL;
-    if (!n && !d) return;
+    if (!n && !d) { free(marks); free(names); return; }
     struct nft_chain *c = ir_base_chain_add(t, "forward_v6", "filter", "forward", "mangle", 0);
     for (size_t k = 0; k < n; k++) {
         struct nft_rule *r = ir_rule(c);
@@ -1143,6 +1184,8 @@ static void build_forward_v6(struct nft_table *t, const struct spec *sp, const s
         ir_x(r, "reject with icmpx type admin-prohibited");
         ir_comment(r, "steer-v6drop:%s", names[k]);
     }
+    free(marks);
+    free(names);
     if (d) v6donor_guard(c, sp, d);
 }
 
@@ -1208,19 +1251,26 @@ static void build_forward_v6(struct nft_table *t, const struct spec *sp, const s
  * Старая раскладка (legacy.c) цепочку не трогает: filter на postrouting в inet есть и на 4.9, и в
  * ней нет ни nat, ни notrack. Счётчик на правиле — чтобы diag и человек видели, что пакеты
  * отбрасывались. */
-static size_t guard_devs(const struct spec *sp, const struct output *o, const char **devs,
-                         size_t n, size_t max, int depth) {
-    if (depth > MAX_OUTPUTS) return n;
-    const struct output *m[MAX_MEMBERS];
+struct guard_list { const char **v; size_t n, cap; int oom; };
+
+static void guard_devs(const struct spec *sp, const struct output *o, struct guard_list *d,
+                       size_t depth) {
+    if (depth > sp->out_n) return;      /* группы без кругов вкладываются не глубже, чем их всего */
     if (out_group(o)) {
-        size_t mn = out_members(sp, o, m, MAX_MEMBERS);
-        for (size_t k = 0; k < mn; k++) n = guard_devs(sp, m[k], devs, n, max, depth + 1);
-        return n;
+        size_t mn = out_members_n(sp, o);
+        for (size_t k = 0; k < mn; k++) guard_devs(sp, out_member(sp, o, k), d, depth + 1);
+        return;
     }
-    if (!o->device[0]) return n;
-    for (size_t k = 0; k < n; k++) if (!strcmp(devs[k], o->device)) return n;
-    if (n < max) devs[n++] = o->device;
-    return n;
+    if (!o->device[0]) return;
+    for (size_t k = 0; k < d->n; k++) if (!strcmp(d->v[k], o->device)) return;
+    if (d->n == d->cap) {
+        size_t nc = d->cap ? d->cap * 2 : 16;
+        const char **nv = realloc(d->v, nc * sizeof(*nv));
+        if (!nv) { d->oom = 1; return; }
+        d->v = nv;
+        d->cap = nc;
+    }
+    d->v[d->n++] = o->device;
 }
 
 /* Чьи метки вообще бывают на пакетах: выход правила, члены группы balance вглубь (их метку ставит
@@ -1230,21 +1280,20 @@ static size_t guard_devs(const struct spec *sp, const struct output *o, const ch
  * без меток) разошлись бы с набором правил v1 (стенд v2match). Замер группы latency через члена
  * (urltest, SO_MARK члена) сюда не входит по той же причине: у v1 он идёт SO_BINDTODEVICE. */
 static void guard_use(const struct spec *sp, const struct output *o, unsigned char *used,
-                      int depth) {
-    if (!o || depth > MAX_OUTPUTS) return;
-    size_t i = (size_t)(o - sp->out);
-    if (i >= sp->out_n || used[i]) return;
+                      size_t depth) {
+    if (!o || depth > sp->out_n) return;
+    size_t i = spec_out_idx(sp, o);
+    if (i == (size_t)-1 || used[i]) return;
     used[i] = 1;
     if (!out_balanced(o)) return;
-    const struct output *m[MAX_MEMBERS];
-    size_t mn = out_members(sp, o, m, MAX_MEMBERS);
-    for (size_t k = 0; k < mn; k++) guard_use(sp, m[k], used, depth + 1);
+    size_t mn = out_members_n(sp, o);
+    for (size_t k = 0; k < mn; k++) guard_use(sp, out_member(sp, o, k), used, depth + 1);
 }
 
 static void build_guard(struct nft_table *t, const struct spec *sp, const struct groups *gr) {
-    unsigned char used[MAX_OUTPUTS + MAX_ANON];
-    if (sp->out_n > sizeof(used)) return;
-    memset(used, 0, sizeof(used));
+    unsigned char *used = calloc(sp->out_n ? sp->out_n : 1, 1);
+    if (!used) return;
+    struct guard_list dl = {0};
     for (size_t i = 0; i < gr->n; i++) guard_use(sp, out_by_name(sp, gr->g[i].out), used, 0);
     for (size_t i = 0; i < sp->out_n; i++)
         if (sp->out[i].over[0]) guard_use(sp, out_over(sp, &sp->out[i]), used, 0);
@@ -1264,8 +1313,10 @@ static void build_guard(struct nft_table *t, const struct spec *sp, const struct
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
         if (!used[i] || !out_has_device(o) || !o->mark || !o->table) continue;
-        const char *devs[MAX_OUTPUTS * MAX_MEMBERS];
-        size_t nd = guard_devs(sp, o, devs, 0, sizeof(devs) / sizeof(devs[0]), 0);
+        dl.n = 0;
+        guard_devs(sp, o, &dl, 0);
+        const char *const *devs = dl.v;
+        size_t nd = dl.n;
         if (!nd) continue;
         if (!c) {
             c = ir_base_chain_add(t, "postrouting_guard", "filter", "postrouting", "filter", 0);
@@ -1289,11 +1340,13 @@ static void build_guard(struct nft_table *t, const struct spec *sp, const struct
             for (size_t k = 0; k < nd; k++) sb_add(&b, "%s\"%s\"", k ? ", " : "", devs[k]);
             sb_add(&b, " }");
         }
-        ir_x(r, "%s", b.s);
+        sb_emit(r, &b);
         ir_counter(r, 0, 0);
         ir_x(r, "drop");
         ir_comment(r, "steer-guard:%s", o->name);
     }
+    free(dl.v);
+    free(used);
 }
 
 /* ПЕРЕНАПРАВЛЕНИЕ DNS СТОИТ ВСЕГДА, а не только при доменных каналах (кроме профиля без
@@ -1626,7 +1679,7 @@ static int local_who(struct nft_rule *r, const struct group *g, struct err *e) {
         else sb_add(&b, "%s%u-%u", i ? ", " : "", lo, hi);
     }
     if (!one) sb_add(&b, " }");
-    ir_x(r, "%s", b.s);
+    sb_emit(r, &b);
     ir_x(r, "ct direction original");
     return 0;
 }

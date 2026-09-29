@@ -114,26 +114,35 @@ static int via_idx(const struct spec *sp, const struct output *o) { return (int)
 /* Устройства, в которые может уйти трафик выхода: у группы — устройства её членов, у выхода с
  * устройством — его собственное (out_members). */
 /* Устройства выхода: у группы — листья всех членов, вниз по вложенным группам (любое из них может
- * оказаться выбранным); dst — на MAX_MEMBERS * 4 записей (вложенность глубже на деле не пишут, а
- * сверх предела листья просто не проверяются). leaves = 0 — только члены без групп: так смотрит
- * проверка дубликатов, где вложенная группа с общими листьями законна (bal из res и wg1, а рядом
- * запасной wg0). */
-#define VIA_DEVS_MAX (MAX_MEMBERS * 4)
-static size_t devs_of(const struct spec *sp, const struct output *o, const char **dst, size_t n,
-                      int leaves, int depth) {
-    const struct output *m[MAX_MEMBERS];
-    size_t mn = out_members(sp, o, m, MAX_MEMBERS);
-    for (size_t i = 0; i < mn && n < VIA_DEVS_MAX; i++) {
-        if (m[i] != o && out_group(m[i])) {
-            if (leaves && depth < MAX_OUTPUTS) n = devs_of(sp, m[i], dst, n, leaves, depth + 1);
+ * оказаться выбранным); список растёт по числу устройств (раньше — 64 записи, а сверх них листья
+ * просто не проверялись, то есть проверка молча слепла на большом пуле). Вложенность ограничена
+ * числом выходов: группы без кругов вкладываются не глубже, чем их всего. leaves = 0 — только
+ * члены без групп: так смотрит проверка дубликатов, где вложенная группа с общими листьями
+ * законна (bal из res и wg1, а рядом запасной wg0). */
+struct devlist { const char **v; size_t n, cap; };
+static int devs_of(const struct spec *sp, const struct output *o, struct devlist *d, int leaves,
+                   size_t depth) {
+    size_t mn = out_members_n(sp, o);
+    for (size_t i = 0; i < mn; i++) {
+        const struct output *m = out_member(sp, o, i);
+        if (m != o && out_group(m)) {
+            if (leaves && depth < sp->out_n && devs_of(sp, m, d, leaves, depth + 1) != 0) return -1;
             continue;
         }
-        dst[n++] = m[i]->device;
+        if (d->n == d->cap) {
+            size_t nc = d->cap ? d->cap * 2 : 16;
+            const char **nv = realloc(d->v, nc * sizeof(*nv));
+            if (!nv) return -1;
+            d->v = nv;
+            d->cap = nc;
+        }
+        d->v[d->n++] = m->device;
     }
-    return n;
+    return 0;
 }
-static size_t via_devs(const struct spec *sp, const struct output *o, const char **dst) {
-    return devs_of(sp, o, dst, 0, 1, 0);
+static int via_devs(const struct spec *sp, const struct output *o, struct devlist *d) {
+    d->n = 0;
+    return devs_of(sp, o, d, 1, 0);
 }
 
 /* Выход, которому принадлежит устройство пула, — тот же ответ, что device_owner в failover.c
@@ -148,8 +157,16 @@ static const struct output *via_dev_owner(const struct spec *sp, const char *dev
     return NULL;
 }
 
-static int over_check(const struct spec *sp, const char *w, int *bad, struct err *e) {
+/* Рабочие массивы обхода подложек: по числу выходов спеки, а не на предельное число. */
+struct over_ws { int *on_path, *seen, *stack; struct devlist td, od; };
+
+static int over_check_run(const struct spec *sp, const char *w, int *bad, struct err *e,
+                          struct over_ws *ws) {
     static char msg[512];
+    int *on_path = ws->on_path, *seen = ws->seen, *stack = ws->stack;
+#define td (ws->td)                 /* списки устройств живут в ws: realloc виден обёртке */
+#define od (ws->od)
+    int rc = 0;
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
         if (!o->over[0]) continue;
@@ -184,7 +201,7 @@ static int over_check(const struct spec *sp, const char *w, int *bad, struct err
         /* Цепочка по одним подложкам: круг и глубина. Путь печатается целиком — по одному имени
          * человек круга не найдёт, если в спеке шестнадцать выходов. */
         char path[256];
-        int on_path[MAX_OUTPUTS] = {0};
+        memset(on_path, 0, sp->out_n * sizeof(int));
         size_t pl = (size_t)snprintf(path, sizeof(path), "%s", o->name);
         on_path[via_idx(sp, o)] = 1;
         int hops = 0;
@@ -207,37 +224,64 @@ static int over_check(const struct spec *sp, const char *w, int *bad, struct err
 
         /* Круг через пул: обход всего, во что может уйти трафик туннеля o, — целей подложки и
          * владельцев устройств в пулах целей. Встретить устройство самого o или сам o — круг. */
-        int seen[MAX_OUTPUTS] = {0};
-        int stack[MAX_OUTPUTS * (MAX_MEMBERS + 1)];
+        /* seen ставится при постановке в стек, а не при выемке: каждый выход попадает в стек не
+         * больше раза, и стек длиной в число выходов не переполняется никаким пулом. */
+        memset(seen, 0, sp->out_n * sizeof(int));
         int top = 0;
         stack[top++] = via_idx(sp, v);
+        seen[via_idx(sp, v)] = 1;
         while (top) {
             const struct output *t = &sp->out[stack[--top]];
-            if (seen[via_idx(sp, t)]) continue;
-            seen[via_idx(sp, t)] = 1;
             if (t == o) {
                 snprintf(msg, sizeof(msg), "выход %.31s: %s замыкается в круг через устройства "
                          "пула — туннель однажды пошёл бы внутрь себя", o->name, w);
-                return err_set(e, "%s", msg);
+                rc = err_set(e, "%s", msg);
+                goto out;
             }
-            const char *td[VIA_DEVS_MAX], *od[VIA_DEVS_MAX];
-            size_t tn = via_devs(sp, t, td), on = via_devs(sp, o, od);
-            for (size_t d = 0; d < tn; d++) {
-                for (size_t k = 0; k < on; k++)
-                    if (!strcmp(td[d], od[k])) {
+            if (via_devs(sp, t, &td) != 0 || via_devs(sp, o, &od) != 0) {
+                rc = err_set(e, "%s", "недостаточно памяти для проверки спеки");
+                goto out;
+            }
+            for (size_t d = 0; d < td.n; d++) {
+                for (size_t k = 0; k < od.n; k++)
+                    if (!strcmp(td.v[d], od.v[k])) {
                         snprintf(msg, sizeof(msg), "выход %.31s: %s ведёт в %.31s, а среди его "
                                  "устройств %.31s — устройство самого выхода, туннель пошёл бы "
-                                 "внутрь себя", o->name, w, t->name, td[d]);
-                        return err_set(e, "%s", msg);
+                                 "внутрь себя", o->name, w, t->name, td.v[d]);
+                        rc = err_set(e, "%s", msg);
+                        goto out;
                     }
-                const struct output *wo = via_dev_owner(sp, td[d], t);
-                if (wo && !seen[via_idx(sp, wo)]) stack[top++] = via_idx(sp, wo);
+                const struct output *wo = via_dev_owner(sp, td.v[d], t);
+                if (wo && !seen[via_idx(sp, wo)]) { seen[via_idx(sp, wo)] = 1; stack[top++] = via_idx(sp, wo); }
             }
             const struct output *n = out_over(sp, t);
-            if (n && !seen[via_idx(sp, n)]) stack[top++] = via_idx(sp, n);
+            if (n && !seen[via_idx(sp, n)]) { seen[via_idx(sp, n)] = 1; stack[top++] = via_idx(sp, n); }
         }
     }
-    return 0;
+out:
+    return rc;
+#undef td
+#undef od
+}
+
+static int over_check(const struct spec *sp, const char *w, int *bad, struct err *e) {
+    /* У спеки без `over` (почти всех) ничего не выделяется. */
+    size_t any = 0;
+    for (size_t i = 0; i < sp->out_n; i++) any += sp->out[i].over[0] != 0;
+    if (!any) return 0;
+    struct over_ws ws = { calloc(sp->out_n, sizeof(int)), calloc(sp->out_n, sizeof(int)),
+                          malloc(sp->out_n * sizeof(int)), {0}, {0} };
+    int rc;
+    if (!ws.on_path || !ws.seen || !ws.stack)
+        rc = err_set(e, "%s", "недостаточно памяти для проверки спеки");
+    else
+        rc = over_check_run(sp, w, bad, e, &ws);
+    free(ws.on_path);
+    free(ws.seen);
+    free(ws.stack);
+    free(ws.td.v);
+    free(ws.od.v);
+    return rc;
 }
 
 /* ---- защита от конфигураций, которые отрежут доступ к роутеру ------------------------------
@@ -246,6 +290,7 @@ static int over_check(const struct spec *sp, const char *w, int *bad, struct err
  * как «роутер пропал». Отказать на них дешевле, чем потом объяснять, как чинить коробку, до
  * которой уже не достучаться. */
 int spec_check_outputs(const struct spec *sp, const char *over_word, int *bad, struct err *e) {
+    struct devlist dv = {0};
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
         if (!out_has_device(o)) continue;
@@ -262,21 +307,44 @@ int spec_check_outputs(const struct spec *sp, const char *over_word, int *bad, s
                 snprintf(msg, sizeof(msg),
                          "выход %s ведёт в %s — это локальная сеть, трафик закольцуется",
                          o->name, sp->lan_dev[d]);
+                free(dv.v);
                 return err_set(e, "%s", msg);
             }
 
         /* Дубликат устройства внутри одного пула делает failover бессмысленным: второй
          * кандидат ничем не отличается от первого. */
-        const char *dv[VIA_DEVS_MAX];
-        size_t dn = devs_of(sp, o, dv, 0, 0, 0);
-        for (size_t a = 0; a < dn; a++)
-            for (size_t b = a + 1; b < dn; b++)
-                if (!strcmp(dv[a], dv[b])) {
+        dv.n = 0;
+        if (devs_of(sp, o, &dv, 0, 0) != 0) {
+            free(dv.v);
+            return err_set(e, "%s", "недостаточно памяти для проверки спеки");
+        }
+        for (size_t a = 0; a < dv.n; a++)
+            for (size_t b = a + 1; b < dv.n; b++)
+                if (!strcmp(dv.v[a], dv.v[b])) {
                     char msg[160];
                     snprintf(msg, sizeof(msg), "выход %s: устройство %s указано дважды",
-                             o->name, dv[a]);
+                             o->name, dv.v[a]);
+                    free(dv.v);
                     return err_set(e, "%s", msg);
                 }
     }
+    free(dv.v);
     return over_check(sp, over_word, bad, e);
+}
+
+int check_mark_slots(const struct spec *sp, struct err *e) {
+    size_t n = 0;
+    for (size_t i = 0; i < sp->out_n; i++)
+        if (out_needs_mark(&sp->out[i])) n++;
+    unsigned slots = steer_mark_slots();
+    if (n <= slots) return 0;
+    /* Цифры раскладки, а не имя константы: столько мест даёт поле метки, вот какие это биты, и
+     * вот почему больше нельзя (marks.h, «СКОЛЬКО ВЫХОДОВ ВЛЕЗАЕТ В ПОЛЕ МЕТКИ»). */
+    char msg[600];
+    snprintf(msg, sizeof(msg), "выходов с меткой %zu, а поле метки даёт мест не больше %u: у метки "
+             "%d бит (биты %d-%d), значения, которые чужая перезапись соседних битов 16-23 могла бы "
+             "превратить в метку другого выхода, не раздаются. Выходы без метки (direct) в счёт не "
+             "идут", n, slots, STEER_MARK_BITS,
+             STEER_MARK_LOBIT, STEER_MARK_HIBIT);
+    return err_set(e, "%s", msg);
 }

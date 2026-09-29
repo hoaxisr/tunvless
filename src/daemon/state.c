@@ -52,13 +52,15 @@ int steerd_load(struct steerd *d) {
     if (load_spec(d->spec_path, ns, &e) < 0 || registry_assign(ns, &e) < 0 ||
         build_groups(ns, ng, &e) < 0) {
         snprintf(d->err, sizeof(d->err), "%s", e.msg);
-        groups_free(ng);
+        groups_release(ng);
         free(ng);
+        spec_release(ns);
         free(ns);
         return -1;
     }
-    groups_free(d->gr);
+    groups_release(d->gr);
     free(d->gr);
+    spec_release(d->sp);        /* арена — по счётчику ссылок: копия сторожа, идущая сейчас, её держит */
     free(d->sp);
     d->sp = ns;
     d->gr = ng;

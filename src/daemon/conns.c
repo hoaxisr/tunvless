@@ -52,8 +52,8 @@ struct conns_reg { char name[32]; uint32_t mark; };
 struct ctnl_conns_ctx {
     FILE *out;
     int shown, total;
-    struct conns_reg reg[MAX_OUTPUTS * 2];   /* мест не больше MAX_OUTPUTS (STEER_MARK_SLOTS) */
-    size_t reg_n;
+    struct conns_reg *reg;                   /* растёт по числу записей реестра */
+    size_t reg_n, reg_cap;
 };
 
 static const char *ct_proto_name(uint8_t p) {
@@ -187,9 +187,15 @@ static void conns_registry(struct ctnl_conns_ctx *x) {
     char name[32];
     unsigned mark;
     int table;
-    while (x->reg_n < sizeof(x->reg) / sizeof(x->reg[0]) &&
-           fscanf(f, "%31s %x %d\n", name, &mark, &table) == 3) {
+    while (fscanf(f, "%31s %x %d\n", name, &mark, &table) == 3) {
         if (!mark || (mark & ~STEER_MARK_MASK)) continue;
+        if (x->reg_n == x->reg_cap) {
+            size_t nc = x->reg_cap ? x->reg_cap * 2 : 32;
+            struct conns_reg *nr = realloc(x->reg, nc * sizeof(*nr));
+            if (!nr) break;
+            x->reg = nr;
+            x->reg_cap = nc;
+        }
         snprintf(x->reg[x->reg_n].name, sizeof(x->reg[0].name), "%s", name);
         x->reg[x->reg_n++].mark = mark;
     }
@@ -200,6 +206,7 @@ static void conns_registry(struct ctnl_conns_ctx *x) {
  * NETLINK_NETFILTER, модуля nf_conntrack_netlink или прав), причина — в stderr, stdout пуст. */
 int ctnl_conns_print(FILE *out) {
     static struct ctnl_conns_ctx x;
+    free(x.reg);                    /* реестр прошлого вызова (в процессе демона вызовов много) */
     memset(&x, 0, sizeof(x));
     x.out = out;
     conns_registry(&x);

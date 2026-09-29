@@ -97,6 +97,20 @@ struct rule {
 #define RTAG_EXACT     1u
 #define RTAG_NAMESPACE 2u
 
+/* НАБОР КАНАЛОВ ИМЕНИ — число, а не 64 бита. Раньше это был uint64_t по биту на канал, и каналов
+ * было «не больше 64»; теперь набор — номер записи в таблице различных наборов
+ * (table.c, chm_*), которая хранит их битовыми строками любой длины. Нуль — пустой набор. Число
+ * различных наборов — единицы (имя обычно под одним правилом, редко под двумя), поэтому запись
+ * fake-IP несёт четыре байта, а не восемь, а число каналов ничем не ограничено. Таблица только
+ * растёт и живёт до конца процесса: номера выданы записям, которые могут пережить перезагрузку
+ * таблицы каналов. */
+typedef uint32_t chm_t;
+chm_t chm_one(size_t ch);                       /* набор из одного канала */
+chm_t chm_or(chm_t a, chm_t b);
+chm_t chm_andn(chm_t a, chm_t b);               /* a без каналов b */
+chm_t chm_upto(chm_t m, size_t n);              /* только каналы с номером < n */
+int chm_has(chm_t m, size_t ch);
+
 struct ruleset {
     struct rule *rules;
     size_t n;
@@ -154,7 +168,7 @@ struct fakeip_entry {
      * правил, который человек видит и меняет стрелками. Это и есть «победитель —
      * который выше» (решение владельца), а не «нижнее правило отбрасываем».
      *
-     * Бит на канал влезает точно: доменных каналов не больше MAX_RULES = 64.
+     * Набор каналов — chm_t (выше): число каналов не ограничено 64 битами.
      *
      * NOT persisted to the state file: it is re-derived on (re)query and on the
      * rehydrate pass, so the 2-field/3-field formats on disk stay unchanged. The
@@ -164,7 +178,7 @@ struct fakeip_entry {
      * main route — i.e. the WAN — silently bypassing the tunnel. Now the fake IP
      * is a PERMANENT element of its channel set, exactly like it is permanent in
      * the DNAT map, so the path stays stable for the whole lifetime of the flow. */
-    uint64_t sets;
+    chm_t sets;
     /* Дроссели горячего пути, оба — время последнего действия (0 = никогда).
      * Не сохраняются: после рестарта первый запрос всё сделает заново, это
      * и есть желаемое поведение.
@@ -190,7 +204,7 @@ struct fakeip_entry {
      * AAAA; на диск не пишутся. */
     uint8_t real6[16];
     int has_real6;
-    uint64_t sets6;
+    chm_t sets6;
     time_t route6_asserted;
     time_t refreshed6;
 };
@@ -220,8 +234,8 @@ struct dchan {
     /* Источники правил: путь к списку (`.lst` или `.srs` — различается подписью файла) либо
      * выбор из набора и сужение для составного набора — формы разбирает dch_rules_load
      * (rules.c): «srs:<клаузы>:<путь>», «cl:<сужение>:<путь>». */
-    const char *rules_path[MAX_FILES];
-    size_t rules_n;
+    const char **rules_path;    /* куча, растёт по числу путей (dch_src): раньше — 64 места */
+    size_t rules_n, rules_cap;
     struct ruleset rules;
     struct dpart *parts;        /* правила со своим сужением или исключениями */
     size_t parts_n;
@@ -269,8 +283,11 @@ extern struct sindex g_fakeip_idx;
 extern size_t g_fakeip_next;
 
 /* каналы: таблица «канал → набор» (table.c) */
-extern struct dchan g_dch[MAX_RULES];
-extern size_t g_dch_n;
+extern struct dchan *g_dch;     /* куча, растёт по числу доменных каналов */
+extern size_t g_dch_n, g_dch_cap;
+/* Место под ещё один канал (обнулённый). NULL — нет памяти. Указатель на элемент живёт до
+ * следующего dch_new: держат индекс. */
+struct dchan *dch_new(void);
 
 /* proxy: адрес назначения из conntrack, метка соединения, контекст TCP (proxy.c) */
 extern int g_origdst;
@@ -343,7 +360,7 @@ uint32_t fakeip_entry_get_real(const char *domain);
  * (real_saved). 0 — не знаем. Им сверяется новый ответ и смена значения в карте. */
 uint32_t fakeip_entry_known_real(const char *domain);
 void fakeip_entry_set_real(const char *domain, uint32_t real_host);
-void fakeip_route_set(const char *domain, uint64_t want);
+void fakeip_route_set(const char *domain, chm_t want);
 size_t fakeip_rehydrate(int nk_open, size_t *routed_out);
 /* fake-IP v6: настоящий адрес под элементом карты fakeip6 (NULL — не знаем), его запись и
  * постоянный элемент поддельного IPv6 в наборах «<канал>6» из want. */
@@ -351,17 +368,17 @@ const uint8_t *fakeip_entry_get_real6(const char *domain);
 /* То же, что fakeip_entry_known_real, для IPv6: стоящий в карте fakeip6 или сохранённый. */
 const uint8_t *fakeip_entry_known_real6(const char *domain);
 void fakeip_entry_set_real6(const char *domain, const uint8_t real6[16]);
-void fakeip_route_set6(const char *domain, uint64_t want);
+void fakeip_route_set6(const char *domain, chm_t want);
 extern const char *g_fakeip6_map;
 
 /* table.c */
-uint64_t dch_match_mask(const char *host);
-int dch_first(uint64_t mask);
-uint64_t dch_fakeip_only(uint64_t mask);
+chm_t dch_match_mask(const char *host);
+int dch_first(chm_t mask);
+chm_t dch_fakeip_only(chm_t mask);
 /* Все ли каналы из mask несут IPv6 (DCH_V6) — отвечать ли на AAAA имени адресом, а не пустым
  * ответом. Все, а не первый: канал без IPv6 среди совпавших не забрал бы поддельный IPv6 своих
  * клиентов, и их соединение ушло бы мимо его выхода. Пустой mask — 0. */
-int dch_all_v6(uint64_t mask);
+int dch_all_v6(chm_t mask);
 void dch_build(const struct spec *sp);
 void dch_sig_write(void);
 
@@ -476,7 +493,7 @@ struct pending {
     /* Полный набор совпавших каналов — тот же, что посчитал приём запроса (см.
      * dch_match_mask). Хранится рядом с `hit` по той же причине, по какой хранится `hit`:
      * ответ несёт то же имя, и второй проход по каналам ничего не узнаёт. */
-    uint64_t sets;
+    chm_t sets;
     unsigned rules_gen;
     /* Запрос наверх по TCP (номер в g_tcpu) или -1 — по UDP. Ответ по TCP приходит на свой
      * сокет, и датаграмма с тем же номером транзакции на сокет UDP этому ожиданию не ответ

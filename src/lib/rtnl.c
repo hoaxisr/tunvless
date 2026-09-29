@@ -185,7 +185,8 @@ static void rule_cb(const struct nlmsghdr *h, void *ctx) {
     tb_line(t, line);
 }
 
-int rtnl_rules_text(char *out, size_t n) {
+/* Дамп правил в out (n байт); *full — не всё влезло. */
+static int rules_text_full(char *out, size_t n, int *full) {
     if (!n) return -1;
     out[0] = '\0';
     uint8_t buf[64];
@@ -197,7 +198,33 @@ int rtnl_rules_text(char *out, size_t n) {
                                     NLM_F_REQUEST | NLM_F_DUMP, &fr, sizeof(fr));
     struct textbuf t = { out, n, 0, 0 };
     if (rtnl_talk(buf, msg_end(&b, nh), rule_cb, &t) != 0) { out[0] = '\0'; return -1; }
+    if (full) *full = t.full;
     return 0;
+}
+
+int rtnl_rules_text(char *out, size_t n) {
+    return rules_text_full(out, n, NULL);
+}
+
+char *rtnl_rules_dup(int v6) {
+    size_t n = 16384;
+    int saved = g_fam;
+    g_fam = v6 ? AF_INET6 : AF_INET;
+    char *res = NULL;
+    for (;;) {
+        char *p = malloc(n);
+        if (!p) break;
+        int full = 0;
+        if (rules_text_full(p, n, &full) != 0) { free(p); break; }
+        if (!full) { res = p; break; }
+        free(p);
+        /* Потолок 64 МиБ — не размер таблицы правил, а защита от дампа, который не кончается:
+         * правил столько не бывает (одно на выход и на семейство плюс десяток ядерных). */
+        if (n >= ((size_t)64 << 20)) break;
+        n *= 2;
+    }
+    g_fam = saved;
+    return res;
 }
 
 int rtnl_rules_text6(char *out, size_t n) {

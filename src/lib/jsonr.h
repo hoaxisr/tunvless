@@ -25,6 +25,8 @@ int js_str(struct js *j, char *buf, size_t n, struct err *e);
 int js_num(struct js *j, long *out, struct err *e);
 int js_skip(struct js *j, struct err *e);
 const char *keep(const char *s, struct err *e);
+/* Число элементов массива под j (j не двигается); не массив — 0. Для буфера ровно нужной длины. */
+size_t js_count(const struct js *j);
 /* (size_t)-1 — отказ, текст уже в e->msg (переполнение элемента, предел списка или висящая
  * запятая — все три сами знают, что сказать). Иначе — как раньше: сколько строк прочитано,
  * включая мягкую остановку на первом нестроковом элементе (не отказ, см. определение). */

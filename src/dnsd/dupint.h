@@ -29,6 +29,8 @@ struct dial {
 
     /* Вход. */
     struct spec_dns_up u;
+    char (*ips_own)[46];                /* личные копии u.ips и u.boot (dial_free отдаёт) */
+    char (*boot_own)[46];
     unsigned mark;
     int doh;                            /* ALPN http/1.1 и проверка, что выбрано оно */
     struct sockaddr_storage cached[DIAL_MAXADDR];

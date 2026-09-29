@@ -34,8 +34,9 @@
  * apply: apply должен завершаться, а туннель — жить. Init-скрипт держит по экземпляру
  * procd на каждый такой выход, поэтому падение одного не уносит остальные.
  */
-#define MAX_NODES 128
-static struct vless_node g_nodes[MAX_NODES];
+/* Узлы подписки — массив в куче по числу узлов в файле (vless_load_sub): раньше их было «не больше
+ * 128», статикой на 157 КБ, а хвост подписки терялся. */
+static struct vless_node *g_nodes;
 /* Что нужно слежке за узлом, когда стек поднимет устройство (vl_ready). */
 struct vl_ready_arg {
     const struct vless_node *nodes;
@@ -62,18 +63,11 @@ static struct spec *spec_new(void) {
  * слою нужно показать локации подписки ДО того, как на неё заведён хоть один выход — иначе
  * человек собирает выход из подписки, локаций которой не видит. */
 static int load_nodes_file(const char *path, size_t *cnt, struct vless_sub_stats *st) {
-    /* Подписка читается с диска: скачивание — дело управляющего слоя. */
-    FILE *f = fopen(path, "r");
-    if (!f) { fprintf(stderr, LOG_W2 "%s не читается\n", path); return 2; }
-    static char raw[262144], dec[262144];
-    size_t n = fread(raw, 1, sizeof(raw) - 1, f);
-    raw[n] = '\0';
-    fclose(f);
-    /* Какой это формат — решает sub.c: там же, где формат и разбирается, и там же, где это
-     * можно проверить стендом. */
-    const char *text = vless_sub_text(raw, n, dec, sizeof(dec));
-
-    *cnt = vless_parse_sub(text, g_nodes, MAX_NODES, st);
+    /* Подписка читается с диска: скачивание — дело управляющего слоя. Какой это формат — решает
+     * sub.c: там же, где формат и разбирается, и там же, где это можно проверить стендом. */
+    free(g_nodes);
+    g_nodes = vless_load_sub(path, cnt, st);
+    if (!g_nodes) { fprintf(stderr, LOG_W2 "%s не читается\n", path); return 2; }
     return 0;
 }
 
@@ -240,13 +234,14 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
     /* node < 0 — «как поднимется выход», а поднимется он по кандидатам из спеки: при
      * выбранном подмножестве перебор идёт по нему и в его порядке. Той же функцией, что и
      * подъём, — иначе диагностика показывала бы порядок, которого не будет. */
-    static int sel[MAX_NODES];
+    int *sel = calloc(cnt + 1, sizeof(int));           /* кандидатов не больше узлов подписки */
+    if (!sel) { printf("{\"ok\":false,\"error\":\"нет памяти\"}\n"); return 1; }
     size_t sel_n = 0;
     if (node >= 0) { sel[0] = node; sel_n = 1; }
     else if (by_file) {
-        for (size_t i = 0; i < cnt && i < MAX_NODES; i++) sel[sel_n++] = (int)i;
+        for (size_t i = 0; i < cnt; i++) sel[sel_n++] = (int)i;
     } else {
-        sel_n = out_node_list(o, cnt, sel, MAX_NODES);
+        sel_n = out_node_list(o, cnt, sel, cnt + 1);
         if (!sel_n) {
             printf("{\"ok\":false,\"error\":\"выбранных узлов нет в подписке, "
                    "пригодных всего %zu\"}\n", cnt);
@@ -353,8 +348,9 @@ int cmd_vless(const char *spec_path, const char *out_name) {
      * подписка», выбранное подмножество — только его узлы и только в написанном порядке. Одна
      * функция на подъём и на `vless-probe`: покажи диагностика другой порядок, она объясняла
      * бы не тот перебор, который случится (см. out_node_list в kinds/vless.c). */
-    static int sel[MAX_NODES];
-    size_t sel_n = out_node_list(o, cnt, sel, MAX_NODES);
+    int *sel = calloc(cnt + 1, sizeof(int));           /* кандидатов не больше узлов подписки */
+    if (!sel) { fprintf(stderr, LOG_W2 "нет памяти под список кандидатов\n"); return 1; }
+    size_t sel_n = out_node_list(o, cnt, sel, cnt + 1);
     if (!sel_n) {
         /* Сюда попадают только выборы, целиком уехавшие за пределы подписки: она обновилась,
          * узлов стало меньше. Перебирать вместо выбранного что попало нельзя — это увело бы

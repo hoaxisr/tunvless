@@ -155,8 +155,8 @@
  * мёртвых устройств. Прерывается с уборкой (fo_pass_abort). С запасом: восемь выходов по восемь
  * мёртвых устройств с оживлением и замером — это минуты, а не десять. */
 #define WATCHD_PASS_MAX_S 600
-/* Событий за проход — не больше, чем решений у выходов: по одному-два на выход. */
-#define WATCHD_EV_MAX 64
+/* События прохода копятся в растущем массиве (watchd_ev): их столько, сколько решений у выходов
+ * за проход, а выходов не 16 (раньше — 64 записи, и события сверх них молча пропадали). */
 
 /* ---- память выходов ------------------------------------------------------------------ */
 
@@ -284,7 +284,7 @@ static const struct fo_hsrc_ops hmem_ops = {
 struct wev {
     enum fo_ev_kind kind;
     char out[48], from[48], to[48], why[24], of[16], member[48];
-    char alive[MAX_MEMBERS * 33];
+    char *alive;                  /* имена живых членов через запятую — в куче, любой длины */
 };
 
 struct watchd {
@@ -303,17 +303,23 @@ struct watchd {
     unsigned long passes;         /* проходов с начала — первый отмечается в журнале */
     struct fo_run *run;           /* идущий проход; NULL — нет */
     struct spec *sp;              /* копия спеки для прохода */
-    struct wev ev[WATCHD_EV_MAX];
-    int ev_n;
+    struct wev *ev;
+    int ev_n, ev_cap;
     long masq_at;                 /* когда последний раз возвращали masquerade (телефон) */
     struct fo_mem mem;
     struct fo_hmem hmem;          /* здоровье помощников — у супервизора демона (--supervise) */
     struct folat *lat;            /* замеры групп latency своими таймерами (folat.c) */
     /* Устройства раздачи и их номера, какими их видел сторож (шапка, «УСТРОЙСТВА РАЗДАЧИ»);
      * 0 — устройства нет. */
-    struct { char name[IFNAMSIZ]; int idx; } lan[MAX_LAN_DEV];
-    size_t lan_n;
+    struct { char name[IFNAMSIZ]; int idx; } *lan;   /* растёт по числу устройств спеки */
+    size_t lan_n, lan_cap;
 };
+
+/* Сбросить очередь событий: alive у каждого — своя строка в куче. */
+static void wev_clear(struct watchd *w) {
+    for (int i = 0; i < w->ev_n; i++) { free(w->ev[i].alive); w->ev[i].alive = NULL; }
+    w->ev_n = 0;
+}
 
 static void watchd_pass_start(struct watchd *w);
 
@@ -335,7 +341,14 @@ static int *lan_slot(struct watchd *w, const char *name, int create, int idx, in
     *fresh = 0;
     for (size_t i = 0; i < w->lan_n; i++)
         if (!strcmp(w->lan[i].name, name)) return &w->lan[i].idx;
-    if (!create || w->lan_n >= MAX_LAN_DEV || strlen(name) >= IFNAMSIZ) return NULL;
+    if (!create || strlen(name) >= IFNAMSIZ) return NULL;
+    if (w->lan_n == w->lan_cap) {
+        size_t nc = w->lan_cap ? w->lan_cap * 2 : 8;
+        void *nl = realloc(w->lan, nc * sizeof(*w->lan));
+        if (!nl) return NULL;
+        w->lan = nl;
+        w->lan_cap = nc;
+    }
     snprintf(w->lan[w->lan_n].name, IFNAMSIZ, "%s", name);
     w->lan[w->lan_n].idx = idx;
     *fresh = 1;
@@ -482,7 +495,13 @@ void watchd_helper_changed(struct watchd *w) {
 /* Событие прохода — в очередь до конца прохода. */
 static void watchd_ev(void *arg, const struct fo_event *e) {
     struct watchd *w = arg;
-    if (w->ev_n >= WATCHD_EV_MAX) return;
+    if (w->ev_n == w->ev_cap) {
+        int nc = w->ev_cap ? w->ev_cap * 2 : 64;
+        struct wev *ne = realloc(w->ev, (size_t)nc * sizeof(*ne));
+        if (!ne) return;                /* событие теряется только без памяти */
+        w->ev = ne;
+        w->ev_cap = nc;
+    }
     struct wev *q = &w->ev[w->ev_n++];
     q->kind = e->kind;
     snprintf(q->out, sizeof(q->out), "%s", e->out ? e->out : "");
@@ -491,7 +510,7 @@ static void watchd_ev(void *arg, const struct fo_event *e) {
     snprintf(q->why, sizeof(q->why), "%s", e->why ? e->why : "");
     snprintf(q->of, sizeof(q->of), "%s", e->on_fail ? e->on_fail : "");
     snprintf(q->member, sizeof(q->member), "%s", e->member ? e->member : "");
-    snprintf(q->alive, sizeof(q->alive), "%s", e->alive ? e->alive : "");
+    q->alive = strdup(e->alive ? e->alive : "");
 }
 
 void steerd_fo_emit(struct steerd *d, const struct fo_event *e) {
@@ -527,19 +546,24 @@ void steerd_fo_emit(struct steerd *d, const struct fo_event *e) {
         steerd_emit(d, "revived", f);
         break;
     case FO_EV_BALANCE: {
-        /* alive — массив имён живых членов (в карте раздачи). */
-        size_t l = (size_t)snprintf(f, sizeof(f), ",\"out\":%s,\"alive\":[", out);
-        char names[MAX_MEMBERS * 33];
-        snprintf(names, sizeof(names), "%s", e->alive ? e->alive : "");
+        /* alive — массив имён живых членов (в карте раздачи). Буфер — по длине списка: имён в
+         * группе не «не больше 16», а сколько написано (имя в JSON — до ~112 байт с кавычками). */
+        const char *al = e->alive ? e->alive : "";
+        size_t fc = 256 + strlen(al) * 4 + 16;
+        char *fb = malloc(fc), *names = strdup(al);
+        if (!fb || !names) { free(fb); free(names); break; }
+        size_t l = (size_t)snprintf(fb, fc, ",\"out\":%s,\"alive\":[", out);
         int first = 1;
-        for (char *tok = strtok(names, ","); tok && l < sizeof(f); tok = strtok(NULL, ",")) {
+        for (char *tok = strtok(names, ","); tok && l < fc; tok = strtok(NULL, ",")) {
             char js[112];
             steerd_json_str(js, sizeof(js), tok);
-            l += (size_t)snprintf(f + l, sizeof(f) - l, "%s%s", first ? "" : ",", js);
+            l += (size_t)snprintf(fb + l, fc - l, "%s%s", first ? "" : ",", js);
             first = 0;
         }
-        if (l < sizeof(f)) snprintf(f + l, sizeof(f) - l, "]");
-        steerd_emit(d, "balance", f);
+        if (l < fc) snprintf(fb + l, fc - l, "]");
+        steerd_emit(d, "balance", fb);
+        free(fb);
+        free(names);
         break;
     }
     }
@@ -559,7 +583,11 @@ static void watchd_after(struct watchd *w) {
     /* Память выходов уже новая — теперь события (см. шапку). */
     int n = w->ev_n;
     w->ev_n = 0;
-    for (int i = 0; i < n; i++) watchd_emit(w, &w->ev[i]);
+    for (int i = 0; i < n; i++) {
+        watchd_emit(w, &w->ev[i]);
+        free(w->ev[i].alive);
+        w->ev[i].alive = NULL;
+    }
     /* masquerade правилом iptables (телефон) — см. шапку: не на каждом проходе. */
     if (plat()->iptables_masq && w->d->have && watch_masq_due(&w->masq_at, w->eventful))
         iptables_masq_ensure(w->d->sp);
@@ -596,7 +624,7 @@ static void watchd_kill(struct loop *l, struct loop_timer *t, void *arg) {
     fo_pass_abort(w->run);
     /* Выбор прерванного прохода не записан (active кладётся в конце) — и его события тоже не
      * уходят: следующий проход решит заново и скажет сам. */
-    w->ev_n = 0;
+    wev_clear(w);
     watchd_after(w);
 }
 
@@ -607,8 +635,8 @@ static int group_reaches(const struct spec *sp, const struct output *a, const st
                          int depth) {
     if (a == g) return 1;
     const struct group_cfg *ga = out_group(a);
-    for (size_t k = 0; ga && k < ga->members_n && depth < MAX_OUTPUTS; k++)
-        if (ga->members[k] < MAX_OUTPUTS &&
+    for (size_t k = 0; ga && k < ga->members_n && (size_t)depth < sp->out_n; k++)
+        if (spec_is_named(ga->members[k]) &&
             group_reaches(sp, &sp->out[ga->members[k]], g, depth + 1))
             return 1;
     return 0;
@@ -616,7 +644,7 @@ static int group_reaches(const struct spec *sp, const struct output *a, const st
 
 struct wtraffic {
     const struct groups *gr;
-    unsigned char want[256];          /* по номеру группы каналов: её правила — трафик группы */
+    unsigned char *want;              /* по номеру группы каналов: её правила — трафик группы */
     unsigned long long pkts;
 };
 
@@ -625,7 +653,7 @@ static void wtraffic_rule(void *arg, const char *comment, int has_counter, uint6
     (void)bytes;
     struct wtraffic *t = arg;
     if (!has_counter || strncmp(comment, "steer:", 6) != 0) return;
-    for (size_t i = 0; i < t->gr->n && i < sizeof(t->want); i++)
+    for (size_t i = 0; i < t->gr->n; i++)
         if (t->want[i] && !strcmp(t->gr->g[i].name, comment + 6)) t->pkts += packets;
 }
 
@@ -639,14 +667,17 @@ static int watchd_traffic(void *arg, const struct spec *sp, const struct output 
     struct wtraffic t;
     memset(&t, 0, sizeof(t));
     t.gr = w->d->gr;
+    t.want = calloc(t.gr->n ? t.gr->n : 1, 1);      /* по группе каналов — их не 256 */
+    if (!t.want) return -1;
     int any = 0;
-    for (size_t i = 0; i < t.gr->n && i < sizeof(t.want); i++) {
+    for (size_t i = 0; i < t.gr->n; i++) {
         const struct output *o = NULL;
         for (size_t k = 0; k < sp->out_n; k++)
             if (!strcmp(sp->out[k].name, t.gr->g[i].out)) o = &sp->out[k];
         if (o && group_reaches(sp, o, &sp->out[g - sp->out], 0)) t.want[i] = any = 1;
     }
     if (!any) {
+        free(t.want);
         *pkts = 0;
         return 0;
     }
@@ -656,7 +687,9 @@ static int watchd_traffic(void *arg, const struct spec *sp, const struct output 
      * находит. Пакет, который разметили оба хука (чужая перезапись метки между ними), здесь
      * засчитывается дважды: вопрос «шёл ли трафик» от этого не меняется. */
     static const char *const chains[] = { "ingress_mark", "prerouting_mark", "output_mark" };
-    if (nfd_chain_rules(NFD_INET, nft_table(), chains, 3, wtraffic_rule, &t) != 0) return -1;
+    int rc = nfd_chain_rules(NFD_INET, nft_table(), chains, 3, wtraffic_rule, &t);
+    free(t.want);
+    if (rc != 0) return -1;
     *pkts = t.pkts;
     return 0;
 }
@@ -686,16 +719,17 @@ static void watchd_lat_kick(void *arg, const char *group) {
 }
 
 static void watchd_pass_start(struct watchd *w) {
-    if (!w->sp) w->sp = malloc(sizeof(*w->sp));
-    if (!w->sp) {
+    if (!w->sp) w->sp = calloc(1, sizeof(*w->sp));
+    /* Проход меняет device у выходов — своя копия, а спека демона остаётся нетронутой для
+     * status и masquerade (они смотрят на спеку так, как её прочитал бы свежий процесс).
+     * Копируются выходы и состояние групп; правила, списки и клиенты читаются из общей арены
+     * по ссылке (spec_clone): раньше здесь был memcpy всей struct spec, под 250 КБ на проход. */
+    if (!w->sp || spec_clone(w->sp, w->d->sp) != 0) {
         fprintf(stderr, LOG_WW "нет памяти под проход\n");
         watchd_period(w);
         return;
     }
-    /* Проход меняет device у выходов — своя копия, а спека демона остаётся нетронутой для
-     * status и masquerade (они смотрят на спеку так, как её прочитал бы свежий процесс). */
-    memcpy(w->sp, w->d->sp, sizeof(*w->sp));
-    w->ev_n = 0;
+    wev_clear(w);
     if (!w->passes++) fprintf(stderr, "steer[info] watch: первый проход\n");
     loop_timer_stop(w->tm);
     w->run = fo_pass_start(w->l, w->sp, &w->mem.base, 0, watchd_ev, w, watchd_pass_done, w);
@@ -767,10 +801,25 @@ struct watchd *watchd_start(struct steerd *d, const struct watchd_conf *c, int o
     for (size_t r = 0; r < sizeof(kept) / sizeof(kept[0]); r++) {
         FILE *f = fo_store_files.ops->open_r(&fo_store_files, kept[r]);
         if (!f) continue;
-        static char buf[MAX_OUTPUTS * 700 + 1];
-        size_t n = fread(buf, 1, sizeof(buf), f);
+        /* Файл читается целиком в буфер по его размеру (раньше — 11 КБ на «16 выходов по 700»:
+         * длиннее — не подхватывался вовсе, и выбор устройств у большой спеки терялся). */
+        size_t cap = 4096, n = 0;
+        char *buf = malloc(cap);
+        for (;;) {
+            if (!buf) break;
+            if (n == cap) {
+                char *nb = realloc(buf, cap * 2);
+                if (!nb) { free(buf); buf = NULL; break; }
+                buf = nb;
+                cap *= 2;
+            }
+            size_t got = fread(buf + n, 1, cap - n, f);
+            if (!got) break;
+            n += got;
+        }
         fclose(f);
-        if (n < sizeof(buf)) mem_set(&w->mem, kept[r], buf, n);
+        if (buf) mem_set(&w->mem, kept[r], buf, n);
+        free(buf);
     }
     w->mem.mirror = 1;
     /* Замеры awg — в памяти процесса, как у `failover --loop`. */
@@ -802,7 +851,7 @@ void watchd_enable(struct watchd *w, int on) {
     if (w->run) {
         fo_pass_abort(w->run);
         w->run = NULL;
-        w->ev_n = 0;
+        wev_clear(w);
     }
     loop_timer_stop(w->kill_tm);
     loop_timer_stop(w->tm);
@@ -825,7 +874,7 @@ void watchd_preempt(struct watchd *w) {
     if (!w || !w->run) return;
     fo_pass_abort(w->run);
     w->run = NULL;
-    w->ev_n = 0;
+    wev_clear(w);
     loop_timer_stop(w->kill_tm);
     w->pending = 0;
     /* Следующий проход — после успокоения (он сверит всё заново по ядру и памяти); таймер периода

@@ -25,10 +25,12 @@ struct recon_plan {
     int nftc;
     unsigned long long fp;          /* отпечаток текста набора правил */
     size_t ch_n, out_n;
-    struct recon_out out[MAX_OUTPUTS];
-    size_t n;
-    struct { unsigned mark; int table; } stale[MAX_OUTPUTS];
-    size_t stale_n;
+    /* Массивы растут по числу строк плана (recon_plan_parse) и отдаются recon_plan_free:
+     * выходов в плане столько, сколько в спеке (в том числе direct без метки), а не «не больше 16». */
+    struct recon_out *out;
+    size_t n, cap;
+    struct { unsigned mark; int table; } *stale;
+    size_t stale_n, stale_cap;
     /* Сводка элементов статических наборов в ядре на момент плана (строка kelems, только с
      * --kernel-elems): kel_ok 0 — не спрашивали или снять не вышло. */
     int kel_ok;
@@ -50,28 +52,29 @@ struct recon_state {
      * элементы до следующего nft -f не сверяются. */
     int kel_ok;
     uint64_t kel, kel_n;
-    struct recon_out out[MAX_OUTPUTS];
-    size_t n;
+    struct recon_out *out;          /* куча, recon_applied растит; отдаёт recon_state_free */
+    size_t n, cap;
     /* Подписи сторожа — отдельно от применённого: их сверка нужна и тогда, когда в ядро ничего
      * не шло. */
     int wvalid;
-    struct { char name[32]; unsigned long long wsig; } w[MAX_OUTPUTS];
-    size_t wn;
+    struct { char name[32]; unsigned long long wsig; } *w;
+    size_t wn, wcap;
     int nftc;                       /* раскладка из первого плана; -1 — ещё не знаем */
 };
 
 /* Решение: что применять. */
 struct recon_diff {
     int ruleset;
-    char route[MAX_OUTPUTS][32];
-    size_t route_n;
+    /* Массивы растут по числу выходов решения и отдаются recon_diff_free. */
+    char (*route)[32];
+    size_t route_n, route_cap;
     /* route_kern[i] — выход route[i] привязывается заново только потому, что ядро разошлось с
      * ожидаемым, а подпись его маршрутизации в спеке не менялась: такая привязка ничего не снимает
      * нарочно, и страж правил вправе возвращать правила этого выхода, пока она идёт (rulewd.c).
      * Выход с изменившейся подписью, новый и полный apply — 0: спека могла отнять у него IPv6. */
-    unsigned char route_kern[MAX_OUTPUTS];
-    struct { unsigned mark; int table; } drop[2 * MAX_OUTPUTS];
-    size_t drop_n;
+    unsigned char *route_kern;      /* параллельно route */
+    struct { unsigned mark; int table; } *drop;
+    size_t drop_n, drop_cap;
     int awg, masq;
     /* Сторожу внеочередной проход: в ядре нашлось расхождение, которое сверка вернула сама
      * (проход подтвердит выбор устройств и карты раздачи), или то, что возвращает только он
@@ -90,6 +93,11 @@ struct recon_kernel {
 
 struct fo_store;
 void recon_init(struct recon_state *st);
+/* Отдать массивы и обнулить. Структуры несут указатели: их обнуление memset'ом без этих вызовов —
+ * утечка. recon_plan_parse и recon_decide начинают с нулевой структуры (свежее соединение). */
+void recon_plan_free(struct recon_plan *p);
+void recon_diff_free(struct recon_diff *d);
+void recon_state_free(struct recon_state *st);
 /* Разобрать вывод плана. 0 — годный. */
 int recon_plan_parse(const char *text, size_t n, struct recon_plan *p);
 /* Решить по плану и применённому — и по ядру: таблица на месте и та же ли (номер), не изменены ли
@@ -102,9 +110,12 @@ void recon_decide(const struct recon_state *st, const struct recon_plan *p, cons
                   struct fo_store *outs, struct recon_diff *d);
 /* Есть ли что применять в ядро (набор правил или маршрутизация). */
 int recon_diff_any(const struct recon_diff *d);
-/* argv для `steer apply-commit` по решению: буферы — в buf (n байт), av — не меньше 20 мест. */
-void recon_commit_argv(const struct recon_diff *d, const char *exe, const char *spec,
-                       const char *state_dir, int nftc, char *buf, size_t n, char **av);
+/* argv для `steer apply-commit` по решению: строки — в куче, ровно по размеру (список выходов в
+ * --route и меток в --drop длинный, сколько выходов, столько и байт; раньше — буфер в килобайт, и
+ * хвост списка молча не привязывался), av — не меньше 20 мест. Возврат — блок для free после
+ * запуска; NULL — нехватка памяти (av не годен). */
+char *recon_commit_argv(const struct recon_diff *d, const char *exe, const char *spec,
+                        const char *state_dir, int nftc, char **av);
 /* Применение прошло: запомнить план как применённое (ruleset — ставился ли набор правил). k —
  * ядро после nft -f от apply-commit (NULL или !ok — снимает сам демон, без сводки элементов). */
 void recon_applied(struct recon_state *st, const struct recon_plan *p, const struct recon_diff *d,

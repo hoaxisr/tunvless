@@ -150,14 +150,16 @@ static void t_groups(void) {
     check_str("снаружи — прежний вид", "interface", out_kind_name(p));
     check("pick: order", PICK_ORDER, g ? (long)g->pick : -1);
     check("членов два", 2, g ? (long)g->members_n : -1);
-    const struct output *m[MAX_MEMBERS];
-    size_t mn = out_members(&g_spec, p, m, MAX_MEMBERS);
+    size_t mn = out_members_n(&g_spec, p);
+    const struct output *m[2] = { mn > 0 ? out_member(&g_spec, p, 0) : NULL,
+                                  mn > 1 ? out_member(&g_spec, p, 1) : NULL };
     check("кандидаты группы — её члены", 2, (long)mn);
     check_str("член 0 — устройство wg0", "wg0", mn > 0 ? m[0]->device : "");
     check_str("член 1 — устройство wg1", "wg1", mn > 1 ? m[1]->device : "");
     check("члены безымянные", 1, mn == 2 && !m[0]->name[0] && !m[1]->name[0]);
     check_str("члены — интерфейсы", "interface", mn ? out_kind_name(m[0]) : "");
-    check("члены лежат за именованными", 1, mn == 2 && m[0] >= &g_spec.out[MAX_OUTPUTS]);
+    check("члены лежат отдельно от именованных (sp->anon)", 1,
+          mn == 2 && m[0] >= g_spec.anon && m[0] < g_spec.anon + g_spec.anon_n);
     check_str("активное до сторожа — первое устройство", "wg0", p->device);
     check("on_fail — у группы", FAIL_DIRECT, p->on_fail);
     check("у группы есть устройство (свойство членов)", 1, out_has_device(p));
@@ -171,8 +173,8 @@ static void t_groups(void) {
     struct output *one = &g_spec.out[2];
     check("один devices — не группа", 1, out_group(one) == NULL);
     check_str("… устройство из devices", "wg2", one->device);
-    mn = out_members(&g_spec, one, m, MAX_MEMBERS);
-    check("… кандидат — он сам", 1, mn == 1 && m[0] == one);
+    mn = out_members_n(&g_spec, one);
+    check("… кандидат — он сам", 1, mn == 1 && out_member(&g_spec, one, 0) == one);
 
     const struct group_cfg *f = out_group(&g_spec.out[3]);
     check("prefer: latency — pick: latency", PICK_LATENCY, f ? (long)f->pick : -1);
@@ -183,11 +185,10 @@ static void t_groups(void) {
     struct output *odd = &g_spec.out[4];
     check("device и другое devices — группа", 1, out_group(odd) != NULL);
     check_str("… активное — названное device", "wg6", odd->device);
-    mn = out_members(&g_spec, odd, m, MAX_MEMBERS);
-    check_str("… член — из devices", "wg7", mn ? m[0]->device : "");
+    mn = out_members_n(&g_spec, odd);
+    check_str("… член — из devices", "wg7", mn ? out_member(&g_spec, odd, 0)->device : "");
 
-    check("прямому выходу выбирать не из чего", 0,
-          (long)out_members(&g_spec, &g_spec.out[0], m, MAX_MEMBERS));
+    check("прямому выходу выбирать не из чего", 0, (long)out_members_n(&g_spec, &g_spec.out[0]));
 
     check("via → over", 0, load(
         "{\"schema\":1,\"from_default\":[\"192.168.1.0/24\"],"
@@ -222,18 +223,26 @@ static void t_groups(void) {
         "\"channels\":[]}"));
     check("… прежним текстом", 1, has("у kind awg одно устройство"));
 
-    /* Пять пулов по шестнадцать устройств — 80 безымянных членов больше MAX_ANON (64). */
+    /* Пул из ста устройств и пять пулов по шестнадцать: безымянных членов сколько написано (раньше
+     * «не больше 16 в пуле и 64 на спеку»). */
     {
-        char big[12000], *o = big;
+        char *big = malloc(65536), *o = big;
         o += sprintf(o, "{\"schema\":1,\"outputs\":{");
         for (int i = 0; i < 5; i++) {
             o += sprintf(o, "%s\"p%d\":{\"kind\":\"interface\",\"devices\":[", i ? "," : "", i);
             for (int k = 0; k < 16; k++) o += sprintf(o, "%s\"d%d_%d\"", k ? "," : "", i, k);
             o += sprintf(o, "]}");
         }
-        sprintf(o, "},\"channels\":[]}");
-        check("устройств в пулах больше MAX_ANON — отказ", -1, load(big));
-        check("… с пределом в тексте", 1, has("64"));
+        o += sprintf(o, ",\"big\":{\"kind\":\"interface\",\"devices\":[");
+        for (int k = 0; k < 100; k++) o += sprintf(o, "%s\"e%d\"", k ? "," : "", k);
+        sprintf(o, "]}},\"channels\":[]}");
+        check("пулы на 80 + 100 устройств — принимаются", 0, load(big));
+        check("безымянных членов 180", 180, (long)g_spec.anon_n);
+        const struct output *bg = out_by_name(&g_spec, "big");
+        check("в пуле из ста устройств сто кандидатов", 100, bg ? (long)out_members_n(&g_spec, bg) : -1);
+        check_str("последний кандидат сотого пула — e99", "e99",
+                  bg ? out_member(&g_spec, bg, 99)->device : "");
+        free(big);
     }
 }
 
@@ -341,30 +350,46 @@ static void t_groups_v2(void) {
     check("… с объяснением", 1, has("членом группы pick: order она быть не может"));
 
     /* Слоты карты balance: по весам живых методом наибольшего остатка. */
+    static struct spec gs;
     struct group_cfg g;
     group_cfg_init(&g);
+    group_members_alloc(&gs, &g, 7);
     g.members_n = 3;
     g.weight[0] = 2;
     unsigned char own[GROUP_BAL_SLOTS];
     int cnt[4];
-    group_balance_slots(&g, 7u, own);
+    const unsigned char alive3[3] = { 1, 1, 1 }, alive_no1[3] = { 0, 1, 1 };
+    group_balance_slots(&g, alive3, own);
     memset(cnt, 0, sizeof(cnt));
     for (int s = 0; s < GROUP_BAL_SLOTS; s++) cnt[own[s] == 0xff ? 3 : own[s]]++;
     check("слоты: веса 2:1:1 — 60/30/30", 603030, cnt[0] * 10000L + cnt[1] * 100L + cnt[2]);
-    group_balance_slots(&g, 6u, own);
+    group_balance_slots(&g, alive_no1, own);
     memset(cnt, 0, sizeof(cnt));
     for (int s = 0; s < GROUP_BAL_SLOTS; s++) cnt[own[s] == 0xff ? 3 : own[s]]++;
     check("слоты: первый упал — 0/60/60", 6060, cnt[0] * 10000L + cnt[1] * 100L + cnt[2]);
     g.members_n = 7;
-    memset(g.weight, 0, sizeof(g.weight));
-    group_balance_slots(&g, 0x7fu, own);
+    memset(g.weight, 0, 7);
+    group_balance_slots(&g, NULL, own);                 /* NULL — все живы */
     memset(cnt, 0, sizeof(cnt));
     int mx = 0, mn = GROUP_BAL_SLOTS, per[7] = {0};
     for (int s = 0; s < GROUP_BAL_SLOTS; s++) per[own[s]]++;
     for (int k = 0; k < 7; k++) { if (per[k] > mx) mx = per[k]; if (per[k] < mn) mn = per[k]; }
     check("слоты: семь равных — 17 или 18 у каждого", 1718, mn * 100L + mx);
-    group_balance_slots(&g, 0u, own);
+    const unsigned char none7[7] = { 0 };
+    group_balance_slots(&g, none7, own);
     check("слоты: живых нет — карта пуста", 0xff, own[0] == 0xff && own[GROUP_BAL_SLOTS - 1] == 0xff ? 0xff : 0);
+    /* Много членов: карта делится между шестьюдесятью — у каждого хотя бы слот; больше слотов, чем
+     * их есть, balance не принимает (group_seal, предел — свойство карты). */
+    group_cfg_init(&g);
+    group_members_alloc(&gs, &g, 60);
+    g.members_n = 60;
+    group_balance_slots(&g, NULL, own);
+    int empty = 0, over60 = 0;
+    int per60[60] = {0};
+    for (int s = 0; s < GROUP_BAL_SLOTS; s++) { if (own[s] >= 60) over60++; else per60[own[s]]++; }
+    for (int k = 0; k < 60; k++) empty += per60[k] == 0;
+    check("слоты: 60 членов — у каждого не меньше слота", 0, empty + over60);
+    spec_release(&gs);
 }
 
 /* ---- решения выбора группы --------------------------------------------------------------- */

@@ -60,8 +60,9 @@ static void tabfmt_release_current(void) {
         dch_parts_free(g_dch[i].parts, g_dch[i].parts_n);
         for (size_t k = 0; k < g_dch[i].rules_n; k++)
             free((char *)g_dch[i].rules_path[k]);
+        free(g_dch[i].rules_path);
     }
-    memset(g_dch, 0, sizeof(g_dch));
+    if (g_dch) memset(g_dch, 0, g_dch_n * sizeof(*g_dch));
     g_dch_n = 0;
 }
 
@@ -114,17 +115,22 @@ static int parse_chan_line(const char *buf, size_t from, size_t line_end, struct
                     c->up = atoi(num);
                     break;
                 }
-                if (c->rules_n < MAX_FILES) {
+                {
+                    /* Путей у канала — сколько прислал демон (раньше — не больше 64, остальные
+                     * молча отбрасывались). */
                     char *p = malloc(flen + 1);
                     if (!p) return -1;
                     memcpy(p, buf + pos, flen);
                     p[flen] = '\0';
+                    if (c->rules_n == c->rules_cap) {
+                        size_t nc = c->rules_cap ? c->rules_cap * 2 : 8;
+                        const char **np = realloc(c->rules_path, nc * sizeof(*np));
+                        if (!np) { free(p); return -1; }
+                        c->rules_path = np;
+                        c->rules_cap = nc;
+                    }
                     c->rules_path[c->rules_n++] = p;
                 }
-                /* Путей больше MAX_FILES — поле молча отбрасывается (та же граница, что у
-                 * dch_build: g_dch[k].rules_n < MAX_FILES в цикле по domains_files/prefixes_files,
-                 * table.c), а не отказ разбора: обрезанный список правил хуже полного, но не хуже
-                 * отсутствующего резолвера. */
                 break;
         }
         field++;
@@ -142,7 +148,7 @@ static int parse_header(const char *buf, size_t nl, long *want, long *upn, struc
     long n = strtol(h, &end, 10);
     *upn = 0;
     memset(cc, 0, sizeof(*cc));
-    if (end == h || n < 0 || (size_t)n > MAX_RULES) return -1;
+    if (end == h || n < 0) return -1;       /* число каналов ничем, кроме памяти, не ограничено */
     *want = n;
     if (*end == '\0') return 0;
     if (*end != ' ') return -1;
@@ -151,7 +157,7 @@ static int parse_header(const char *buf, size_t nl, long *want, long *upn, struc
     if (sscanf(end + 1, "%ld %ld %ld %ld %ld%n", &u, &e, &mn, &mx, &ng, &used) != 5 ||
         end[1 + used] != '\0')
         return -1;
-    if (u < 0 || u > MAX_DNS_UP || e < 0 || e > 1000000 || mn < 0 || mx < 0 || ng < 0) return -1;
+    if (u < 0 || e < 0 || e > 1000000 || mn < 0 || mx < 0 || ng < 0) return -1;
     *upn = u;
     cc->entries = e; cc->ttl_min = mn; cc->ttl_max = mx; cc->ttl_neg = ng;
     return 0;
@@ -171,19 +177,27 @@ static size_t split_fields(const char *buf, size_t from, size_t end, size_t (*f)
     return n;
 }
 
-static void list_into(const char *s, size_t n, char (*dst)[46], unsigned char *cnt) {
+/* Список адресов через запятую — в кучу по числу записей (раньше — не больше четырёх). */
+static int list_into(const char *s, size_t n, char (**dst)[46], size_t *cnt) {
     *cnt = 0;
-    if (n == 1 && s[0] == '-') return;
+    *dst = NULL;
+    if (n == 1 && s[0] == '-') return 0;
+    size_t items = 1;
+    for (size_t i = 0; i < n; i++) items += s[i] == ',';
+    char (*a)[46] = calloc(items, sizeof(*a));
+    if (!a) return -1;
     size_t pos = 0;
-    while (pos <= n && *cnt < MAX_DNS_IPS) {
+    while (pos <= n) {
         size_t e = pos;
         while (e < n && s[e] != ',') e++;
-        if (e > pos) {
-            field_copy(dst[*cnt], 46, s + pos, e - pos);
+        if (e > pos && *cnt < items) {
+            field_copy(a[*cnt], 46, s + pos, e - pos);
             (*cnt)++;
         }
         pos = e + 1;
     }
+    if (*cnt) *dst = a; else free(a);
+    return 0;
 }
 
 /* Строка апстрима «имя|адрес|выход|метка|адреса|bootstrap». Адрес, который не разбирается (таблицу
@@ -202,8 +216,15 @@ static int parse_up_line(const char *buf, size_t from, size_t end, struct dup_cf
     char num[16];
     field_copy(num, sizeof(num), buf + f[3][0], f[3][1]);
     c->mark = (unsigned)strtoul(num, NULL, 10);
-    list_into(buf + f[4][0], f[4][1], c->u.ips, &c->u.ips_n);
-    list_into(buf + f[5][0], f[5][1], c->u.boot, &c->u.boot_n);
+    c->own = 1;                     /* массивы адресов ниже — куча этой записи (dup_cfg_list_reset) */
+    if (list_into(buf + f[4][0], f[4][1], &c->u.ips, &c->u.ips_n) != 0 ||
+        list_into(buf + f[5][0], f[5][1], &c->u.boot, &c->u.boot_n) != 0) {
+        free(c->u.ips);
+        free(c->u.boot);
+        c->u.ips = c->u.boot = NULL;
+        c->u.ips_n = c->u.boot_n = 0;
+        return -1;
+    }
     char why[96];
     struct spec_dns_up p;
     memset(&p, 0, sizeof(p));
@@ -224,8 +245,7 @@ int tabfmt_parse(const char *buf, size_t len) {
     if (parse_header(buf, nl, &want, &upn, &cc) != 0) return -1;
 
     tabfmt_release_current();
-    memset(g_dup_cfg, 0, sizeof(g_dup_cfg));
-    g_dup_cfg_n = 0;
+    dup_cfg_list_reset();
     g_dcache_cfg = cc;
 
     size_t out_n = 0;
@@ -244,13 +264,23 @@ int tabfmt_parse(const char *buf, size_t len) {
         int has6 = !strcmp(family, "6") || !strcmp(family, "46");
         if (!has4 && !has6) return -1; /* не «4», не «6», не «46» — испорченный текст */
         tmp.fam = (has4 ? DCH_V4 : 0) | (has6 ? DCH_V6 : 0);
-        g_dch[out_n++] = tmp;
+        struct dchan *nd = dch_new();
+        if (!nd) return -1;
+        *nd = tmp;
+        g_dch_n = ++out_n;
         pos = line_end + 1;
     }
     g_dch_n = out_n;
     for (long i = 0; i < upn; i++) {
         size_t line_end = find_nl(buf, len, pos);
         if (line_end >= len) return -1;
+        if (g_dup_cfg_n == g_dup_cfg_cap) {
+            size_t nc = g_dup_cfg_cap ? g_dup_cfg_cap * 2 : 8;
+            struct dup_cfg *np = realloc(g_dup_cfg, nc * sizeof(*np));
+            if (!np) return -1;
+            g_dup_cfg = np;
+            g_dup_cfg_cap = nc;
+        }
         if (parse_up_line(buf, pos, line_end, &g_dup_cfg[g_dup_cfg_n]) != 0) return -1;
         g_dup_cfg_n++;
         pos = line_end + 1;
@@ -265,7 +295,15 @@ int tabfmt_parse(const char *buf, size_t len) {
 
 int tabfmt_feed(struct tabfmt_feed *st, const char *data, size_t n) {
     if (n) {
-        if (st->len + n > sizeof(st->buf)) return -1;
+        if (st->len + n > TABFMT_FEED_MAX) return -1;
+        if (st->len + n > st->cap) {
+            size_t nc = st->cap ? st->cap : 16384;
+            while (nc < st->len + n) nc *= 2;
+            char *nb = realloc(st->buf, nc);
+            if (!nb) return -1;
+            st->buf = nb;
+            st->cap = nc;
+        }
         memcpy(st->buf + st->len, data, n);
         st->len += n;
     }

@@ -36,6 +36,7 @@ for i, a in enumerate(sys.argv):
         TTL = int(sys.argv[i + 1])
 
 lock = threading.Lock()
+busy = 0
 
 
 def log(proto, client, name):
@@ -68,6 +69,18 @@ def answer(data, proto, client):
         return None
     name, qtype, qclass, qend = q
     log(proto, client, name)
+    if ".slow." in name:
+        # Медленный ответ (полторы секунды) и счётчик одновременно занятых: у DoH по HTTP/1.1 один
+        # запрос на соединение, поэтому пик занятых и есть число одновременно открытых соединений.
+        # Стенд «пул растёт по нагрузке» (tests/dnsup.sh) читает строки «peak N» журнала.
+        global busy
+        with lock:
+            busy += 1
+            cur = busy
+        log("peak", cur, name)
+        time.sleep(1.5)
+        with lock:
+            busy -= 1
     ip = None
     for suf, v in ZONES.items():
         if name == suf or name.endswith("." + suf):

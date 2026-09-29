@@ -46,14 +46,18 @@ struct dup_cfg {
     char via[32];               /* имя выхода для status; "" — напрямую */
     unsigned mark;              /* метка сокета; 0 — не метить */
     int need_mark;              /* через выход: без метки слать нельзя (см. выше) */
+    int own;                    /* u.ips и u.boot — куча, отданная этой записи (разбор текста таблицы);
+                                 * 0 — указатели взаймы у спеки (сборка таблицы демоном) */
 };
 
 /* Кэш ответов для имён под правилами (dcache.c). entries == 0 — кэша нет. */
 struct dcache_cfg { long entries, ttl_min, ttl_max, ttl_neg; };
 
 /* Разобранное таблицей: резолвер берёт настройку отсюда (tabfmt_parse, dup_cfg_from_spec). */
-extern struct dup_cfg g_dup_cfg[MAX_DNS_UP];
-extern size_t g_dup_cfg_n;
+extern struct dup_cfg *g_dup_cfg;      /* куча, растёт по числу апстримов таблицы */
+extern size_t g_dup_cfg_n, g_dup_cfg_cap;
+/* Список апстримов — пустым; массивы адресов освобождаются у владельцев (cfg.own). */
+void dup_cfg_list_reset(void);
 extern struct dcache_cfg g_dcache_cfg;
 
 /* Ответ апстрима или отказ. Зовётся ровно один раз на принятый dup_ask. ans == NULL — отказ

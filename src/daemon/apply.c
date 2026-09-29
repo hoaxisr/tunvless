@@ -64,8 +64,10 @@ static void routing6_drop(unsigned mark, int table) {
     rule_drop6(mark, table);
     route6_flush(table);
 }
-static struct oldreg g_oldreg[MAX_OUTPUTS];
-static size_t g_oldreg_n;
+/* Прежний реестр — по записи на выход, сколько их было; растёт (раньше — 16 записей, и хвост
+ * реестра не убирался: правила выходов за шестнадцатым переживали удаление выхода). */
+static struct oldreg *g_oldreg;
+static size_t g_oldreg_n, g_oldreg_cap;
 
 static void registry_snapshot(void) {
     char path[512];
@@ -75,11 +77,17 @@ static void registry_snapshot(void) {
     char name[32];
     unsigned mark;
     int table;
-    while (g_oldreg_n < MAX_OUTPUTS &&
-           fscanf(f, "%31s %x %d\n", name, &mark, &table) == 3) {
+    while (fscanf(f, "%31s %x %d\n", name, &mark, &table) == 3) {
         /* Чужой диапазон — чужие правила и чужая таблица (см. registry_assign): снимать их
          * по такой записи значило бы опустошить таблицу другого экземпляра движка. */
         if (!mark || (mark & ~STEER_MARK_MASK)) continue;
+        if (g_oldreg_n == g_oldreg_cap) {
+            size_t nc = g_oldreg_cap ? g_oldreg_cap * 2 : 32;
+            struct oldreg *nr = realloc(g_oldreg, nc * sizeof(*nr));
+            if (!nr) break;
+            g_oldreg = nr;
+            g_oldreg_cap = nc;
+        }
         g_oldreg[g_oldreg_n].mark = mark;
         g_oldreg[g_oldreg_n].table = table;
         g_oldreg_n++;
@@ -252,20 +260,20 @@ void iptables_masq_ensure(const struct spec *sp) {
         snprintf(mk, sizeof(mk), "0x%x/0x%x", o->mark, STEER_MARK_MASK);
         /* На каждое устройство, в которое выход может увести трафик: у группы — устройства
          * членов, у выхода с устройством — его собственное (out_members). */
-        const struct output *m[MAX_MEMBERS];
-        size_t mn = out_members(sp, o, m, MAX_MEMBERS);
+        size_t mn = out_members_n(sp, o);
         for (int ti = 0; ti < tn; ti++)
         for (size_t k = 0; k < mn; k++) {
+            const struct output *mk_o = out_member(sp, o, k);
             const char *chk[] = { tools[ti], "-w", "-t", "nat", "-C", "POSTROUTING",
-                                  "-o", m[k]->device, "-m", "mark", "--mark", mk,
+                                  "-o", mk_o->device, "-m", "mark", "--mark", mk,
                                   "-j", "MASQUERADE", NULL };
             if (run(chk) == 0) continue;
             const char *add[] = { tools[ti], "-w", "-t", "nat", "-I", "POSTROUTING", "1",
-                                  "-o", m[k]->device, "-m", "mark", "--mark", mk,
+                                  "-o", mk_o->device, "-m", "mark", "--mark", mk,
                                   "-j", "MASQUERADE", NULL };
             if (run(add) == 0)
                 fprintf(stderr, "steer[info] failover: masquerade%s на %s возвращён\n",
-                        ti ? " IPv6" : "", m[k]->device);
+                        ti ? " IPv6" : "", mk_o->device);
         }
     }
 }
@@ -283,16 +291,16 @@ static void iptables_masq_sync(const struct spec *sp) {
                             "уйдёт\n", o->name);
         char mk[32];
         snprintf(mk, sizeof(mk), "0x%x/0x%x", o->mark, STEER_MARK_MASK);
-        const struct output *m[MAX_MEMBERS];
-        size_t mn = out_members(sp, o, m, MAX_MEMBERS);
+        size_t mn = out_members_n(sp, o);
         for (int ti = 0; ti < tn; ti++)
         for (size_t k = 0; k < mn; k++) {
+            const struct output *mo = out_member(sp, o, k);
             const char *add[] = { tools[ti], "-w", "-t", "nat", "-I", "POSTROUTING", "1",
-                                  "-o", m[k]->device, "-m", "mark", "--mark", mk,
+                                  "-o", mo->device, "-m", "mark", "--mark", mk,
                                   "-j", "MASQUERADE", NULL };
             if (run(add) != 0)
                 fprintf(stderr, LOG_W "output %s: masquerade на %s не встал (%s)\n",
-                        o->name, m[k]->device, tools[ti]);
+                        o->name, mo->device, tools[ti]);
         }
     }
 }
@@ -924,10 +932,11 @@ static unsigned long long out_route_sig(const struct spec *sp, const struct outp
     kind_sig_mix(&h, &o->table, sizeof(o->table));
     int of = (int)o->on_fail;
     kind_sig_mix(&h, &of, sizeof(of));
-    const struct output *m[MAX_MEMBERS];
-    size_t mn = out_members(sp, o, m, MAX_MEMBERS);
-    for (size_t k = 0; k < mn; k++)
-        kind_sig_mix(&h, m[k]->device, strlen(m[k]->device));
+    size_t mn = out_members_n(sp, o);
+    for (size_t k = 0; k < mn; k++) {
+        const char *dev = out_member(sp, o, k)->device;
+        kind_sig_mix(&h, dev, strlen(dev));
+    }
     if (!mn) kind_sig_mix(&h, o->device, strlen(o->device));
     /* Маршрутизация IPv6 (out_route6): появилась или пропала — выход привязывается заново. В
      * подпись входит только тогда, когда она есть, — у выходов без IPv6 подпись прежняя. */

@@ -115,19 +115,19 @@ size_t realip_reassert(void) {
     size_t put = 0;
     for (size_t i = 0; i < g_ri_n;) {
         struct realip_ent *e = &g_ri[i];
-        uint64_t all = dch_match_mask(e->domain);
-        uint64_t m = 0;
-        for (size_t c = 0; c < g_dch_n && c < 64; c++) {
-            if (!(all & (1ULL << c)) || !g_dch[c].realip) continue;
+        chm_t all = dch_match_mask(e->domain);
+        chm_t m = 0;
+        for (size_t c = 0; c < g_dch_n; c++) {
+            if (!chm_has(all, c) || !g_dch[c].realip) continue;
             if (!(g_dch[c].fam & (e->v6 ? DCH_V6 : DCH_V4))) continue;
-            m |= 1ULL << c;
+            m = chm_or(m, chm_one(c));
         }
         if (e->v6 && !dch_all_v6(all)) m = 0;
         if (!m) { ri_drop(i); continue; }
         uint32_t left = (uint32_t)(e->expires - now);
         if (left < 1) left = 1;
-        for (size_t c = 0; c < g_dch_n && c < 64; c++) {
-            if (!(m & (1ULL << c))) continue;
+        for (size_t c = 0; c < g_dch_n; c++) {
+            if (!chm_has(m, c)) continue;
             if (e->v6) {
                 dch_add6(c, e->domain, e->addr, left);
             } else {

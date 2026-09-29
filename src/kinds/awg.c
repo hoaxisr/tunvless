@@ -1158,21 +1158,30 @@ static inline int resolve_peers(struct awg_conf *c, const char *dev, int loud, i
 
 /* ---- реестр устройств и подпись параметров ------------------------------------------- */
 
-#define REG_MAX (MAX_OUTPUTS * 2)
-
 static void reg_path(char *buf, size_t n) { snprintf(buf, n, "%s/awg-devices", steer_state_dir()); }
 
-static size_t reg_read(char dst[][IFNAMSIZ]) {
+/* Прочитать реестр устройств в кучу: *dst — массив имён (free вызывающему), возвращает число.
+ * Число не ограничено: раньше массивы на стеке были на 2 * 16, и устройства сверх них не
+ * убирались вместе с выходом. */
+static size_t reg_read(char (**dst)[IFNAMSIZ]) {
+    *dst = NULL;
     char path[512];
     reg_path(path, sizeof path);
     FILE *f = fopen(path, "r");
     if (!f) return 0;
-    size_t n = 0;
+    size_t n = 0, cap = 0;
     char line[64];
-    while (n < REG_MAX && fgets(line, sizeof line, f)) {
+    while (fgets(line, sizeof line, f)) {
         char *t = trim(line);
         if (!*t || strlen(t) >= IFNAMSIZ || !name_ok(t)) continue;
-        snprintf(dst[n++], IFNAMSIZ, "%s", t);
+        if (n == cap) {
+            size_t nc = cap ? cap * 2 : 16;
+            char (*nv)[IFNAMSIZ] = realloc(*dst, nc * sizeof(*nv));
+            if (!nv) break;
+            *dst = nv;
+            cap = nc;
+        }
+        snprintf((*dst)[n++], IFNAMSIZ, "%s", t);
     }
     fclose(f);
     return n;
@@ -1252,8 +1261,9 @@ struct hs_sample {
     long t;
     int v;
 };
-static struct hs_sample g_hs[REG_MAX];
-static size_t g_hs_n;
+/* Замеры в памяти процесса (--loop, демон) — по устройству, растут по их числу. */
+static struct hs_sample *g_hs;
+static size_t g_hs_n, g_hs_cap;
 static int g_hs_mem;
 
 void awg_hs_memory(int on) { g_hs_mem = on; }
@@ -1278,7 +1288,13 @@ static void hs_put(const char *dev, const struct hs_sample *s) {
         size_t i = 0;
         while (i < g_hs_n && strcmp(g_hs[i].dev, dev)) i++;
         if (i == g_hs_n) {
-            if (g_hs_n >= REG_MAX) return;
+            if (g_hs_n == g_hs_cap) {
+                size_t nc = g_hs_cap ? g_hs_cap * 2 : 16;
+                struct hs_sample *nh = realloc(g_hs, nc * sizeof(*nh));
+                if (!nh) return;
+                g_hs = nh;
+                g_hs_cap = nc;
+            }
             g_hs_n++;
         }
         g_hs[i] = *s;
@@ -1478,8 +1494,11 @@ out:
 /* ---- apply и down ------------------------------------------------------------------------ */
 
 int awg_apply_all(const struct spec *sp) {
-    char reg[REG_MAX][IFNAMSIZ], keep[REG_MAX][IFNAMSIZ];
-    size_t reg_n = reg_read(reg), keep_n = 0;
+    char (*reg)[IFNAMSIZ];
+    size_t reg_n = reg_read(&reg), keep_n = 0;
+    /* Оставляемые устройства — не больше выходов спеки. */
+    char (*keep)[IFNAMSIZ] = calloc(sp->out_n ? sp->out_n : 1, sizeof(*keep));
+    if (!keep) { free(reg); return 1; }
     int bad = 0;
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
@@ -1498,7 +1517,7 @@ int awg_apply_all(const struct spec *sp) {
         if (awg_configure(sp, o, 1, NULL, 0) != 0) bad++;
         /* В реестр — даже при отказе: устройство могло быть создано до отказа настройки, и
          * снять его потом должен кто-то. */
-        if (keep_n < REG_MAX) snprintf(keep[keep_n++], IFNAMSIZ, "%s", o->device);
+        snprintf(keep[keep_n++], IFNAMSIZ, "%.15s", o->device);
     }
     /* Выходы, которых в спеке больше нет: их устройства снимаются. Только наши по виду — имя
      * из реестра могло с тех пор достаться чужому устройству. */
@@ -1514,6 +1533,8 @@ int awg_apply_all(const struct spec *sp) {
         dev_state_drop(reg[r]);
     }
     if (keep_n || reg_n) reg_write(keep, keep_n);
+    free(reg);
+    free(keep);
     return bad;
 }
 
@@ -1542,14 +1563,15 @@ int awg_check_all(const struct spec *sp) {
 }
 
 void awg_down_all(void) {
-    char reg[REG_MAX][IFNAMSIZ];
-    size_t n = reg_read(reg);
+    char (*reg)[IFNAMSIZ];
+    size_t n = reg_read(&reg);
     for (size_t i = 0; i < n; i++) {
         char kind[32] = "";
         if (link_query(reg[i], kind, sizeof kind, NULL) == 0 && is_our_kind(kind))
             link_delete(reg[i]);
         dev_state_drop(reg[i]);
     }
+    free(reg);
     char path[512];
     reg_path(path, sizeof path);
     unlink(path);

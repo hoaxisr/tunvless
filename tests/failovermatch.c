@@ -134,7 +134,12 @@ static struct spec g_spec;
 /* cmd_failover держит СВОЙ static struct spec (правило 6) и заполняет его настоящим
  * load_spec — здесь подмена копирует туда фикстуру стенда, собранную в g_spec тестовыми
  * блоками (out_set и соседи), ровно как настоящий load_spec заполнил бы её из файла. */
-int load_spec(const char *path, struct spec *s, struct err *e) { (void)path; (void)e; *s = g_spec; return 0; }
+int load_spec(const char *path, struct spec *s, struct err *e) {
+    (void)path; (void)e;
+    /* Своя копия выходов и состояния групп (spec_clone), как у настоящего load_spec: команда меняет
+     * device и приговоры, и фикстура стенда от этого не должна меняться. */
+    return spec_clone(s, &g_spec);
+}
 int registry_assign(struct spec *s, struct err *e) { (void)s; (void)e; return 0; }
 
 /* Ход подъёма выхода читается из файла в state_dir (probe_read, src/model/probe.c). Здесь он задаётся прямо:
@@ -296,8 +301,8 @@ static char g_dir[64];
 
 /* Сбросить выходы спеки — и именованные, и безымянных членов групп. */
 static void outs_reset(void) {
-    memset(g_spec.out, 0, sizeof(g_spec.out));
-    g_spec.anon_n = 0;
+    spec_release(&g_spec);
+    if (spec_reserve_out(&g_spec, 8) != 0) { perror("outs_reset"); exit(1); }
 }
 
 /* Пул устройств выхода — группа pick: order из безымянных членов (модель v2, «4в»), собранная тем
@@ -879,7 +884,7 @@ int main(void) {
          * тоже нет — оставляем как было, и apply честно доложит отказ, а при on_fail=drop
          * поставит запрет. Гадать тут нечем и незачем. */
         {
-            struct output *m1 = &g_spec.out[grp(&g_spec.out[0])->members[1]];
+            struct output *m1 = spec_out(&g_spec, grp(&g_spec.out[0])->members[1]);
             snprintf(m1->device, sizeof(m1->device), "%s", "nodev1");
         }
         snprintf(g_spec.out[0].device, sizeof(g_spec.out[0].device), "%s", "nodev0");

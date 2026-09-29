@@ -22,7 +22,9 @@ const struct vless_cfg *out_vless(const struct output *o) {
 
 static int vless_parse(struct output *o, const struct out_keys *k, struct err *e) {
     snprintf(o->vless.sub_file, sizeof(o->vless.sub_file), "%s", k->sub_file);
-    memcpy(o->vless.nodes, k->nodes, sizeof(o->vless.nodes));
+    /* Массив номеров узлов лежит в арене спеки (его завёл читатель формата ровно на nodes_n): выход
+     * берёт его по указателю, копировать нечего. Число узлов в выборе константой не ограничено. */
+    o->vless.nodes = k->nodes;
     o->vless.nodes_n = k->nodes_n;
     o->vless.transports = k->transports;
     if (!o->vless.sub_file[0]) {
@@ -48,7 +50,7 @@ static int vless_parse(struct output *o, const struct out_keys *k, struct err *e
  * из имени. */
 static void vless_keys_of(const struct output *o, struct out_keys *k) {
     snprintf(k->sub_file, sizeof(k->sub_file), "%s", o->vless.sub_file);
-    memcpy(k->nodes, o->vless.nodes, sizeof(k->nodes));
+    k->nodes = o->vless.nodes;
     k->nodes_n = o->vless.nodes_n;
     k->transports = o->vless.transports;
     char dev[32];

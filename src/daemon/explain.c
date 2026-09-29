@@ -452,7 +452,7 @@ int explain_emit(const struct spec *cfg, const struct groups *gr, const char *wh
             fprintf(out, "      правило набора ограничено клиентами (source_ip_cidr): "
                    "подсетей %zu — остальные клиенты идут мимо\n", gr->g[i].xsrc_n);
         if (!l4match_empty(gr->g[i].l4)) {
-            /* С запасом на предел MAX_PORTS: шестнадцать диапазонов вида «50000-65535» с
+            /* С запасом на предел L4_PORTS_MAX:шестнадцать диапазонов вида «50000-65535» с
              * разделителями — это 217 байт, и обрезанное пояснение было бы хуже полного. */
             char d[256];
             l4_describe(gr->g[i].l4, d, sizeof(d));

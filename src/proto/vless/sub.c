@@ -1245,3 +1245,38 @@ const char *vless_sub_text(const char *raw, size_t raw_n, char *dec, size_t dec_
     b64_decode(raw, raw_n, dec, dec_n);
     return dec;
 }
+
+/* Подписка из файла целиком: буферы и массив узлов — в куче по размеру файла и числу узлов в нём.
+ * Раньше буферы были статикой в 256 КиБ, а узлов — 128 (статика в 157 КБ): подписка длиннее
+ * теряла хвост, узлов больше — «не помещаются». Мест под узлы столько, сколько в тексте ссылок
+ * («://») и объектов Xray («"protocol"») — верхняя граница числа узлов; остаток арифметики
+ * (usable + skipped + foreign) сходится, как и прежде. Потолок файла — 64 МиБ: защита от файла-
+ * не-подписки под этим именем, а не размер подписки (тысяча узлов — сотни килобайт).
+ * NULL — файл не открылся, слишком велик или нет памяти; иначе массив (free), *cnt — узлов. */
+#define VLESS_SUB_FILE_MAX ((size_t)64 << 20)
+struct vless_node *vless_load_sub(const char *path, size_t *cnt, struct vless_sub_stats *st) {
+    *cnt = 0;
+    if (st) memset(st, 0, sizeof(*st));
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long fl = ftell(f);
+    rewind(f);
+    if (fl < 0 || (size_t)fl > VLESS_SUB_FILE_MAX) { fclose(f); return NULL; }
+    size_t sz = (size_t)fl;
+    char *raw = malloc(sz + 1), *dec = malloc(sz + 16);
+    if (!raw || !dec) { fclose(f); free(raw); free(dec); return NULL; }
+    size_t n = fread(raw, 1, sz, f);
+    fclose(f);
+    raw[n] = '\0';
+    dec[0] = '\0';
+    const char *text = vless_sub_text(raw, n, dec, sz + 16);
+    size_t hint = 1;
+    for (const char *q = text; (q = strstr(q, "://")); q += 3) hint++;
+    for (const char *q = text; (q = strstr(q, "\"protocol\"")); q += 10) hint++;
+    struct vless_node *nodes = calloc(hint, sizeof(*nodes));
+    if (nodes) *cnt = vless_parse_sub(text, nodes, hint, st);
+    free(raw);
+    free(dec);
+    return nodes;
+}

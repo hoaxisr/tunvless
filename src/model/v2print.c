@@ -77,29 +77,39 @@ static void fseq(struct flow *w, const char *key, const char *const *v, size_t n
     fputc(']', w->f);
 }
 
+/* Перечень из массива строк одинаковой ширины (`char (*)[stride]` спеки): без промежуточного
+ * массива указателей — раньше он лежал на стеке под предельное число записей. */
+static void fseq_s(struct flow *w, const char *key, const char *base, size_t stride, size_t n) {
+    fk(w, key);
+    fputc('[', w->f);
+    for (size_t i = 0; i < n; i++) {
+        if (i) fputs(", ", w->f);
+        yq(w->f, base + i * stride);
+    }
+    fputc(']', w->f);
+}
+
+/* Имена выходов по номеру, каким его хранит модель: именованные — [0, named), безымянные члены
+ * пулов (SPEC_ANON_BASE + k) — следом. */
+struct onames { const char (*v)[32]; size_t named; };
+static const char *oname_of(const struct onames *on, size_t idx) {
+    return on->v[idx >= SPEC_ANON_BASE ? on->named + (idx - SPEC_ANON_BASE) : idx];
+}
+
 /* Апстрим DNS одним отображением `{ url: …, out: …, ips: […], bootstrap: […] }`. */
-static void dns_up_flow(FILE *f, const struct spec_dns_up *u, const char (*oname)[32]) {
+static void dns_up_flow(FILE *f, const struct spec_dns_up *u, const struct onames *oname) {
     struct flow w = { f, 0 };
-    const char *b[MAX_DNS_IPS];
     fputs("{ ", f);
     fs(&w, "url", u->url);
-    if (u->out >= 0) fs(&w, "out", oname[u->out]);
-    if (u->ips_n) {
-        for (size_t k = 0; k < u->ips_n; k++) b[k] = u->ips[k];
-        fseq(&w, "ips", b, u->ips_n);
-    }
-    if (u->boot_n) {
-        for (size_t k = 0; k < u->boot_n; k++) b[k] = u->boot[k];
-        fseq(&w, "bootstrap", b, u->boot_n);
-    }
+    if (u->out >= 0) fs(&w, "out", oname_of(oname, (size_t)u->out));
+    if (u->ips_n) fseq_s(&w, "ips", u->ips[0], sizeof(u->ips[0]), u->ips_n);
+    if (u->boot_n) fseq_s(&w, "bootstrap", u->boot[0], sizeof(u->boot[0]), u->boot_n);
     fputs(" }", f);
 }
 
 /* ---- имена ----------------------------------------------------------------------------------- */
 
-#define NAMES_MAX (MAX_OUTPUTS + MAX_ANON + MAX_LISTS + MAX_CLIENTS)
-
-struct names { char v[NAMES_MAX][32]; size_t n; };
+struct names { char (*v)[32]; size_t n, cap; };
 
 static int name_used(const struct names *ns, const char *s) {
     for (size_t i = 0; i < ns->n; i++) if (!strcmp(ns->v[i], s)) return 1;
@@ -113,7 +123,14 @@ static void name_take(struct names *ns, const char *base, const char *reserved, 
     snprintf(dst, 32, "%s", b);
     for (int k = 2; name_used(ns, dst) || (reserved && !strcmp(dst, reserved)); k++)
         snprintf(dst, 32, "%.24s-%d", b, k % 1000);
-    if (ns->n < NAMES_MAX) snprintf(ns->v[ns->n++], 32, "%s", dst);
+    if (ns->n == ns->cap) {
+        size_t nc = ns->cap ? ns->cap * 2 : 32;
+        char (*nv)[32] = realloc(ns->v, nc * sizeof(*nv));
+        if (!nv) return;                /* без памяти имя не запоминается: печать всё равно идёт */
+        ns->v = nv;
+        ns->cap = nc;
+    }
+    snprintf(ns->v[ns->n++], 32, "%s", dst);
 }
 
 /* Имя, которое сущность правила получит от правила: имя канала, если годится, иначе rule<N>. */
@@ -144,7 +161,10 @@ static void key_pad(FILE *f, const char *name, size_t w) {
 
 /* Записи клиента: адреса, MAC, приложения телефона (uid:N[-M]) и self. */
 static void client_flow(FILE *f, const struct spec_client *c) {
-    const char *addr[MAX_FROM], *mac[MAX_FROM], *uid[MAX_FROM];
+    /* Три перечня — один кусок на 3 * from_n указателей (записей каждого вида не больше from_n). */
+    const char **buf = calloc(c->from_n * 3 + 1, sizeof(*buf));
+    if (!buf) return;
+    const char **addr = buf, **mac = buf + c->from_n, **uid = buf + 2 * c->from_n;
     size_t an = 0, mn = 0, un = 0;
     int self = 0;
     for (size_t i = 0; i < c->from_n; i++) {
@@ -162,6 +182,7 @@ static void client_flow(FILE *f, const struct spec_client *c) {
     if (un) fseq(&w, "uid", uid, un);
     if (self) { fk(&w, "self"); fputs("true", f); }
     fputs(" }", f);
+    free(buf);
 }
 
 /* ПУТИ — АБСОЛЮТНЫМИ. У v1 относительный путь — от рабочего каталога движка, у v2 — от каталога
@@ -174,10 +195,15 @@ static const char *absp(char *buf, size_t n, const char *p) {
 }
 
 static void fpaths(struct flow *w, const char *key, const char *const *v, size_t n) {
-    static char b[MAX_FILES][800];
-    const char *a[MAX_FILES];
-    for (size_t i = 0; i < n && i < MAX_FILES; i++) a[i] = absp(b[i], sizeof(b[i]), v[i]);
-    fseq(w, key, a, n);
+    /* Путь за путём, без массива промежуточных строк: их число не ограничено. */
+    fk(w, key);
+    fputc('[', w->f);
+    for (size_t i = 0; i < n; i++) {
+        char b[800];
+        if (i) fputs(", ", w->f);
+        yq(w->f, absp(b, sizeof(b), v[i]));
+    }
+    fputc(']', w->f);
 }
 
 static void fpath(struct flow *w, const char *key, const char *v) {
@@ -210,7 +236,7 @@ static const char *on_fail_name(enum on_fail f) {
     return f == FAIL_DIRECT ? "direct" : f == FAIL_ZAPRET ? "zapret" : "drop";
 }
 
-static void output_flow(FILE *f, const struct output *o, const char (*oname)[32]) {
+static void output_flow(FILE *f, const struct output *o, const struct onames *oname) {
     const struct kind_ops *k = kind_of(o);
     const struct group_cfg *g = out_group(o);
     struct flow w = { f, 0 };
@@ -219,11 +245,15 @@ static void output_flow(FILE *f, const struct output *o, const char (*oname)[32]
         static const char *const PICK[] = { "order", "latency", "manual", "balance" };
         fs(&w, "kind", "group");
         fs(&w, "pick", PICK[g->pick]);
-        const char *m[MAX_MEMBERS];
-        for (size_t i = 0; i < g->members_n; i++) m[i] = oname[g->members[i]];
-        fseq(&w, "members", m, g->members_n);
+        fk(&w, "members");
+        fputc('[', f);
+        for (size_t i = 0; i < g->members_n; i++) {
+            if (i) fputs(", ", f);
+            yq(f, oname_of(oname, g->members[i]));
+        }
+        fputc(']', f);
         if (g->pick == PICK_MANUAL && g->def >= 0 && (size_t)g->def < g->members_n)
-            fs(&w, "default", oname[g->members[g->def]]);
+            fs(&w, "default", oname_of(oname, g->members[g->def]));
         if (g->pick == PICK_LATENCY && g->lat_tolerance_ms) {
             fk(&w, "tolerance");
             fprintf(f, "%d", g->lat_tolerance_ms);
@@ -310,42 +340,70 @@ static void output_flow(FILE *f, const struct output *o, const char (*oname)[32]
     fputs(" }", f);
 }
 
-int spec_print_v2(FILE *f, const struct spec *s, struct err *e) {
-    /* Имена всех сущностей модели: выходы (именованные и безымянные члены), клиенты, списки. */
-    static char oname[MAX_OUTPUTS + MAX_ANON][32], cname[MAX_CLIENTS][32], lname[MAX_LISTS][32];
-    static unsigned char cshow[MAX_CLIENTS], lshow[MAX_LISTS];
-    static struct names on, cn, ln;
-    memset(oname, 0, sizeof(oname));
-    memset(cname, 0, sizeof(cname));
-    memset(lname, 0, sizeof(lname));
-    memset(cshow, 0, sizeof(cshow));
-    memset(lshow, 0, sizeof(lshow));
-    on.n = cn.n = ln.n = 0;
+/* Рабочие таблицы печати: имена всех сущностей модели — выходы (именованные и безымянные члены),
+ * клиенты, списки. По числу сущностей спеки, а не на предельное число (раньше — статические
+ * массивы под 16 + 64 + 64 + 64 имён). */
+struct pv2 {
+    char (*oname)[32], (*cname)[32], (*lname)[32];
+    unsigned char *cshow, *lshow;
+    struct names on, cn, ln;
+    size_t *anon_order;
+};
 
-    for (size_t i = 0; i < s->out_n; i++) name_take(&on, s->out[i].name, NULL, oname[i]);
-    /* Члены пулов — после именованных, в порядке групп. */
-    size_t anon_order[MAX_ANON], anon_n = 0;
+static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, struct pv2 *pv);
+
+int spec_print_v2(FILE *f, const struct spec *s, struct err *e) {
+    struct pv2 pv;
+    memset(&pv, 0, sizeof(pv));
+    pv.oname = calloc(s->out_n + s->anon_n + 1, sizeof(*pv.oname));
+    pv.cname = calloc(s->client_n + 1, sizeof(*pv.cname));
+    pv.lname = calloc(s->list_n + 1, sizeof(*pv.lname));
+    pv.cshow = calloc(s->client_n + 1, 1);
+    pv.lshow = calloc(s->list_n + 1, 1);
+    pv.anon_order = calloc(s->anon_n + 1, sizeof(*pv.anon_order));
+    int rc = -1;
+    if (pv.oname && pv.cname && pv.lname && pv.cshow && pv.lshow && pv.anon_order)
+        rc = spec_print_v2_body(f, s, e, &pv);
+    else if (e) err_set(e, "%s", "недостаточно памяти для печати спеки");
+    free(pv.oname); free(pv.cname); free(pv.lname); free(pv.cshow); free(pv.lshow);
+    free(pv.anon_order); free(pv.on.v); free(pv.cn.v); free(pv.ln.v);
+    return rc;
+}
+
+static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, struct pv2 *pv) {
+    char (*oname)[32] = pv->oname, (*cname)[32] = pv->cname, (*lname)[32] = pv->lname;
+    unsigned char *cshow = pv->cshow, *lshow = pv->lshow;
+    struct names *on = &pv->on, *cn = &pv->cn, *ln = &pv->ln;
+    size_t *anon_order = pv->anon_order;
+    struct onames onm = { (const char (*)[32])oname, s->out_n };
+
+    for (size_t i = 0; i < s->out_n; i++) name_take(on, s->out[i].name, NULL, oname[i]);
+    /* Члены пулов — после именованных, в порядке групп. Имя члена лежит в oname за именованными
+     * (oname_of): позиция = out_n + номер в sp->anon. */
+    size_t anon_n = 0;
     for (size_t i = 0; i < s->out_n; i++) {
         const struct group_cfg *g = out_group(&s->out[i]);
         for (size_t k = 0; g && k < g->members_n; k++) {
             size_t m = g->members[k];
-            if (m < MAX_OUTPUTS || oname[m][0]) continue;
+            if (spec_is_named(m)) continue;
+            size_t slot = s->out_n + (m - SPEC_ANON_BASE);
+            if (oname[slot][0]) continue;
             char base[64];
-            snprintf(base, sizeof(base), "%.15s.%.15s", s->out[i].name, s->out[m].device);
+            snprintf(base, sizeof(base), "%.15s.%.15s", s->out[i].name, spec_out(s, m)->device);
             if (!name_ok(base)) {
                 if (e) err_set(e, "выход %s: имя члена группы не складывается из имени и устройства",
                                s->out[i].name);
                 return -1;
             }
-            name_take(&on, base, NULL, oname[m]);
-            anon_order[anon_n++] = m;
+            name_take(on, base, NULL, oname[slot]);
+            anon_order[anon_n++] = slot;
         }
     }
     /* Клиенты и списки: свои имена (спека v2) или имя правила, которое на них ссылается первым. */
     for (size_t i = 0; i < s->client_n; i++)
-        if (s->client[i].name[0]) { name_take(&cn, s->client[i].name, "lan", cname[i]); cshow[i] = 1; }
+        if (s->client[i].name[0]) { name_take(cn, s->client[i].name, "lan", cname[i]); cshow[i] = 1; }
     for (size_t i = 0; i < s->list_n; i++)
-        if (s->list[i].name[0]) { name_take(&ln, s->list[i].name, "all", lname[i]); lshow[i] = 1; }
+        if (s->list[i].name[0]) { name_take(ln, s->list[i].name, "all", lname[i]); lshow[i] = 1; }
     for (size_t r = 0; r < s->rule_n; r++) {
         const struct spec_rule *ru = &s->rule[r];
         char base[32];
@@ -353,7 +411,7 @@ int spec_print_v2(FILE *f, const struct spec *s, struct err *e) {
         for (size_t k = 0; k < ru->clients_n; k++) {
             size_t c = ru->clients[k];
             if (cshow[c] || !s->client[c].from_n) continue;
-            name_take(&cn, base, "lan", cname[c]);
+            name_take(cn, base, "lan", cname[c]);
             cshow[c] = 1;
         }
         for (size_t k = 0; k < ru->lists_n; k++) {
@@ -363,7 +421,7 @@ int spec_print_v2(FILE *f, const struct spec *s, struct err *e) {
             /* «Весь трафик» без сужения — это `to: all`, списка для него не нужно. */
             if (li->all && l4match_empty(&li->l4) && !li->srs_n && !li->prefixes_n && !li->domains_n)
                 continue;
-            name_take(&ln, base, "all", lname[l]);
+            name_take(ln, base, "all", lname[l]);
             lshow[l] = 1;
         }
     }
@@ -372,16 +430,11 @@ int spec_print_v2(FILE *f, const struct spec *s, struct err *e) {
 
     /* lan */
     {
-        const char *dv[MAX_LAN_DEV];
-        for (size_t i = 0; i < s->lan_dev_n; i++) dv[i] = s->lan_dev[i];
         struct flow w = { f, 0 };
         fputs("lan: { ", f);
-        fseq(&w, "devices", dv, s->lan_dev_n);
-        if (s->lan.from_n) {
-            const char *ad[MAX_FROM];
-            for (size_t i = 0; i < s->lan.from_n; i++) ad[i] = s->lan.from[i];
-            fseq(&w, "addr", ad, s->lan.from_n);
-        }
+        fseq_s(&w, "devices", s->lan_dev[0], sizeof(s->lan_dev[0]), s->lan_dev_n);
+        if (s->lan.from_n)
+            fseq_s(&w, "addr", s->lan.from[0], sizeof(s->lan.from[0]), s->lan.from_n);
         fputs(" }\n", f);
     }
 
@@ -414,13 +467,13 @@ int spec_print_v2(FILE *f, const struct spec *s, struct err *e) {
         fputs("\noutputs:\n", f);
         for (size_t i = 0; i < s->out_n; i++) {
             key_pad(f, oname[i], ow);
-            output_flow(f, &s->out[i], oname);
+            output_flow(f, &s->out[i], &onm);
             fputc('\n', f);
         }
         for (size_t i = 0; i < anon_n; i++) {
-            const struct output *m = &s->out[anon_order[i]];
+            const struct output *m = spec_out(s, SPEC_ANON_BASE + (anon_order[i] - s->out_n));
             key_pad(f, oname[anon_order[i]], ow);
-            output_flow(f, m, oname);
+            output_flow(f, m, &onm);
             fputc('\n', f);
         }
     }
@@ -438,10 +491,8 @@ int spec_print_v2(FILE *f, const struct spec *s, struct err *e) {
         }
         if (s->dns.boot_n) {
             struct flow w = { f, 0 };
-            const char *b[MAX_DNS_IPS];
-            for (size_t k = 0; k < s->dns.boot_n; k++) b[k] = s->dns.boot[k];
             fputs("  ", f);
-            fseq(&w, "bootstrap", b, s->dns.boot_n);
+            fseq_s(&w, "bootstrap", s->dns.boot[0], sizeof(s->dns.boot[0]), s->dns.boot_n);
             fputc('\n', f);
         }
         if (s->dns.general && s->dns.general <= s->dns.up_n)
@@ -453,7 +504,7 @@ int spec_print_v2(FILE *f, const struct spec *s, struct err *e) {
                 fputs("    ", f);
                 yq(f, s->dns.up[i].name);
                 fputs(": ", f);
-                dns_up_flow(f, &s->dns.up[i], oname);
+                dns_up_flow(f, &s->dns.up[i], &onm);
                 fputc('\n', f);
             }
         }
@@ -466,7 +517,8 @@ int spec_print_v2(FILE *f, const struct spec *s, struct err *e) {
             struct flow w = { f, 0 };
             fputs("  - { ", f);
             fs(&w, "name", ru->name);
-            const char *refs[MAX_RULE_REFS];
+            const char **refs = malloc((ru->clients_n + ru->lists_n + 1) * sizeof(*refs));
+            if (!refs) return e ? err_set(e, "%s", "недостаточно памяти для печати спеки") : -1;
             size_t rn = 0;
             for (size_t k = 0; k < ru->clients_n; k++)
                 if (cshow[ru->clients[k]]) refs[rn++] = cname[ru->clients[k]];
@@ -476,13 +528,14 @@ int spec_print_v2(FILE *f, const struct spec *s, struct err *e) {
                 if (lshow[ru->lists[k]]) refs[rn++] = lname[ru->lists[k]];
             if (rn) fseq(&w, "to", refs, rn);
             else fs(&w, "to", "all");
+            free(refs);
             fs(&w, "out", oname[ru->out]);
             if (ru->realip) fs(&w, "resolve", "realip");
             if (ru->dns && ru->dns <= s->dns.up_n) {
                 const struct spec_dns_up *du = &s->dns.up[ru->dns - 1];
                 if (du->inl) {
                     fk(&w, "dns");
-                    dns_up_flow(f, du, oname);
+                    dns_up_flow(f, du, &onm);
                 } else {
                     fs(&w, "dns", du->name);
                 }

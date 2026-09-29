@@ -47,9 +47,7 @@ static int load(const char *tmpl) {
     }
     *o = '\0';
     put("spec.json", buf);
-    memset(&g_spec, 0, sizeof(g_spec));
-    strcpy(g_spec.lan_dev[0], "br-lan");
-    g_spec.lan_dev_n = 1;
+    spec_release(&g_spec);              /* load_spec ставит умолчания (br-lan) сам */
     char p[512];
     snprintf(p, sizeof(p), "%s/spec.json", g_tmp);
     struct err e = {0};

@@ -66,10 +66,10 @@ void status_snap_path(char *buf, size_t n) {
     snprintf(buf, n, "%s/status.json", steer_state_dir());
 }
 
-/* Снимок больше этого не бывает: сотня выходов и сотня каналов — это единицы килобайт.
- * Предел стоит потому, что файл читается в буфер на стеке, а писать его мог не только
- * движок. */
-#define STATUS_SNAP_MAX 262144
+/* Потолок размера снимка — защита от чужого файла под нашим именем (писать его мог не только
+ * движок): снимок читается в память целиком, и файл в сотни мегабайт не должен туда попасть.
+ * Настоящий снимок на тысячи каналов — единицы мегабайт. */
+#define STATUS_SNAP_MAX (16 * 1024 * 1024)
 
 /* Отдать запомненное. 0 — отдали, -1 — снимка нет или он не похож на наш ответ.
  *
@@ -81,16 +81,24 @@ int status_fast(FILE *out) {
     status_snap_path(snap, sizeof snap);
     FILE *f = fopen(snap, "r");
     if (!f) return -1;
-    static char buf[STATUS_SNAP_MAX];
-    size_t n = fread(buf, 1, sizeof buf, f);
-    int truncated = !feof(f);
+    /* Буфер — в куче и по размеру файла (раньше — статические 256 КиБ bss на каждой коробке, а
+     * снимок больше них считался «не нашим», и быстрый путь тихо отключался у большой спеки). */
+    fseek(f, 0, SEEK_END);
+    long fl = ftell(f);
+    rewind(f);
+    if (fl < 3 || fl > STATUS_SNAP_MAX) { fclose(f); return -1; }
+    char *buf = malloc((size_t)fl + 1);
+    if (!buf) { fclose(f); return -1; }
+    size_t n = fread(buf, 1, (size_t)fl, f);
+    int truncated = n != (size_t)fl;
     fclose(f);
-    if (truncated) return -1;   /* не влез — значит это не наш снимок */
+    if (truncated) { free(buf); return -1; }   /* файл менялся под рукой — это не наш снимок */
     while (n && (buf[n - 1] == '\n' || buf[n - 1] == ' ')) n--;
     /* Проверка формы, а не доверие имени файла: оборванная запись оставила бы обрубок,
      * и отдать его значило бы выдать половину JSON за ответ движка. */
-    if (n < 3 || buf[0] != '{' || buf[n - 1] != '}') return -1;
+    if (n < 3 || buf[0] != '{' || buf[n - 1] != '}') { free(buf); return -1; }
     fwrite(buf, 1, n - 1, out);
+    free(buf);
     fputs(",\"cached\":true}\n", out);
     return 0;
 }
@@ -113,23 +121,23 @@ static void group_emit(FILE *out, const struct spec *sp, const struct output *o)
     if (!g || g->shown) return;
     fprintf(out, ",\"group\":{\"pick\":\"%s\",\"members\":[", group_pick_name(g->pick));
     for (size_t k = 0; k < g->members_n; k++)
-        fprintf(out, "%s\"%s\"", k ? "," : "", sp->out[g->members[k]].name);
+        fprintf(out, "%s\"%s\"", k ? "," : "", spec_out(sp, g->members[k])->name);
     if (g->cur >= 0 && (size_t)g->cur < g->members_n)
-        fprintf(out, "],\"selected\":\"%s\",\"alive\":[", sp->out[g->members[g->cur]].name);
+        fprintf(out, "],\"selected\":\"%s\",\"alive\":[", spec_out(sp, g->members[g->cur])->name);
     else
         fprintf(out, "],\"selected\":null,\"alive\":[");
     int n = 0;
     for (size_t k = 0; k < g->members_n; k++)
-        if ((g->alive >> k) & 1u) fprintf(out, "%s\"%s\"", n++ ? "," : "", sp->out[g->members[k]].name);
+        if (g->alive[k]) fprintf(out, "%s\"%s\"", n++ ? "," : "", spec_out(sp, g->members[k])->name);
     fprintf(out, "]");
     if (g->pick == PICK_MANUAL && g->sel >= 0 && (size_t)g->sel < g->members_n)
-        fprintf(out, ",\"select\":\"%s\"", sp->out[g->members[g->sel]].name);
+        fprintf(out, ",\"select\":\"%s\"", spec_out(sp, g->members[g->sel])->name);
     if (g->pick == PICK_LATENCY) {
         fprintf(out, ",\"url\":\"%s\",\"latency\":{", g->url[0] ? g->url : GROUP_URL_DEFAULT);
         n = 0;
         for (size_t k = 0; k < g->members_n; k++)
             if (g->lat_ms[k] >= 0)
-                fprintf(out, "%s\"%s\":%d", n++ ? "," : "", sp->out[g->members[k]].name, g->lat_ms[k]);
+                fprintf(out, "%s\"%s\":%d", n++ ? "," : "", spec_out(sp, g->members[k])->name, g->lat_ms[k]);
         fprintf(out, "}");
         /* Группа, меренная по обоим семействам (все живые члены несут IPv6, src/daemon/folat.c):
          * замеры по IPv4 и IPv6 порознь; latency тогда — худший из двух, по нему и выбор. */
@@ -141,7 +149,7 @@ static void group_emit(FILE *out, const struct spec *sp, const struct output *o)
             fprintf(out, ",\"latency%d\":{", v ? 6 : 4);
             n = 0;
             for (size_t k = 0; k < g->members_n; k++)
-                if (a[k] >= 0) fprintf(out, "%s\"%s\":%d", n++ ? "," : "", sp->out[g->members[k]].name, a[k]);
+                if (a[k] >= 0) fprintf(out, "%s\"%s\":%d", n++ ? "," : "", spec_out(sp, g->members[k])->name, a[k]);
             fprintf(out, "}");
         }
     }
@@ -312,11 +320,10 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
                 fprintf(out, ",\"since\":%ld}", pr.since);
             }
             /* Кандидаты: у группы — устройства членов по порядку, у выхода — его устройство. */
-            const struct output *m[MAX_MEMBERS];
-            size_t mn = out_members(sp, &sp->out[i], m, MAX_MEMBERS);
+            size_t mn = out_members_n(sp, &sp->out[i]);
             fprintf(out, ",\"devices\":[");
             for (size_t d = 0; d < mn; d++)
-                fprintf(out, "%s\"%s\"", d ? "," : "", m[d]->device);
+                fprintf(out, "%s\"%s\"", d ? "," : "", out_member(sp, &sp->out[i], d)->device);
             fprintf(out, "],\"on_fail\":\"%s\"",
                    sp->out[i].on_fail == FAIL_DROP ? "drop" :
                    sp->out[i].on_fail == FAIL_ZAPRET ? "zapret" : "direct");

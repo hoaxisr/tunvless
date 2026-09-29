@@ -268,9 +268,11 @@ const struct group_cfg *out_group(const struct output *o);
 /* КАНДИДАТЫ ВЫХОДА — из чего сторож выбирает устройство: у группы — её члены по порядку, у
  * выхода с устройством — он сам, единственным кандидатом, у остальных — никого. Одна функция на
  * всех, кому нужен «пул» (сторож, status, apply, сверка), — чтобы группа и одиночный выход не
- * расходились в ответе на один и тот же вопрос. Пишет не больше max, возвращает, сколько. */
-size_t out_members(const struct spec *sp, const struct output *o, const struct output **dst,
-                   size_t max);
+ * расходились в ответе на один и тот же вопрос. Сколько их — out_members_n (число не ограничено
+ * константой: пул любой длины), i-й — out_member (i < out_members_n). Раньше членов копировали
+ * в массив вызывающего на предельное число; теперь читают по одному, ничего не выделяя. */
+size_t out_members_n(const struct spec *sp, const struct output *o);
+const struct output *out_member(const struct spec *sp, const struct output *o, size_t i);
 /* Сделать выход o группой pick: order из безымянных выходов-членов, по одному на устройство devs
  * (того же вида, каким был o), — так перевод v1 превращает пул `devices` в группу (model/v1.c), и
  * так же собирают пул стенды. Имя, активное устройство, over, on_fail, метка и таблица остаются
@@ -289,11 +291,20 @@ void group_cfg_init(struct group_cfg *g);
 int group_named(const struct group_cfg *g);
 /* Имя pick (enum group_pick в spec.h), как пишется в спеке. */
 const char *group_pick_name(int p);
+/* Завести группе массивы на n членов в арене спеки: members, weight, alive, lat_ms, lat4_ms,
+ * lat6_ms (замеры «не мерили», weight 0, никто не жив). n == 0 не выделяет ничего. 0 — есть;
+ * -1 — нехватка памяти. Число членов константой не ограничено. */
+int group_members_alloc(struct spec *sp, struct group_cfg *g, size_t n);
 /* balance: карта ядра — GROUP_BAL_SLOTS слотов `numgen random mod N`; owner[s] — номер члена
- * слота s (0..members_n-1) по весам живых членов alive (бит на члена), 0xff — живых нет. Почему
- * слоты, а не `mod <живых>` — у определения. */
+ * слота s (0..members_n-1) по весам живых членов alive (байт на члена, 1 — жив; NULL — все
+ * живы), 0xff — живых нет. Почему слоты, а не `mod <живых>` — у определения.
+ *
+ * ЭТО НАСТОЯЩИЙ ПРЕДЕЛ balance, и он свойство карты, а не выбор кода: у члена без слота доли нет,
+ * поэтому членов у группы pick: balance не больше слотов (group_seal отказывает с цифрой), а
+ * номер члена в owner — байт (0xff занят под «живых нет»). Остальные pick пределов по числу
+ * членов не имеют. */
 #define GROUP_BAL_SLOTS 120
-void group_balance_slots(const struct group_cfg *g, unsigned alive,
+void group_balance_slots(const struct group_cfg *g, const unsigned char *alive,
                          unsigned char owner[GROUP_BAL_SLOTS]);
 /* Имена объектов balance в таблице движка (compile/balance.c строит, сторож переписывает карту):
  * цепочка группы `bal_<таблица>`, её карта `balmap_<таблица>` (`type mark : verdict`, ключ — слот

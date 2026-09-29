@@ -116,6 +116,12 @@ int main(void) {
     check("  метка выхода в строке апстрима g", 1, strstr(txt, "https://dns.google/dns-query|vpn|1048576|-|1.1.1.1,8.8.8.8") != NULL);
     check("  для t (без выхода): метка 0, адреса", 1, strstr(txt, "tls://dns.test|-|0|192.0.2.1|1.1.1.1,8.8.8.8") != NULL);
     size_t before_n = g_dup_cfg_n;
+    /* g_dch держит строки спеки взаймы (сборка), а tabfmt_parse освобождает прежнее как своё —
+     * в настоящем процессе они не встречаются вместе; здесь встречаются ради сравнения, поэтому
+     * таблица обнуляется руками (те же слова — в tests/dnsmatch.c). */
+    for (size_t i = 0; i < g_dch_n; i++) free(g_dch[i].rules_path);
+    memset(g_dch, 0, g_dch_cap * sizeof(*g_dch));
+    g_dch_n = 0;
     check("  разбор своей же таблицы", 0, tabfmt_parse(txt, tn));
     check("  апстримов", (int)before_n, (int)g_dup_cfg_n);
     check("  протокол t — DoT", DNSP_DOT, g_dup_cfg[0].u.proto == DNSP_DOT ? DNSP_DOT : g_dup_cfg[1].u.proto);
@@ -134,6 +140,9 @@ int main(void) {
     tabfmt_build(&cfg2, m); fclose(m);
     check("таблица без dns: заголовок «1»", 0, strncmp(txt, "1\n", 2));
     check("  ни одного dns: и строки апстрима", 1, strstr(txt, "dns:") == NULL && g_dup_cfg_n == 0);
+    for (size_t i = 0; i < g_dch_n; i++) free(g_dch[i].rules_path);
+    memset(g_dch, 0, g_dch_cap * sizeof(*g_dch));
+    g_dch_n = 0;
     check("  разбор старой", 0, tabfmt_parse(txt, tn));
     check("  кэша нет", 0, (int)g_dcache_cfg.entries);
     free(txt);
@@ -151,7 +160,7 @@ int main(void) {
         fprintf(f, "version: 2\nlan: { devices: [br-lan] }\noutputs:\n  vpn: { kind: interface, device: wg0 }\n%s\n", bad[i]);
         fclose(f);
         static struct spec cfg3;
-        memset(&cfg3, 0, sizeof(cfg3));
+        spec_release(&cfg3);
         struct err e3 = {0};
         char nm[80]; snprintf(nm, sizeof(nm), "отказ спеки №%zu", i + 1);
         check(nm, 1, load_spec(sp, &cfg3, &e3) < 0);

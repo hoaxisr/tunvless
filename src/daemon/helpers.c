@@ -130,7 +130,21 @@ static void take_params(struct helper *h, const struct helper *f) {
     h->module = f->module;
 }
 
+int helpers_reserve(struct helper_set *s, size_t n) {
+    if (n <= s->cap) return 0;
+    size_t nc = s->cap ? s->cap : 8;
+    while (nc < n) nc *= 2;
+    struct helper *np = realloc(s->h, nc * sizeof(*np));
+    if (!np) return -1;
+    memset(np + s->cap, 0, (nc - s->cap) * sizeof(*np));
+    s->h = np;
+    s->cap = nc;
+    return 0;
+}
+
 void helpers_merge(struct helper_set *s, const struct helper *fresh, size_t fn) {
+    /* Место сразу на всех возможных новичков: дальше элементы наборы не двигает. */
+    if (helpers_reserve(s, s->n + fn) != 0) return;
     struct helper *h = s->h;
     for (size_t i = 0; i < s->n; i++) {
         int keep = 0;
@@ -158,7 +172,7 @@ void helpers_merge(struct helper_set *s, const struct helper *fresh, size_t fn) 
             }
         }
     }
-    for (size_t k = 0; k < fn && s->n < HELPERS_MAX; k++) {
+    for (size_t k = 0; k < fn; k++) {
         int have = 0;
         for (size_t i = 0; i < s->n; i++) {
             if (!same_helper(&h[i], &fresh[k])) continue;
