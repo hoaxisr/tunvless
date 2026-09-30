@@ -4,6 +4,7 @@
  * tests/dnsup.sh и tests/doqup.sh. Устройство проверяемого — src/dnsd/dup.h, src/dnsd/doq.h. */
 #include "dnsd_int.h"
 #include "doq.h"
+#include "doh2.h"
 #include "tabfmt.h"
 #include <sys/stat.h>
 
@@ -256,6 +257,79 @@ int main(void) {
         check("DOQ_UNSPECIFIED_ERROR", 5, (int)DOQ_UNSPECIFIED_ERROR);
         check_str("  имя кода", "DOQ_PROTOCOL_ERROR", doq_err_name(DOQ_PROTOCOL_ERROR));
         check_str("  неизвестный код", "DOQ_?", doq_err_name(0x1234));
+    }
+
+    /* ---- DoH по HTTP/2: кадры и HPACK (RFC 9113, RFC 7541) ---- */
+    {
+        uint8_t hb[256], rq[2048];
+        struct h2d_frame f;
+        size_t hl = h2d_hello(hb, sizeof(hb));
+        check("h2: преамбула + SETTINGS = 24 + 9 + 12 байт", 45, (int)hl);
+        check("  начинается с PRI * HTTP/2.0", 0, memcmp(hb, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24));
+        check("  дальше кадр SETTINGS", 1, h2d_next(hb + 24, hl - 24, &f));
+        check("  тип SETTINGS, поток 0", (H2D_SETTINGS << 8) | 0, (f.type << 8) | (int)f.sid);
+        check("  HEADER_TABLE_SIZE = 0", 0, (f.body[0] << 8 | f.body[1]) != 1 || f.body[2] || f.body[3] || f.body[4] || f.body[5]);
+        check("  ENABLE_PUSH = 0", 0, (f.body[6] << 8 | f.body[7]) != 2 || f.body[8] || f.body[9] || f.body[10] || f.body[11]);
+        check("  мало места — 0", 0, (int)h2d_hello(hb, 44));
+
+        uint8_t qq[64];
+        size_t qlen = mk_query(qq, "h2.test");
+        qq[0] = 0xAB; qq[1] = 0xCD;
+        size_t rl = h2d_request(rq, sizeof(rq), 7, "dns.test:8443", "/dns-query", qq, qlen);
+        check("h2: запрос собран", 1, rl > 0);
+        check("  первый кадр — HEADERS с END_HEADERS на потоке 7", 1, h2d_next(rq, rl, &f) == 1 && f.type == H2D_HEADERS &&
+              f.flags == H2D_F_END_HEADERS && f.sid == 7);
+        check("  заголовки: :method POST и :scheme https — по индексам 3 и 7", 1, f.body[0] == 0x83 && f.body[1] == 0x87);
+        check("  путь и authority — литералами с именами 4 и 1", 1, f.body[2] == 0x04 && f.body[3] == 10 &&
+              memcmp(f.body + 4, "/dns-query", 10) == 0 && f.body[14] == 0x01 && f.body[15] == 13 &&
+              memcmp(f.body + 16, "dns.test:8443", 13) == 0);
+        check("  в блоке есть application/dns-message", 1, memmem(f.body, f.len, "application/dns-message", 23) != NULL);
+        size_t first = f.total;
+        check("  второй кадр — DATA с END_STREAM на том же потоке", 1, h2d_next(rq + first, rl - first, &f) == 1 &&
+              f.type == H2D_DATA && f.flags == H2D_F_END_STREAM && f.sid == 7 && f.len == qlen);
+        check("  номер сообщения в теле — 0", 0, f.body[0] | f.body[1]);
+        check("  остальное сообщение — как есть", 0, memcmp(f.body + 2, qq + 2, qlen - 2));
+        check("  вход не изменён", 0xABCD, (qq[0] << 8) | qq[1]);
+        check("  короче заголовка DNS — 0", 0, (int)h2d_request(rq, sizeof(rq), 1, "a", "/", qq, 11));
+        check("  мало места — 0", 0, (int)h2d_request(rq, 20, 1, "a", "/", qq, qlen));
+
+        check("h2: половина заголовка кадра — ждём", 0, h2d_next(rq, 5, &f));
+        check("  кадр без последнего байта — ждём", 0, h2d_next(rq, first - 1, &f));
+        uint8_t big[9] = { 0, 0x40, 1, 0, 0, 0, 0, 0, 1 };      /* длина 16385 */
+        check("  кадр длиннее 16384 — нарушение", -1, h2d_next(big, sizeof(big), &f));
+        uint8_t hi[9 + 4] = { 0, 0, 4, H2D_WINDOW_UPDATE, 0, 0x80, 0, 0, 3, 0, 0, 1, 0 };
+        check("  старший бит номера потока отбрасывается", 3, h2d_next(hi, sizeof(hi), &f) == 1 ? (int)f.sid : -1);
+
+        /* Статус ответа. */
+        static const uint8_t s200[] = { 0x88 }, s404[] = { 0x8d }, s500[] = { 0x8e };
+        static const uint8_t s505p[] = { 0x08, 3, '5', '0', '5' };                 /* литерал, цифры */
+        static const uint8_t s505h[] = { 0x08, 0x83, 0x6c, 0x0d, 0xff };          /* тот же, кодом Хаффмана */
+        static const uint8_t s502h[] = { 0x08, 0x82, 0x6c, 0x02 };                /* «502» ровно в 16 бит */
+        static const uint8_t s200x[] = { 0x20, 0x88, 0x0f, 0x0d, 0x02, '4', '2' }; /* размер таблицы, статус, content-length */
+        static const uint8_t sinc[] = { 0x48, 3, '4', '0', '3' };                  /* с индексацией: имя 8 — 6 бит */
+        static const uint8_t s103[] = { 0x08, 3, '1', '0', '3' };
+        static const uint8_t strl[] = { 0x0f, 0x0d, 0x02, '4', '2' };              /* только content-length */
+        static const uint8_t dyn[] = { 0xbe };                                     /* индекс 62: таблицы нет */
+        static const uint8_t cut[] = { 0x08, 5, '5', '0' };
+        static const uint8_t junk[] = { 0x08, 3, 'x', '0', '5' };
+        static const uint8_t name[] = { 0x00, 7, ':', 's', 't', 'a', 't', 'u', 's', 3, '4', '1', '8' };
+        check("h2: статус 200 (индекс 8)", 200, h2d_status(s200, sizeof(s200)));
+        check("  404 (индекс 13)", 404, h2d_status(s404, sizeof(s404)));
+        check("  500 (индекс 14)", 500, h2d_status(s500, sizeof(s500)));
+        check("  505 литералом с цифрами", 505, h2d_status(s505p, sizeof(s505p)));
+        check("  505 кодом Хаффмана (как пишет сервер Quad9)", 505, h2d_status(s505h, sizeof(s505h)));
+        check("  502 кодом Хаффмана без набивки", 502, h2d_status(s502h, sizeof(s502h)));
+        check("  обновление размера таблицы, статус и прочие поля", 200, h2d_status(s200x, sizeof(s200x)));
+        check("  литерал с индексацией", 403, h2d_status(sinc, sizeof(sinc)));
+        check("  статус, заданный именем строкой", 418, h2d_status(name, sizeof(name)));
+        check("  103 — информационный, код возвращается как есть", 103, h2d_status(s103, sizeof(s103)));
+        check("  без :status (трейлеры) — 0", 0, h2d_status(strl, sizeof(strl)));
+        check("  ссылка на динамическую таблицу — ошибка", -1, h2d_status(dyn, sizeof(dyn)));
+        check("  оборванная строка — ошибка", -1, h2d_status(cut, sizeof(cut)));
+        check("  нецифровое значение — ошибка", -1, h2d_status(junk, sizeof(junk)));
+        char nb[24];
+        check_str("h2: имя кода 7", "REFUSED_STREAM", h2d_errname(H2D_E_REFUSED_STREAM, nb, sizeof(nb)));
+        check_str("  неизвестный код", "код 99", h2d_errname(99, nb, sizeof(nb)));
     }
 
     unlink(lst); unlink(lst2); unlink(sp); rmdir(dir);

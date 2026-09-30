@@ -32,7 +32,7 @@ struct dial {
     char (*ips_own)[46];                /* личные копии u.ips и u.boot (dial_free отдаёт) */
     char (*boot_own)[46];
     unsigned mark;
-    int doh;                            /* ALPN http/1.1 и проверка, что выбрано оно */
+    int doh;                            /* DoH: сервер обязан выбрать h2 или http/1.1 */
     int quic;                           /* DoQ: поток только находит адреса сервера (список — в
                                          * addr), connect и рукопожатие ведёт цикл через dupq_open */
     struct sockaddr_storage cached[DIAL_MAXADDR];
@@ -41,6 +41,7 @@ struct dial {
     int timeout_ms;                     /* на всё: bootstrap, connect, рукопожатие */
 
     /* Выход. */
+    int h2;                             /* DoH: сервер выбрал h2 */
     int rc;                             /* 0 — соединение готово */
     char err[192];
     int fd;                             /* сокет, уже неблокирующий */

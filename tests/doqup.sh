@@ -306,6 +306,17 @@ check "dns-log: doq готов, соединение одно" "ready 1 doq vpn"
 check "DoT к dnsproxy: ответ" fake "$(fake "$(ask a.dot.svc.test)")"
 check "DoH к dnsproxy: ответ" fake "$(fake "$(ask a.doh.svc.test)")"
 sleep 1
+# DoH по HTTP/2: dnsproxy (Go) выбирает h2, если он предложен; сто вопросов разом идут потоками одного
+# соединения (у HTTP/1.1 это было бы соединение на вопрос).
+check "  DoH: сервер выбрал HTTP/2" "h2" "$(dnslog doh http)"
+: > "$tmp/h2par.res"
+for i in $(seq 1 100); do ( fake "$(ask "q$i.doh.svc.test")" >> "$tmp/h2par.res" ) & done
+n=0; while [ "$(wc -l < "$tmp/h2par.res")" -lt 100 ] && [ $n -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
+sleep 1
+check "  DoH/h2: сто одновременных вопросов — все с ответом" "100" "$(grep -c '^fake$' "$tmp/h2par.res")"
+check "  и все дошли до авторитетного сервера" "100" "$(cnt 'q[0-9]*\.doh\.svc\.test')"
+check "  соединение одно" "1" "$(dnslog doh conns)"
+check "  отказов нет" "0" "$(dnslog doh failed)"
 echo "     (dot: $(dnslog dot state) sent=$(dnslog dot sent) ok=$(dnslog dot ok) error=$(dnslog dot error); doh: $(dnslog doh state) sent=$(dnslog doh sent) ok=$(dnslog doh ok) error=$(dnslog doh error))"
 
 # ---- 2. одно соединение, много вопросов ---------------------------------------------------------------
@@ -353,6 +364,8 @@ check "сервер перезапущен: следующий вопрос до
 check "  и сервер его получил" "1" "$([ "$(pq 'e.doq.svc.test')" -ge 1 ] && echo 1 || echo 0)"
 r="$(ask e2.doq.svc.test)"
 check "  дальше — как обычно" fake "$(fake "$r")"
+r="$(ask e.doh.svc.test)"; sleep 1
+check "  DoH/h2: новое соединение после перезапуска, вопрос дошёл" "1" "$([ "$(pq 'e.doh.svc.test')" -ge 1 ] && echo 1 || echo 0)"
 proxy_stop
 fl0=$(dnslog doq failed)
 t0=$(date +%s)
