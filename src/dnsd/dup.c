@@ -29,9 +29,10 @@
  *     QUIC не блокирует ничего: qc_open только создаёт сокет и шлёт первый пакет, дальше его ведут
  *     события того же epoll и таймер qc_timeout_ms (dup_wait_ms), а потоку dial остаётся найти
  *     адреса сервера через bootstrap. Сокет соединения метится меткой выхода (sock_mark), как и
- *     остальные. 0-RTT нет: обёртка не хранит билеты сессии, и каждое новое соединение платит
- *     полное рукопожатие (один RTT сверх DoT-подобного минимума QUIC) — соединение долгоживущее,
- *     платить приходится раз на простой в DUP_IDLE_MS.
+ *     остальные. Новое соединение, для сервера которого есть билет прошлой сессии, берёт вопросы
+ *     до конца рукопожатия (0-RTT, dupq_early_ready в pick_conn); сервер, отвергший 0-RTT, получает
+ *     их заново на том же соединении (on_early_rejected, quic_after). Без билета — полное
+ *     рукопожатие, и платить его приходится раз на простой в DUP_IDLE_MS.
  * Соединение TLS создаётся потоком (dial), сокет тогда переходит циклу. Пока соединения нет,
  * вопросы ждут в той же таблице (ci < 0); не установилось — все ожидающие получают отказ сразу,
  * а следующая попытка — через растущую паузу (1, 2, 4 ... 30 с). Обрыв соединения под вопросом —
@@ -108,7 +109,7 @@ static int dup_conn_limit(void) {
 /* Вопросов в полёте — тоже растущий пул блоками (req_ref): предел — очередь ожидающих резолвера
  * (MAX_PENDING в dnsd_int.h, защита от шторма запросов), а не размер массива здесь. */
 #define DUP_REQ_BLOCK 64
-#define DUP_QMAX 1024
+/* DUP_QMAX — в dupint.h. */
 #define DUP_REQ_MS 4000
 #define DUP_UDP_RETRY_MS 1500
 /* DoQ: вопрос без ответа через столько миллисекунд на соединении, которое за это время не подало
@@ -132,127 +133,30 @@ static long dup_idle_ms(void) {
     return v;
 }
 #define DUP_IDLE_MS dup_idle_ms()
-#define DUP_DIAL_MS 6000
-#define DUP_RBUF_MAX (70 * 1024)
+/* DUP_DIAL_MS — в dupint.h. */
+/* Буфер чтения соединения: недочитанное сообщение с длиной (до 2 + 65535 байт, DoT и TCP) плюс одна
+ * запись TLS целиком (TLS13_MAX_PLAIN), которая может нести его хвост и начало следующего. Прежние
+ * 70 КиБ были меньше этой суммы (81 920), и ответ почти в 64 КиБ закрывал исправное соединение. */
+#define DUP_RBUF_MAX (2 + 65535 + TLS13_MAX_PLAIN + 1024)
 #define DUP_BACKOFF_MAX 30000
 
-enum { CS_FREE = 0, CS_DIAL, CS_TCPCONN, CS_READY, CS_QHS };   /* CS_QHS — DoQ, рукопожатие идёт */
-
-struct dup;
-struct dconn {
-    struct dtag tag;
-    struct dup *up;
-    /* DoQ. qc — соединение QUIC (fd тогда -1: сокетом владеет обёртка, а в epoll он лежит под qfd).
-     * Обратные вызовы обёртки НЕ делают ничего, кроме отметок ниже: ответить клиенту, поставить в
-     * поток следующий вопрос или закрыть соединение изнутри вызова из ngtcp2 нельзя (ngtcp2 не
-     * терпит повторного входа), поэтому все последствия разбирает quic_after после возврата из
-     * qc_on_readable / qc_on_timer. */
-    struct dupq *qc;
-    int qfd;
-    long qrx_ms;                /* когда от сервера в последний раз пришёл хоть один пакет */
-    int qhs;                    /* on_handshake сработал */
-    int qerej;                  /* on_early_rejected сработал: вопросы, ушедшие до рукопожатия, потеряны */
-    int qclosed;                /* on_closed сработал: qc больше не пригоден, только qc_free */
-    int qreason;                /* QC_CLOSE_* */
-    char qwhy[64];
-    uint64_t qerr;              /* код приложения при нашем закрытии (DOQ_*) */
-    int fd, st;
-    struct tls13 *tls;
-    struct dial *dial;
-    uint8_t *rb;
-    size_t rn, rcap;
-    uint8_t *wb;
-    size_t wn, woff;
-    /* DoH по HTTP/2 (h2 — сервер выбрал h2 в ALPN). Вопрос — поток, номер потока в dreq.sid, число
-     * открытых потоков — busy. Окна отправки ведутся только по данным: заголовки в окно не входят
-     * (RFC 9113, 6.9), а тело вопроса — до килобайта. */
-    int h2;
-    int h2_go;                  /* GOAWAY получен (или номера потоков кончились): новых вопросов нет,
-                                 * соединение закрывается, когда откроется последний поток */
-    uint32_t h2_next;           /* номер следующего потока (нечётный) */
-    uint32_t h2_maxs;           /* SETTINGS_MAX_CONCURRENT_STREAMS сервера */
-    int64_t h2_win;             /* окно отправки соединения (может уйти в минус по SETTINGS) */
-    int64_t h2_iwin;            /* начальное окно потока, объявленное сервером */
-    uint8_t *hb;                /* блок заголовков, пришедший кусками (HEADERS без END_HEADERS) */
-    size_t hbn;
-    uint32_t hb_sid;
-    int hb_fin;                 /* у HEADERS был END_STREAM */
-    long last_ms;
-    int idx;                    /* номер в up->c: адрес соединения не переезжает (метка epoll) */
-    int busy;                   /* DoH: номер вопроса плюс один; DoT/TCP: число вопросов на нём */
-    int close_after;
-    /* Разбор ответа HTTP. */
-    int hdr_done, chunked;
-    long clen;
-    size_t body_off;
-};
-
-struct dup {
-    struct dtag utag;
-    int live;
-    unsigned gen;
-    struct dup_cfg cfg;
-    int ufd;
-    struct sockaddr_storage srv;
-    int srv_ok;
-    /* Соединения — каждое отдельным блоком: адрес dconn — метка epoll, и он не должен переезжать,
-     * когда пул растёт. Блоки живут, пока живёт сам dup (они, как и он, не освобождаются). */
-    struct dconn **c;
-    int c_n, c_cap;
-    char (*ips_own)[46];        /* личные копии адресов cfg.u.ips и cfg.u.boot */
-    char (*boot_own)[46];
-    struct sockaddr_storage ad[DIAL_MAXADDR];
-    int ad_n;
-    long ad_exp_ms;
-    unsigned qpos;              /* DoQ: с какого адреса из ad начинать; неудача рукопожатия сдвигает */
-    int dialing;
-    long retry_at_ms;
-    long backoff_ms;
-    char err[192];
-    long err_ms, ok_ms;
-    unsigned long q_sent, q_ok, q_fail;
-    unsigned long q_early, q_early_rej;   /* DoQ: вопросов ушло в 0-RTT; соединений, где сервер его отверг */
-    uint16_t next_id;
-    int hproto;                 /* DoH: что выбрал сервер при последнем соединении — 0 не знаем, 1
-                                 * http/1.1, 2 h2 (от этого зависит, сколько соединений заводить) */
-};
-
-struct dreq {
-    int used;
-    int slot;                   /* номер места (RQ): busy у DoH — это slot плюс один */
-    struct dup *up;
-    unsigned up_gen;
-    int ci;                     /* соединение или -1 — ждёт */
-    int tcp;                    /* усечённый ответ по UDP: идти по TCP */
-    uint8_t tries;
-    uint16_t wid, oid;
-    long t0, deadline;
-    dup_done_fn cb;
-    void *ctx;
-    /* DoQ: поток вопроса (-1 — ещё не открыт) и накопленный ответ (rxn байт из rxcap, куча). rxfin —
-     * поток закончен (FIN или закрыт), rxbad — закрыт с кодом ошибки. Всё это обнуляется вместе с
-     * полями выше при приёме вопроса (memset до q), поэтому rx освобождает req_finish и никто иной. */
-    int64_t sid;
-    uint8_t *rx;
-    size_t rxn, rxcap;
-    int rxfin, rxbad;
-    int hgot;                   /* DoH/h2: заголовки ответа с кодом 200 пришли */
-    uint8_t q[DUP_QMAX];
-    uint16_t qn;
-};
+/* Состояния соединения и struct dconn, struct dup, struct dreq — в dupint.h (их смотрит стенд
+ * tests/dupconnmatch.c). */
 
 /* Хранилище объектов апстримов и таблица текущих — растут по числу апстримов; объекты (struct dup)
  * лежат каждый в своём блоке и не освобождаются (шапка, «ПАМЯТЬ»): освободившийся (live == 0)
  * берётся снова. */
 static struct dup **g_store;
 static size_t g_store_n, g_store_cap;
-static struct dup **g_dups;
-static size_t g_dups_n, g_dups_cap;
+struct dup **g_dups;                /* dupint.h: видны стенду */
+size_t g_dups_n;
+static size_t g_dups_cap;
 /* Вопросы в полёте — блоками по DUP_REQ_BLOCK: адрес вопроса стабилен (его держат вызовы
  * обратной связи), рост — новый блок. */
 static struct dreq **g_reqb;
-static int g_req_cap;               /* всего мест: кратно DUP_REQ_BLOCK */
-static struct dreq *req_ref(int k) { return &g_reqb[k / DUP_REQ_BLOCK][k % DUP_REQ_BLOCK]; }
+int g_req_cap;                      /* dupint.h */
+               /* всего мест: кратно DUP_REQ_BLOCK */
+struct dreq *req_ref(int k) { return &g_reqb[k / DUP_REQ_BLOCK][k % DUP_REQ_BLOCK]; }
 #define RQ(k) (*req_ref(k))
 static int req_grow(void) {
     struct dreq **nb = realloc(g_reqb, (size_t)(g_req_cap / DUP_REQ_BLOCK + 1) * sizeof(*nb));
@@ -531,7 +435,8 @@ static int conn_send(struct dup *up, struct dconn *c, struct dreq *r) {
          * отказывать, приходится при пределе потоков, объявленном сервером, и при исчерпанном окне
          * отправки: то и другое снимается кадром сервера (закрылся чужой поток, WINDOW_UPDATE,
          * SETTINGS), после которого conn_readable зовёт up_kick. */
-        if (c->h2_go || c->h2_next > 0x7FFFFFF0u) return 1;
+        if (c->h2_next > 0x7FFFFFF0u) c->h2_go = 1;  /* номера кончились: как после GOAWAY (поле h2_go) */
+        if (c->h2_go) return 1;
         if (c->busy >= 0 && (uint32_t)c->busy >= c->h2_maxs) return 1;
         if (c->h2_win < r->qn || c->h2_iwin < r->qn) return 1;
         char auth[160];
@@ -1067,6 +972,13 @@ static void up_kick(struct dup *up) {
         struct dconn *c = pick_conn(up);
         if (!c) break;
         int sr = conn_send(up, c, r);
+        if (sr == 1 && c->h2 && c->h2_go) {
+            /* HTTP/2: на соединении кончились номера потоков. pick_conn его больше не выберет — вопрос
+             * пробует следующее, а пустое закрывается сразу (с вопросами — когда ответит последний). */
+            if (!c->busy) conn_close(c, NULL);
+            k--;
+            continue;
+        }
         if (sr == 1) break;             /* DoQ: потоков пока нет — ждать закрытия чужого (quic_after) */
         if (sr != 0) { conn_close(c, "запись в соединение не удалась"); k = -1; }
         else if (c->qc && c->qclosed) { quic_after(c); k = -1; }  /* соединение умерло при отправке */
@@ -1168,15 +1080,21 @@ static int doh_parse(struct dconn *c) {
     size_t have = c->rn - c->body_off;
     uint8_t *msg = NULL;
     size_t mlen = 0;
-    uint8_t dec[DUP_QMAX * 4];
+    /* Тело кусками собирается сюда. Предел — сообщение DNS (65535), как у тела с Content-Length: прежний
+     * буфер в 4 КиБ (DUP_QMAX * 4 — размер ВОПРОСА) отвергал ответ кусками больше 4 КиБ и рвал соединение,
+     * хотя тот же ответ с длиной проходил. Статический: цикл резолвера один, поток установки сюда не ходит. */
+    static uint8_t dec[DOQ_MSG_MAX];
     if (c->chunked) {
         size_t o = 0, out = 0;
         int done = 0;
         while (o < have) {
-            char sz[20];
+            /* Строка размера куска: шестнадцатеричное число, возможно с расширением («;name=value»),
+             * до CRLF. Длиннее 64 знаков — не ответ DNS. */
+            char sz[65];
             size_t l = 0;
             while (o + l < have && body[o + l] != '\r' && l < sizeof(sz) - 1) { sz[l] = (char)body[o + l]; l++; }
-            if (o + l + 2 > have) break;
+            if (o + l + 2 > have) { if (l == sizeof(sz) - 1) return -1; break; }
+            if (body[o + l] != '\r' || body[o + l + 1] != '\n') return -1;
             sz[l] = '\0';
             long cl = strtol(sz, NULL, 16);
             if (cl < 0 || (size_t)cl > sizeof(dec)) return -1;
@@ -1486,7 +1404,13 @@ static void conn_readable(struct dconn *c) {
         up_kick(up);
         return;
     }
-    for (int guard = 0; guard < 64; guard++) {
+    /* Предел в 64 витка — против того, чтобы один сокет держал цикл, пока сервер шлёт без остановки;
+     * он считает чтения сокета, а не записи TLS, уже лежащие в буфере соединения. Те прочитаны у
+     * ядра, и событие epoll о них не придёт: в одну порцию слоя TLS (до 16 КиБ) помещается сотня
+     * коротких ответов DoT, каждый своей записью, и уйти после 64-й значило оставить остальные
+     * лежать до следующего пакета сервера или до срока вопроса. Буфер конечен, так что дочитать его
+     * до конца — ограниченная работа. */
+    for (int guard = 0; guard < 64 || (c->tls && tls13_has_record && tls13_has_record(c->tls)); guard++) {
         if (c->tls) {
             static unsigned char pl[TLS13_MAX_PLAIN + 16];
             size_t got = 0;
@@ -1515,6 +1439,7 @@ static void conn_readable(struct dconn *c) {
             ssize_t r = recv(c->fd, c->rb + c->rn, c->rcap - c->rn, MSG_DONTWAIT);
             if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) break;
             if (r <= 0) { conn_close(c, "сервер закрыл соединение"); return; }
+            c->qrx_ms = now_ms();                   /* от сервера пришло: не молчащее (dup_tick) */
             c->rn += (size_t)r;
             stream_frames(c);
         }
@@ -1857,11 +1782,20 @@ void dup_tick(void) {
         int silent = ci >= 0 && ci < up->c_n && CN(up, ci)->qrx_ms <= r->t0;
         req_finish(r, NULL, 0);
         if (ci >= 0 && CN(up, ci)->st == CS_READY) {
-            /* HTTP/2: остальные потоки живы, поток брошенного вопроса req_finish сбросил; соединение
-             * рвём, только если с ухода вопроса от сервера не пришло ни байта (мёртвый путь). */
-            if (up->cfg.u.proto == DNSP_DOH && CN(up, ci)->h2) { if (silent) conn_close(CN(up, ci), NULL); }
+            /* HTTP/2, DoT и TCP: остальные вопросы соединения живы (поток брошенного вопроса h2
+             * req_finish сбросил); соединение рвём, только если с ухода вопроса от сервера не пришло
+             * ни байта (мёртвый путь). Иначе мёртвое DoT-соединение принимало бы все вопросы апстрима,
+             * пока ядро не бросит повторы TCP (tcp_retries2 — десятки минут). */
+            int closed = 1;
+            if (up->cfg.u.proto == DNSP_DOH && CN(up, ci)->h2) { if (silent) conn_close(CN(up, ci), NULL); else closed = 0; }
             else if (up->cfg.u.proto == DNSP_DOH) conn_close(CN(up, ci), NULL);
-            else if (!quic_proto(up) && CN(up, ci)->busy > 0) CN(up, ci)->busy--;   /* у DoQ — req_finish */
+            else if (!quic_proto(up)) {                                            /* у DoQ — req_finish */
+                if (CN(up, ci)->busy > 0) CN(up, ci)->busy--;
+                if (silent) conn_close(CN(up, ci), NULL); else closed = 0;
+            } else closed = 0;
+            /* Вопросы закрытого соединения conn_close переставил в ожидание — отправить их сейчас (по
+             * другому соединению или новому), а не в следующий раз, когда кто-нибудь спросит апстрим. */
+            if (closed) { up_kick(up); k = -1; }
         }
     }
     for (size_t i = 0; i < g_dups_n; i++) {
@@ -1876,6 +1810,15 @@ void dup_tick(void) {
              * дескрипторы впрок. */
             long idle = k == 0 ? DUP_IDLE_MS : 30000L;
             if (c->st == CS_READY && !c->busy && now - c->last_ms > idle) conn_close(c, NULL);
+            /* tcp:// (и TCP после усечённого UDP): connect идёт в цикле, и без своего срока SYN в никуда
+             * держал бы место «соединяемся» столько, сколько ядро его повторяет (около двух минут), —
+             * новое соединение всё это время не заводится. Срок — как у установки TLS в потоке. */
+            if (c->st == CS_TCPCONN && now - c->last_ms > DUP_DIAL_MS) {
+                up_err(up, "TCP: соединение не установилось за %d мс", DUP_DIAL_MS);
+                conn_close(c, NULL);
+                up_backoff(up);
+                fail_waiting(up);
+            }
         }
     }
 }
@@ -1898,6 +1841,11 @@ int dup_wait_ms(void) {
         const struct dup *up = g_dups[i];
         for (int k = 0; k < up->c_n; k++) {
             struct dconn *c = CN(up, k);
+            if (c->st == CS_TCPCONN) {
+                long t = c->last_ms + DUP_DIAL_MS + 1;
+                if (best < 0 || t < best) best = t;
+                continue;
+            }
             if (!c->qc || (c->st != CS_READY && c->st != CS_QHS)) continue;
             int qt = dupq_timeout_ms ? dupq_timeout_ms(c->qc) : -1;
             if (qt >= 0 && (best < 0 || now + qt < best)) best = now + qt;
