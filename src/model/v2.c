@@ -763,7 +763,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
                 if (str_of(x, v, w, &sv)) return -1;
                 if (urltest_url_parse(sv, &u, why, sizeof(why)) != 0)
                     return fail(x, v, "%s: %s", w, why);
-                if (u.https && !urltest_https_ok())
+                if (u.https && urltest_https_refused())
                     return fail(x, v, "%s: https:// в этой сборке нет (steer-mini без TLS) — нужен полный "
                                 "пакет steer или адрес http://", w);
                 if (copy_to(x, v, w, sv, o.grp.url, sizeof(o.grp.url))) return -1;

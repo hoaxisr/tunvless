@@ -5,12 +5,30 @@
 
 #include "grpurl.h"
 
-/* Определён в src/proto/tls/urltls.c — только в полном пакете. Слабая ссылка: в сборке без него
- * адрес символа — ноль, и это и есть ответ «HTTPS нет». */
+/* Определён в src/proto/tls/urltls.c — только там, где замер задержки группы действительно
+ * ведётся (steerd и полный статический движок). Слабая ссылка: в сборке без него адрес символа —
+ * ноль, и это и есть ответ «HTTPS нет». */
 extern const int steer_urltls_present __attribute__((weak));
+
+/* Процесс, который спеку только читает (модуль: steer-vless, steer-xsteer, steer-hysteria2, obfs,
+ * tgws). Замер групп ведёт один steerd, и есть ли в системе HTTPS для замера, решает он: символ
+ * steer_urltls_present в бинарник модуля не попадает (urltls.c нужен только замеру), и слабая ссылка
+ * там всегда нулевая — не потому, что TLS в системе нет, а потому, что модулю он ни к чему. Раньше
+ * разбор в модуле на этом отказывал: спека с https-группой роняла каждый модуль кодом 2, а
+ * steerd её при этом принимал. Свойство «https:// доступен» — свойство системы, не того бинарника,
+ * где идёт разбор, поэтому читатель отказ не выносит, а отказывает тот, кто мерит. */
+static int g_reader_only;
+
+void urltest_reader_only(void) {
+    g_reader_only = 1;
+}
 
 int urltest_https_ok(void) {
     return &steer_urltls_present != NULL && steer_urltls_present;
+}
+
+int urltest_https_refused(void) {
+    return !g_reader_only && !urltest_https_ok();
 }
 
 static int fail(char *why, size_t wn, const char *msg) {

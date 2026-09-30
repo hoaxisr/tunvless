@@ -127,6 +127,24 @@ cp "$L/steer-hysteria2" "$empty/steer-hysteria2"
 out="$(STEER_MODULE_DIR="$empty" "$L/steerd" apply --dry-run --spec "$L/hy2spec/spec.yaml" --state-dir "$L/hy2spec/st" 2>&1)"
 check "  с модулем та же спека принимается" "0" "$(printf '%s' "$out" | grep -c 'требует пакет')"
 rm -f "$empty/steer-hysteria2"
+# Спека с группой замера по https:// читается модулем: свойство «https:// доступен» — системы, и
+# steerd, который меряет, его принимает; модуль разбор не отвергает (раньше слабая ссылка на
+# steer_urltls_present в бинарнике модуля была нулевой, и каждый модуль падал кодом 2).
+mkdir -p "$L/httpsspec"
+printf 'vless://11111111-2222-3333-4444-555555555555@vless.test:443?security=tls&sni=vless.test#n\n' \
+    > "$L/httpsspec/sub.txt"
+cat > "$L/httpsspec/spec.yaml" <<SPEC
+version: 2
+outputs:
+  vl: { kind: tunnel, protocol: vless, subscription: sub.txt }
+  lat: { kind: group, pick: latency, members: [vl], url: "https://vless.test:18447/generate_204" }
+SPEC
+out="$("$L/steer-vless" vless-nodes vl --spec "$L/httpsspec/spec.yaml" --state-dir "$L/httpsspec/st" 2>&1)"; rc=$?
+check "модуль читает спеку с https-группой: не отказ про https, не код 2" "0 0" \
+    "$(printf '%s' "$out" | grep -c 'https:// в этой сборке нет') $([ "$rc" = 2 ] && echo 1 || echo 0)"
+out="$("$L/steerd" apply --dry-run --spec "$L/httpsspec/spec.yaml" --state-dir "$L/httpsspec/st" 2>&1)"
+check "  и steerd такую же спеку принимает (замер ведёт он)" "0" \
+    "$(printf '%s' "$out" | grep -c 'https:// в этой сборке нет')"
 # С модулем: steerd передаёт командную строку модулю, ответ тот же байт в байт.
 cp "$L/steer-vless" "$empty/steer-vless"
 a="$(STEER_MODULE_DIR="$empty" "$L/steerd" vless-nodes nosuch --spec /nonexistent 2>&1; echo "rc=$?")"
