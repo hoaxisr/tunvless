@@ -313,6 +313,9 @@ int main(void) {
         static const uint8_t cut[] = { 0x08, 5, '5', '0' };
         static const uint8_t junk[] = { 0x08, 3, 'x', '0', '5' };
         static const uint8_t name[] = { 0x00, 7, ':', 's', 't', 'a', 't', 'u', 's', 3, '4', '1', '8' };
+        /* «1=0» кодом Хаффмана: '1' 00001, '=' 100000, '0' 00000 — ровно 16 бит. Шестибитный код '='
+         * (0x20) лежит выше цифр (0x19…0x1F) и прежде читался как «цифра 10»: 1·100 + 10·10 + 0 = 200. */
+        static const uint8_t s1eq0[] = { 0x08, 0x82, 0x0c, 0x00 };
         check("h2: статус 200 (индекс 8)", 200, h2d_status(s200, sizeof(s200)));
         check("  404 (индекс 13)", 404, h2d_status(s404, sizeof(s404)));
         check("  500 (индекс 14)", 500, h2d_status(s500, sizeof(s500)));
@@ -327,6 +330,7 @@ int main(void) {
         check("  ссылка на динамическую таблицу — ошибка", -1, h2d_status(dyn, sizeof(dyn)));
         check("  оборванная строка — ошибка", -1, h2d_status(cut, sizeof(cut)));
         check("  нецифровое значение — ошибка", -1, h2d_status(junk, sizeof(junk)));
+        check("  нецифровой знак кодом Хаффмана («1=0») — ошибка, а не 200", -1, h2d_status(s1eq0, sizeof(s1eq0)));
         char nb[24];
         check_str("h2: имя кода 7", "REFUSED_STREAM", h2d_errname(H2D_E_REFUSED_STREAM, nb, sizeof(nb)));
         check_str("  неизвестный код", "код 99", h2d_errname(99, nb, sizeof(nb)));

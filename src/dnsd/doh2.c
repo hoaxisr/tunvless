@@ -133,7 +133,7 @@ static int status_huff(const uint8_t *p, size_t n) {
         else {
             if (bits < 6) return -1;
             unsigned c6 = (acc >> (bits - 6)) & 0x3F;
-            if (c6 < 0x19) return -1;
+            if (c6 < 0x19 || c6 > 0x1F) return -1;  /* выше 0x1F — '=', 'A', '_' и прочие, не цифры */
             d = c6 - 0x19 + 3;
             bits -= 6;
         }
