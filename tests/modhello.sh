@@ -98,6 +98,7 @@ check "модуль чужой версии: отвергнут" "True" "$(hf vf
 check "  причина в last_down называет обе версии" \
     "модуль steer-vless версии 0.0.1, а движок $VER — обновите пакеты steer вместе" \
     "$(hf vf last_down)"
+check "  helper показывает версию, которой модуль представился" "0.0.1" "$(hf vf module_ver)"
 check "  up после hello чужой версии не принят" "False" "$(hf vf up)"
 check "  в журнале демона — та же причина" "1" \
     "$(grep -c "vless vf — модуль steer-vless версии 0.0.1, а движок $VER — обновите пакеты steer вместе: отвергнут" "$tmp/d.err")"

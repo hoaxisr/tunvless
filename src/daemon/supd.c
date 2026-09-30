@@ -308,6 +308,9 @@ static void mod_hello(struct supd *s, struct helper *h, const struct evline *e) 
         mod_reject(s, h, "прислал hello без версии");
         return;
     }
+    /* Версия, которой модуль представился, запоминается и у отвергнутого: по ней человек видит в
+     * helper, какой модуль стоит, а не только «отвергнут» (docs/ctl.md, module_ver). */
+    snprintf(h->mver, sizeof(h->mver), "%s", ver);
     if (strcmp(ver, steer_engine_version()) != 0) {
         char why[160];
         snprintf(why, sizeof(why), "версии %.16s, а движок %.16s — обновите пакеты steer вместе",
@@ -316,7 +319,6 @@ static void mod_hello(struct supd *s, struct helper *h, const struct evline *e) 
         return;
     }
     h->hello = 1;
-    snprintf(h->mver, sizeof(h->mver), "%s", ver);
 }
 
 static void ev_line(struct supd *s, struct helper *h, const char *line) {
@@ -1432,7 +1434,7 @@ int supd_helper_json(const struct supd *s, const char *name, FILE *out) {
          * чужую версию помечен — причина в last_down. */
         if (h->module) {
             fprintf(out, ",\"module\":\"%s\"", h->prog);
-            if (h->hello) {
+            if (h->mver[0]) {
                 steerd_json_str(wj, sizeof(wj), h->mver);
                 fprintf(out, ",\"module_ver\":%s", wj);
             }
