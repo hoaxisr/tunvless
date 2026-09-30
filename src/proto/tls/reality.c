@@ -470,7 +470,8 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
     }
 
     /* application_settings (ALPS), новый номер 0x44cd: список из одного "h2". */
-    { struct buf ab = { b_alps, 0, sizeof(b_alps) };
+    if (!(car && car->no_alps)) {           /* no_alps — DoH по HTTP/2, см. reality.h */
+      struct buf ab = { b_alps, 0, sizeof(b_alps) };
       put16(&ab, 3); put8(&ab, 2); put(&ab, "h2", 2);
       px[pn].type = 0x44CD; px[pn].body = b_alps; px[pn].n = ab.len; pn++; }
 

@@ -479,13 +479,25 @@ for spec in $ISAS; do
             _ipkx="$(printf '%s\nReplaces: %s\nProvides: %s' "$_ipkx" "$(echo $_rp | sed 's/ /, /g')" "$_pv")"
             _ipkx="$(printf '%s' "$_ipkx" | sed '/^$/d')"
         fi
-        # apk: скрипты — три хука. post-deinstall нужен модулям (перезапуск после удаления).
+        # apk: скрипты — четыре хука. post-deinstall нужен модулям (перезапуск после удаления).
+        # post-upgrade нужен всем, у кого post-install что-то делает: apk при обновлении пакета
+        # на другую версию зовёт pre-upgrade/post-upgrade, а НЕ pre-deinstall/post-install
+        # (на OpenWrt 25.12.5 старый steerd с бинарником `(deleted)` работал после
+        # `apk add`, пока службу не перезапускали руками). Тело то же, что у post-install:
+        # ядро включает и перезапускает службу, модуль перезапускает; остановка при обновлении
+        # не нужна (pre-deinstall при нём не вызывается), а при удалении остаётся как было.
+        # opkg зовёт postinst и при обновлении, поэтому ipk остаётся с одним файлом.
+        # Компромисс: apk не даёт хука «конец транзакции», так что обновление ядра вместе с
+        # модулями перезапускает службу по разу на пакет (ядро, затем каждый модуль); перезапуск
+        # идемпотентен, а модули ставятся после ядра (зависимость), так что последний из них
+        # застаёт демон с уже полным составом.
         docker run --rm -v "$PWD":/w -w /w alpine:latest sh -c \
             "apk add --no-cache apk-tools >/dev/null 2>&1; apk mkpkg \
                --info name:$_n --info version:$VERSION-r1 \
                --info description:'$_ds' \
                --info arch:$arch $_dinfo \
                --script post-install:build/scripts/$_sk.postinst \
+               --script post-upgrade:build/scripts/$_sk.postinst \
                --script pre-deinstall:build/scripts/$_sk.prerm \
                --script post-deinstall:build/scripts/$_sk.postrm \
                -F $_r -o $OUT/$_n-$VERSION-1_$arch.apk" >/dev/null 2>&1 \

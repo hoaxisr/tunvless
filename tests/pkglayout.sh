@@ -22,7 +22,8 @@
 #      у каждого файла один владелец, старых пакетов в базе не осталось, служба после обновления
 #      включена (старый prerm выключает её, новый postinst включает — порядок сверяется по журналу).
 #      Старые пакеты изготавливаются из файлов нового: важны имена, версии, зависимости и
-#      скрипты, а не байты. opkg в контейнере нет: для .ipk проверяется только состав метаданных
+#      скрипты, а не байты. Отдельно — обновление на БОЛЕЕ НОВУЮ версию тех же пакетов (post-upgrade
+#      перезапускает службу, остановки и выключения нет). opkg в контейнере нет: для .ipk проверяется только состав метаданных
 #      (пункт 2); порядок его действий здесь не воспроизведён.
 #
 # Нужны docker и собранные пакеты (`STEER_ARCH=<арх> sh build.sh`); нет — громкий пропуск (это не
@@ -269,6 +270,37 @@ check "удаление: файлов движка в корне не остал
     "$(ls "$_r"/usr/sbin "$_r"/usr/lib "$_r"/etc/init.d 2>/dev/null | tr '\n' ' ' | sed 's/^ *//')"
 check "удаление: служба остановлена и выключена" "1 1" \
     "$(grep -c '^RC stop$' "$_r/order.log") $(grep -c '^RC disable$' "$_r/order.log")"
+
+# Обновление на БОЛЕЕ НОВУЮ версию того же пакета: apk зовёт не post-install, а post-upgrade. Раньше у
+# пакетов был только post-install — на OpenWrt 25.12.5 после `apk add` работал старый steerd с
+# бинарником `(deleted)`, пока службу не перезапускали руками. Старые пакеты — те же имена
+# (steer-core, steer-vless) заведомо меньшей версии; скрипты новых берутся из настоящих .apk.
+check "steer-core (apk) несёт post-upgrade" "1" "$(grep -c 'post-upgrade' "$T/dump.steer-core")"
+for m in vless xsteer obfs tgws hysteria2; do
+    check "steer-$m (apk) несёт post-upgrade" "1" "$(grep -c 'post-upgrade' "$T/dump.steer-$m")"
+done
+_r="$T/r-upg"
+rm -f "$R0/old/$A"/*.apk
+mk_old steer-core "0.9-r1" "" "$T/oldroot/steer"
+mk_old steer-vless "0.9-r1" "steer-core=0.9-r1 kmod-tun" "$T/oldroot/vless"
+for r in old new sys; do
+    apk mkndx --allow-untrusted -o "$R0/$r/$A/APKINDEX.tar.gz" "$R0/$r/$A"/*.apk >/dev/null 2>&1
+done
+mkroot "$_r"
+apkr "$_r" "sys old" --initdb add steer-core steer-vless kmod-tun >/dev/null 2>&1
+check "[upgrade] старые версии встали" "0.9-r1 0.9-r1" \
+    "$(apk --root "$_r" list -I 2>/dev/null | sed -n 's/^steer-\(core\|vless\)-\(0\.9-r1\) .*/\2/p' | tr '\n' ' ' | sed 's/ $//')"
+: > "$_r/order.log"
+apkr "$_r" "sys new" upgrade >"$T/out-upg" 2>&1
+check "[upgrade] команда завершилась успешно" "0" "$?"
+check "[upgrade] версии обновились" "$V-r1 $V-r1" \
+    "$(apk --root "$_r" list -I 2>/dev/null | sed -n "s/^steer-\(core\|vless\)-\($V-r1\) .*/\2/p" | tr '\n' ' ' | sed 's/ $//')"
+check "[upgrade] post-upgrade перезапустил службу (не меньше одного раза)" "yes" \
+    "$([ "$(grep -c '^RC restart$' "$_r/order.log")" -ge 1 ] && echo yes || echo no)"
+check "[upgrade] последним действием со службой был restart" "RC restart" "$(tail -1 "$_r/order.log")"
+check "[upgrade] обновление не останавливает и не выключает службу" "0" \
+    "$(grep -cE '^RC (stop|disable)$' "$_r/order.log")"
+printf '  [upgrade] журнал служб: %s\n' "$(tr '\n' ' ' < "$_r/order.log")"
 
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi

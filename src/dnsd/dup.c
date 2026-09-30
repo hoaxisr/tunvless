@@ -9,12 +9,17 @@
  *     соединению, вопросы идут по нему вперемешку и сопоставляются с ответами по номеру
  *     транзакции: номер у каждого вопроса свой на апстрим, а не тот, что дал вызывающий (исходный
  *     возвращается в ответе). DoT отличается от TCP только слоем TLS;
- *   - DoH — HTTP/1.1 поверх TLS, POST application/dns-message (RFC 8484), keep-alive. HTTP/2
- *     не взят нарочно: h2.c у нас — клиент одного потока для xsteer, а мультиплексировать вопросы
- *     на одном соединении ему нечем. Вместо этого соединение на каждый ожидающий вопрос (пул
- *     растёт по нагрузке до предела дескрипторов, dup_conn_limit), на каждом один вопрос
- *     за раз; следующий ждёт свободного или нового соединения. Номер в теле — 0, как рекомендует
- *     RFC 8484 (кэшируемость), а исходный возвращается в ответе.
+ *   - DoH — POST application/dns-message поверх TLS (RFC 8484). В ALPN предлагается «h2,
+ *     http/1.1», дальше — по выбору сервера, потому что RFC 8484 требует от сервера поддержки
+ *     HTTP/2, а HTTP/1.1 — нет (Quad9 отвечает на него кодом 505).
+ *     HTTP/2 (кадры и HPACK — doh2.c): одно соединение на апстрим и по потоку на вопрос, вопросы
+ *     идут вперемешку и обгоняют друг друга; число одновременных потоков — то, что сервер объявил
+ *     (SETTINGS_MAX_CONCURRENT_STREAMS), сверх этого вопрос ждёт закрытия чужого потока. Свой клиент
+ *     h2.c для этого не годится: он ведёт один поток для xsteer и мультиплексировать не умеет.
+ *     HTTP/1.1: keep-alive, соединение на каждый ожидающий вопрос (пул растёт по нагрузке до
+ *     предела дескрипторов, dup_conn_limit), на каждом один вопрос за раз; следующий ждёт
+ *     свободного или нового соединения. Номер в теле — 0 в обоих случаях, как рекомендует RFC 8484
+ *     (кэшируемость), а исходный возвращается в ответе.
  *   - DoQ (RFC 9250) — QUIC поверх обёртки src/proto/quic (ngtcp2 на wolfSSL), ALPN `doq`. Одно
  *     долгоживущее соединение на апстрим (пока нужно — одно: потоков QUIC хватает на все вопросы),
  *     и КАЖДЫЙ ВОПРОС — СВОЙ двунаправленный поток: запрос (длина, сообщение с номером 0) и FIN,
@@ -51,6 +56,7 @@
 #include "dupint.h"
 #include "tls13.h"
 #include "doq.h"
+#include "doh2.h"
 #include "dupq.h"
 
 /* Обёртка QUIC — через шов dupq.h, слабыми ссылками, как и TLS ниже: в статической базовой сборке
@@ -142,6 +148,20 @@ struct dconn {
     size_t rn, rcap;
     uint8_t *wb;
     size_t wn, woff;
+    /* DoH по HTTP/2 (h2 — сервер выбрал h2 в ALPN). Вопрос — поток, номер потока в dreq.sid, число
+     * открытых потоков — busy. Окна отправки ведутся только по данным: заголовки в окно не входят
+     * (RFC 9113, 6.9), а тело вопроса — до килобайта. */
+    int h2;
+    int h2_go;                  /* GOAWAY получен (или номера потоков кончились): новых вопросов нет,
+                                 * соединение закрывается, когда откроется последний поток */
+    uint32_t h2_next;           /* номер следующего потока (нечётный) */
+    uint32_t h2_maxs;           /* SETTINGS_MAX_CONCURRENT_STREAMS сервера */
+    int64_t h2_win;             /* окно отправки соединения (может уйти в минус по SETTINGS) */
+    int64_t h2_iwin;            /* начальное окно потока, объявленное сервером */
+    uint8_t *hb;                /* блок заголовков, пришедший кусками (HEADERS без END_HEADERS) */
+    size_t hbn;
+    uint32_t hb_sid;
+    int hb_fin;                 /* у HEADERS был END_STREAM */
     long last_ms;
     int idx;                    /* номер в up->c: адрес соединения не переезжает (метка epoll) */
     int busy;                   /* DoH: номер вопроса плюс один; DoT/TCP: число вопросов на нём */
@@ -177,6 +197,8 @@ struct dup {
     long err_ms, ok_ms;
     unsigned long q_sent, q_ok, q_fail;
     uint16_t next_id;
+    int hproto;                 /* DoH: что выбрал сервер при последнем соединении — 0 не знаем, 1
+                                 * http/1.1, 2 h2 (от этого зависит, сколько соединений заводить) */
 };
 
 struct dreq {
@@ -198,6 +220,7 @@ struct dreq {
     uint8_t *rx;
     size_t rxn, rxcap;
     int rxfin, rxbad;
+    int hgot;                   /* DoH/h2: заголовки ответа с кодом 200 пришли */
     uint8_t q[DUP_QMAX];
     uint16_t qn;
 };
@@ -287,6 +310,8 @@ static int same_question(const struct dreq *r, const uint8_t *a, size_t an) {
 
 /* ---- запросы --------------------------------------------------------------------------------- */
 
+static void h2_rst(struct dconn *c, uint32_t sid, uint32_t code);
+
 static void req_finish(struct dreq *r, uint8_t *ans, size_t n) {
     uint8_t q[DUP_QMAX];
     uint16_t qn = r->qn;
@@ -303,7 +328,18 @@ static void req_finish(struct dreq *r, uint8_t *ans, size_t n) {
             dupq_stream_reset(c->qc, r->sid, DOQ_REQUEST_CANCELLED);
         if (r->sid >= 0 && c->busy > 0) c->busy--;
     }
-    uint8_t *rx = r->rx;            /* ans при DoQ лежит внутри него: освободить после обратного вызова */
+    if (up->cfg.u.proto == DNSP_DOH && r->sid >= 0 && r->ci >= 0 && r->ci < up->c_n) {
+        struct dconn *c = CN(up, r->ci);
+        /* HTTP/2: брошенный вопрос (таймаут, ошибка сервера в ответе) — сбросить поток кодом CANCEL,
+         * чтобы сервер не работал над ответом, а его место в пределе потоков освободилось. Поток,
+         * дочитанный до конца, не трогаем. Соединение, уже закрытое (conn_close), не в счёт: у него
+         * busy обнулён. */
+        if (c->h2 && c->st == CS_READY) {
+            if (!ans && !r->rxfin) h2_rst(c, (uint32_t)r->sid, H2D_E_CANCEL);
+            if (c->busy > 0) c->busy--;
+        }
+    }
+    uint8_t *rx = r->rx;            /* ans при DoQ и DoH/h2 лежит внутри него: освободить после обратного вызова */
     r->rx = NULL;
     r->used = 0;
     if (ans) {
@@ -364,6 +400,10 @@ static void conn_close(struct dconn *c, const char *why) {
     c->busy = 0;
     c->close_after = 0;
     c->hdr_done = 0;
+    c->h2 = c->h2_go = 0;
+    free(c->hb);
+    c->hb = NULL;
+    c->hbn = 0;
     conn_free_bufs(c);
     int had = 0;
     for (int k = 0; k < g_req_cap; k++) {
@@ -378,6 +418,7 @@ static void conn_close(struct dconn *c, const char *why) {
             r->rx = NULL;
             r->rxn = r->rxcap = 0;
             r->rxfin = r->rxbad = 0;
+            r->hgot = 0;
         } else {
             req_finish(r, NULL, 0);
         }
@@ -468,6 +509,31 @@ static int conn_send(struct dup *up, struct dconn *c, struct dreq *r) {
         up->q_sent++;
         return 0;
     }
+    if (c->h2) {
+        /* HTTP/2: вопрос — новый поток, HEADERS и DATA с END_STREAM одной записью. Ждать (1), а не
+         * отказывать, приходится при пределе потоков, объявленном сервером, и при исчерпанном окне
+         * отправки: то и другое снимается кадром сервера (закрылся чужой поток, WINDOW_UPDATE,
+         * SETTINGS), после которого conn_readable зовёт up_kick. */
+        if (c->h2_go || c->h2_next > 0x7FFFFFF0u) return 1;
+        if (c->busy >= 0 && (uint32_t)c->busy >= c->h2_maxs) return 1;
+        if (c->h2_win < r->qn || c->h2_iwin < r->qn) return 1;
+        char auth[160];
+        if (up->cfg.u.port != 443) snprintf(auth, sizeof(auth), "%s:%u", up->cfg.u.host, up->cfg.u.port);
+        else snprintf(auth, sizeof(auth), "%s", up->cfg.u.host);
+        uint8_t buf[1200 + DUP_QMAX];
+        size_t bn = h2d_request(buf, sizeof(buf), c->h2_next, auth, up->cfg.u.path, r->q, r->qn);
+        if (!bn) return -1;
+        if (conn_write(c, buf, bn) != 0) return -1;
+        r->ci = cidx(c);
+        r->sid = c->h2_next;
+        r->hgot = 0;
+        c->h2_next += 2;
+        c->h2_win -= r->qn;
+        c->busy++;
+        c->last_ms = now_ms();
+        up->q_sent++;
+        return 0;
+    }
     r->ci = cidx(c);
     if (up->cfg.u.proto == DNSP_DOH) {
         /* Порт в Host — только нестандартный (RFC 9110, 7.2), как у остальных HTTPS движка. */
@@ -516,7 +582,11 @@ static int up_conns_alive(const struct dup *up) {
 
 static int up_want_conns(const struct dup *up) {
     if (up->cfg.u.proto != DNSP_DOH) return 1;
-    /* DoH: по соединению на ожидающий вопрос, но не больше предела дескрипторов (dup_conn_limit),
+    /* h2 (или ещё не знаем, что выберет сервер): одно соединение — вопросы идут потоками по нему.
+     * Пока не знаем, не тратим рукопожатия на пачку соединений, из которых окажется нужно одно; если
+     * сервер выберет http/1.1, пул вырастет со следующего кадра диспетчера. */
+    if (up->hproto != 1) return 1;
+    /* DoH по http/1.1: по соединению на ожидающий вопрос, но не больше предела дескрипторов (dup_conn_limit),
      * и уже идущие не считаются. */
     int waiting = 0, lim = dup_conn_limit();
     for (int k = 0; k < g_req_cap; k++)
@@ -700,12 +770,31 @@ static void dial_event_cb(struct dial *d) {
     c->tls = d->tls;
     c->st = CS_READY;
     c->last_ms = now_ms();
+    c->qrx_ms = c->last_ms;
     c->busy = 0;
+    c->h2 = d->h2;
+    c->h2_go = 0;
+    c->h2_next = 1;
+    c->h2_maxs = 100;           /* до SETTINGS сервера — минимум, который RFC 9113 (6.5.2) советует
+                                 * поддерживать; настоящее число придёт кадром и заменит это */
+    c->h2_win = c->h2_iwin = H2D_WINDOW_DEFAULT;
+    if (up->cfg.u.proto == DNSP_DOH) up->hproto = d->h2 ? 2 : 1;
     up->backoff_ms = 0;
     up->retry_at_ms = 0;
     up->err[0] = '\0';
     dial_free(d);
     conn_register(c, EPOLLIN);
+    if (c->h2) {
+        uint8_t hello[64];
+        size_t hn = h2d_hello(hello, sizeof(hello));
+        if (!hn || conn_write(c, hello, hn) != 0) {
+            conn_close(c, NULL);
+            up_err(up, "HTTP/2: преамбула не ушла");
+            up_backoff(up);
+            fail_waiting(up);
+            return;
+        }
+    }
     up_kick(up);
 }
 
@@ -873,8 +962,15 @@ static void quic_start(struct dup *up, struct dconn *c, const struct sockaddr_st
         int rc = dupq_open(&cfg, &ops, c, &c->qc);
         if (rc != 0) {
             c->qc = NULL;
-            static char buf[96];
-            snprintf(buf, sizeof(buf), "соединение QUIC не открылось (код %d)", rc);
+            /* Код обёртки (src/proto/quic/quic.h, QC_E*) называем причиной: «код -3» из журнала ничего
+             * не говорил тому, кто его читает. */
+            const char *why = rc == -1 ? "неверный адрес или параметр" :
+                              rc == -2 ? "не хватило памяти" :
+                              rc == -3 ? "сокет UDP не открылся или не связался с адресом сервера" :
+                              rc == -4 ? "не создался контекст TLS (корни сертификатов)" :
+                              rc == -5 ? "ngtcp2 отказал при создании соединения" : "причина не названа";
+            static char buf[256];
+            snprintf(buf, sizeof(buf), "соединение QUIC не открылось: %s (код %d)", why, rc);
             err = buf;
         }
     }
@@ -911,7 +1007,8 @@ static struct dconn *pick_conn(struct dup *up) {
     for (int i = 0; i < up->c_n; i++) {
         struct dconn *c = CN(up, i);
         if (c->st != CS_READY) continue;
-        if (up->cfg.u.proto == DNSP_DOH) { if (!c->busy) return c; }
+        if (up->cfg.u.proto == DNSP_DOH && !c->h2) { if (!c->busy) return c; }
+        else if (c->h2 && c->h2_go) continue;
         else if (!best || c->busy < best->busy) best = c;
     }
     return best;
@@ -931,7 +1028,8 @@ static void up_kick(struct dup *up) {
     int waiting = 0;
     for (int k = 0; k < g_req_cap; k++) if (RQ(k).used && RQ(k).up == up && RQ(k).ci == -1) waiting++;
     if (!waiting) return;
-    if (quic_proto(up) && pick_conn(up)) return;   /* соединение есть, вопросы ждут потоков, а не второго */
+    /* Соединение есть, вопросы ждут потоков, а не второго соединения (DoQ; DoH по h2). */
+    if ((quic_proto(up) || (up->cfg.u.proto == DNSP_DOH && up->hproto == 2)) && pick_conn(up)) return;
     if (now_ms() < up->retry_at_ms) { fail_waiting(up); return; }
     int have = 0;
     for (int i = 0; i < up->c_n; i++)
@@ -1066,6 +1164,261 @@ static int doh_parse(struct dconn *c) {
     return 1;
 }
 
+/* ---- DoH по HTTP/2 --------------------------------------------------------------------------- */
+
+static void h2_rst(struct dconn *c, uint32_t sid, uint32_t code) {
+    uint8_t b[16], body[4] = { (uint8_t)(code >> 24), (uint8_t)(code >> 16), (uint8_t)(code >> 8), (uint8_t)code };
+    size_t n = h2d_frame_put(b, sizeof(b), H2D_RST_STREAM, 0, sid, body, 4);
+    if (n) conn_write(c, b, n);
+}
+
+static struct dreq *find_by_sid(struct dup *up, int ci, uint32_t sid) {
+    for (int k = 0; k < g_req_cap; k++) {
+        struct dreq *r = &RQ(k);
+        if (r->used && r->up == up && r->ci == ci && r->sid == (int64_t)sid) return r;
+    }
+    return NULL;
+}
+
+/* Вопрос вернуть в ожидание: сервер его не обработал (GOAWAY за пределом last_stream_id, REFUSED_STREAM)
+ * или соединение уходит. Поток на этом соединении закрыт, место в счётчике освобождается. */
+static void h2_requeue(struct dconn *c, struct dreq *r) {
+    if (c->busy > 0) c->busy--;
+    r->ci = -1;
+    r->sid = -1;
+    free(r->rx);
+    r->rx = NULL;
+    r->rxn = r->rxcap = 0;
+    r->rxfin = r->rxbad = 0;
+    r->hgot = 0;
+}
+
+static int rx_append(struct dreq *r, const uint8_t *d, size_t n) {
+    if (r->rxn + n > DOQ_MSG_MAX) return -1;            /* больше сообщения DNS не бывает */
+    if (r->rxn + n > r->rxcap) {
+        size_t cap = r->rxcap ? r->rxcap : 512;
+        while (cap < r->rxn + n) cap *= 2;
+        uint8_t *nb = realloc(r->rx, cap);
+        if (!nb) return -1;
+        r->rx = nb;
+        r->rxcap = cap;
+    }
+    if (n) memcpy(r->rx + r->rxn, d, n);
+    r->rxn += n;
+    return 0;
+}
+
+/* Ответ потока получен целиком. */
+static void h2_complete(struct dconn *c, struct dreq *r) {
+    struct dup *up = c->up;
+    r->rxfin = 1;
+    if (r->rxn >= 12 && same_question(r, r->rx, r->rxn)) {
+        c->last_ms = now_ms();
+        req_finish(r, r->rx, r->rxn);
+        return;
+    }
+    up_err(up, r->rxn < 12 ? "HTTP/2: ответ DoH пуст или короче заголовка DNS" : "ответ не на наш вопрос");
+    req_finish(r, NULL, 0);
+}
+
+/* Блок заголовков ответа (целиком). 0 — принят; -1 — блок негоден (нарушение протокола). */
+static int h2_headers(struct dconn *c, uint32_t sid, const uint8_t *blk, size_t n, int fin) {
+    struct dup *up = c->up;
+    struct dreq *r = find_by_sid(up, cidx(c), sid);
+    int st = h2d_status(blk, n);
+    if (st < 0) return -1;
+    if (!r) return 0;                                   /* поток уже закрыт нашей стороной */
+    if (st == 0) {                                      /* трейлеры: тело кончилось, больше ничего */
+        if (r->hgot && fin) h2_complete(c, r);
+        return 0;
+    }
+    if (st < 200) return 0;                             /* 1xx: настоящий ответ впереди */
+    if (st != 200) {
+        /* Причина отказа сервера доходит до dns-log как есть. Раньше она терялась в общем «нет
+         * ответа за N мс» (dup_tick перезаписывал error). Quad9 на HTTP/1.1 — 505. */
+        up_err(up, "HTTP %d от сервера", st);
+        r->rxfin = fin;
+        req_finish(r, NULL, 0);
+        return 0;
+    }
+    r->hgot = 1;
+    if (fin) h2_complete(c, r);
+    return 0;
+}
+
+/* Разбор накопленных в c->rb кадров. 0 — разобрано (осталась неполная часть); -1 — соединение закрыто
+ * (нарушение протокола или GOAWAY без вопросов), c больше не трогать. */
+static int h2_frames(struct dconn *c) {
+    struct dup *up = c->up;
+    size_t off = 0;
+    uint64_t owed = 0;
+    const char *bad = NULL;
+    char nb[24];
+    for (;;) {
+        struct h2d_frame f;
+        int fr = h2d_next(c->rb + off, c->rn - off, &f);
+        if (fr < 0) { bad = "кадр длиннее 16 КиБ"; break; }
+        if (!fr) break;
+        const uint8_t *b = f.body;
+        /* Блок заголовков, начатый HEADERS без END_HEADERS, продолжают только CONTINUATION того же
+         * потока (RFC 9113, 6.10). */
+        if (c->hb && (f.type != H2D_CONTINUATION || f.sid != c->hb_sid)) { bad = "блок заголовков прерван"; break; }
+        switch (f.type) {
+        case H2D_SETTINGS: {
+            if (f.flags & H2D_F_ACK) break;
+            if (f.sid || f.len % 6) { bad = "SETTINGS неверной формы"; break; }
+            for (size_t i = 0; i + 6 <= f.len; i += 6) {
+                unsigned id = ((unsigned)b[i] << 8) | b[i + 1];
+                uint32_t v = ((uint32_t)b[i + 2] << 24) | ((uint32_t)b[i + 3] << 16) | ((uint32_t)b[i + 4] << 8) | b[i + 5];
+                if (id == H2D_S_MAX_CONCURRENT_STREAMS) c->h2_maxs = v;
+                else if (id == H2D_S_INITIAL_WINDOW_SIZE) {
+                    if (v > 0x7FFFFFFFu) { bad = "начальное окно больше 2^31-1"; break; }
+                    c->h2_iwin = v;
+                }
+            }
+            if (bad) break;
+            uint8_t ack[9];
+            size_t an = h2d_frame_put(ack, sizeof(ack), H2D_SETTINGS, H2D_F_ACK, 0, NULL, 0);
+            if (an) conn_write(c, ack, an);
+            break;
+        }
+        case H2D_PING:
+            if (f.sid || f.len != 8) { bad = "PING неверной формы"; break; }
+            if (!(f.flags & H2D_F_ACK)) {
+                uint8_t pong[17];
+                size_t pn = h2d_frame_put(pong, sizeof(pong), H2D_PING, H2D_F_ACK, 0, b, 8);
+                if (pn) conn_write(c, pong, pn);
+            }
+            break;
+        case H2D_GOAWAY: {
+            if (f.sid || f.len < 8) { bad = "GOAWAY неверной формы"; break; }
+            uint32_t last = (((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3]) & 0x7FFFFFFFu;
+            uint32_t code = ((uint32_t)b[4] << 24) | ((uint32_t)b[5] << 16) | ((uint32_t)b[6] << 8) | b[7];
+            c->h2_go = 1;
+            /* Потоки за last_stream_id сервер не обрабатывал: их вопросы уходят на новое соединение,
+             * попытка не считается. Остальные дорабатывают на этом. */
+            for (int k = 0; k < g_req_cap; k++) {
+                struct dreq *r = &RQ(k);
+                if (r->used && r->up == up && r->ci == cidx(c) && r->sid > (int64_t)last) h2_requeue(c, r);
+            }
+            if (code != H2D_E_NO_ERROR)
+                up_err(up, "HTTP/2: сервер закрывает соединение (GOAWAY, %s)", h2d_errname(code, nb, sizeof(nb)));
+            break;
+        }
+        case H2D_RST_STREAM: {
+            if (!f.sid || f.len != 4) { bad = "RST_STREAM неверной формы"; break; }
+            uint32_t code = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
+            struct dreq *r = find_by_sid(up, cidx(c), f.sid);
+            if (!r) break;
+            if (code == H2D_E_REFUSED_STREAM && r->tries < 1) {
+                r->tries++;                             /* сервер вопрос не принял: повтор, один раз */
+                h2_requeue(c, r);
+                break;
+            }
+            up_err(up, "HTTP/2: сервер сбросил поток (%s)", h2d_errname(code, nb, sizeof(nb)));
+            r->rxfin = 1;
+            req_finish(r, NULL, 0);
+            break;
+        }
+        case H2D_WINDOW_UPDATE: {
+            if (f.len != 4) { bad = "WINDOW_UPDATE неверной формы"; break; }
+            uint32_t inc = (((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3]) & 0x7FFFFFFFu;
+            if (!f.sid) {
+                if (!inc || c->h2_win + inc > 0x7FFFFFFF) { bad = "WINDOW_UPDATE выводит окно за предел"; break; }
+                c->h2_win += inc;
+            }                                           /* окно потока: тело вопроса всегда меньше начального */
+            break;
+        }
+        case H2D_HEADERS:
+        case H2D_CONTINUATION: {
+            size_t o = 0, pad = 0;
+            if (!f.sid || (f.type == H2D_CONTINUATION && !c->hb)) { bad = "заголовки без потока"; break; }
+            if (f.type == H2D_HEADERS) {
+                if (f.flags & H2D_F_PADDED) { if (!f.len) { bad = "HEADERS короче набивки"; break; } pad = b[0]; o = 1; }
+                if (f.flags & H2D_F_PRIORITY) o += 5;
+            }
+            if (o + pad > f.len) { bad = "HEADERS короче набивки"; break; }
+            const uint8_t *frag = b + o;
+            size_t fl = f.len - o - pad;
+            int fin = f.type == H2D_HEADERS ? (f.flags & H2D_F_END_STREAM) != 0 : c->hb_fin;
+            uint32_t sid = f.sid;
+            if (f.flags & H2D_F_END_HEADERS) {
+                int rc;
+                if (c->hb) {                            /* последний кусок составного блока */
+                    uint8_t *nbuf = realloc(c->hb, c->hbn + fl + 1);
+                    if (!nbuf) { bad = "нет памяти"; break; }
+                    c->hb = nbuf;
+                    memcpy(c->hb + c->hbn, frag, fl);
+                    c->hbn += fl;
+                    rc = h2_headers(c, sid, c->hb, c->hbn, fin);
+                    free(c->hb);
+                    c->hb = NULL;
+                    c->hbn = 0;
+                } else {
+                    rc = h2_headers(c, sid, frag, fl, fin);
+                }
+                if (rc < 0) bad = "блок заголовков не разобрался (HPACK)";
+            } else {
+                if (c->hbn + fl > 65536) { bad = "блок заголовков слишком велик"; break; }
+                uint8_t *nbuf = realloc(c->hb, c->hbn + fl + 1);
+                if (!nbuf) { bad = "нет памяти"; break; }
+                c->hb = nbuf;
+                memcpy(c->hb + c->hbn, frag, fl);
+                c->hbn += fl;
+                c->hb_sid = sid;
+                if (f.type == H2D_HEADERS) c->hb_fin = fin;
+            }
+            break;
+        }
+        case H2D_DATA: {
+            if (!f.sid) { bad = "DATA без потока"; break; }
+            size_t o = 0, pad = 0;
+            if (f.flags & H2D_F_PADDED) { if (!f.len) { bad = "DATA короче набивки"; break; } pad = b[0]; o = 1; }
+            if (o + pad > f.len) { bad = "DATA короче набивки"; break; }
+            owed += f.len;                              /* окно соединения возвращается за весь кадр */
+            struct dreq *r = find_by_sid(up, cidx(c), f.sid);
+            if (!r) break;
+            if (!r->hgot) { bad = "DATA раньше заголовков"; break; }
+            if (rx_append(r, b + o, f.len - o - pad) != 0) {
+                up_err(up, "HTTP/2: ответ DoH длиннее сообщения DNS");
+                req_finish(r, NULL, 0);                 /* rxfin не выставлен: поток будет сброшен */
+                break;
+            }
+            if (f.flags & H2D_F_END_STREAM) h2_complete(c, r);
+            break;
+        }
+        case H2D_PUSH_PROMISE:
+            bad = "PUSH_PROMISE при выключенном push";
+            break;
+        default:
+            break;                                      /* PRIORITY и неизвестные типы — мимо (RFC 9113, 4.1) */
+        }
+        if (bad) break;
+        if (c->st != CS_READY || !c->rb) return -1;     /* обратный вызов закрыл соединение */
+        off += f.total;
+    }
+    if (bad) {
+        up_err(up, "HTTP/2: %s", bad);
+        conn_close(c, NULL);
+        return -1;
+    }
+    if (off) {
+        memmove(c->rb, c->rb + off, c->rn - off);
+        c->rn -= off;
+    }
+    /* Окно приёма соединения — 65535, и без возврата оно кончилось бы через сотню ответов. Возвращаем
+     * сразу всё принятое: буфера под данные мы не держим (тело потока копится в вопросе). */
+    while (owed) {
+        uint32_t inc = owed > 0x7FFFFFFFu ? 0x7FFFFFFFu : (uint32_t)owed;
+        uint8_t wu[13], body[4] = { (uint8_t)(inc >> 24), (uint8_t)(inc >> 16), (uint8_t)(inc >> 8), (uint8_t)inc };
+        size_t wn = h2d_frame_put(wu, sizeof(wu), H2D_WINDOW_UPDATE, 0, 0, body, 4);
+        if (wn) conn_write(c, wu, wn);
+        owed -= inc;
+    }
+    if (c->h2_go && !c->busy) { conn_close(c, NULL); return -1; }
+    return 0;
+}
+
 static void conn_readable(struct dconn *c) {
     struct dup *up = c->up;
     if (c->st == CS_TCPCONN) {
@@ -1098,7 +1451,10 @@ static void conn_readable(struct dconn *c) {
                 memcpy(c->rb + c->rn, pl, got);
                 c->rn += got;
             }
-            if (up->cfg.u.proto == DNSP_DOH) {
+            if (got) c->qrx_ms = now_ms();
+            if (c->h2) {
+                if (c->rn && h2_frames(c) != 0) { up_kick(up); return; }
+            } else if (up->cfg.u.proto == DNSP_DOH) {
                 if (c->rn) {
                     int pr = doh_parse(c);
                     if (pr < 0) { conn_close(c, NULL); return; }
@@ -1448,10 +1804,16 @@ void dup_tick(void) {
         }
         if (now < r->deadline) continue;
         int ci = r->ci;
-        up_err(up, "нет ответа за %d мс", DUP_REQ_MS);
+        /* Причина, названная сервером или соединением после ухода вопроса (HTTP 505, сброс потока,
+         * отказ TLS), полезнее общего «нет ответа»: её и оставляем в last_error. */
+        if (!(up->err[0] && up->err_ms >= r->t0)) up_err(up, "нет ответа за %d мс", DUP_REQ_MS);
+        int silent = ci >= 0 && ci < up->c_n && CN(up, ci)->qrx_ms <= r->t0;
         req_finish(r, NULL, 0);
         if (ci >= 0 && CN(up, ci)->st == CS_READY) {
-            if (up->cfg.u.proto == DNSP_DOH) conn_close(CN(up, ci), NULL);
+            /* HTTP/2: остальные потоки живы, поток брошенного вопроса req_finish сбросил; соединение
+             * рвём, только если с ухода вопроса от сервера не пришло ни байта (мёртвый путь). */
+            if (up->cfg.u.proto == DNSP_DOH && CN(up, ci)->h2) { if (silent) conn_close(CN(up, ci), NULL); }
+            else if (up->cfg.u.proto == DNSP_DOH) conn_close(CN(up, ci), NULL);
             else if (!quic_proto(up) && CN(up, ci)->busy > 0) CN(up, ci)->busy--;   /* у DoQ — req_finish */
         }
     }
@@ -1561,6 +1923,9 @@ void dup_render(FILE *f) {
         } else {
             fputs("null,\"error_ago\":null", f);
         }
+        /* DoH: по какому HTTP говорит сервер (выбор ALPN при последнем соединении). */
+        if (up->cfg.u.proto == DNSP_DOH && up->hproto)
+            fprintf(f, ",\"http\":\"%s\"", up->hproto == 2 ? "h2" : "http/1.1");
         fputc('}', f);
     }
 }

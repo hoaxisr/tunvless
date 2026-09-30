@@ -16,9 +16,9 @@
  *   2. connect с меткой пути (SO_MARK) — по адресам по очереди, в пределах срока.
  *   3. ClientHello (reality_build_hello_carry в режиме plain — тот же облик, что у остального TLS
  *      движка), tls13_handshake_auth: цепочка проверяется до корней (sc_chain_verify) и имя — по
- *      SNI. Для DoH в ALPN предлагается только http/1.1 (носитель alpn_http11); у DoT Hello — как у
- *      остального TLS движка, с обычной парой ALPN «h2, http/1.1»: сервер DoT (RFC 7858) ALPN не
- *      требует и его не проверяет (dnsproxy — проверено стендом tests/doqup.sh).
+ *      SNI. ALPN — обычная пара «h2, http/1.1»: у DoH сервер выбирает HTTP/2 или HTTP/1.1
+ *      (d->h2 сообщает выбор циклу), сервер DoT (RFC 7858) ALPN не требует и его не проверяет
+ *      (dnsproxy — проверено стендом tests/doqup.sh).
  *   4. Сокет — обратно неблокирующий; поток пишет в wfd байт и больше структуры не касается.
  *
  * TLS в сборке может не быть (статический steerd без пакета TLS, мини-сборка): функции TLS здесь
@@ -318,18 +318,21 @@ static void dial_run(struct dial *d) {
     /* 3. TLS. */
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
     set_timeo(fd, deadline);
-    struct reality_cfg cfg = { .sni = d->u.host, .alpn = d->doh ? "http/1.1" : NULL, .plain = 1 };
+    /* ALPN — обычная пара «h2, http/1.1», как у остального TLS движка и у DoT. Выбор за сервером: h2
+     * ведёт мультиплексный клиент в dup.c (doh2.c), http/1.1 — прежний разбор. Так надо потому, что
+     * RFC 8484 требует от сервера DoH поддержки HTTP/2, а HTTP/1.1 — нет: Quad9 на HTTP/1.1 отвечает
+     * 505. Раньше DoH предлагал ТОЛЬКО http/1.1 (носитель alpn_http11) и отказывал серверу, выбравшему
+     * h2; работали лишь серверы, знающие один HTTP/1.1.
+     *
+     * Расширение ALPS из Hello DoH убрано (no_alps): dns.google, выбрав h2, принимал его и ждал от
+     * клиента блок настроек приложения, которого у нас нет, — и рвал рукопожатие оповещением
+     * unexpected_message до первого кадра (подробнее в reality.h). У DoT сервер h2 не выбирает,
+     * поэтому его Hello остаётся байт в байт прежним. */
+    struct reality_cfg cfg = { .sni = d->u.host, .alpn = NULL, .plain = 1 };
+    struct reality_carrier car = { .no_alps = 1 };
     struct reality_state rst;
     unsigned char hello[2048];
     size_t hello_n = 0;
-    /* DoH просит в ALPN ТОЛЬКО http/1.1: соединение — HTTP/1.1, и сервер, выбравший h2 (а Go, nginx,
-     * Google и Cloudflare выбирают его первым, если он предложен), получил бы от нас запрос не на
-     * том протоколе. Поле reality_cfg.alpn на обычный TLS не действует (это ALPN для grpc/xhttp
-     * Reality) — предложение ALPN задаёт носитель alpn_http11, как у веб-сокета в trsec.c. Раньше
-     * Hello DoH нёс обычную пару «h2, http/1.1», и проверка ниже («сервер выбрал h2») отказывала
-     * каждому серверу, что умеет h2: работал только тот, кто h2 не знает (сервер стенда dnsup). У DoT
-     * носителя нет, его Hello не меняется. */
-    struct reality_carrier car = { .alpn_http11 = 1 };
     if (reality_build_hello_carry(&cfg, &rst, d->doh ? &car : NULL, hello, sizeof(hello), &hello_n) != 0 ||
         write_all(fd, hello, hello_n) != 0) {
         snprintf(d->err, sizeof(d->err), "ClientHello не ушёл");
@@ -350,8 +353,9 @@ static void dial_run(struct dial *d) {
         close(fd);
         return;
     }
-    if (d->doh && t->alpn[0] && strcmp(t->alpn, "http/1.1") != 0) {
-        snprintf(d->err, sizeof(d->err), "сервер выбрал протокол %.20s вместо http/1.1", t->alpn);
+    d->h2 = d->doh && strcmp(t->alpn, "h2") == 0;
+    if (d->doh && t->alpn[0] && !d->h2 && strcmp(t->alpn, "http/1.1") != 0) {
+        snprintf(d->err, sizeof(d->err), "сервер выбрал протокол %.20s вместо h2 или http/1.1", t->alpn);
         tls13_free(t);
         free(t);
         close(fd);
