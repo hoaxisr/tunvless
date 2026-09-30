@@ -106,15 +106,15 @@ jobs:
           fi
           # Ожидаемое число считается из самого build.sh, а не вписано сюда числом:
           # список архитектур меняется, и константа разошлась бы с ним молча. На каждую
-          # архитектуру восемь пакетов (с 1.10, шаг 4): libsteer-wolfssl, libsteer, steer, модули
-          # steer-vless, steer-xsteer, steer-obfs, steer-tgws и мета-пакет steer-extended — и это
-          # в КАЖДОМ из двух форматов.
+          # архитектуру семь пакетов: steer-core (ядро с общими библиотеками), модули steer-vless,
+          # steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2 и мета-пакет steer-extended —
+          # и это в КАЖДОМ из двух форматов.
           arch_n=$(sed -n '/^ISAS="/,/^"$/p' build.sh | grep -c '^[a-z0-9_.-]*:')
-          want=$((arch_n * 8))
+          want=$((arch_n * 7))
           for ext in apk ipk; do
             n=$(ls out/*."$ext" 2>/dev/null | wc -l)
             [ "$n" -eq "$want" ] || {
-              echo "::error::пакетов .$ext — $n, а ожидалось $want (архитектур $arch_n × 8)"
+              echo "::error::пакетов .$ext — $n, а ожидалось $want (архитектур $arch_n × 7)"
               ls -la out/ 2>/dev/null
               exit 1; }
             echo "собрано .$ext: $n из $want ожидаемых"
@@ -268,14 +268,17 @@ jobs:
             **Какой пакет брать.** Имя файла содержит архитектуру — ту же, что показывает
             `apk --print-arch` на роутере.
 
-            * `steer-*` — ядро: каналы, наборы адресов, доменные списки с fake-IP, failover
-              между устройствами. Ему нужны `libsteer` и `libsteer-wolfssl` (общие библиотеки).
+            * `steer-core-*` — ядро: каналы, наборы адресов, доменные списки с fake-IP, failover
+              между устройствами, общая криптография (библиотеки `libsteer` и `libsteer-wolfssl`
+              лежат внутри пакета). Заменяет прежние пакеты `steer`, `libsteer` и `libsteer-wolfssl`.
             * `steer-vless-*`, `steer-xsteer-*` — клиенты туннелей (VLESS/Reality с Vision,
               транспортами tcp/grpc/xhttp/ws/httpupgrade; звезда xsteer) — отдельные модули.
               Нужны, только если туннель поднимает сам движок; для готового wireguard или
               amneziawg достаточно ядра.
-            * `steer-obfs-*` (обфускатор WireGuard) и `steer-tgws-*` (мост Telegram) — модули.
-            * `steer-extended-*` — мета-пакет: ядро и все четыре модуля разом.
+            * `steer-obfs-*` (обфускатор WireGuard), `steer-tgws-*` (мост Telegram) и
+              `steer-hysteria2-*` (клиент hysteria2) — модули.
+            * `steer-extended-*` — устаревший мета-пакет: ядро и модули vless, xsteer, obfs, tgws
+              (без hysteria2). Взамен — `steer-core` и нужные модули.
 
             Модуль должен быть той же версии, что ядро (менеджер пакетов следит сам).
 
