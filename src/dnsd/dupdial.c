@@ -14,10 +14,11 @@
  *      если срок не вышел; иначе bootstrap. Если bootstrap не ответил, а прежние адреса есть, —
  *      прежние (устаревший адрес лучше отказа: серверы DNS меняют адреса раз в годы).
  *   2. connect с меткой пути (SO_MARK) — по адресам по очереди, в пределах срока.
- *   3. ClientHello (reality_build_hello в режиме plain — тот же облик, что у остального TLS
+ *   3. ClientHello (reality_build_hello_carry в режиме plain — тот же облик, что у остального TLS
  *      движка), tls13_handshake_auth: цепочка проверяется до корней (sc_chain_verify) и имя — по
- *      SNI. Для DoH ALPN http/1.1, для DoT ALPN нет (RFC 7858 его не требует, а лишнее расширение
- *      строгие серверы отвергают).
+ *      SNI. Для DoH в ALPN предлагается только http/1.1 (носитель alpn_http11); у DoT Hello — как у
+ *      остального TLS движка, с обычной парой ALPN «h2, http/1.1»: сервер DoT (RFC 7858) ALPN не
+ *      требует и его не проверяет (dnsproxy — проверено стендом tests/doqup.sh).
  *   4. Сокет — обратно неблокирующий; поток пишет в wfd байт и больше структуры не касается.
  *
  * TLS в сборке может не быть (статический steerd без пакета TLS, мини-сборка): функции TLS здесь
@@ -44,15 +45,16 @@ extern const char *tls_cert_roots(void) __attribute__((weak));
 extern int tls13_handshake_auth(struct tls13 *t, int fd, const unsigned char *client_hello,
                                 size_t hello_n, const unsigned char *shared_secret,
                                 const struct tls13_auth *auth) __attribute__((weak));
-extern int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
-                               unsigned char *out, size_t out_n, size_t *out_len) __attribute__((weak));
+extern int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_state *st,
+                                     const struct reality_carrier *car, unsigned char *out, size_t out_n,
+                                     size_t *out_len) __attribute__((weak));
 extern void tls13_free(struct tls13 *t) __attribute__((weak));
 extern int tls13_write(struct tls13 *t, const unsigned char *data, size_t n) __attribute__((weak));
 extern const char *tls_cert_roots(void) __attribute__((weak));
 extern const char *tls13_verify_reason(void) __attribute__((weak));
 
 int dup_have_tls(void) {
-    return tls13_handshake_auth && reality_build_hello && tls13_free && tls13_write;
+    return tls13_handshake_auth && reality_build_hello_carry && tls13_free && tls13_write;
 }
 
 const char *g_dup_ca_file;
@@ -320,7 +322,15 @@ static void dial_run(struct dial *d) {
     struct reality_state rst;
     unsigned char hello[2048];
     size_t hello_n = 0;
-    if (reality_build_hello(&cfg, &rst, hello, sizeof(hello), &hello_n) != 0 ||
+    /* DoH просит в ALPN ТОЛЬКО http/1.1: соединение — HTTP/1.1, и сервер, выбравший h2 (а Go, nginx,
+     * Google и Cloudflare выбирают его первым, если он предложен), получил бы от нас запрос не на
+     * том протоколе. Поле reality_cfg.alpn на обычный TLS не действует (это ALPN для grpc/xhttp
+     * Reality) — предложение ALPN задаёт носитель alpn_http11, как у веб-сокета в trsec.c. Раньше
+     * Hello DoH нёс обычную пару «h2, http/1.1», и проверка ниже («сервер выбрал h2») отказывала
+     * каждому серверу, что умеет h2: работал только тот, кто h2 не знает (сервер стенда dnsup). У DoT
+     * носителя нет, его Hello не меняется. */
+    struct reality_carrier car = { .alpn_http11 = 1 };
+    if (reality_build_hello_carry(&cfg, &rst, d->doh ? &car : NULL, hello, sizeof(hello), &hello_n) != 0 ||
         write_all(fd, hello, hello_n) != 0) {
         snprintf(d->err, sizeof(d->err), "ClientHello не ушёл");
         close(fd);
