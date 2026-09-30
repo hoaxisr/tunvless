@@ -340,26 +340,46 @@ check "барьер релиза считает архитектуры тем ж
 # их никто не обновит. Пакет собирается в обоих форматах из одного дерева файлов, и
 # забыть один формат легко — он ничего не ломает в сборке, просто половина устройств
 # остаётся без пакета. Поэтому оба вида упаковки сверяются здесь по составу.
-# С шага 4 выпуска 1.10 пакетов на архитектуру восемь (libsteer-wolfssl, libsteer, steer, четыре
-# модуля и мета-пакет steer-extended), и обе упаковки для всех идут через ОДНУ функцию pack
-# в build.sh (apk mkpkg и mk_ipk из одного дерева): забыть формат у одного пакета из восьми
-# нельзя, не забыв его у всех. Поэтому сверяется, что каждый пакет упаковывается и что функция
-# зовёт оба формата.
-for pkg in libsteer-wolfssl libsteer steer steer-extended; do
+# Пакетов на архитектуру семь (steer-core, пять модулей и мета-пакет steer-extended), и обе
+# упаковки для всех идут через ОДНУ функцию pack в build.sh (apk mkpkg и mk_ipk из одного
+# дерева): забыть формат у одного пакета из семи нельзя, не забыв его у всех. Поэтому
+# сверяется, что каждый пакет упаковывается и что функция зовёт оба формата.
+for pkg in steer-core steer-extended; do
     check "build.sh упаковывает $pkg" "1" "$(grep -c "^ *pack $pkg " build.sh)"
 done
+# Раскладка: библиотеки — внутри steer-core, отдельных пакетов libsteer и libsteer-wolfssl нет
+# (иначе у ядра и у библиотек снова было бы по имени, которое надо держать в одной версии).
+check "отдельных пакетов библиотек нет" "0" \
+    "$(grep -c '^ *pack libsteer' build.sh)"
+check "обе библиотеки кладутся в корень steer-core" "1" \
+    "$(grep -c 'cp "\$libs"/libsteer.so.\* "\$libs"/libsteer-wolfssl.so.\* "\$root/usr/lib/"' build.sh)"
+check "модуль не несёт библиотек ядра" "0" \
+    "$(sed -n '/^    for m in vless xsteer/,/^    done/p' build.sh | grep -c 'libsteer')"
+# Миграция со старых пакетов: provides и replaces имени steer, конфликт с steer, libsteer и
+# libsteer-wolfssl — в обоих форматах (apk: `!имя` в depends, opkg: Conflicts).
+check "steer-core заменяет и вытесняет steer, libsteer, libsteer-wolfssl" "1" \
+    "$(grep -c 'steer "steer libsteer libsteer-wolfssl" "steer libsteer libsteer-wolfssl"$' build.sh)"
+check "pack пишет конфликты как !имя (apk) и Conflicts (opkg)" "1 1" \
+    "$(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c '_dall="\$_dall !\$_c"') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c "Conflicts: ")"
+check "pack пишет Replaces и Provides в обоих форматах" "1 1 1 1" \
+    "$(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c -- '--info replaces:') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c -- '--info provides:') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c 'Replaces: ') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c 'Provides: ')"
 check "build.sh упаковывает модули по кругу vless xsteer obfs tgws hysteria2" "1 1" \
     "$(grep -c '^ *pack "steer-\$m" ' build.sh) $(grep -c '^    for m in vless xsteer obfs tgws hysteria2; do' build.sh)"
 check "pack зовёт apk mkpkg и mk_ipk из одного дерева" "1 1" \
     "$(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c 'apk mkpkg') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c 'mk_ipk ')"
-# Мета-пакет steer-extended ставит ядро и ВСЕ модули (имя ждёт splify2), а модули зависят от ядра.
+# Мета-пакет steer-extended ставит ядро и четыре модуля (имя ждёт splify2, пакет устарел), а
+# модули зависят от ядра.
 check "steer-extended зависит от ядра и четырёх модулей" "1" \
-    "$(grep -c 'pack steer-extended "\$xroot" "steer steer-vless steer-xsteer steer-obfs steer-tgws"' build.sh)"
+    "$(grep -c 'pack steer-extended "\$xroot" "steer-core steer-vless steer-xsteer steer-obfs steer-tgws"' build.sh)"
+check "steer-extended помечен устаревшим в описании" "1" \
+    "$(grep -A1 'pack steer-extended' build.sh | grep -c 'steer-extended (устарел')"
 # steer-hysteria2 — отдельный пакет: мета-пакет его не ставит (решение владельца), и вид без модуля
 # отвечает «требует пакет steer-hysteria2», а не отсылкой к steer-extended.
 check "steer-extended не включает steer-hysteria2" "0" \
     "$(grep 'pack steer-extended' build.sh | grep -c hysteria2)"
-check "модули зависят от steer" "1" "$(grep -c 'mdeps="steer \$(pkg_deps' build.sh)"
+check "модули зависят от steer-core" "1" "$(grep -c 'mdeps="steer-core \$(pkg_deps' build.sh)"
+check "список наших пакетов — новая раскладка (steer-core, модули, мета)" "1" \
+    "$(grep -c '^OURS=" steer-core steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steer-extended "$' build.sh)"
 # Зависимости между нашими пакетами — точной версии (формат линии событий и ABI libsteer между
 # выпусками не обещаны).
 check "наши пакеты зависят друг от друга точной версией (apk и opkg)" "1 1" \
@@ -727,9 +747,11 @@ check "модуль с TUN добавляет kmod-tun" "kmod-tun" "$(pkg_deps "
 check "обычный модуль системных зависимостей не имеет" "" "$(pkg_deps "$dtmp/static" mod)"
 check "статическая сборка НЕ требует пакета библиотеки" \
     "" "$(pkg_deps "$dtmp/static" tun | grep -o 'libsteer\|libwolfssl')"
-check "связанная с libsteer сборка требует её" \
-    "nftables ip-full conntrack kmod-nft-queue libsteer" "$(pkg_deps "$dtmp/shared" core)"
-check "  и модуль с TUN — тоже" "kmod-tun libsteer" "$(pkg_deps "$dtmp/shared" tun)"
+# Библиотеки лежат в steer-core, отдельного пакета нет: связанный с libsteer.so бинарник (в
+# каком бы виде) отдельной зависимости от библиотеки не получает — её даёт steer-core.
+check "связанная с libsteer сборка отдельной зависимости от библиотеки не имеет" \
+    "nftables ip-full conntrack kmod-nft-queue" "$(pkg_deps "$dtmp/shared" core)"
+check "  и модуль с TUN — тоже" "kmod-tun" "$(pkg_deps "$dtmp/shared" tun)"
 check "системная libwolfssl зависимостью не становится" \
     "nftables ip-full conntrack kmod-nft-queue" "$(pkg_deps "$dtmp/system" core)"
 rm -rf "$dtmp"
@@ -739,7 +761,7 @@ rm -rf "$dtmp"
 # собранным ровно так же, как .apk с новым. Поэтому проверяется, что и там и там подставлена
 # ОДНА переменная (`$_dp` в pack), которую преобразуют dep_apk и dep_ipk, а не литерал.
 check "apk берёт зависимости через dep_apk из одной переменной" "1" \
-    "$(grep -c 'depends:.\$(dep_apk "\$_dp")' build.sh)"
+    "$(grep -c '_dall="\$(dep_apk "\$_dp")"' build.sh)"
 check "opkg берёт зависимости через dep_ipk из той же переменной" "1" \
     "$(grep -c 'mk_ipk "\$_r" "\$_n" "\$arch" "\$(dep_ipk "\$_dp")"' build.sh)"
 check "литералов зависимостей в упаковке не осталось" "" \

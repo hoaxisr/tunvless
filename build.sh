@@ -197,41 +197,30 @@ fi
 #                        больше не пересматривает — и запрет on_fail=drop до него не
 #                        доходит (H-110, R-096). Предупреждение в журнале читают редко,
 #                        а зависимость проверяет менеджер пакетов при установке.
-#   libsteer           — ТОЛЬКО когда бинарник связан с разделяемой libsteer.so (шаг 4 выпуска
-#                        1.10); libsteer-wolfssl подтягивает уже она сама, своей зависимостью.
 #   kmod-tun           — модулям, которые сами создают TUN (steer-vless, steer-xsteer).
 #
-# Про библиотеки важно, что зависимость выводится ИЗ БИНАРНИКА, а не приписывается пакету
-# списком: статический файл без пакета работает, связанный с .so — не запустится ни одной
-# командой, и список «пакет зависит от библиотеки» был бы ложью в первом случае и правдой во
-# втором. Проверка самого файла верна в обоих и не требует помнить, каким рецептом он собран.
-#
-# Ищется SONAME в самом файле: у статического бинарника строки «libsteer.so.» нет — она
-# появляется только записью DT_NEEDED, которую пишет линковщик. readelf для этого не нужен (его нет
-# ни в alpine по умолчанию, ни на машине сборщика гарантированно), а grep -a по бинарнику есть
-# везде. Системный libwolfssl OpenWrt сюда не подходит нарочно: его SONAME несёт хеш опций и
-# меняется с каждым обновлением, а QUIC в нём нет.
+# Библиотек среди зависимостей нет: libsteer.so и libsteer-wolfssl.so лежат ВНУТРИ пакета
+# steer-core (у них один владелец и один срок жизни с движком), а модули, связанные с ними по
+# DT_NEEDED, получают их зависимостью от steer-core. Системный libwolfssl OpenWrt тут не
+# подходит нарочно: его SONAME несёт хеш опций и меняется с каждым обновлением, а QUIC в нём нет.
 pkg_deps() {  # ФАЙЛ_БИНАРНИКА ВИД (core|mod|tun) -> "nftables ip-full ..." через пробел
     case "$2" in
         core) _pd="nftables ip-full conntrack kmod-nft-queue" ;;
         tun)  _pd="kmod-tun" ;;
         *)    _pd="" ;;
     esac
-    if grep -aq 'libsteer\.so\.' "$1" 2>/dev/null; then
-        _pd="$_pd libsteer"
-    fi
     printf '%s' "$_pd"
 }
 
 # ---- зависимости между НАШИМИ пакетами: точная версия --------------------------------
 #
 # Формат событий между движком и модулями, ABI libsteer и раскладка libsteer-wolfssl между
-# выпусками не обещаются (шаг 4 выпуска 1.10), поэтому модуль той же версии, что движок, — не
-# пожелание, а условие: `steer-vless (= версия)`, `libsteer (= версия)`. Менеджер пакетов не даст
+# выпусками не обещаются, поэтому модуль той же версии, что движок, — не
+# пожелание, а условие: `steer-vless` зависит от `steer-core (= версия)`. Менеджер пакетов не даст
 # обновить один, оставив другой (apk — `имя=версия`, opkg — `имя (= версия)`). Чужие пакеты
 # (nftables, kmod-…) остаются без версии. Демон дополнительно проверяет версию при запуске модуля
 # (hello, docs/ctl.md) — на случай установки файлами мимо менеджера.
-OURS=" steer libsteer libsteer-wolfssl steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steer-extended "
+OURS=" steer-core steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steer-extended "
 dep_apk() {  # ИМЕНА через пробел -> "имя=версия ..." для наших
     for _d in $1; do
         case "$OURS" in *" $_d "*) printf '%s=%s-r1 ' "$_d" "$VERSION" ;; *) printf '%s ' "$_d" ;; esac
@@ -377,29 +366,41 @@ for spec in $ISAS; do
 
     # ---- пакеты ---------------------------------------------------------------------------
     #
-    # Шесть пакетов и один мета-пакет на архитектуру (шаг 4 выпуска 1.10, docs/architecture.md,
-    # «Сборки»):
+    # Пять пакетов модулей, ядро и один мета-пакет на архитектуру (docs/architecture.md, «Сборки»):
     #
-    #   libsteer-wolfssl   наша wolfSSL (QUIC включён заранее, см. build/wolfssl) как .so;
-    #   libsteer           libsteer.so.<версия>: модель, виды, TLS, транспорты, стек, слой
-    #                      криптографии; зависит от libsteer-wolfssl;
-    #   steer              ядро: steerd на общих библиотеках, клиент steer, init-скрипт, обработчик
-    #                      обхода; зависит от libsteer (и через неё от libsteer-wolfssl);
-    #   steer-vless, steer-xsteer, steer-obfs, steer-tgws
-    #                      по бинарнику модуля; зависят от steer и libsteer ТОЧНОЙ версии;
-    #   steer-extended     мета-пакет из прежних времён: ставит ядро и все четыре модуля. Имя
-    #                      сохранено, потому что его ставит splify2 (`steer_install`) и читает
-    #                      определение вида пакета; замена базового пакета (provides/replaces)
-    #                      ему больше не нужна — у файлов ядра один владелец, пакет steer.
+    #   steer-core         ядро и общая крипта: steerd на общих библиотеках, клиент steer,
+    #                      libsteer.so.<версия> (модель, виды, TLS, транспорты, стек, слой
+    #                      криптографии), libsteer-wolfssl.so.<версия wolfSSL> (наша wolfSSL,
+    #                      QUIC включён заранее, см. build/wolfssl), init-скрипт, обработчик обхода,
+    #                      hotplug, keep.d. dnsd — подкоманда steerd, своего файла у него нет;
+    #   steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2
+    #                      по одному бинарнику модуля; зависят от steer-core ТОЧНОЙ версии и ничего
+    #                      из файлов ядра не повторяют;
+    #   steer-extended     мета-пакет на переход: ядро и модули vless, xsteer, obfs, tgws (без
+    #                      hysteria2). Его по имени ставит splify2 (`steer_install`); уйдёт,
+    #                      когда splify2 начнёт ставить steer-core и модули сам.
     #
-    # Ядро зависит от libsteer и libsteer-wolfssl, а не только от libsteer: steerd сам ходит по
-    # HTTPS (замер групп, urltls; в 1.11 к DoH и DoT добавится dnsd), то есть ему нужен TLS и
-    # слой криптографии — и без модулей. Отдельного пакета «ядро без TLS» нет: цена — 0,6 МБ
-    # библиотеки на флеше и в памяти, выигрыш — один набор файлов и ни одной веточки «есть ли TLS».
+    # Библиотеки лежат в steer-core, отдельных пакетов libsteer и libsteer-wolfssl нет. Довод:
+    # ядру крипта нужна и без модулей — steerd сам ходит по HTTPS (замер групп, urltls) и
+    # по DoH/DoT (dnsd), — а значит, «ядра без TLS» не бывает, и пакеты библиотек были бы лишь
+    # двумя лишними именами, которые надо держать в одной версии с ядром. Цена — 0,6 МБ
+    # библиотек на флеше и в памяти, выигрыш — один набор файлов, ни одной веточки «есть ли TLS»
+    # и один владелец у каждого файла.
+    #
+    # МИГРАЦИЯ со старой раскладки (пакеты steer, libsteer, libsteer-wolfssl). steer-core
+    # объявляет себя provides steer (кто зависит от имени `steer`, продолжает его находить),
+    # replaces steer, libsteer, libsteer-wolfssl (может занять их файлы) и конфликтует с ними:
+    # без конфликта старые пакеты остались бы в базе и владели бы /usr/sbin/steerd вместе с
+    # новым. В apk конфликт пишется как `!имя` в depends, в opkg — поле Conflicts.
+    # Версия у конфликта не проверяется: старое ядро того же номера (промежуточные сборки одного
+    # выпуска) заменяется точно так же, как ядро прежнего выпуска.
     root="build/pkg/$arch"
     rm -rf "$root"
-    mkdir -p "$root/usr/sbin" "$root/etc/init.d" "$root/etc/steer/lists" \
+    mkdir -p "$root/usr/sbin" "$root/usr/lib" "$root/etc/init.d" "$root/etc/steer/lists" \
              "$root/lib/upgrade/keep.d" "$root/etc/hotplug.d/iface"
+    # Обе библиотеки — часть ядра (см. комментарий к раскладке выше): steerd и каждый модуль
+    # находят их по SONAME в /usr/lib.
+    cp "$libs"/libsteer.so.* "$libs"/libsteer-wolfssl.so.* "$root/usr/lib/"
     # Три имени (docs/architecture.md, раздел 4а): steerd — движок целиком, steer — клиент сокета,
     # steer-tools — ссылка на steerd, под этим именем движок отвечает только на инструменты.
     cp "$libs/steerd" "$root/usr/sbin/steerd"
@@ -459,12 +460,25 @@ for spec in $ISAS; do
     printf '#!/bin/sh\nexit 0\n' > build/scripts/steer.postrm
     chmod +x build/scripts/*
 
-    # pack ИМЯ КОРЕНЬ ЗАВИСИМОСТИ ОПИСАНИЕ ВИД-СКРИПТОВ — оба формата из одного дерева. Зависимости
-    # пишутся один раз (имена через пробел), версии нашим пакетам ставят dep_apk и dep_ipk.
+    # pack ИМЯ КОРЕНЬ ЗАВИСИМОСТИ ОПИСАНИЕ ВИД-СКРИПТОВ [КОНФЛИКТЫ] [ЗАМЕНЯЕТ] — оба формата из одного
+    # дерева. Зависимости пишутся один раз (имена через пробел), версии нашим пакетам ставят
+    # dep_apk и dep_ipk. КОНФЛИКТЫ — имена пакетов, с которыми этот несовместим (apk: `!имя`
+    # в depends; opkg: Conflicts). ЗАМЕНЯЕТ — пакеты, чьи файлы этот вправе занять и чьё имя он
+    # берёт на себя (apk: replaces + provides имя=версия; opkg: Replaces + Provides).
     pack() {
-        _n="$1"; _r="$2"; _dp="$3"; _ds="$4"; _sk="$5"
+        _n="$1"; _r="$2"; _dp="$3"; _ds="$4"; _sk="$5"; _cf="${6:-}"; _rp="${7:-}"
         _dinfo=""
-        [ -n "$_dp" ] && _dinfo="--info depends:'$(dep_apk "$_dp")'"
+        _dall="$(dep_apk "$_dp")"
+        for _c in $_cf; do _dall="$_dall !$_c"; done
+        [ -n "$_dall" ] && _dinfo="--info depends:'$_dall'"
+        _ipkx=""
+        [ -n "$_cf" ] && _ipkx="$(printf 'Conflicts: %s' "$(echo $_cf | sed 's/ /, /g')")"
+        if [ -n "$_rp" ]; then
+            _pv="${_rp%% *}"
+            _dinfo="$_dinfo --info replaces:'$_rp' --info provides:'$_pv=$VERSION-r1'"
+            _ipkx="$(printf '%s\nReplaces: %s\nProvides: %s' "$_ipkx" "$(echo $_rp | sed 's/ /, /g')" "$_pv")"
+            _ipkx="$(printf '%s' "$_ipkx" | sed '/^$/d')"
+        fi
         # apk: скрипты — три хука. post-deinstall нужен модулям (перезапуск после удаления).
         docker run --rm -v "$PWD":/w -w /w alpine:latest sh -c \
             "apk add --no-cache apk-tools >/dev/null 2>&1; apk mkpkg \
@@ -476,31 +490,19 @@ for spec in $ISAS; do
                --script post-deinstall:build/scripts/$_sk.postrm \
                -F $_r -o $OUT/$_n-$VERSION-1_$arch.apk" >/dev/null 2>&1 \
             || echo "    (apk packaging failed for $_n $arch)"
-        mk_ipk "$_r" "$_n" "$arch" "$(dep_ipk "$_dp")" "$_ds" "" "$_sk"
+        mk_ipk "$_r" "$_n" "$arch" "$(dep_ipk "$_dp")" "$_ds" "$_ipkx" "$_sk"
     }
 
-    # Библиотеки. Зависимости считаются по СОБРАННОМУ файлу — см. pkg_deps выше; libsteer-wolfssl
-    # не зависит ни от чего нашего, libsteer — от неё (pkg_deps по DT_NEEDED самой libsteer).
-    lroot="build/pkg/$arch-libsteer-wolfssl"
-    rm -rf "$lroot"
-    mkdir -p "$lroot/usr/lib"
-    cp "$libs"/libsteer-wolfssl.so.* "$lroot/usr/lib/"
-    pack libsteer-wolfssl "$lroot" "" "wolfSSL со своими опциями для steer (TLS 1.3, QUIC): общая библиотека" noop
-    lroot="build/pkg/$arch-libsteer"
-    rm -rf "$lroot"
-    mkdir -p "$lroot/usr/lib"
-    cp "$libs"/libsteer.so.* "$lroot/usr/lib/"
-    ldeps=""
-    grep -aq 'libsteer-wolfssl\.so\.' "$lroot"/usr/lib/libsteer.so.* && ldeps="libsteer-wolfssl"
-    pack libsteer "$lroot" "$ldeps" "libsteer: модель, TLS и транспорты, стек TUN — общее для steerd и модулей" noop
-
-    # Ядро. Зависит от libsteer (по DT_NEEDED steerd), а через неё — от libsteer-wolfssl.
+    # Ядро вместе с библиотеками. Своих зависимостей от наших пакетов нет; предыдущие пакеты
+    # steer, libsteer и libsteer-wolfssl — конфликтуют и заменяются (миграция, см. выше). Имя
+    # `steer` идёт первым в ЗАМЕНЯЕТ: pack берёт первое как provides.
     deps="$(pkg_deps "$root/usr/sbin/steerd" core)"
-    pack steer "$root" "$deps" "policy routing engine: channels in, nftables out" steer
+    pack steer-core "$root" "$deps" "steer-core: движок маршрутизации по политике (каналы на входе, nftables на выходе) и общая крипта" \
+        steer "steer libsteer libsteer-wolfssl" "steer libsteer libsteer-wolfssl"
 
     # Модули: по одному бинарнику в usr/sbin рядом со steerd, где их находит движок (src/lib/
-    # module.c). Зависимость от steer — точной версии: ядро и модуль общаются линией событий, формат
-    # которой между выпусками не обещан (hello в docs/ctl.md).
+    # module.c). Зависимость от steer-core — точной версии: ядро и модуль общаются линией событий,
+    # формат которой между выпусками не обещан (hello в docs/ctl.md).
     # steer-hysteria2 — тоже модуль, но в steer-extended он НЕ входит: отдельный пакет, который
     # ставят сознательно (см. мета-пакет ниже).
     for m in vless xsteer obfs tgws hysteria2; do
@@ -516,19 +518,20 @@ for spec in $ISAS; do
             tgws)   md="steer-tgws: мост Telegram для steer (модуль)"; mk=mod ;;
             hysteria2) md="steer-hysteria2: клиент hysteria2 (QUIC, Brutal) для steer (модуль)"; mk=tun ;;
         esac
-        mdeps="steer $(pkg_deps "$mroot/usr/sbin/steer-$m" "$mk")"
+        mdeps="steer-core $(pkg_deps "$mroot/usr/sbin/steer-$m" "$mk")"
         pack "steer-$m" "$mroot" "$mdeps" "$md" mod
     done
 
-    # Мета-пакет steer-extended: ядро и все четыре модуля. Пустой пакет менеджеры не любят, поэтому
-    # в нём один маленький файл-метка. Имя сохранено ради splify2, который ставит его по имени.
+    # Мета-пакет steer-extended (устарел, оставлен на переход): ядро и модули vless, xsteer, obfs,
+    # tgws; hysteria2 не входит. Пустой пакет менеджеры не любят, поэтому в нём один маленький
+    # файл-метка. Имя сохранено ради splify2, который ставит его по имени.
     xroot="build/pkg/$arch-extended"
     rm -rf "$xroot"
     mkdir -p "$xroot/usr/lib/steer"
-    printf 'steer-extended %s: мета-пакет — steer, steer-vless, steer-xsteer, steer-obfs, steer-tgws\n' \
+    printf 'steer-extended %s: мета-пакет — steer-core, steer-vless, steer-xsteer, steer-obfs, steer-tgws\n' \
         "$VERSION" > "$xroot/usr/lib/steer/extended"
-    pack steer-extended "$xroot" "steer steer-vless steer-xsteer steer-obfs steer-tgws" \
-        "steer со всеми модулями: VLESS/Reality, xsteer, обфускатор, мост Telegram (как dnsmasq-full)" noop
+    pack steer-extended "$xroot" "steer-core steer-vless steer-xsteer steer-obfs steer-tgws" \
+        "steer-extended (устарел, взамен — steer-core и нужные модули): ядро, VLESS/Reality, xsteer, обфускатор, мост Telegram" noop
 done
 
 # ---- серверная половина обфускации: архив для VPS -----------------------------

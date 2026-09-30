@@ -48,7 +48,7 @@ xsteer — [docs/xsteer.md](xsteer.md).
 Экспорт `libsteer.so` — version-script `build/libsteer.map` (только то, что берут `steerd` и
 модули; порождён из кода `build/libs-exports.sh`, проверка — `make libs-test`), SONAME
 `libsteer.so.<версия движка>`; ABI между версиями не обещается, поэтому модуль той же версии, что
-движок (зависимость пакета `steer (= версия)`; демон дополнительно проверяет версию из `hello`
+движок (зависимость пакета `steer-core (= версия)`; демон дополнительно проверяет версию из `hello`
 модуля, `docs/ctl.md`). Экспорт `libsteer-wolfssl.so` — `build/wolfssl/libsteer-wolfssl.map`:
 символы wolfSSL, которые зовёт слой примитивов, и отпечаток сборки. Библиотеки собираются `-fPIC` и
 `-ftls-model=initial-exec`; видимость задаёт version-script, а не `-fvisibility=hidden` (пометка
@@ -58,12 +58,22 @@ xsteer — [docs/xsteer.md](xsteer.md).
 `ld-musl-armhf.so.1`, `ld-musl-arm.so.1`, `ld-musl-x86_64.so.1`; RPATH нет — библиотеки в
 `/usr/lib`.
 
-Пакеты: `libsteer-wolfssl`, `libsteer` (зависит от предыдущего), `steer` (ядро: `steerd`, `steer`,
-`steer-tools`, `steer-nfqws`, init-скрипт, hotplug, `keep.d`; зависит от `libsteer`),
-`steer-vless`, `steer-xsteer`, `steer-obfs`, `steer-tgws`, `steer-hysteria2` (по бинарнику; зависят
-от `steer` и `libsteer` той же версии) и мета-пакет `steer-extended` (ядро и первые четыре модуля;
-`steer-hysteria2` в него не входит). Ядро зависит
-от обеих библиотек, потому что `steerd` сам ходит по HTTPS (замер групп, `urltls.c`).
+Пакеты (`build.sh`, функция `pack`; оба формата — `.apk` и `.ipk` — из одного дерева файлов):
+`steer-core` (`steerd`, `steer`, `steer-tools` — ссылка на `steerd`, `steer-nfqws`, обе библиотеки
+в `/usr/lib`, init-скрипт, hotplug, `keep.d`; зависит только от чужих `nftables`, `ip-full`,
+`conntrack`, `kmod-nft-queue`), `steer-vless`, `steer-xsteer`, `steer-obfs`, `steer-tgws`,
+`steer-hysteria2` (по одному бинарнику `usr/sbin/steer-<имя>`; зависят от `steer-core (= версия)`,
+модули с собственным TUN — ещё от `kmod-tun`) и мета-пакет `steer-extended` (устаревший: ядро и
+первые четыре модуля; `steer-hysteria2` в него не входит). Библиотеки лежат внутри `steer-core`, а
+не в своих пакетах: `steerd` сам ходит по HTTPS (замер групп, `urltls.c`) и по DoH и DoT (резолвер),
+поэтому криптография нужна ядру и без модулей. Модули файлов ядра не повторяют — у каждого файла
+один владелец.
+
+`steer-core` заменяет пакеты прежней раскладки — `steer`, `libsteer`, `libsteer-wolfssl`: он
+объявляет `provides steer`, `replaces` и конфликт с ними (apk: `provides`, `replaces` и `!имя` в
+`depends`; opkg: поля `Provides`, `Replaces`, `Conflicts`), поэтому установка и обновление снимают
+старые пакеты, а `/usr/sbin/steerd` принадлежит одному пакету. Проверка на настоящем менеджере apk —
+`tests/pkglayout.sh`; для opkg проверяются только поля метаданных.
 
 Модуль, которого нет в системе, — не отсутствие команды. Вид выхода `vless` или `xsteer` при
 разборе спеки отвечает «kind vless требует пакет steer-vless (входит в steer-extended)» —
