@@ -92,6 +92,8 @@ struct tr_node {
      * insecure — ключ выхода, не подписка. */
     const char *pcs, *pks, *vcn;
     int insecure;
+    /* security=tls: ECHConfigList в base64 (Xray echConfigList, `ech=` ссылки) или NULL — без ECH. */
+    const char *ech;
     /* VLESS encryption: строка `encryption` узла без изменений (mlkem768x25519plus.…) или NULL —
      * шифрования нет. Разбирает и исполняет vlenc.c поверх готовой связи. */
     const char *encryption;

@@ -50,6 +50,7 @@ static void tr_node_of(const struct vless_node *n, struct tr_node *t) {
     t->pcs = tls ? n->pcs : NULL;
     t->pks = tls ? n->pks : NULL;
     t->vcn = tls ? n->vcn : NULL;
+    t->ech = tls ? n->ech : NULL;
     t->insecure = tls && n->insecure;
     t->encryption = n->encryption;
 }

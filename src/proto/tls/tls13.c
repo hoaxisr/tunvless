@@ -429,6 +429,37 @@ static int handshake(struct tls13 *t, int fd,
     H = t->hash_n;
     md = H == 48 ? SC_SHA384 : SC_SHA256;
 
+    /* ECH: сервер принял внутренний Hello или нет (RFC 9849, 7.2). Подтверждение — восемь последних байт
+     * ServerHello.random: HKDF-Expand-Label(HKDF-Extract(0, random Inner), "ech accept confirmation",
+     * Hash(Inner ‖ ServerHello с обнулёнными этими восемью байтами), 8). Принял — транскрипт с этой минуты
+     * строится от Inner, а не от отправленного Outer (и ключи, и Finished считаются по нему). Не принял —
+     * рукопожатие обрывается (TLS13_EECH, см. tls13.h). Сравнение без раннего выхода: подтверждение не
+     * секрет, но привычка дешевле исключения. */
+    if (auth && auth->ech) {
+        struct sc_hash_ctx ic;
+        unsigned char ch[48], prk[48], conf[8], zero8[8] = { 0 };
+        if (n < 38) return TLS13_EBADREC;
+        if (sc_hash_init(&ic, md) != 0) return TLS13_ECRYPTO;
+        sc_hash_update(&ic, auth->ech->inner, auth->ech->inner_n);
+        sc_hash_update(&ic, rec, 30);
+        sc_hash_update(&ic, zero8, 8);
+        sc_hash_update(&ic, rec + 38, n - 38);
+        int hr = sc_hash_final(&ic, ch);
+        sc_hash_free(&ic);
+        if (hr != 0 || sc_hkdf_extract(md, NULL, 0, auth->ech->random, 32, prk) != 0 ||
+            expand_label(md, prk, H, "ech accept confirmation", ch, H, conf, 8) != 0)
+            return TLS13_ECRYPTO;
+        unsigned char diff = 0;
+        for (int i = 0; i < 8; i++) diff |= (unsigned char)(conf[i] ^ rec[30 + i]);
+        if (diff) return TLS13_EECH;
+        /* Транскрипт заново: Inner, затем настоящий ServerHello. */
+        sc_hash_free(&t->tr);
+        sc_hash_free(&t->tr384);
+        tr_init(t);
+        tr_add(t, auth->ech->inner, auth->ech->inner_n);
+        tr_add(t, rec, n);
+    }
+
     /* Расписание ключей RFC 8446 §7.1. Каждый шаг обязателен и порядок его строг:
      * early -> handshake -> master, с derive-secret между ними. */
     unsigned char zeros[48] = {0};

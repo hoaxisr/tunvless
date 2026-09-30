@@ -252,6 +252,7 @@ cc_binary {
         "src/proto/transport/transport.c",
         "src/proto/transport/trdial.c",
         "src/proto/transport/trsec.c",
+        "src/proto/tls/ech.c",
         "src/proto/transport/trgrpc.c",
         "src/proto/transport/trxhttp.c",
         "src/proto/transport/trupgrade.c",

@@ -400,6 +400,33 @@ static void set_vcn(struct vless_node *n, const char *v) {
     if (bl) n->vcn = sub_intern(buf, bl);
 }
 
+/* ECH: ECHConfigList узла (Xray echConfigList, `ech=` ссылки, ech-opts.config Clash, ech.config sing-box) в
+ * base64. Здесь — только форма: список начинается длиной и в нём есть запись версии 0xfe0d; какую запись
+ * можно использовать, решает ech_pick при подключении (ech.c не линкуется в стенд подписки, а причина
+ * отказа там названа отдельно). Значение в виде «домен+https://сервер DNS» (Xray умеет спросить запись из
+ * DNS) не поддержано: узел пропускается с причиной, а не уходит без ECH — молчаливая отправка имени
+ * открытым текстом была бы тем самым, от чего ECH защищает. */
+static const char SUB_BAD_ECH[] = "!ech";
+static const char SUB_ECH_DNS[] = "!ech-dns";
+static void set_ech(struct vless_node *n, const char *v) {
+    char raw[1100];
+    n->ech = NULL;
+    if (!v[0]) return;
+    if (strstr(v, "://")) { n->ech = SUB_ECH_DNS; return; }
+    size_t bl = b64_decode(v, strlen(v), raw, sizeof raw);
+    int ok = bl >= 8 && bl < sizeof raw && (size_t)(((unsigned char)raw[0] << 8) | (unsigned char)raw[1]) + 2 == bl;
+    if (ok) {
+        ok = 0;
+        for (size_t p = 2; p + 4 <= bl;) {
+            size_t l = ((unsigned char)raw[p + 2] << 8) | (unsigned char)raw[p + 3];
+            if (p + 4 + l > bl) { ok = 0; break; }
+            if ((((unsigned char)raw[p] << 8) | (unsigned char)raw[p + 1]) == 0xfe0d) ok = 1;
+            p += 4 + l;
+        }
+    }
+    n->ech = ok ? sub_intern(v, strlen(v)) : SUB_BAD_ECH;
+}
+
 /* allowInsecure / insecure / skip-cert-verify: 1, true, yes — «включено». Всё остальное, в том числе
  * пустое, — выключено: включать отказ проверки сертификата догадкой нельзя, выключать можно. */
 static int truthy_flag(const char *v) {
@@ -520,6 +547,10 @@ int vless_parse_url(const char *url, struct vless_node *n) {
                         free(d);
                     } else if (k[0] == 'p') n->pcs = SUB_BAD_PIN; else n->vcn = SUB_BAD_PIN;
                 }
+                else if (klen == 3 && !strncmp(k, "ech", 3)) {
+                    char *d = param_dup(v, vlen);
+                    if (d) { set_ech(n, d); free(d); } else n->ech = SUB_BAD_ECH;
+                }
                 else if ((klen == 13 && !strncmp(k, "allowInsecure", 13)) || (klen == 8 && !strncmp(k, "insecure", 8))) {
                     char *d = param_dup(v, vlen);
                     if (d) { if (truthy_flag(d)) n->allow_insecure = 1; free(d); }
@@ -638,6 +669,18 @@ static int node_usable(struct vless_node *n) {
      * протокол, а pcs/vcn/allowInsecure, попавшие в такую ссылку, ничего не значат. Испорченный
      * отпечаток у tls — непригодный узел, а не проверка, которая молча ничего не сверяет. */
     if (!strcmp(n->security, "tls")) {
+        if (n->ech == SUB_BAD_ECH) {
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "ech: не ECHConfigList в base64");
+            return 1;
+        }
+        if (n->ech == SUB_ECH_DNS) {
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "ech: запрос записи из DNS не поддержан");
+            return 1;
+        }
+        if (n->ech == SUB_FULL) {
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "слишком много разных ключей");
+            return 1;
+        }
         if (n->pcs == SUB_BAD_PIN) {
             snprintf(n->skip_reason, sizeof(n->skip_reason), "pcs: не SHA-256 в hex");
             return 1;
@@ -1071,6 +1114,11 @@ static void xray_stream(struct sj *j, struct vless_node *n) {
                     set_vcn(n, vv);
                 }
                 else if (!strcmp(k2, "allowInsecure")) { if (sj_bool(j)) n->allow_insecure = 1; }
+                else if (!strcmp(k2, "echConfigList")) {
+                    char ev[1400] = "";
+                    sj_str(j, ev, sizeof ev);
+                    set_ech(n, ev);
+                }
                 else sj_skip(j);
             }
         } else if (!strcmp(k, "grpcSettings")) {
@@ -1253,6 +1301,30 @@ static void sb_tls(struct sj *j, struct vless_node *n, int *enabled, int *realit
         if (!strcmp(k, "enabled")) *enabled = sj_bool(j);
         else if (!strcmp(k, "server_name")) sj_str(j, n->sni, sizeof n->sni);
         else if (!strcmp(k, "insecure")) { if (sj_bool(j)) n->allow_insecure = 1; }
+        else if (!strcmp(k, "ech")) {
+            /* {"enabled": true, "config": ["-----BEGIN ECH CONFIGS-----", "base64…", "-----END ECH CONFIGS-----"]}.
+             * Строки PEM склеиваются без рамки; без config (только query_server_name) — запрос из DNS, не поддержан. */
+            int f2 = 1, on = 1, have = 0;
+            char k2[64], joined[1400] = "";
+            size_t jl = 0;
+            while (sj_obj_key(j, &f2, k2, sizeof k2) == 0) {
+                if (!strcmp(k2, "enabled")) on = sj_bool(j);
+                else if (!strcmp(k2, "config")) {
+                    int fa = 1;
+                    char line[1400];
+                    int r = sj_arr_next(j, &fa);          /* < 0 — не массив, а одна строка */
+                    do {
+                        line[0] = '\0';
+                        if (sj_str(j, line, sizeof line) != 0) break;
+                        size_t ll = strlen(line);
+                        if (line[0] != '-' && jl + ll < sizeof joined) { memcpy(joined + jl, line, ll + 1); jl += ll; have = 1; }
+                        r = r < 0 ? 1 : sj_arr_next(j, &fa);
+                    } while (r == 0);
+                } else sj_skip(j);
+            }
+            if (on && have) set_ech(n, joined);
+            else if (on) n->ech = SUB_ECH_DNS;
+        }
         else if (!strcmp(k, "certificate_public_key_sha256")) {
             /* Массив строк base64: SHA-256 от SubjectPublicKeyInfo. Строка вместо массива — тоже. */
             char pv[80];
@@ -1707,6 +1779,7 @@ static int clash_node(const struct yflat *f, struct vless_node *n) {
      * `skip-cert-verify` — allowInsecure. */
     if ((v = yf_get(f, "fingerprint")) && v[0]) add_pins(n, v, 0);
     if ((v = yf_get(f, "skip-cert-verify")) && truthy_flag(v)) n->allow_insecure = 1;
+    if ((v = yf_get(f, "ech-opts.config")) && v[0]) set_ech(n, v);
     const char *pbk = yf_get(f, "reality-opts.public-key");
     if (pbk) {
         set_field(n->pbk, sizeof n->pbk, pbk, strlen(pbk));

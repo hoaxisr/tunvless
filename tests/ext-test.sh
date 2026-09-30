@@ -100,6 +100,11 @@ echo "ext-test: собираю и прогоняю hellofreeze..."
 $CC -O2 -w $STEER_INC -o "$BUILD/hellofreeze" tests/hellofreeze.c $CRYPTO -lpthread
 "$BUILD/hellofreeze"
 
+echo "ext-test: собираю и прогоняю echmatch..."
+$CC -O2 -w $STEER_INC -Itests -o "$BUILD/echmatch" tests/echmatch.c src/proto/tls/ech.c src/proto/tls/reality.c \
+	$CRYPTO -lpthread
+"$BUILD/echmatch"
+
 echo "ext-test: собираю и прогоняю xsepochmatch..."
 $CC -O2 -w $STEER_INC -o "$BUILD/xsepochmatch" tests/xsepochmatch.c src/proto/xsteer/xsepoch.c \
 	src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c src/proto/tls/h2.c \
@@ -181,7 +186,7 @@ $CC -O1 -g -w $STEER_INC $ASAN -o "$BUILD/spokematch" \
 # MBEDTLS_X509_CRT_WRITE_C, которого в урезанной конфигурации роутера не было).
 echo "ext-test: собираю и прогоняю vlessmatch (ASan: ${ASAN:-нет})..."
 $CC -O1 -g -w $STEER_INC -Itests $ASAN -DSTEER_HAVE_X509WRITE -o "$BUILD/vlessmatch" tests/vlessmatch.c \
-	src/proto/vless/client.c src/proto/transport/transport.c src/proto/transport/trsec.c \
+	src/proto/vless/client.c src/proto/transport/transport.c src/proto/transport/trsec.c src/proto/tls/ech.c \
 	src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c \
 	src/proto/transport/trupgrade.c src/proto/transport/trws.c src/proto/transport/trpath.c \
 	src/proto/transport/trvenc.c \
@@ -195,7 +200,7 @@ $CC -O1 -g -w $STEER_INC -Itests $ASAN -DSTEER_HAVE_X509WRITE -o "$BUILD/vlessma
 # Клиент тот же, что в работе: vless_connect → transport_open → tr_venc_open.
 echo "ext-test: собираю vencprobe и прогоняю venc.sh (сквозные проверки против Xray-core)..."
 $CC -O1 -g -w $STEER_INC -o "$BUILD/vencprobe" tests/vencprobe.c \
-	src/proto/vless/client.c src/proto/transport/transport.c src/proto/transport/trsec.c \
+	src/proto/vless/client.c src/proto/transport/transport.c src/proto/transport/trsec.c src/proto/tls/ech.c \
 	src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c src/proto/transport/trdial.c src/proto/tls/roots.c \
 	src/proto/transport/trupgrade.c src/proto/transport/trws.c src/proto/transport/trpath.c \
 	src/proto/transport/trvenc.c \
@@ -209,7 +214,7 @@ BUILD="$BUILD" sh tests/venc.sh
 # Дайлер (vldial.c) — тот же, что в работе; стек подменён заглушками в самом стенде.
 echo "ext-test: собираю xudpprobe и прогоняю xudp.sh (UDP по vision против Xray-core и sing-box)..."
 $CC -O1 -g -w $STEER_INC -o "$BUILD/xudpprobe" tests/xudpprobe.c src/proto/vless/vldial.c \
-	src/proto/vless/client.c src/proto/transport/transport.c src/proto/transport/trsec.c \
+	src/proto/vless/client.c src/proto/transport/transport.c src/proto/transport/trsec.c src/proto/tls/ech.c \
 	src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c src/proto/transport/trdial.c src/proto/tls/roots.c \
 	src/proto/transport/trupgrade.c src/proto/transport/trws.c src/proto/transport/trpath.c \
 	src/proto/transport/trvenc.c \
@@ -217,6 +222,11 @@ $CC -O1 -g -w $STEER_INC -o "$BUILD/xudpprobe" tests/xudpprobe.c src/proto/vless
 	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
 	$MODEL_SRC $KINDS_SRC $CRYPTO -lpthread
 BUILD="$BUILD" sh tests/xudp.sh
+
+# ech.sh — Encrypted Client Hello против настоящего Xray-core (XRAY=бинарник; нет — громкий пропуск). Клиент —
+# тот же vencprobe (vless_probe: рукопожатие TLS с ECH, затем запрос VLESS).
+echo "ext-test: прогоняю ech.sh (ECH против Xray-core)..."
+BUILD="$BUILD" sh tests/ech.sh
 
 # androidroots — склейка каталога корней Android в файл для certverify (cert_roots в
 # src/proto/tls/roots.c — стенд его включает — на платформе с системным хранилищем корней;
@@ -253,7 +263,7 @@ $CC -O2 -w $STEER_INC -o "$BUILD/devupmatch" tests/devupmatch.c \
 	src/tunnel/stack.c src/tunnel/rtx.c src/tunnel/tun.c \
 	src/proto/vless/vldial.c src/proto/vless/vlwatch.c src/proto/vless/client.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/vless/sub.c \
-	src/proto/transport/transport.c src/proto/transport/trdial.c src/proto/transport/trsec.c \
+	src/proto/transport/transport.c src/proto/transport/trdial.c src/proto/transport/trsec.c src/proto/tls/ech.c \
 	src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c src/proto/tls/roots.c \
 	src/proto/transport/trupgrade.c src/proto/transport/trws.c src/proto/transport/trpath.c \
 	src/proto/transport/trvenc.c \

@@ -296,6 +296,50 @@ int main(void) {
         }
     }
 
+    /* ---- ECH: echConfigList / ech= (Xray), ech-opts (Clash), ech (sing-box) ---- */
+    {
+        static const char ECH[] = "AEX+DQBBNwAgACANG785NbYxf2vAoHiUugO7PDLchnWNz2f+95epg2DJewAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=";
+        struct vless_node n;
+        char q[400];
+        snprintf(q, sizeof q, "security=tls&sni=t.example&ech=%s", "AEX%2BDQBBNwAgACANG785NbYxf2vAoHiUugO7PDLchnWNz2f%2B95epg2DJewAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA%3D");
+        check("ech= в ссылке: узел пригоден", url(q, &n) == 0);
+        check_s("  значение раскодировано из %-формы", ECH, n.ech);
+        check("ech= не ECHConfigList — узел непригоден", url("security=tls&sni=t.example&ech=AAAA", &n) == 1);
+        check_s("  причина названа", "ech: не ECHConfigList в base64", n.skip_reason);
+        check("ech= в виде «домен+https://…» (запрос из DNS) — узел непригоден",
+              url("security=tls&sni=t.example&ech=cloudflare-ech.com%2Bhttps://1.1.1.1/dns-query", &n) == 1);
+        check_s("  причина названа", "ech: запрос записи из DNS не поддержан", n.skip_reason);
+        check("ech у reality ничего не значит",
+              url("security=reality&pbk=K4ALTVxNnrDTywBj_Stb5bomQ21QlSWOlGGT44n9Nng&sid=0123&ech=AAAA", &n) == 0);
+
+        char js[1200];
+        snprintf(js, sizeof js,
+            "{\"outbounds\":[{\"protocol\":\"vless\",\"settings\":{\"vnext\":[{\"address\":\"x.example\",\"port\":443,"
+            "\"users\":[{\"id\":\"" UUID "\"}]}]},\"streamSettings\":{\"network\":\"tcp\",\"security\":\"tls\","
+            "\"tlsSettings\":{\"serverName\":\"x.example\",\"echConfigList\":\"%s\"}}}]}", ECH);
+        struct vless_node out[2];
+        struct vless_sub_stats st;
+        size_t cnt = vless_parse_sub(js, out, 2, &st);
+        check("Xray JSON: echConfigList", cnt == 1 && out[0].ech && !strcmp(out[0].ech, ECH));
+        char y[900];
+        snprintf(y, sizeof y,
+            "proxies:\n  - name: c1\n    type: vless\n    server: x.example\n    port: 443\n    uuid: " UUID "\n"
+            "    network: tcp\n    tls: true\n    servername: x.example\n    ech-opts:\n      enable: true\n      config: %s\n", ECH);
+        cnt = vless_parse_sub(y, out, 2, &st);
+        check("Clash: ech-opts.config", cnt == 1 && out[0].ech && !strcmp(out[0].ech, ECH));
+        char sb[1300];
+        snprintf(sb, sizeof sb,
+            "{\"outbounds\":[{\"type\":\"vless\",\"tag\":\"a\",\"server\":\"x.example\",\"server_port\":443,\"uuid\":\"" UUID "\","
+            "\"tls\":{\"enabled\":true,\"server_name\":\"x.example\",\"ech\":{\"enabled\":true,\"config\":["
+            "\"-----BEGIN ECH CONFIGS-----\",\"%s\",\"-----END ECH CONFIGS-----\"]}}}]}", ECH);
+        cnt = vless_parse_sub(sb, out, 2, &st);
+        check("sing-box: ech.config (строки PEM)", cnt == 1 && out[0].ech && !strcmp(out[0].ech, ECH));
+        static const char *sb2 =
+            "{\"outbounds\":[{\"type\":\"vless\",\"tag\":\"a\",\"server\":\"x.example\",\"server_port\":443,\"uuid\":\"" UUID "\","
+            "\"tls\":{\"enabled\":true,\"server_name\":\"x.example\",\"ech\":{\"enabled\":true}}}]}";
+        check("sing-box: ech без config (запрос из DNS) — узел пропущен", vless_parse_sub(sb2, out, 2, &st) == 0 && st.skipped == 1);
+    }
+
     printf(g_fail ? "ПРОВАЛОВ: %d (прошло %d)\n" : "subpq: всё совпало (%d проверок)\n", g_fail ? g_fail : g_pass, g_pass);
     return g_fail ? 1 : 0;
 }

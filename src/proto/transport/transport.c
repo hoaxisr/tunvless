@@ -18,6 +18,7 @@
 
 #include "transport.h"
 #include "reality.h"
+#include "ech.h"
 
 /* ---- ввод-вывод связи ----------------------------------------------------------------- */
 
@@ -268,6 +269,11 @@ const char *transport_strerror(int rc) {
         case TLS13_ENOKEYSHARE: return "ServerHello без key_share";
         case TLS13_EBADSUITE: return "сервер выбрал неподдержанный шифр";
         case TLS13_EBADREC: return "испорченная TLS-запись";
+        case TLS13_EECH: return "сервер не принял ECH (ключ ECH в ссылке устарел или сервер его не знает)";
+        case ECH_EPARSE: return "ECH: ECHConfigList из ссылки не разобрался";
+        case ECH_ENOCONFIG: return "ECH: в ECHConfigList нет записи, которую мы умеем (нужен X25519, HKDF-SHA256, AES-128-GCM или ChaCha20)";
+        case ECH_ECRYPTO: return "ECH: сбой криптографии";
+        case ECH_ETOOBIG: return "ECH: ClientHello не влез";
         case TLS13_ECLOSED: return "TLS закрыт сервером";
         case TLS13_EIO: return "ошибка чтения TLS";
         /* «Молчит», а не «ошибка»: соединение TCP встало, а на ClientHello ответа нет. Так

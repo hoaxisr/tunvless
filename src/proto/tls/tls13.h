@@ -43,6 +43,11 @@
  * «ключи разъехались», а здесь рукопожатие математически верно и собеседник не тот. Точную
  * причину несёт certverify.h; сюда она приходит через tls13_verify_reason(). */
 #define TLS13_ECERT        (-22)
+/* Hello ушёл с ECH (Encrypted Client Hello), а сервер его не принял: подтверждения в ServerHello.random
+ * нет. Рукопожатие обрывается сразу, до всякой работы с сертификатом: сервер ответил по внешнему Hello, то
+ * есть разговаривает с нами не как с клиентом нужного имени (ключ ECH в ссылке устарел или сервер ECH не
+ * знает). Продолжать значило бы выдать имя в открытом виде, ради чего ECH и затеян. */
+#define TLS13_EECH         (-23)
 
 enum tls13_aead { TLS13_AEAD_AES128, TLS13_AEAD_AES256, TLS13_AEAD_CHACHA };
 
@@ -152,6 +157,13 @@ int tls13_handshake(struct tls13 *t, int fd,
  *
  * roots — путь к хранилищу корней, NULL/"" для умолчания. Нужен только вместе с host. */
 struct cert_policy;
+/* ECH: внутренний ClientHello (ech.h, ech_state) для проверки принятия и транскрипта. Тип свой, а не
+ * ech_state, чтобы tls13.c не зависел от ech.c: заполняет трансп. слой (trsec.c). */
+struct tls13_ech {
+    const unsigned char *inner;     /* handshake-сообщение ClientHelloInner целиком (с заголовком из 4 байт) */
+    size_t inner_n;
+    const unsigned char *random;    /* 32 байта: random Inner */
+};
 struct tls13_auth {
     const unsigned char *reality_key;
     const char *host;
@@ -166,6 +178,8 @@ struct tls13_auth {
     /* Правила проверки сертификата при host != NULL (certverify.h): закрепления, имена, insecure.
      * NULL — умолчание: цепочка до корней и имя host. */
     const struct cert_policy *policy;
+    /* Hello, переданный в tls13_handshake_auth, — внешний ClientHelloOuter ECH. NULL — ECH нет. */
+    const struct tls13_ech *ech;
 };
 
 /* То же рукопожатие, но с проверкой подлинности сервера.

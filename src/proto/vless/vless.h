@@ -70,6 +70,8 @@ struct vless_node {
      * sub_intern, NULL — поля нет. pcs и pks — SHA-256 в hex строчными, через запятую: pcs от всего
      * сертификата (DER), pks от его SubjectPublicKeyInfo; vcn — имена через запятую. */
     const char *pcs, *pks, *vcn;
+    /* security=tls: ECHConfigList в base64 (Encrypted Client Hello), интернирован; NULL — без ECH. */
+    const char *ech;
     /* allowInsecure=1 (skip-cert-verify, insecure) в подписке. Подписка сама проверку сертификата НЕ
      * выключает: узел пригоден, только если у выхода явно стоит `insecure` (sub.c, node_usable). */
     uint8_t allow_insecure;
