@@ -35,4 +35,12 @@ int urltest_url_parse(const char *url, struct urltest_url *u, char *why, size_t 
  * Вопрос к слабой ссылке, а не #ifdef: модель одна на все профили (build/sources.mk). */
 int urltest_https_ok(void);
 
+/* Отказать ли при разборе адресу https://: да там, где замер ведётся и HTTPS в сборке нет
+ * (steer-mini), нет — в процессе, объявившем себя читателем (urltest_reader_only). */
+int urltest_https_refused(void);
+
+/* Вызывается в начале модуля (до load_spec): этот процесс спеку читает и группы не меряет, так что
+ * доступность HTTPS для замера — не его вопрос. Доводы — в grpurl.c. */
+void urltest_reader_only(void);
+
 #endif

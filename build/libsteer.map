@@ -258,6 +258,7 @@ LIBSTEER_1 {
     tun_gro_push;
     tun_open;
     tun_read_packet;
+    urltest_reader_only;
     urltest_url_parse;
     x25519_shared_ext;
     xc_cpu_has_aes;

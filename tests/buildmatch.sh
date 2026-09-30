@@ -1039,6 +1039,20 @@ check "ngtcp2: build-libs.sh и libs-exports.sh собирают её рецеп
 check "ngtcp2: патчи (Brutal и смена перегрузки на ходу) — в build/ngtcp2/patches" "2" \
     "$(ls build/ngtcp2/patches/*.patch | wc -l | tr -d ' ')"
 
+# ---- слабые символы разбора спеки (модуль читает ту же спеку, что steerd) ------------------------
+# «https:// доступен для замера группы» — свойство системы, а не бинарника, где идёт разбор: символ
+# steer_urltls_present живёт в urltls.c, который есть только у steerd (замер ведёт он), и в бинарнике
+# модуля слабая ссылка всегда нулевая. Поэтому разбор в модуле отказа не выносит: steer_module_main
+# объявляет процесс читателем, а urltest_reader_only отдаёт libsteer (иначе модуль не слинкуется).
+# Остальные слабые ссылки в model/kinds/compile — виды (kind.c: в libsteer есть всегда) и профиль
+# (profile.c: умолчания совпадают с полным движком) — разбор спеки модулем не портят.
+check "разбор спеки: steer_module_main объявляет модуль читателем до разбора" "1" \
+    "$(grep -c 'urltest_reader_only();' src/cli/modcmd.c)"
+check "разбор спеки: urltest_reader_only отдаёт libsteer (модуль берёт её оттуда)" "1" \
+    "$(grep -c '^    urltest_reader_only;' build/libsteer.map)"
+check "разбор спеки: единственная слабая ссылка model/kinds на символ urltls — в grpurl.c" "1" \
+    "$(grep -rl 'steer_urltls_present' src/model src/kinds src/compile src/cli | wc -l | tr -d ' ')"
+
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
 printf '\nвсе проверки прошли\n'

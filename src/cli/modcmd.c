@@ -38,6 +38,7 @@
 #include "spec.h"
 #include "cli.h"
 #include "evline.h"
+#include "grpurl.h"
 #include "module.h"
 #include "modcmd.h"
 #include "platform.h"
@@ -225,6 +226,9 @@ int steer_module_main(int argc, char **argv, const char *module, const char *ver
      * отвергнёт, не дожидаясь up. Раньше разбора аргументов — чтобы и отказ разбора у модуля
      * чужой версии читался как «чужая версия», а не как «модуль сломан». */
     evline_hello(module, version);
+    /* Модуль спеку читает, а группы не меряет: «https:// в адресе замера недоступен» решает steerd,
+     * который меряет, — и решает по своему бинарнику, а не по бинарнику модуля (kinds/grpurl.c). */
+    urltest_reader_only();
     if (argc < 2) {
         fprintf(stderr, "steer-%s: нужна команда (модуль запускает демон; человеку — steer <команда>)\n",
                 module);
