@@ -1101,11 +1101,11 @@ static int p_dns_up(struct v2 *x, const struct ynode *val, const char *where, co
     return 0;
 }
 
-/* Имя сервера DoT и DoH, не записанное адресом, нужно откуда-то разрешить: `ips` апстрима или
+/* Имя сервера DoT, DoH и DoQ, не записанное адресом, нужно откуда-то разрешить: `ips` апстрима или
  * bootstrap (его или общий). Без них апстрим при первом же запросе не нашёл бы сервер. */
 static int up_has_way(const struct spec *s, const struct spec_dns_up *u) {
     struct in6_addr a;
-    if (u->proto != DNSP_DOT && u->proto != DNSP_DOH) return 1;
+    if (u->proto != DNSP_DOT && u->proto != DNSP_DOH && u->proto != DNSP_QUIC) return 1;
     if (inet_pton(AF_INET, u->host, &a) == 1 || inet_pton(AF_INET6, u->host, &a) == 1) return 1;
     return u->ips_n || u->boot_n || s->dns.boot_n;
 }

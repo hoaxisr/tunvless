@@ -667,9 +667,11 @@ int spec_is_mac(const char *s) {
 /* ---- адрес апстрима DNS (dns.upstreams, docs/spec-v2.md) ---------------------------------------
  *
  * Схема выбирает транспорт, и только она: `https://` — DoH (RFC 8484), `tls://` — DoT (RFC 7858),
- * `udp://` и `tcp://` — обычный DNS, `quic://` — DoQ (RFC 9250). DoQ схема принимает как слово, но
- * разбор её отвергает: клиента QUIC в резолвере ещё нет, и спека с ним не должна молча превратиться
- * в спеку без апстрима.
+ * `udp://` и `tcp://` — обычный DNS, `quic://` — DoQ (RFC 9250, порт 853 по UDP, ALPN `doq`). Так же
+ * пишут DoQ AdGuard (dnsproxy, AdGuard Home) и sing-box (`quic://dns.adguard-dns.com`); Xray для
+ * него пишет `quic+local://`, а `doq://` — не схема ни у одного из этих клиентов, поэтому её нет и
+ * здесь. Имя в quic:// и tls:// — одного рода: SNI и проверка сертификата идут по нему, а адрес
+ * находят `ips` или bootstrap.
  *
  * Имя или адрес сервера — до первого `:` или `/`; адрес IPv6 пишется в скобках, как в любом URL.
  * Для udp:// и tcp:// нужен адрес, а не имя: обычный DNS на имя потребовал бы разрешить его тем же
@@ -687,11 +689,7 @@ int dnsurl_parse(const char *url, struct spec_dns_up *u, char *why, size_t why_n
     for (; k < sizeof(S) / sizeof(S[0]); k++)
         if (!strncmp(url, S[k].scheme, strlen(S[k].scheme))) break;
     if (k == sizeof(S) / sizeof(S[0])) {
-        snprintf(why, why_n, "нужен адрес вида https://… (DoH), tls://… (DoT), udp://… или tcp://…");
-        return -1;
-    }
-    if (S[k].proto == DNSP_QUIC) {
-        snprintf(why, why_n, "DoQ (quic://) ещё не поддерживается");
+        snprintf(why, why_n, "нужен адрес вида https://… (DoH), tls://… (DoT), quic://… (DoQ), udp://… или tcp://…");
         return -1;
     }
     const char *p = url + strlen(S[k].scheme);

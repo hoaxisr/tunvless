@@ -424,7 +424,23 @@ dns:
   upstreams:
     doq: { url: "quic://1.1.1.1" }
 EOF
-refused "DoQ пока отказ" "DoQ (quic://) ещё не поддерживается" 4
+accepted "DoQ (quic://) — принят (с 1.11)"
+
+y <<'EOF'
+version: 2
+dns:
+  upstreams:
+    doq: { url: "quic://dns.test" }
+EOF
+refused "имя сервера DoQ без ips и bootstrap — отказ" "нечем разрешить" 4
+
+y <<'EOF'
+version: 2
+dns:
+  upstreams:
+    doq: { url: "doq://dns.test", ips: [192.0.2.1] }
+EOF
+refused "doq:// — не схема" "нужен адрес вида" 4
 
 # Адреса IPv6 клиентов и lan законны с 1.9 (docs/architecture.md, «4б»): правило получает
 # v6-двойник, convert печатает адреса как есть.
