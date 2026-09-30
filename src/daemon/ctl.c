@@ -2810,6 +2810,37 @@ static void srv_resync(struct ctl_srv *s, int kind) {
  *     сюда — когда проход пришёл, пока устройства ещё нет, или событие потерялось. */
 static int srv_lan_budget(struct ctl_srv *s);
 
+/* ТАБЛИЦЫ ДВИЖКА НЕТ, А ПРАВИЛА ВЫХОДОВ СТОЯТ — ЕЁ СНЯЛИ МИМО НАС (steer#4, проверка на QEMU
+ * a5d8f10). `/etc/init.d/firewall stop` — это `fw4 flush`, а он снимает не свою inet fw4, а ВСЕ
+ * таблицы nftables подряд (`nft list tables | while … nft delete table`), и наши вместе с ними.
+ * `firewall start` следом ставит только fw4. Прежде проход сторожа принимал «таблицы inet нет» за
+ * `steer down` и молчал: метки не ставились, postrouting_guard (он в той же таблице) не держал, и
+ * трафик каналов шёл напрямую — на стенде 90 с и дольше, до перезапуска службы, ни строки в
+ * журнале. (`firewall restart` и `reload` таблицы движка не трогают: restart — это `fw4 stop` +
+ * `start`, а stop снимает одну inet fw4.)
+ *
+ * Признак «снято мимо нас» — таблицы inet нет, движок включён, и хоть у одного выхода с
+ * устройством правило и таблица на месте (rulewd_missing не насчитал пропажу у всех): fw4 flush
+ * правил маршрутизации не касается. Штатная остановка сюда не попадает — init зовёт `steer down`
+ * после выхода демона, — а условие по правилам держит от гонки при выключении, когда таблицы уже
+ * сняты, а правила ещё нет. Ручной `steerd down` при живом демоне (правила сторож возвращает сам
+ * через проход) после этого возвращается и таблицей — прежде движок оставался полусобранным.
+ * Выходов с устройством нет (одни zapret и direct) — отличить нечем, и остаётся прежнее «движок
+ * снят». Дамп правил — в процессе, rtnetlink, и только когда таблицы нет: проход по здоровому ядру
+ * его не делает. */
+static int srv_table_flushed(struct ctl_srv *s) {
+    if (!s->d.have || !ctl_enabled()) return 0;
+    size_t routed = 0;
+    for (size_t i = 0; i < s->d.sp->out_n; i++) {
+        const struct output *o = &s->d.sp->out[i];
+        if (out_has_device(o) && o->mark && o->table) routed++;
+    }
+    if (!routed) return 0;
+    char list[512];
+    int miss = rulewd_missing(s->d.sp, list, sizeof(list));
+    return miss >= 0 && (size_t)miss < routed;
+}
+
 static void srv_kcheck(void *arg) {
     struct ctl_srv *s = arg;
     /* Своя изменяющая команда идёт или ждёт очереди — её замена набора правил ещё не запомнена
@@ -2819,7 +2850,12 @@ static void srv_kcheck(void *arg) {
     for (struct conn *c = s->conns; c; c = c->next)
         if (c->resync) return;
     const char *why = "";
-    if (recon_kernel_drift(&s->rec, &why) != 1) return;
+    int drift = recon_kernel_drift(&s->rec, &why);
+    if (drift == 2 && srv_table_flushed(s)) {
+        why = "таблицы движка нет в ядре, а правила выходов стоят — её снял кто-то другой";
+        drift = 1;
+    }
+    if (drift != 1) return;
     long now = loop_now_ms();
     int lan = s->lan_at && s->lan_at >= s->plan_at;
     if (lan && srv_lan_budget(s)) {

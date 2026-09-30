@@ -566,6 +566,22 @@ check "подсеть списка в доменном наборе снята: 
 c4 apply >/dev/null 2>&1
 check "  apply той же спеки возвращает её, в журнале почему" "1 1" \
     "$(in_dom) $(grep -c 'элементы статических наборов в ядре не те' "$tmp/d4.err")"
+# `/etc/init.d/firewall stop` — это `fw4 flush`: он снимает ВСЕ таблицы nftables, и наши тоже,
+# а `firewall start` ставит только fw4 (steer#4). Правила выходов при этом стоят — это не
+# `steer down`, и проход сторожа обязан вернуть таблицу сам, не позже периода + починка.
+"$real_nft" list tables | while read -r _ fam tab; do "$real_nft" delete table "$fam" "$tab"; done
+"$real_nft" add table inet fw4
+check "fw4 flush: таблицы движка нет, правило выхода стоит" "0 yes" \
+    "$("$real_nft" list tables | grep -c 'inet steer$') $([ "$(ip rule | grep -c fwmark)" -ge 1 ] && echo yes || echo no)"
+t0=$(date +%s%N)
+wait_for '[ "$(chan_n)" = "$cn" ]' 10
+ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+# Срок — два периода и секунда: снятие приходится на случайное место периода (до 3 с до прохода),
+# а сама починка — полная замена набора правил. Без возврата таблица не появляется вовсе.
+check "  проход сторожа вернул таблицу движка сам, ≤ 2 периодов + 1 с" "yes" \
+    "$([ "$(chan_n)" = "$cn" ] && [ $ms -le 7000 ] && echo yes || echo "no:$ms ms")"
+check "  в журнале — почему" "1" \
+    "$(drift4 'таблицы движка нет в ядре, а правила выходов стоят — её снял кто-то другой')"
 kill $SUB 2>/dev/null; wait $SUB 2>/dev/null; SUB=""
 
 # Выход в отказе: устройство поднято (operstate up), но трафик не несёт — адреса у него нет, и
