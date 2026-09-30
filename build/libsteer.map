@@ -23,6 +23,18 @@ LIBSTEER_1 {
     die;
     dnsurl_parse;
     dom6_ok;
+    dupq_close;
+    dupq_fd;
+    dupq_free;
+    dupq_on_readable;
+    dupq_on_timer;
+    dupq_open;
+    dupq_prepare;
+    dupq_ready;
+    dupq_stream_open;
+    dupq_stream_reset;
+    dupq_stream_send;
+    dupq_timeout_ms;
     err_die;
     err_set;
     evline_emit;
@@ -241,6 +253,7 @@ LIBSTEER_1 {
     tls13_keys_free;
     tls13_keys_setup;
     tls13_read;
+    tls13_verify_reason;
     tls13_write;
     tls_cert_roots;
     transport_close;

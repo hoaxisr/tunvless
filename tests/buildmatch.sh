@@ -881,7 +881,7 @@ cat "$sd/libsteer" "$sd/steerd" "$sd/mod_vless" "$sd/mod_xsteer" "$sd/mod_obfs" 
 check "раскладка покрывает расширенный профиль (кроме файла профиля)" "src/profile/extended.c " \
     "$(comm -23 "$sd/extended" "$sd/all" | tr '\n' ' ')"
 # (Обёртка QUIC src/proto/quic — в libsteer, в статическом профиле её нет: потребителя нет, телефону — шаг 6.)
-check "  и добавляет только точки входа модулей, обёртку QUIC и модуль hysteria2 с его видом" "src/kinds/hysteria2.c src/modules/main_hysteria2.c src/modules/main_obfs.c src/modules/main_tgws.c src/modules/main_vless.c src/modules/main_xsteer.c src/proto/hysteria2/hy2conn.c src/proto/hysteria2/hy2dial.c src/proto/hysteria2/hy2main.c src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2wire.c src/proto/quic/qcssl.c src/proto/quic/quic.c " \
+check "  и добавляет только точки входа модулей, обёртку QUIC и модуль hysteria2 с его видом" "src/kinds/hysteria2.c src/modules/main_hysteria2.c src/modules/main_obfs.c src/modules/main_tgws.c src/modules/main_vless.c src/modules/main_xsteer.c src/proto/hysteria2/hy2conn.c src/proto/hysteria2/hy2dial.c src/proto/hysteria2/hy2main.c src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2wire.c src/proto/quic/qcdoq.c src/proto/quic/qcssl.c src/proto/quic/quic.c " \
     "$(comm -13 "$sd/extended" "$sd/all" | tr '\n' ' ')"
 # Точка входа — единственный main() модуля; steerd свой main держит в daemon/main.c.
 for a in vless xsteer obfs tgws hysteria2; do

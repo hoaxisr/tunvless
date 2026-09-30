@@ -1,7 +1,9 @@
 /* Апстримы резолвера без сети: разбор адреса, спека v2 с dns, таблица «демон -> dnsd» (построение и
  * разбор, старый формат до байта), кэш ответов (срок, зажим, возраст, отрицательные, вытеснение).
- * Сеть, TLS и путь через выход проверяет tests/dnsup.sh. Устройство проверяемого — src/dnsd/dup.h. */
+ * Кадры DoQ (RFC 9250) — по байтам, без QUIC. Сеть, TLS, QUIC и путь через выход проверяют
+ * tests/dnsup.sh и tests/doqup.sh. Устройство проверяемого — src/dnsd/dup.h, src/dnsd/doq.h. */
 #include "dnsd_int.h"
+#include "doq.h"
 #include "tabfmt.h"
 #include <sys/stat.h>
 
@@ -74,7 +76,15 @@ int main(void) {
     check("udp://1.1.1.1 — порт 53", 0, parse("udp://1.1.1.1", &u));
     check("  порт", 53, u.port);
     check("udp://имя — отказ (обычному DNS нечем разрешить имя)", -1, parse("udp://dns.test", &u));
-    check("quic:// — пока отказ", -1, parse("quic://dns.test", &u));
+    check("quic://dns.test — DoQ 853", 0, parse("quic://dns.test", &u));
+    check("  протокол", DNSP_QUIC, u.proto);
+    check("  порт 853", 853, u.port);
+    check_str("  имя", "dns.test", u.host);
+    check("quic://[2001:db8::1]:8853 — IPv6 и порт", 0, parse("quic://[2001:db8::1]:8853", &u));
+    check("  порт", 8853, u.port);
+    check_str("  адрес", "2001:db8::1", u.host);
+    check("путь у quic:// — отказ", -1, parse("quic://dns.test/x", &u));
+    check("doq:// — не схема (ни AdGuard, ни sing-box, ни Xray её не пишут)", -1, parse("doq://dns.test", &u));
     check("http:// — отказ", -1, parse("http://dns.test", &u));
     check("путь у tls:// — отказ", -1, parse("tls://dns.test/x", &u));
     check("порт 99999 — отказ", -1, parse("tls://dns.test:99999", &u));
@@ -150,7 +160,7 @@ int main(void) {
     /* Отказы спеки. */
     const char *bad[] = {
         "dns: { upstreams: { a: { url: 'tls://dns.test' } } }",                    /* нечем разрешить имя */
-        "dns: { upstreams: { a: { url: 'quic://dns.test', ips: [1.1.1.1] } } }",     /* DoQ */
+        "dns: { upstreams: { a: { url: 'quic://dns.test' } } }",                    /* DoQ: нечем разрешить имя */
         "dns: { upstream: nope }",                                                  /* нет такого */
         "dns: { upstreams: { a: { url: 'tls://1.1.1.1', out: nope } } }",          /* нет выхода */
         "dns: { cache_ttl: { min: 100, max: 10 } }",                                /* min > max */
@@ -204,6 +214,49 @@ int main(void) {
     struct dcache_cfg c0 = { 0, 0, 0, 0 };
     dcache_config(&c0);
     check("кэш 0 — выключен", 0, dcache_on());
+
+    /* ---- DoQ: кадры RFC 9250 ---- */
+    {
+        uint8_t qq[64], fr[128], rs[300];
+        size_t qlen = mk_query(qq, "doq.test");
+        qq[0] = 0xAB; qq[1] = 0xCD;                    /* номер клиента */
+        size_t fl = doq_frame_query(fr, sizeof(fr), qq, qlen);
+        check("DoQ: кадр запроса = 2 + длина сообщения", (int)(2 + qlen), (int)fl);
+        check("  длина в сетевом порядке", (int)qlen, (fr[0] << 8) | fr[1]);
+        check("  номер сообщения в кадре — 0 (RFC 9250, 4.2.1)", 0, (fr[2] << 8) | fr[3]);
+        check("  остальное сообщение — как есть", 0, memcmp(fr + 4, qq + 2, qlen - 2));
+        check("  вход не изменён", 0xABCD, (qq[0] << 8) | qq[1]);
+        check("  мало места — 0", 0, (int)doq_frame_query(fr, qlen + 1, qq, qlen));
+        check("  короче заголовка DNS — 0", 0, (int)doq_frame_query(fr, sizeof(fr), qq, 11));
+
+        /* Ответ на потоке. */
+        size_t al = mk_answer(rs + 2, "doq.test", 60, 0, 1);
+        rs[0] = (uint8_t)(al >> 8); rs[1] = (uint8_t)al;
+        rs[2] = 0; rs[3] = 0;                          /* сервер отвечает с номером 0 */
+        const uint8_t *m = NULL; size_t ml = 0;
+        check("DoQ: пусто — ждём", 0, doq_take_answer(rs, 0, &m, &ml));
+        check("  один байт длины — ждём", 0, doq_take_answer(rs, 1, &m, &ml));
+        check("  длина есть, тела нет — ждём", 0, doq_take_answer(rs, 2, &m, &ml));
+        check("  без последнего байта — ждём", 0, doq_take_answer(rs, 2 + al - 1, &m, &ml));
+        check("  целый ответ", 1, doq_take_answer(rs, 2 + al, &m, &ml));
+        check("  длина сообщения", (int)al, (int)ml);
+        check("  указатель — за длиной", 1, m == rs + 2);
+        check("  лишний байт после сообщения — нарушение формата", -1, doq_take_answer(rs, 2 + al + 1, &m, &ml));
+        rs[0] = 0; rs[1] = 5;
+        check("  длина короче заголовка DNS — нарушение", -1, doq_take_answer(rs, 2 + 5, &m, &ml));
+        rs[0] = 0xFF; rs[1] = 0xFF;
+        check("  длина 65535 — ждём (предел формата)", 0, doq_take_answer(rs, 100, &m, &ml));
+
+        /* Коды RFC 9250, раздел 8.4. */
+        check("DOQ_NO_ERROR", 0, (int)DOQ_NO_ERROR);
+        check("DOQ_INTERNAL_ERROR", 1, (int)DOQ_INTERNAL_ERROR);
+        check("DOQ_PROTOCOL_ERROR", 2, (int)DOQ_PROTOCOL_ERROR);
+        check("DOQ_REQUEST_CANCELLED", 3, (int)DOQ_REQUEST_CANCELLED);
+        check("DOQ_EXCESSIVE_LOAD", 4, (int)DOQ_EXCESSIVE_LOAD);
+        check("DOQ_UNSPECIFIED_ERROR", 5, (int)DOQ_UNSPECIFIED_ERROR);
+        check_str("  имя кода", "DOQ_PROTOCOL_ERROR", doq_err_name(DOQ_PROTOCOL_ERROR));
+        check_str("  неизвестный код", "DOQ_?", doq_err_name(0x1234));
+    }
 
     unlink(lst); unlink(lst2); unlink(sp); rmdir(dir);
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");

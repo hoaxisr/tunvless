@@ -32,6 +32,14 @@
 #include <pthread.h>
 #include "tls13.h"
 #include "reality.h"
+#include "dupq.h"
+
+/* Контекст TLS соединений DoQ (корни разбираются один раз на процесс) готовит шов dupq.h — здесь,
+ * в потоке установки: разбор файла корней блокирует, а цикл резолвера — нет. Корни те же, что у DoT:
+ * --ca-file стенда, иначе хранилище движка (tls_cert_roots), иначе умолчание обёртки. Слабая ссылка:
+ * без обёртки QUIC в сборке DoQ отказывает в dup.c, а не здесь. */
+extern int dupq_prepare(const char *roots) __attribute__((weak));
+extern const char *tls_cert_roots(void) __attribute__((weak));
 
 extern int tls13_handshake_auth(struct tls13 *t, int fd, const unsigned char *client_hello,
                                 size_t hello_n, const unsigned char *shared_secret,
@@ -235,7 +243,7 @@ static void dial_run(struct dial *d) {
     d->rc = -1;
     d->fd = -1;
     d->tls = NULL;
-    if (!dup_have_tls()) {
+    if (!d->quic && !dup_have_tls()) {
         snprintf(d->err, sizeof(d->err), "в этой сборке нет TLS: DoT и DoH недоступны");
         return;
     }
@@ -276,6 +284,16 @@ static void dial_run(struct dial *d) {
     }
     if (!ln) {
         snprintf(d->err, sizeof(d->err), "нет адреса сервера %.60s", d->u.host);
+        return;
+    }
+    /* DoQ: дальше — не блокирующее. qc_open только создаёт сокет UDP и шлёт первый пакет, а
+     * рукопожатие QUIC идёт в цикле резолвера событиями (qc_on_readable, qc_on_timer), поэтому
+     * потоку остаётся отдать адреса — то единственное блокирующее (bootstrap), что у DoQ есть. */
+    if (d->quic) {
+        if (dupq_prepare)                              /* корни разобрать здесь, а не в цикле */
+            dupq_prepare(g_dup_ca_file ? g_dup_ca_file : (tls_cert_roots ? tls_cert_roots() : NULL));
+        for (int i = 0; i < ln; i++) d->addr[d->addr_n++] = list[i];
+        d->rc = 0;
         return;
     }
     /* 2. connect. */

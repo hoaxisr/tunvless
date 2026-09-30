@@ -118,7 +118,8 @@ DNSD_TABLE_SRC := src/dnsd/table.c src/dnsd/tabfmt.c
 DNSD_SRC := src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c \
             src/dnsd/rules.c src/dnsd/wire.c src/dnsd/origdst.c src/dnsd/fakeip.c $(DNSD_TABLE_SRC) \
             src/dnsd/dlog.c src/dnsd/realip.c src/dnsd/adopt.c src/dnsd/proxy.c src/dnsd/main.c \
-            src/dnsd/fpseed.c src/dnsd/dcache.c src/dnsd/dup.c src/dnsd/dupdial.c
+            src/dnsd/fpseed.c src/dnsd/dcache.c src/dnsd/dup.c src/dnsd/dupdial.c \
+            src/dnsd/doq.c
 
 # Виды выхода (src/kinds, docs/architecture.md, раздел 2, правило 1): вид — это файл, и какие виды
 # есть в сборке, решает профиль. Реестр (kind.c) ссылается на записи видов слабо, поэтому вид,
@@ -267,7 +268,9 @@ PROFILE_android  := $(PROFILE_extended)
 # и QUIC-часть wolfSSL остаются в обеих библиотеках и собираются, слинковываются и проверяются на
 # каждой архитектуре. Без стенда сборщик выбросил бы их как недостижимые. Когда придёт настоящий
 # потребитель (DoQ, hysteria2), стенд из списка экспорта уйдёт, а символы останутся его же.
-QUIC_SRC := src/proto/quic/quic.c src/proto/quic/qcssl.c
+# qcdoq.c — сторона QUIC шва резолвера (src/dnsd/dupq.h): DoQ в dnsd берёт обёртку через него, а не
+# заголовком, чтобы статические сборки без QUIC не тянули quic.c по замыканию #include.
+QUIC_SRC := src/proto/quic/quic.c src/proto/quic/qcssl.c src/proto/quic/qcdoq.c
 QUIC_SSL_SRC := src/proto/quic/qcssl.c
 QUIC_STAND_SRC := tests/qcbench.c
 # hysteria2 (модуль steer-hysteria2, docs/hysteria2.md). Запись вида — в libsteer, как у vless и

@@ -95,6 +95,7 @@ cc_defaults {
         "src/dnsd/dcache.c",
         "src/dnsd/dup.c",
         "src/dnsd/dupdial.c",
+        "src/dnsd/doq.c",
         "src/dnsd/proxy.c",
         "src/dnsd/main.c",
         "src/daemon/failover.c",

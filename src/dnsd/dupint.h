@@ -33,6 +33,8 @@ struct dial {
     char (*boot_own)[46];
     unsigned mark;
     int doh;                            /* ALPN http/1.1 и проверка, что выбрано оно */
+    int quic;                           /* DoQ: поток только находит адреса сервера (список — в
+                                         * addr), connect и рукопожатие ведёт цикл через dupq_open */
     struct sockaddr_storage cached[DIAL_MAXADDR];
     int cached_n, cached_fresh;         /* прежде найденные адреса и не истёк ли их срок */
     char ca[256];                       /* файл корней вместо системного ("" — системный) */
@@ -48,6 +50,8 @@ struct dial {
     long res_ttl;                       /* секунд */
     int peer_i;                         /* к какому адресу подключились: индекс в res/cached */
     int peer_from_res;
+    struct sockaddr_storage addr[DIAL_MAXADDR];  /* DoQ: все адреса сервера по порядку выдачи */
+    int addr_n;
 };
 
 /* Запустить поток. 0 — запущен и вернёт байт в wfd; -1 — не удалось (rc и err заполнены). */
