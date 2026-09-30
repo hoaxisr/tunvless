@@ -206,7 +206,7 @@ XS_COMMON_SRC := src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/x
 # sub.c (разбор подписки) — не в модуле: его зовёт и `steer-tools sub-fetch` (subfetch.c).
 STACK_SRC := src/tunnel/stack.c src/tunnel/rtx.c
 TRANSPORT_SRC := src/proto/transport/transport.c src/proto/transport/trdial.c \
-                 src/proto/transport/trsec.c src/proto/transport/trgrpc.c \
+                 src/proto/transport/trsec.c src/proto/tls/ech.c src/proto/transport/trgrpc.c \
                  src/proto/transport/trxhttp.c src/proto/transport/trupgrade.c \
                  src/proto/transport/trws.c src/proto/transport/trpath.c src/proto/tls/roots.c \
                  src/proto/transport/trvenc.c

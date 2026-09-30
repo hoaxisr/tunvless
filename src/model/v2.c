@@ -556,6 +556,7 @@ static const struct { const char *key; unsigned bit; const char *owner; } KIND_K
     { "subscription", KK_SUB,    "kind: tunnel" },
     { "nodes",        KK_NODES,  "kind: tunnel" },
     { "transport",    KK_SUB,    "kind: tunnel" },
+    { "insecure",     KK_SUB,    "kind: tunnel" },
     { "stream",       KK_STREAM, "kind: xsteer" },
     { "stream_port",  KK_STREAM, "kind: xsteer" },
     { "strategy",     KK_OPTS,   "kind: zapret" },
@@ -825,6 +826,8 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
                 if (k.transports & b) return fail(x, it, "%s: %s указан дважды", w, it->str);
                 k.transports |= b;
             }
+        } else if (!strcmp(ks, "insecure")) {
+            if (bool_of(x, v, w, &k.insecure)) return -1;
         } else if (!strcmp(ks, "stream")) {
             if (bool_of(x, v, w, &k.stream)) return -1;
         } else if (!strcmp(ks, "stream_port")) {

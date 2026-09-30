@@ -306,6 +306,7 @@ static void output_flow(FILE *f, const struct output *o, const struct onames *on
                 if (kk.transports & (1u << i)) fprintf(f, "%s%s", m++ ? ", " : "", tunnel_transport_name(i));
             if (c > 1) fputc(']', f);
         }
+        if (kk.insecure) { fk(&w, "insecure"); fputs("true", f); }
         if (kk.conf[0]) fpath(&w, "conf", kk.conf);
         if (kk.stream) { fk(&w, "stream"); fputs("true", f); }
         if (kk.stream_port) { fk(&w, "stream_port"); fprintf(f, "%d", kk.stream_port); }

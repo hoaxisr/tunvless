@@ -45,6 +45,13 @@ static void tr_node_of(const struct vless_node *n, struct tr_node *t) {
     t->http_host = n->http_host;
     t->headers = n->headers;
     t->pqv = n->pqv;
+    /* Проверка сертификата — только у security=tls; у reality эти поля ничего не значат. */
+    int tls = !strcmp(n->security, "tls");
+    t->pcs = tls ? n->pcs : NULL;
+    t->pks = tls ? n->pks : NULL;
+    t->vcn = tls ? n->vcn : NULL;
+    t->ech = tls ? n->ech : NULL;
+    t->insecure = tls && n->insecure;
     t->encryption = n->encryption;
 }
 

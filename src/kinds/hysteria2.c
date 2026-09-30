@@ -40,6 +40,10 @@ static int hy2_parse(struct output *o, const struct out_keys *k, struct err *e) 
      * работает. */
     if (k->transports)
         return err_set(e, "outputs.%s: у kind hysteria2 нет transport — это QUIC целиком", o->name);
+    /* insecure у hysteria2 — параметр ссылки узла (`insecure=1`), а не ключ выхода: промолчать
+     * значило бы принять ключ, который ничего не делает. */
+    if (k->insecure)
+        return err_set(e, "outputs.%s: у kind hysteria2 нет insecure — он задаётся в ссылке узла", o->name);
     /* Имя устройства выводится из имени выхода, как у vless, и по тому же доводу: два имени
      * расходились бы, а пользы от различия нет. */
     if (!o->device[0]) snprintf(o->device, sizeof(o->device), "%.15s", o->name);

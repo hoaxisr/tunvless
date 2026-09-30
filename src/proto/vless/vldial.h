@@ -37,6 +37,11 @@ struct vl_sess {
      * при заводе Vision. */
     unsigned char uuid[16];
     struct vision vis;
+    /* ---- разбор кадров XUDP (только UDP при vision, см. xudp_downstream в vldial.c) ----
+     * xs — что читаем сейчас (XS_*), xneed — длина метаданных кадра, xdiscard — данные кадра
+     * KeepAlive читаются и выбрасываются. Длины двух байт используют lenb/lenb_n, буфер — dg. */
+    uint8_t xs, xdiscard;
+    uint16_t xneed;
     /* ---- связь с узлом ---- */
     struct transport t;
     unsigned char dg[UDP_DGRAM_MAX];

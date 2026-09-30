@@ -86,6 +86,11 @@ static int load_nodes(struct spec *sp, const char *spec_path, const char *out_na
         return 2;
     }
     *out = o;
+    /* insecure выхода — ДО разбора подписки: от него зависит, пригодны ли узлы с allowInsecure. */
+    vless_set_insecure(vc->insecure);
+    if (vc->insecure)
+        fprintf(stderr, LOG_W2 "выход %s: insecure — сертификат узлов security=tls НЕ проверяется\n",
+                out_name);
     return load_nodes_file(vc->sub_file, cnt, st);
 }
 

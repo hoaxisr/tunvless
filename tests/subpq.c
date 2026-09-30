@@ -215,6 +215,131 @@ int main(void) {
         check("Clash распознан как текст, а не base64", vless_sub_text(y, strlen(y), dec, sizeof dec) == y);
     }
 
+    /* ---- проверка сертификата узла: pcs / vcn / allowInsecure (Xray-core, sing-box, Clash) ---- */
+    {
+        static const char H1[] = "f8c71232f26e142a9ec780c297bd500dcbfadd2bde91f4a97876ab4d73631c12";
+        static const char H2[] = "a0cf13f5063002c9f3cf982cda1fdebcb9f1277a1f56969cfa1b1d7837becfc7";
+        struct vless_node n;
+        char q[400];
+
+        snprintf(q, sizeof q, "security=tls&sni=t.example&pcs=%s", H1);
+        check("pcs: узел пригоден", url(q, &n) == 0);
+        check_s("pcs: отпечаток сохранён", H1, n.pcs);
+        snprintf(q, sizeof q, "security=tls&sni=t.example&pcs=F8:C7:12:32:F2:6E:14:2A:9E:C7:80:C2:97:BD:50:0D:CB:FA:DD:2B:DE:91:F4:A9:78:76:AB:4D:73:63:1C:12,%s&vcn=a.example,%%20b.example", H2);
+        check("pcs с двоеточиями и списком, vcn с пробелом", url(q, &n) == 0);
+        char want2[140];
+        snprintf(want2, sizeof want2, "%s,%s", H1, H2);
+        check_s("pcs: двоеточия сняты, регистр приведён, список сохранён", want2, n.pcs);
+        check_s("vcn: список имён", "a.example,b.example", n.vcn);
+        check("pcs: не SHA-256 — узел непригоден", url("security=tls&sni=t.example&pcs=abcd", &n) == 1);
+        check_s("  причина названа", "pcs: не SHA-256 в hex", n.skip_reason);
+        check("pcs у reality ничего не значит", url("security=reality&pbk=K4ALTVxNnrDTywBj_Stb5bomQ21QlSWOlGGT44n9Nng&sid=0123&pcs=abcd", &n) == 0);
+
+        /* allowInsecure: подписка проверку сама не выключает. */
+        vless_set_insecure(0);
+        check("allowInsecure=1 при tls без ключа выхода — узел непригоден", url("security=tls&sni=t.example&allowInsecure=1", &n) == 1);
+        check_s("  причина названа", "allowInsecure: включите insecure у выхода явно", n.skip_reason);
+        check("insecure=1 (как пишут панели) — то же", url("security=tls&sni=t.example&insecure=1", &n) == 1);
+        check("allowInsecure=0 — обычный узел", url("security=tls&sni=t.example&allowInsecure=0", &n) == 0 && !n.insecure);
+        check("allowInsecure у reality не мешает", url("security=reality&pbk=K4ALTVxNnrDTywBj_Stb5bomQ21QlSWOlGGT44n9Nng&sid=0123&allowInsecure=1", &n) == 0);
+        vless_set_insecure(1);
+        check("с ключом выхода insecure узел пригоден и помечен", url("security=tls&sni=t.example&allowInsecure=1", &n) == 0 && n.insecure);
+        vless_set_insecure(0);
+
+        /* Конфиг Xray. */
+        {
+            static const char *js =
+                "{\"outbounds\":[{\"protocol\":\"vless\",\"settings\":{\"vnext\":[{\"address\":\"x.example\",\"port\":443,"
+                "\"users\":[{\"id\":\"" UUID "\"}]}]},\"streamSettings\":{\"network\":\"tcp\",\"security\":\"tls\","
+                "\"tlsSettings\":{\"serverName\":\"x.example\",\"pinnedPeerCertSha256\":\"f8c71232f26e142a9ec780c297bd500dcbfadd2bde91f4a97876ab4d73631c12\","
+                "\"verifyPeerCertByName\":\"v.example\"}}}]}";
+            struct vless_node out[2];
+            struct vless_sub_stats st;
+            size_t cnt = vless_parse_sub(js, out, 2, &st);
+            check("Xray JSON: pinnedPeerCertSha256 и verifyPeerCertByName", cnt == 1 && out[0].pcs && !strcmp(out[0].pcs, H1) &&
+                  out[0].vcn && !strcmp(out[0].vcn, "v.example"));
+            static const char *js2 =
+                "{\"outbounds\":[{\"protocol\":\"vless\",\"settings\":{\"vnext\":[{\"address\":\"x.example\",\"port\":443,"
+                "\"users\":[{\"id\":\"" UUID "\"}]}]},\"streamSettings\":{\"network\":\"tcp\",\"security\":\"tls\","
+                "\"tlsSettings\":{\"serverName\":\"x.example\",\"allowInsecure\":true}}}]}";
+            check("Xray JSON: allowInsecure — узел пропущен", vless_parse_sub(js2, out, 2, &st) == 0 && st.skipped == 1);
+        }
+        /* sing-box. */
+        {
+            static const char *sb =
+                "{\"outbounds\":[{\"type\":\"vless\",\"tag\":\"a\",\"server\":\"x.example\",\"server_port\":443,\"uuid\":\"" UUID "\","
+                "\"tls\":{\"enabled\":true,\"server_name\":\"x.example\","
+                "\"certificate_public_key_sha256\":[\"1hD3S62x74la2vO7hT4FuMdtQwscW6lAZrzE1Ua3dn0=\"]}}]}";
+            struct vless_node out[2];
+            struct vless_sub_stats st;
+            size_t cnt = vless_parse_sub(sb, out, 2, &st);
+            check("sing-box: certificate_public_key_sha256 — в hex",
+                  cnt == 1 && out[0].pks && !strcmp(out[0].pks, "d610f74badb1ef895adaf3bb853e05b8c76d430b1c5ba94066bcc4d546b7767d"));
+            static const char *sb2 =
+                "{\"outbounds\":[{\"type\":\"vless\",\"tag\":\"a\",\"server\":\"x.example\",\"server_port\":443,\"uuid\":\"" UUID "\","
+                "\"tls\":{\"enabled\":true,\"server_name\":\"x.example\",\"insecure\":true}}]}";
+            check("sing-box: insecure — узел пропущен", vless_parse_sub(sb2, out, 2, &st) == 0 && st.skipped == 1);
+        }
+        /* Clash. */
+        {
+            static const char *y =
+                "proxies:\n  - name: c1\n    type: vless\n    server: x.example\n    port: 443\n    uuid: " UUID "\n"
+                "    network: tcp\n    tls: true\n    servername: x.example\n"
+                "    fingerprint: f8c71232f26e142a9ec780c297bd500dcbfadd2bde91f4a97876ab4d73631c12\n"
+                "  - name: c2\n    type: vless\n    server: y.example\n    port: 443\n    uuid: " UUID "\n"
+                "    network: tcp\n    tls: true\n    servername: y.example\n    skip-cert-verify: true\n";
+            struct vless_node out[3];
+            struct vless_sub_stats st;
+            size_t cnt = vless_parse_sub(y, out, 3, &st);
+            check("Clash: fingerprint — pcs; skip-cert-verify — узел пропущен",
+                  cnt == 1 && out[0].pcs && !strcmp(out[0].pcs, H1) && st.skipped == 1);
+        }
+    }
+
+    /* ---- ECH: echConfigList / ech= (Xray), ech-opts (Clash), ech (sing-box) ---- */
+    {
+        static const char ECH[] = "AEX+DQBBNwAgACANG785NbYxf2vAoHiUugO7PDLchnWNz2f+95epg2DJewAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=";
+        struct vless_node n;
+        char q[400];
+        snprintf(q, sizeof q, "security=tls&sni=t.example&ech=%s", "AEX%2BDQBBNwAgACANG785NbYxf2vAoHiUugO7PDLchnWNz2f%2B95epg2DJewAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA%3D");
+        check("ech= в ссылке: узел пригоден", url(q, &n) == 0);
+        check_s("  значение раскодировано из %-формы", ECH, n.ech);
+        check("ech= не ECHConfigList — узел непригоден", url("security=tls&sni=t.example&ech=AAAA", &n) == 1);
+        check_s("  причина названа", "ech: не ECHConfigList в base64", n.skip_reason);
+        check("ech= в виде «домен+https://…» (запрос из DNS) — узел непригоден",
+              url("security=tls&sni=t.example&ech=cloudflare-ech.com%2Bhttps://1.1.1.1/dns-query", &n) == 1);
+        check_s("  причина названа", "ech: запрос записи из DNS не поддержан", n.skip_reason);
+        check("ech у reality ничего не значит",
+              url("security=reality&pbk=K4ALTVxNnrDTywBj_Stb5bomQ21QlSWOlGGT44n9Nng&sid=0123&ech=AAAA", &n) == 0);
+
+        char js[1200];
+        snprintf(js, sizeof js,
+            "{\"outbounds\":[{\"protocol\":\"vless\",\"settings\":{\"vnext\":[{\"address\":\"x.example\",\"port\":443,"
+            "\"users\":[{\"id\":\"" UUID "\"}]}]},\"streamSettings\":{\"network\":\"tcp\",\"security\":\"tls\","
+            "\"tlsSettings\":{\"serverName\":\"x.example\",\"echConfigList\":\"%s\"}}}]}", ECH);
+        struct vless_node out[2];
+        struct vless_sub_stats st;
+        size_t cnt = vless_parse_sub(js, out, 2, &st);
+        check("Xray JSON: echConfigList", cnt == 1 && out[0].ech && !strcmp(out[0].ech, ECH));
+        char y[900];
+        snprintf(y, sizeof y,
+            "proxies:\n  - name: c1\n    type: vless\n    server: x.example\n    port: 443\n    uuid: " UUID "\n"
+            "    network: tcp\n    tls: true\n    servername: x.example\n    ech-opts:\n      enable: true\n      config: %s\n", ECH);
+        cnt = vless_parse_sub(y, out, 2, &st);
+        check("Clash: ech-opts.config", cnt == 1 && out[0].ech && !strcmp(out[0].ech, ECH));
+        char sb[1300];
+        snprintf(sb, sizeof sb,
+            "{\"outbounds\":[{\"type\":\"vless\",\"tag\":\"a\",\"server\":\"x.example\",\"server_port\":443,\"uuid\":\"" UUID "\","
+            "\"tls\":{\"enabled\":true,\"server_name\":\"x.example\",\"ech\":{\"enabled\":true,\"config\":["
+            "\"-----BEGIN ECH CONFIGS-----\",\"%s\",\"-----END ECH CONFIGS-----\"]}}}]}", ECH);
+        cnt = vless_parse_sub(sb, out, 2, &st);
+        check("sing-box: ech.config (строки PEM)", cnt == 1 && out[0].ech && !strcmp(out[0].ech, ECH));
+        static const char *sb2 =
+            "{\"outbounds\":[{\"type\":\"vless\",\"tag\":\"a\",\"server\":\"x.example\",\"server_port\":443,\"uuid\":\"" UUID "\","
+            "\"tls\":{\"enabled\":true,\"server_name\":\"x.example\",\"ech\":{\"enabled\":true}}}]}";
+        check("sing-box: ech без config (запрос из DNS) — узел пропущен", vless_parse_sub(sb2, out, 2, &st) == 0 && st.skipped == 1);
+    }
+
     printf(g_fail ? "ПРОВАЛОВ: %d (прошло %d)\n" : "subpq: всё совпало (%d проверок)\n", g_fail ? g_fail : g_pass, g_pass);
     return g_fail ? 1 : 0;
 }

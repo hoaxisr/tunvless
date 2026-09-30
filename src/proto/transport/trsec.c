@@ -21,6 +21,8 @@
 #include "transport.h"
 #include "reality.h"
 #include "roots.h"
+#include "certverify.h"
+#include "ech.h"
 
 /* security=none — голый поток, без TLS вообще. Полезен в доверенной сети, и именно поэтому он
  * не «частный случай reality», а отдельная ветка: ставить TLS там, где его нет, значило бы
@@ -85,11 +87,42 @@ static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *
                  : reality_build_hello(&cfg, &rst, hello, sizeof(hello), &hello_n);
     if (rc) return rc;
 
+    /* ECH (security=tls, `ech=` узла): собранный выше Hello с настоящим SNI становится внутренним, по
+     * проводу идёт внешний с public_name из ECHConfig (ech.h). Буферы — в куче: внешний Hello вмещает
+     * зашифрованную копию внутреннего, то есть вдвое больше обычного, а стек рабочих потоков мал. */
+    struct ech_heap {
+        struct ech_cfg cfg;
+        struct ech_state st;
+        unsigned char list[1100];
+        unsigned char outer[6144];
+        size_t outer_n;
+    } *eh = NULL;
+    struct tls13_ech te = { 0 };
+    const unsigned char *send_hello = hello;
+    size_t send_n = hello_n;
+    if (is_tls && n->ech && n->ech[0]) {
+        eh = calloc(1, sizeof *eh);
+        if (!eh) return TR_EIO;
+        int ln = ech_b64_decode(n->ech, eh->list, sizeof eh->list);
+        int er = ln <= 0 ? ECH_EPARSE : ech_pick(eh->list, (size_t)ln, &eh->cfg);
+        if (er == 0) er = ech_wrap(&eh->cfg, hello, hello_n, eh->outer, sizeof eh->outer, &eh->outer_n, &eh->st);
+        if (er != 0) {
+            free(eh);
+            return er;                              /* причина — ECH_E* (transport.c, tr_strerror) */
+        }
+        send_hello = eh->outer;
+        send_n = eh->outer_n;
+        te.inner = eh->st.inner;
+        te.inner_n = eh->st.inner_n;
+        te.random = eh->st.random;
+    }
+
     size_t sent = 0;
-    while (sent < hello_n) {
-        ssize_t w = write(l->fd, hello + sent, hello_n - sent);
+    while (sent < send_n) {
+        ssize_t w = write(l->fd, send_hello + sent, send_n - sent);
         if (w <= 0) {
             if (w < 0 && errno == EINTR) continue;
+            free(eh);
             return TR_EIO;
         }
         sent += (size_t)w;
@@ -101,12 +134,21 @@ static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *
      * У обычного TLS это цепочка и имя, у Reality — HMAC в поле подписи временного
      * сертификата на ключе, который есть только у владельца постоянной пары. */
     struct tls13_auth auth = { 0 };
-    if (is_tls) { auth.host = verify_host; auth.roots = tls_cert_roots(); }
-    else        auth.reality_key = rst.authkey;
+    /* Закрепления, имена проверки и явный отказ от проверки — из узла и выхода (certverify.h). Без
+     * них указатель остаётся NULL, и проверка идёт прежним путём: цепочка до корней и SNI. */
+    struct cert_policy pol = { .pcs = n->pcs, .pks = n->pks, .vcn = n->vcn, .insecure = n->insecure };
+    if (is_tls) {
+        auth.host = verify_host;
+        auth.roots = tls_cert_roots();
+        if (pol.pcs || pol.pks || pol.vcn || pol.insecure) auth.policy = &pol;
+    } else auth.reality_key = rst.authkey;
     if (rst.pq) auth.mlkem_dk = rst.mlkem_dk;
     auth.mldsa_pk = have_pqv ? pqv : NULL;
 
-    return tls13_handshake_auth(&l->tls, l->fd, hello, hello_n, rst.priv, &auth);
+    if (eh) auth.ech = &te;
+    int hrc = tls13_handshake_auth(&l->tls, l->fd, send_hello, send_n, rst.priv, &auth);
+    free(eh);
+    return hrc;
 }
 
 static int sec_tls(struct tr_link *l, const struct tr_node *n, const char *alpn) {

@@ -210,6 +210,22 @@ if [ -x "$XK" ]; then
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec tr4.yaml --state-dir "$tmp/state" 2>&1)"
     if echo "$out" | grep -qF "ключ transport есть только у kind: tunnel"; then ok; else
         bad "transport у interface — отказ «только у kind: tunnel»" "$out"; fi
+    # insecure: у туннеля vless — явный отказ от проверки сертификата узлов TLS; convert печатает его
+    # обратно и остаётся неподвижной точкой; у hysteria2 (там insecure — параметр ссылки) и у прочих
+    # видов — отказ.
+    printf 'version: 2\noutputs:\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl, insecure: true }\n' > "$tmp/in1.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec in1.yaml --state-dir "$tmp/state" 2>&1)"
+    if [ $? = 0 ]; then ok; else bad "insecure: true у vless — принят" "$(echo "$out" | head -n 3)"; fi
+    (cd "$tmp" && "$XKA" spec convert --spec in1.yaml > c1.yaml 2>&1 && "$XKA" spec convert --spec c1.yaml > c2.yaml 2>&1)
+    if grep -q 'insecure: true' "$tmp/c1.yaml" && cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml"; then ok; else
+        bad "convert печатает insecure: true (неподвижная точка)" "$(grep -n insecure "$tmp/c1.yaml")"; fi
+    printf 'version: 2\noutputs:\n  hy: { kind: tunnel, protocol: hysteria2, subscription: sub/hy, insecure: true }\n' > "$tmp/in2.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec in2.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -qF "у kind hysteria2 нет insecure"; then ok; else bad "insecure у hysteria2 — отказ" "$out"; fi
+    printf 'version: 2\noutputs:\n  wg: { kind: interface, device: wg0, insecure: true }\n' > "$tmp/in3.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec in3.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -qF "ключ insecure есть только у kind: tunnel"; then ok; else
+        bad "insecure у interface — отказ «только у kind: tunnel»" "$out"; fi
 else
     bad "не собран $XK (make build/steer-xk)"
 fi

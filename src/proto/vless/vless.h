@@ -65,7 +65,21 @@ struct vless_node {
      * заголовок HTTP-маскировки tcp (headerType=http); xh_extra — обфускация запросов xhttp
      * (xPaddingObfsMode, размещения sessionID/seq/данных, downloadSettings). */
     uint8_t tcp_http, xh_extra;
-    char skip_reason[64];  /* почему узел непригоден — чтобы это можно было показать */
+    /* Клиентская проверка сертификата узла security=tls (Xray-core: pinnedPeerCertSha256 / `pcs`,
+     * verifyPeerCertByName / `vcn`; sing-box: certificate_public_key_sha256). Строки из общей таблицы
+     * sub_intern, NULL — поля нет. pcs и pks — SHA-256 в hex строчными, через запятую: pcs от всего
+     * сертификата (DER), pks от его SubjectPublicKeyInfo; vcn — имена через запятую. */
+    const char *pcs, *pks, *vcn;
+    /* security=tls: ECHConfigList в base64 (Encrypted Client Hello), интернирован; NULL — без ECH. */
+    const char *ech;
+    /* allowInsecure=1 (skip-cert-verify, insecure) в подписке. Подписка сама проверку сертификата НЕ
+     * выключает: узел пригоден, только если у выхода явно стоит `insecure` (sub.c, node_usable). */
+    uint8_t allow_insecure;
+    /* Ключ `insecure` выхода на момент разбора (node_usable): клиент не проверяет сертификат этого
+     * узла. Живёт в узле, а не читается из глобала при подключении, чтобы клиент (client.c) не зависел
+     * от разбора подписки: стенды собирают их порознь. */
+    uint8_t insecure;
+    char skip_reason[96];  /* почему узел непригоден — чтобы это можно было показать */
 };
 
 size_t b64_decode(const char *in, size_t n, char *out, size_t out_n);
@@ -102,6 +116,13 @@ struct vless_sub_stats {
     size_t reasons_dropped;                      /* узлов, чья причина не влезла */
     struct vless_skip reasons[VLESS_SKIP_REASONS];
 };
+
+/* Ключ `insecure` выхода: подписке разрешено нести узлы с allowInsecure, а клиент не проверяет
+ * сертификат узлов security=tls. Ставится процессом выхода ДО разбора подписки; по умолчанию — 0.
+ * Глобальная настройка, а не поле узла, потому что процесс клиента обслуживает ровно один выход,
+ * а решение «пригоден ли узел» принимает разбор, которому выхода не передают. */
+void vless_set_insecure(int on);
+int vless_insecure(void);
 
 /* st допускает NULL: подъёму туннеля счётчики не нужны. */
 /* Привести прочитанный файл подписки к тексту для vless_parse_sub: конфиг Xray и список

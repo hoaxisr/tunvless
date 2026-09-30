@@ -17,6 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
+#include <sys/random.h>
 
 #include "vless.h"
 #include "vless_proto.h"
@@ -96,6 +98,8 @@ static void vl_clear(void *sess) {
     s->dg_want = s->dg_have = 0;
     s->dg_skip = 0;
     s->lenb_n = 0;
+    s->xs = 0;
+    s->xdiscard = 0;
 }
 
 static int vl_fd(const void *sess) {
@@ -135,9 +139,179 @@ static int vl_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
         node_id_refused(node, udp ? "соединение UDP" : "соединение TCP");
         return -1;
     }
-    /* У UDP Vision не заводим вовсе: в запросе UDP flow не объявлен, значит кадров не будет
-     * ни в ту, ни в другую сторону. */
-    if (!udp) vision_init(&s->vis, s->uuid);
+    /* У UDP Vision заводим только для узла с flow: там UDP идёт командой Mux с рамками XUDP поверх
+     * потока Vision (vl_send). Без flow в запросе UDP flow не объявлен, кадров не будет ни в ту, ни
+     * в другую сторону. */
+    if (!udp || node->flow[0]) vision_init(&s->vis, s->uuid);
+    return 0;
+}
+
+/* ---- XUDP: UDP по vision-записи (Mux.Cool, как клиент Xray) ---------------------------------------
+ *
+ * Сервер не принимает UDP-запрос (команда 2) к учётной записи с flow=xtls-rprx-vision: Xray-core
+ * отвечает «doesn't support UDP», sing-box сверяет flow с записью для любой команды и отвергает и
+ * пустой, и vision. Собственный клиент Xray ходит иначе (proxy/vless/outbound/outbound.go: при
+ * vision команда UDP заменяется на Mux со службой v1.mux.cool:666): поток Mux.Cool с рамками XUDP
+ * (common/xudp), а весь поток обёрнут Vision, как у TCP. Так и здесь, для узлов с flow.
+ * Узлы без flow остаются на команде 2: она проще, короче на проводе и принимается всеми серверами.
+ *
+ * Рамка (общий вид у Mux.Cool, common/mux/frame.go):
+ *   [длина метаданных u16][идентификатор сессии u16 = 0][статус u8][опции u8][...]  [длина данных u16][данные]
+ *   статус: 1 New, 2 Keep, 3 End, 4 KeepAlive. Опции: бит 0 — есть данные, бит 1 — ошибка.
+ * Первая датаграмма потока — New: после опций сеть (2 = UDP), порт, тип адреса и адрес назначения, затем
+ * GlobalID (8 байт; сервер Xray по нему возвращает один и тот же UDP-сокет при новом потоке —
+ * «full cone»). Дальше — Keep без адреса: назначение потока не меняется, а по Keep без адреса
+ * сервер использует назначение New (sing-box: длина метаданных 4 — адреса нет). Один поток — одно
+ * назначение, как и у команды 2 (см. docs/vless.md): сессия mux одна, мультиплекса адресатов нет.
+ *
+ * ЧЕГО ЗДЕСЬ НЕТ: мультиплекса нескольких сессий в одном потоке и Mux для TCP (concurrency): для
+ * TCP они нужны только чтобы экономить рукопожатия, а у стека для этого есть пул запасных связей. */
+enum { XS_LEN = 0, XS_META, XS_DLEN, XS_DATA, XS_SKIP };
+
+/* GlobalID: непрозрачный 8-байтовый ключ «этот источник», по которому сервер подбирает сокет. От
+ * источника клиента и случайного ключа процесса: одинаков у всех потоков одного источника, разный у
+ * разных и непредсказуем снаружи. Криптостойкость не нужна — это не секрет, а ключ таблицы сервера. */
+static unsigned char g_xudp_key[16];
+static pthread_once_t g_xudp_once = PTHREAD_ONCE_INIT;
+static void xudp_key_init(void) {
+    if (getrandom(g_xudp_key, sizeof g_xudp_key, 0) != (ssize_t)sizeof g_xudp_key) {
+        struct timespec t;
+        clock_gettime(CLOCK_REALTIME, &t);
+        memcpy(g_xudp_key, &t, sizeof t < sizeof g_xudp_key ? sizeof t : sizeof g_xudp_key);
+    }
+}
+
+static void xudp_gid(const struct flow_key *k, unsigned char gid[8]) {
+    pthread_once(&g_xudp_once, xudp_key_init);
+    uint64_t h = 1469598103934665603ULL;               /* FNV-1a, 64 бита */
+    unsigned char in[16 + 6];
+    memcpy(in, g_xudp_key, 16);
+    memcpy(in + 16, &k->src, 4);
+    in[20] = (unsigned char)(k->sport >> 8);
+    in[21] = (unsigned char)k->sport;
+    for (size_t i = 0; i < sizeof in; i++) { h ^= in[i]; h *= 1099511628211ULL; }
+    h ^= h >> 32;
+    for (int i = 0; i < 8; i++) gid[i] = (unsigned char)(h >> (56 - 8 * i));
+}
+
+/* Датаграммы [длина u16][данные] (так их обрамляет dgram_frame) → рамки XUDP. first — первая рамка
+ * потока (New с адресом), остальные — Keep. Возвращает длину результата, 0 — не влезло или брак. */
+static size_t xudp_frames(const struct flow_key *k, int first, const unsigned char *in, size_t n,
+                          unsigned char *out, size_t cap) {
+    size_t o = 0;
+    while (n) {
+        if (n < 2) return 0;
+        size_t dl = ((size_t)in[0] << 8) | in[1];
+        in += 2;
+        n -= 2;
+        if (dl > n) return 0;
+        unsigned char meta[40];
+        size_t m = 0;
+        meta[m++] = 0; meta[m++] = 0;                  /* идентификатор сессии: одна, нулевая */
+        if (first) {
+            meta[m++] = 1;                             /* New */
+            meta[m++] = 1;                             /* опции: есть данные */
+            meta[m++] = 2;                             /* сеть: UDP */
+            meta[m++] = (unsigned char)(k->dport >> 8);
+            meta[m++] = (unsigned char)k->dport;       /* порт, затем тип адреса и адрес */
+            meta[m++] = VLESS_ADDR_IPV4;
+            memcpy(meta + m, &k->dst, 4);
+            m += 4;
+            xudp_gid(k, meta + m);
+            m += 8;
+            first = 0;
+        } else {
+            meta[m++] = 2;                             /* Keep */
+            meta[m++] = 1;
+        }
+        if (o + 2 + m + 2 + dl > cap) return 0;
+        out[o++] = (unsigned char)(m >> 8);
+        out[o++] = (unsigned char)m;
+        memcpy(out + o, meta, m);
+        o += m;
+        out[o++] = (unsigned char)(dl >> 8);
+        out[o++] = (unsigned char)dl;
+        memcpy(out + o, in, dl);
+        o += dl;
+        in += dl;
+        n -= dl;
+    }
+    return o;
+}
+
+/* Разобрать поток рамок XUDP от узла (после снятия Vision) и отдать датаграммы клиенту. Потоковый,
+ * как udp_downstream: границы рамок, кадров Vision и записей TLS не совпадают. 0 или -1.
+ *
+ * Правила — по PacketReader из common/xudp: Keep с данными — датаграмма; KeepAlive — служебная,
+ * данные (если есть) выбрасываются; End, New и всё прочее — конец потока. Адрес отправителя в Keep
+ * пропускается: назначение потока фиксировано, и ответ отдаётся клиенту от него, как у команды 2. */
+static int xudp_downstream(struct vl_sess *s, const unsigned char *d, size_t n,
+                           dialer_emit_fn emit, void *arg) {
+    while (n) {
+        switch (s->xs) {
+        case XS_LEN:
+        case XS_DLEN: {
+            unsigned v;
+            if (!s->lenb_n && n >= 2) { v = (unsigned)(d[0] << 8 | d[1]); d += 2; n -= 2; }
+            else if (!s->lenb_n) { s->lenb = d[0]; s->lenb_n = 1; return 0; }
+            else { v = (unsigned)(s->lenb << 8 | d[0]); s->lenb_n = 0; d++; n--; }
+            if (s->xs == XS_LEN) {
+                if (v < 4 || v > 512) return -1;        /* Xray: короче 4 — конец; длиннее 512 — брак */
+                s->xneed = (uint16_t)v;
+                s->dg_have = 0;
+                s->xs = XS_META;
+            } else if (!v) {
+                s->xs = XS_LEN;
+            } else if (v > UDP_DGRAM_MAX) {
+                s->dg_skip = v;                          /* выбросить ровно по длине, см. udp_downstream */
+                s->xdiscard = 1;
+                s->xs = XS_SKIP;
+            } else {
+                s->dg_want = (uint16_t)v;
+                s->dg_have = 0;
+                s->xs = XS_DATA;
+            }
+            break;
+        }
+        case XS_META: {
+            size_t take = (size_t)s->xneed - s->dg_have;
+            if (take > n) take = n;
+            memcpy(s->dg + s->dg_have, d, take);
+            s->dg_have = (uint16_t)(s->dg_have + take);
+            d += take;
+            n -= take;
+            if (s->dg_have < s->xneed) return 0;
+            unsigned status = s->dg[2], opt = s->dg[3];
+            if (status != 2 && status != 4) return -1;   /* End, New, чужое: конец потока */
+            if (opt & 2) return -1;                      /* опция «ошибка» */
+            s->xdiscard = status == 4;
+            s->xs = (opt & 1) ? XS_DLEN : XS_LEN;
+            break;
+        }
+        case XS_DATA: {
+            size_t take = (size_t)s->dg_want - s->dg_have;
+            if (take > n) take = n;
+            memcpy(s->dg + s->dg_have, d, take);
+            s->dg_have = (uint16_t)(s->dg_have + take);
+            d += take;
+            n -= take;
+            if (s->dg_have < s->dg_want) return 0;
+            s->xs = XS_LEN;
+            if (!s->xdiscard && emit(arg, s->dg, s->dg_want) != 0) return -1;
+            s->dg_want = 0;
+            s->dg_have = 0;
+            break;
+        }
+        default: {                                       /* XS_SKIP */
+            uint32_t take = s->dg_skip < n ? s->dg_skip : (uint32_t)n;
+            d += take;
+            n -= take;
+            s->dg_skip -= take;
+            if (!s->dg_skip) { s->xs = XS_LEN; s->xdiscard = 0; }
+            break;
+        }
+        }
+    }
     return 0;
 }
 
@@ -155,7 +329,24 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
     const unsigned char *body = data;
     size_t len = 0;
 
-    if (!s->header_sent) {
+    /* UDP к узлу с flow: рамки XUDP вместо датаграмм с длиной, см. блок XUDP выше. Данные, которые
+     * пришли обрамлёнными dgram_frame, переупаковываются в xb; дальше путь общий с TCP — Vision, запись. */
+    const int xudp = udp && node->flow[0];
+    if (xudp) {
+        static __thread unsigned char xb[TUNNEL_BUF];
+        size_t xn = xudp_frames(k, !s->header_sent, data, n, xb, sizeof xb);
+        if (!xn) return SEND_FATAL;
+        data = xb;
+        n = xn;
+        body = xb;
+        if (!s->header_sent) {
+            /* У Mux в заголовке нет ни порта, ни адреса (vless_build_request): служба v1.mux.cool:666
+             * подразумевается командой. */
+            len = vless_build_request(s->uuid, VLESS_CMD_MUX, NULL, NULL, 0, node->flow,
+                                      out, sizeof(out));
+            if (!len) return SEND_FATAL;
+        }
+    } else if (!s->header_sent) {
         /* Адрес назначения берём из пакета: имени у нас нет, клиент уже разрешил его сам
          * (или через наш резолвер, который вернул fake-IP и подменит адрес в DNAT). */
         unsigned char ip4[4];
@@ -191,7 +382,7 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
      *
      * Шестьдесят четыре байта копии против невоспроизводимой поломки протокола. */
     struct vision vis_before = s->vis;
-    if (node->flow[0] && !udp && !s->vis.sent_end) {
+    if (node->flow[0] && !s->vis.sent_end) {
         size_t fn = vision_wrap(&s->vis, data, n, out + len, sizeof(out) - len);
         if (!fn) return SEND_FATAL;
         len += fn;
@@ -363,7 +554,21 @@ static int vl_deliver(const void *ctx, void *sess, int udp, const unsigned char 
         TR("заголовок ответа снят (%zu байт), осталось %zu\n", skip, left);
     }
 
-    /* Дальше пути расходятся: у TCP это поток в кадрах Vision, у UDP — датаграммы с
+    /* UDP к узлу с flow: кадры Vision, а в них рамки XUDP. */
+    if (udp && node->flow[0]) {
+        while (left) {
+            size_t used = 0, pl_n = 0;
+            const unsigned char *pl = NULL;
+            int ur = vision_unwrap(&s->vis, cur, left, &used, &pl, &pl_n);
+            if (ur == VISION_EPROTO) return -1;
+            if (ur != 0 || (!used && !pl_n)) break;
+            cur += used;
+            left -= used;
+            if (pl_n && xudp_downstream(s, pl, pl_n, emit, arg) != 0) return -1;
+        }
+        return 0;
+    }
+    /* Дальше пути расходятся: у TCP это поток в кадрах Vision, у UDP без flow — датаграммы с
      * двухбайтовой длиной и без всякого Vision (его в запросе UDP мы не объявляли). */
     if (udp)
         return left ? udp_downstream(s, cur, left, emit, arg) : 0;

@@ -3,6 +3,7 @@
  * потоки и очередь — src/dnsd/dup.c): только перевод вызовов и общий контекст TLS. */
 
 #include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
 #include "dupq.h"
 #include "quic.h"
@@ -19,7 +20,14 @@ static struct qc_tls *g_tls;
 
 int dupq_prepare(const char *roots) {
     pthread_mutex_lock(&g_mu);
-    if (!g_tls) g_tls = qc_tls_new(0, NULL, 0, roots);
+    if (!g_tls) {
+        g_tls = qc_tls_new(0, NULL, 0, roots);
+        /* 0-RTT по билету прошлой сессии — по умолчанию: вопрос DNS идемпотентен, и RFC 9250 (5.5)
+         * прямо разрешает слать его в early data. STEER_DOQ_EARLY_DATA=0 выключает: для сервера, который
+         * принимает 0-RTT неверно, или чтобы сравнить время. Билеты живут в памяти процесса. */
+        const char *e = getenv("STEER_DOQ_EARLY_DATA");
+        if (g_tls && !(e && e[0] == '0')) qc_tls_early(g_tls);
+    }
     int ok = g_tls != NULL;
     pthread_mutex_unlock(&g_mu);
     return ok;
@@ -46,8 +54,10 @@ int dupq_open(const struct dupq_cfg *c, const struct dupq_ops *o, void *user, st
     cfg.mark_required = c->sock_mark != 0;  /* без метки уйти мимо выхода нельзя */
     cfg.handshake_ms = c->handshake_ms;
     cfg.idle_ms = c->idle_ms;
+    cfg.early_data = c->early_data;
     struct qc_ops ops;
     memset(&ops, 0, sizeof(ops));
+    ops.on_early_rejected = o->on_early_rejected;
     ops.on_handshake = o->on_handshake;
     ops.on_stream_data = o->on_stream_data;
     ops.on_stream_close = o->on_stream_close;
@@ -64,6 +74,7 @@ int dupq_fd(const struct dupq *q) { return qc_fd((const struct qc *)q); }
 int dupq_timeout_ms(struct dupq *q) { return qc_timeout_ms((struct qc *)q); }
 int dupq_on_readable(struct dupq *q) { return qc_on_readable((struct qc *)q); }
 int dupq_on_timer(struct dupq *q) { return qc_on_timer((struct qc *)q); }
+int dupq_early_ready(const struct dupq *q) { return qc_early_ready((const struct qc *)q); }
 int dupq_stream_open(struct dupq *q, int64_t *sid) { return qc_stream_open((struct qc *)q, sid); }
 ssize_t dupq_stream_send(struct dupq *q, int64_t sid, const uint8_t *d, size_t n, int fin) {
     return qc_stream_send((struct qc *)q, sid, d, n, fin);
