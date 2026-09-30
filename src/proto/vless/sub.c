@@ -310,6 +310,107 @@ static void set_pqv(struct vless_node *n, const char *v) {
     n->pqv = sub_intern(v, strlen(v));
 }
 
+/* ---- проверка сертификата узла: pcs, pks, vcn, allowInsecure ------------------------------------
+ *
+ * Xray-core (transport/internet/tls/config.go, infra/conf/transport_security.go) знает два способа
+ * не полагаться на хранилище корней: pinnedPeerCertSha256 (`pcs` в ссылке) — SHA-256 сертификата в
+ * hex, через запятую, двоеточия OpenSSL допустимы; verifyPeerCertByName (`vcn`) — имена, против
+ * которых проверяется цепочка ВМЕСТО SNI. allowInsecure Xray снял совсем (конфиг с ним не
+ * собирается), а в ссылках и чужих подписках он живёт по-прежнему. sing-box держит отпечаток иначе —
+ * SHA-256 от SubjectPublicKeyInfo в base64 (`certificate_public_key_sha256`); он хранится отдельно
+ * (pks), потому что считается от другого куска сертификата и смешивать два вида отпечатков нельзя.
+ *
+ * Отпечаток приводится к одному виду (64 знака hex строчными) ЗДЕСЬ, при разборе: испорченный
+ * отпечаток — непригодный узел с названной причиной, а не проверка, которая на каждом соединении
+ * молча ничего не сравнивает. */
+static const char SUB_BAD_PIN[] = "!pin";
+
+static const char *pin_slot(const struct vless_node *n, int spki) { return spki ? n->pks : n->pcs; }
+
+static void add_pins(struct vless_node *n, const char *v, int spki) {
+    const char *cur = pin_slot(n, spki);
+    if (cur == SUB_BAD_PIN || cur == SUB_FULL) return;
+    char buf[1100];
+    size_t bl = 0;
+    if (cur) bl = (size_t)snprintf(buf, sizeof buf, "%s", cur);
+    const char *p = v;
+    int bad = 0;
+    while (*p && !bad) {
+        const char *e = strchr(p, ',');
+        size_t tn = e ? (size_t)(e - p) : strlen(p);
+        while (tn && (*p == ' ' || *p == '\t')) { p++; tn--; }
+        while (tn && (p[tn - 1] == ' ' || p[tn - 1] == '\t')) tn--;
+        unsigned char raw[32] = { 0 };
+        if (tn) {
+            if (spki) {
+                char d[48];
+                bad = tn < 43 || tn > 44 || b64_decode(p, tn, d, sizeof d) != 32;
+                if (!bad) memcpy(raw, d, 32);
+            } else {
+                /* Двоеточия — привычная запись OpenSSL (`AB:CD:…`), Xray их отбрасывает. */
+                size_t k = 0;
+                for (size_t i = 0; i < tn && !bad; i++) {
+                    int c = (unsigned char)p[i], h;
+                    if (c == ':') continue;
+                    h = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                        : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+                    if (h < 0 || k >= 64) { bad = 1; break; }
+                    if (k & 1) raw[k / 2] = (unsigned char)(raw[k / 2] << 4 | h);
+                    else raw[k / 2] = (unsigned char)h;
+                    k++;
+                }
+                if (!bad && k != 64) bad = 1;
+            }
+            if (!bad) {
+                if (bl + 66 >= sizeof buf) bad = 1;
+                else {
+                    if (bl) buf[bl++] = ',';
+                    for (int i = 0; i < 32; i++) bl += (size_t)snprintf(buf + bl, 3, "%02x", raw[i]);
+                }
+            }
+        }
+        if (!e) break;
+        p = e + 1;
+    }
+    const char *r = bad ? SUB_BAD_PIN : bl ? sub_intern(buf, bl) : NULL;
+    if (spki) n->pks = r; else n->pcs = r;
+}
+
+/* verifyPeerCertByName: имена через запятую, пробелы вокруг отбрасываются, пустые пропускаются
+ * (так читает и Xray). */
+static void set_vcn(struct vless_node *n, const char *v) {
+    char buf[300];
+    size_t bl = 0;
+    n->vcn = NULL;
+    const char *p = v;
+    while (*p) {
+        const char *e = strchr(p, ',');
+        size_t tn = e ? (size_t)(e - p) : strlen(p);
+        while (tn && (*p == ' ' || *p == '\t')) { p++; tn--; }
+        while (tn && (p[tn - 1] == ' ' || p[tn - 1] == '\t')) tn--;
+        if (tn) {
+            if (bl + tn + 2 >= sizeof buf) { n->vcn = SUB_BAD_PIN; return; }
+            if (bl) buf[bl++] = ',';
+            memcpy(buf + bl, p, tn);
+            bl += tn;
+        }
+        if (!e) break;
+        p = e + 1;
+    }
+    if (bl) n->vcn = sub_intern(buf, bl);
+}
+
+/* allowInsecure / insecure / skip-cert-verify: 1, true, yes — «включено». Всё остальное, в том числе
+ * пустое, — выключено: включать отказ проверки сертификата догадкой нельзя, выключать можно. */
+static int truthy_flag(const char *v) {
+    return !strcmp(v, "1") || !strcasecmp(v, "true") || !strcasecmp(v, "yes");
+}
+
+/* Ключ `insecure` выхода (см. vless.h). */
+static volatile int g_insecure;
+void vless_set_insecure(int on) { g_insecure = on ? 1 : 0; }
+int vless_insecure(void) { return g_insecure; }
+
 /* Значение параметра ссылки в куче-буфере: длинные значения (pqv, encryption) не помещаются в
  * узел, а стек рабочих потоков мал. Процентная форма раскрывается. Возвращает NULL при нехватке памяти. */
 static char *param_dup(const char *v, size_t vlen) {
@@ -408,6 +509,20 @@ int vless_parse_url(const char *url, struct vless_node *n) {
                 else if (klen == 3 && !strncmp(k, "pqv", 3)) {
                     char *d = param_dup(v, vlen);
                     if (d) { set_pqv(n, d); free(d); } else n->pqv = SUB_BAD_PQV;
+                }
+                /* pcs / vcn — pinnedPeerCertSha256 и verifyPeerCertByName Xray-core; allowInsecure (и
+                 * insecure, как пишут панели) подписка нести вправе, но выключить проверку сама не
+                 * может — см. node_usable. */
+                else if ((klen == 3 && !strncmp(k, "pcs", 3)) || (klen == 3 && !strncmp(k, "vcn", 3))) {
+                    char *d = param_dup(v, vlen);
+                    if (d) {
+                        if (k[0] == 'p') add_pins(n, d, 0); else set_vcn(n, d);
+                        free(d);
+                    } else if (k[0] == 'p') n->pcs = SUB_BAD_PIN; else n->vcn = SUB_BAD_PIN;
+                }
+                else if ((klen == 13 && !strncmp(k, "allowInsecure", 13)) || (klen == 8 && !strncmp(k, "insecure", 8))) {
+                    char *d = param_dup(v, vlen);
+                    if (d) { if (truthy_flag(d)) n->allow_insecure = 1; free(d); }
                 }
                 else if (klen == 4 && !strncmp(k, "path", 4)) set_pct(n->path, sizeof(n->path), v, vlen);
                 else if (klen == 11 && !strncmp(k, "serviceName", 11)) { set_field(n->service, sizeof(n->service), v, vlen); pct_decode(n->service); }
@@ -514,9 +629,34 @@ static int node_usable(struct vless_node *n) {
         snprintf(n->skip_reason, sizeof(n->skip_reason), "xhttp: обфускация не поддержана");
         return 1;
     }
-    if (n->encryption == SUB_FULL || n->pqv == SUB_FULL) {
+    if (n->encryption == SUB_FULL || n->pqv == SUB_FULL || n->pcs == SUB_FULL || n->pks == SUB_FULL ||
+        n->vcn == SUB_FULL) {
         snprintf(n->skip_reason, sizeof(n->skip_reason), "слишком много разных ключей");
         return 1;
+    }
+    /* Проверка сертификата касается только security=tls: у reality подлинность доказывает сам
+     * протокол, а pcs/vcn/allowInsecure, попавшие в такую ссылку, ничего не значат. Испорченный
+     * отпечаток у tls — непригодный узел, а не проверка, которая молча ничего не сверяет. */
+    if (!strcmp(n->security, "tls")) {
+        if (n->pcs == SUB_BAD_PIN) {
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "pcs: не SHA-256 в hex");
+            return 1;
+        }
+        if (n->pks == SUB_BAD_PIN) {
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "certificate_public_key_sha256: не SHA-256");
+            return 1;
+        }
+        if (n->vcn == SUB_BAD_PIN) {
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "vcn: слишком длинный список имён");
+            return 1;
+        }
+        /* Решение безопасности: подписка не выключает проверку сертификата сама. Узел с allowInsecure
+         * пригоден, только если человек явно поставил `insecure` у выхода. */
+        if (n->allow_insecure && !g_insecure) {
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "allowInsecure: включите insecure у выхода явно");
+            return 1;
+        }
+        n->insecure = g_insecure ? 1 : 0;
     }
 
     /* Идентификатор пользователя. Проверяется ЗДЕСЬ по той же причине, что и всё
@@ -920,6 +1060,17 @@ static void xray_stream(struct sj *j, struct vless_node *n) {
                     if (pv) { pv[0] = '\0'; sj_str(j, pv, 4096); set_pqv(n, pv); free(pv); }
                     else sj_skip(j);
                 }
+                else if (!strcmp(k2, "pinnedPeerCertSha256") || !strcmp(k2, "pcs")) {
+                    char pv[1100] = "";
+                    sj_str(j, pv, sizeof pv);
+                    add_pins(n, pv, 0);
+                }
+                else if (!strcmp(k2, "verifyPeerCertByName") || !strcmp(k2, "vcn")) {
+                    char vv[300] = "";
+                    sj_str(j, vv, sizeof vv);
+                    set_vcn(n, vv);
+                }
+                else if (!strcmp(k2, "allowInsecure")) { if (sj_bool(j)) n->allow_insecure = 1; }
                 else sj_skip(j);
             }
         } else if (!strcmp(k, "grpcSettings")) {
@@ -1101,6 +1252,16 @@ static void sb_tls(struct sj *j, struct vless_node *n, int *enabled, int *realit
     while (sj_obj_key(j, &f, k, sizeof k) == 0) {
         if (!strcmp(k, "enabled")) *enabled = sj_bool(j);
         else if (!strcmp(k, "server_name")) sj_str(j, n->sni, sizeof n->sni);
+        else if (!strcmp(k, "insecure")) { if (sj_bool(j)) n->allow_insecure = 1; }
+        else if (!strcmp(k, "certificate_public_key_sha256")) {
+            /* Массив строк base64: SHA-256 от SubjectPublicKeyInfo. Строка вместо массива — тоже. */
+            char pv[80];
+            int fa = 1;
+            int r = sj_arr_next(j, &fa);
+            if (r == 0) {
+                do { pv[0] = '\0'; sj_str(j, pv, sizeof pv); add_pins(n, pv, 1); } while (sj_arr_next(j, &fa) == 0);
+            } else if (r < 0) { pv[0] = '\0'; sj_str(j, pv, sizeof pv); add_pins(n, pv, 1); }
+        }
         else if (!strcmp(k, "utls")) {
             int f2 = 1, on = 1;
             char k2[64], fp[sizeof n->fp] = "";
@@ -1542,6 +1703,10 @@ static int clash_node(const struct yflat *f, struct vless_node *n) {
     if ((v = yf_get(f, "flow"))) set_field(n->flow, sizeof n->flow, v, strlen(v));
     if ((v = yf_get(f, "servername")) || (v = yf_get(f, "sni"))) set_field(n->sni, sizeof n->sni, v, strlen(v));
     if ((v = yf_get(f, "client-fingerprint"))) set_field(n->fp, sizeof n->fp, v, strlen(v));
+    /* Clash/mihomo: `fingerprint` — SHA-256 сертификата узла (то же, что pinnedPeerCertSha256 Xray),
+     * `skip-cert-verify` — allowInsecure. */
+    if ((v = yf_get(f, "fingerprint")) && v[0]) add_pins(n, v, 0);
+    if ((v = yf_get(f, "skip-cert-verify")) && truthy_flag(v)) n->allow_insecure = 1;
     const char *pbk = yf_get(f, "reality-opts.public-key");
     if (pbk) {
         set_field(n->pbk, sizeof n->pbk, pbk, strlen(pbk));

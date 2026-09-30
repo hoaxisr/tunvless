@@ -151,6 +151,7 @@ int tls13_handshake(struct tls13 *t, int fd,
  *   подпись CertificateVerify над транскриптом.
  *
  * roots — путь к хранилищу корней, NULL/"" для умолчания. Нужен только вместе с host. */
+struct cert_policy;
 struct tls13_auth {
     const unsigned char *reality_key;
     const char *host;
@@ -162,6 +163,9 @@ struct tls13_auth {
      * сертификат Reality обязан нести подпись ML-DSA-65 над HMAC-SHA512(authkey, pub ‖ ClientHello ‖
      * ServerHello); без подписи или с неверной узел не признан. Только вместе с reality_key. */
     const unsigned char *mldsa_pk;
+    /* Правила проверки сертификата при host != NULL (certverify.h): закрепления, имена, insecure.
+     * NULL — умолчание: цепочка до корней и имя host. */
+    const struct cert_policy *policy;
 };
 
 /* То же рукопожатие, но с проверкой подлинности сервера.

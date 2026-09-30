@@ -69,6 +69,7 @@
     wc_Sha512Final;
     wc_Sha512Free;
     wc_Sha512Update;
+    wolfSSL_CertManagerLoadCABuffer;
     wolfSSL_CertManagerLoadCABuffer_ex;
     wolfSSL_check_domain_name;
     wolfSSL_CTX_free;

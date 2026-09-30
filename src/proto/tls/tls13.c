@@ -662,8 +662,8 @@ static int handshake(struct tls13 *t, int fd,
                      "сервер не прислал %s", cert_n ? "подпись" : "сертификат");
             return TLS13_ECERT;
         }
-        int vrc = cert_verify_server(certbuf, cert_n, cv_buf, cv_n,
-                                     cv_transcript, cv_thash_n, host, auth->roots);
+        int vrc = cert_verify_server_ex(certbuf, cert_n, cv_buf, cv_n,
+                                        cv_transcript, cv_thash_n, host, auth->roots, auth->policy);
         if (vrc != 0) {
             snprintf(g_verify_reason, sizeof(g_verify_reason), "%s",
                      cert_verify_strerror(vrc));

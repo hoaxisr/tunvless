@@ -1237,6 +1237,51 @@ int main(void) {
             snprintf(what, sizeof(what), "%s: в куче ничего не осталось", tls_plans[i].name);
             check(what, 0, LEAK_CHECK());
         }
+        /* Закрепления и явный отказ от проверки (Xray pinnedPeerCertSha256 / verifyPeerCertByName).
+         * Ожидания повторяют то, что снято со стенда против сервера Xray-core 26.9.9: закреплённый
+         * лист принимается БЕЗ цепочки и имени (тут — подписан сам собой), чужой отпечаток — отказ,
+         * vcn подменяет имя проверки, insecure снимает цепочку, но не подпись CertificateVerify. */
+        {
+            static const char HEX[] = "0123456789abcdef";
+            char h_ok[65], h_name[65], h_self[65];
+            struct { int idx; char *out; } hh[] = { { LEAF_OK, h_ok }, { LEAF_NAME, h_name }, { LEAF_SELF, h_self } };
+            for (size_t i = 0; i < 3; i++) {
+                unsigned char d[32];
+                sc_hash(SC_SHA256, g_leaf[hh[i].idx].der, g_leaf[hh[i].idx].der_n, d);
+                for (int k = 0; k < 32; k++) { hh[i].out[2 * k] = HEX[d[k] >> 4]; hh[i].out[2 * k + 1] = HEX[d[k] & 15]; }
+                hh[i].out[64] = '\0';
+            }
+            struct { const char *name; struct plan pl; const char *pcs, *vcn; int ins; int want; } pin[] = {
+                { "pcs: закреплён лист, подписанный сам собой", { .chain = LEAF_SELF }, h_self, NULL, 0, 0 },
+                { "pcs: закреплён лист на другое имя",          { .chain = LEAF_NAME }, h_name, NULL, 0, 0 },
+                { "pcs: отпечаток чужого листа — отказ",        { .chain = LEAF_OK },   h_name, NULL, 0, TLS13_ECERT },
+                { "pcs: несколько отпечатков, нужный вторым",   { .chain = LEAF_OK },   NULL,   NULL, 0, 0 },
+                { "vcn: имя проверки вместо sni",               { .chain = LEAF_NAME }, NULL,   "other.invalid", 0, 0 },
+                { "vcn: имя не то — отказ",                     { .chain = LEAF_OK },   NULL,   "other.invalid", 0, TLS13_ECERT },
+                { "insecure: лист подписан сам собой",          { .chain = LEAF_SELF }, NULL,   NULL, 1, 0 },
+                { "insecure: подпись CertificateVerify всё равно проверяется",
+                                                                { .chain = LEAF_OK, .cv_bad_sig = 1 }, NULL, NULL, 1, TLS13_ECERT },
+            };
+            char two[140];
+            snprintf(two, sizeof two, "%s,%s", h_self, h_ok);
+            for (size_t i = 0; i < sizeof pin / sizeof *pin; i++) {
+                struct vless_node tn;
+                node_tls(&tn, "tcp");
+                tn.pcs = i == 3 ? two : pin[i].pcs;
+                tn.vcn = pin[i].vcn;
+                tn.insecure = (uint8_t)pin[i].ins;
+                pin[i].pl.name = pin[i].name;
+                int fd0 = fd_count(), ctx_left = -1;
+                int rc = run_case(&pin[i].pl, &tn, NULL, 0, &ctx_left);
+                char what[160];
+                snprintf(what, sizeof what, "%s: код возврата", pin[i].name);
+                check(what, pin[i].want, rc);
+                snprintf(what, sizeof what, "%s: дескрипторы и контексты не текут", pin[i].name);
+                check(what, 0, (fd_count() - fd0) + (ctx_left > 0 ? ctx_left : 0));
+                snprintf(what, sizeof what, "%s: в куче ничего не осталось", pin[i].name);
+                check(what, 0, LEAK_CHECK());
+            }
+        }
         /* ws и httpupgrade поверх обычного TLS со своей цепочкой: то же, что у Reality выше,
          * плюс настоящая проверка сертификата — путь, которым идут узлы за CDN. */
         static const char *ttype[] = { "ws", "httpupgrade", "ws ed" };

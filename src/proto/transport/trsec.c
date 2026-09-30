@@ -21,6 +21,7 @@
 #include "transport.h"
 #include "reality.h"
 #include "roots.h"
+#include "certverify.h"
 
 /* security=none — голый поток, без TLS вообще. Полезен в доверенной сети, и именно поэтому он
  * не «частный случай reality», а отдельная ветка: ставить TLS там, где его нет, значило бы
@@ -101,8 +102,14 @@ static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *
      * У обычного TLS это цепочка и имя, у Reality — HMAC в поле подписи временного
      * сертификата на ключе, который есть только у владельца постоянной пары. */
     struct tls13_auth auth = { 0 };
-    if (is_tls) { auth.host = verify_host; auth.roots = tls_cert_roots(); }
-    else        auth.reality_key = rst.authkey;
+    /* Закрепления, имена проверки и явный отказ от проверки — из узла и выхода (certverify.h). Без
+     * них указатель остаётся NULL, и проверка идёт прежним путём: цепочка до корней и SNI. */
+    struct cert_policy pol = { .pcs = n->pcs, .pks = n->pks, .vcn = n->vcn, .insecure = n->insecure };
+    if (is_tls) {
+        auth.host = verify_host;
+        auth.roots = tls_cert_roots();
+        if (pol.pcs || pol.pks || pol.vcn || pol.insecure) auth.policy = &pol;
+    } else auth.reality_key = rst.authkey;
     if (rst.pq) auth.mlkem_dk = rst.mlkem_dk;
     auth.mldsa_pk = have_pqv ? pqv : NULL;
 

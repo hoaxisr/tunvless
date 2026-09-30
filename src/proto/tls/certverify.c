@@ -198,24 +198,127 @@ int cert_verify_server(const unsigned char *cert_body, size_t cert_n,
                        const unsigned char *cv_body, size_t cv_n,
                        const unsigned char *transcript, size_t thash_n,
                        const char *host, const char *roots) {
-    if (!cert_body || !cv_body || !host || !host[0]) return CERTV_EPARSE;
+    return cert_verify_server_ex(cert_body, cert_n, cv_body, cv_n, transcript, thash_n, host, roots, NULL);
+}
 
-    g_roots_path = roots;
-    pthread_once(&g_roots_once, roots_load);
-    if (g_roots_rc != 0) return CERTV_ENOROOTS;
+static int der_next(const unsigned char **p, const unsigned char *end,
+                    unsigned char *tag, const unsigned char **val, size_t *val_n);
+
+/* Есть ли отпечаток h среди записей списка (64 знака hex строчными, через запятую). */
+static int pin_listed(const char *list, const unsigned char h[32]) {
+    static const char HEX[] = "0123456789abcdef";
+    char want[64];
+    if (!list) return 0;
+    for (int i = 0; i < 32; i++) { want[2 * i] = HEX[h[i] >> 4]; want[2 * i + 1] = HEX[h[i] & 15]; }
+    for (const char *p = list; *p;) {
+        const char *e = strchr(p, ',');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n == 64 && !memcmp(p, want, 64)) return 1;
+        if (!e) break;
+        p = e + 1;
+    }
+    return 0;
+}
+
+/* SubjectPublicKeyInfo сертификата целиком, вместе с заголовком (его и хеширует sing-box).
+ * tbsCertificate ::= [0] version (необязательно), serial, signature, issuer, validity, subject, spki:
+ * седьмое поле, либо шестое, если версии нет. Обход настоящий: у issuer и subject длина переменная. */
+static int spki_of(const unsigned char *der, size_t n, const unsigned char **spki, size_t *spki_n) {
+    const unsigned char *p = der, *end = der + n, *v;
+    unsigned char tag;
+    size_t vn;
+    if (der_next(&p, end, &tag, &v, &vn) != 0 || tag != 0x30) return -1;   /* Certificate */
+    const unsigned char *ip = v, *iend = v + vn;
+    if (der_next(&ip, iend, &tag, &v, &vn) != 0 || tag != 0x30) return -1;  /* tbs */
+    const unsigned char *tp = v, *tend = v + vn;
+    const unsigned char *start;
+    if (tp < tend && *tp == 0xA0 && der_next(&tp, tend, &tag, &v, &vn) != 0) return -1;
+    for (int i = 0; i < 5; i++)                   /* serial, signature, issuer, validity, subject */
+        if (der_next(&tp, tend, &tag, &v, &vn) != 0) return -1;
+    start = tp;
+    if (der_next(&tp, tend, &tag, &v, &vn) != 0 || tag != 0x30) return -1;
+    *spki = start;
+    *spki_n = (size_t)(tp - start);
+    return 0;
+}
+
+/* Цепочка против ОДНОГО хранилища и списка имён: годится любое имя (verifyPeerCertByName). */
+static int chain_by_names(struct sc_roots *roots, const unsigned char *const *der, const size_t *der_n,
+                          size_t count, const char *names) {
+    int rc = CERTV_ECHAIN;
+    for (const char *p = names; *p;) {
+        const char *e = strchr(p, ',');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        char one[256];
+        if (n && n < sizeof one) {
+            memcpy(one, p, n);
+            one[n] = '\0';
+            int vr = sc_chain_verify(roots, der, der_n, count, one);
+            if (vr == 0) return 0;
+            if (vr == SC_EPARSE) rc = CERTV_EPARSE;
+        }
+        if (!e) break;
+        p = e + 1;
+    }
+    return rc;
+}
+
+int cert_verify_server_ex(const unsigned char *cert_body, size_t cert_n,
+                          const unsigned char *cv_body, size_t cv_n,
+                          const unsigned char *transcript, size_t thash_n,
+                          const char *host, const char *roots, const struct cert_policy *pol) {
+    if (!cert_body || !cv_body || !host || !host[0]) return CERTV_EPARSE;
 
     const unsigned char *der[CHAIN_MAX];
     size_t der_n[CHAIN_MAX], count = 0;
     int rc = parse_chain(cert_body, cert_n, der, der_n, &count);
-    if (rc == 0) {
+    if (rc) return rc;
+
+    /* Явное `insecure` выхода: остаётся подпись, всё остальное не проверяется (см. certverify.h). */
+    if (pol && pol->insecure)
+        return check_signature(der[0], der_n[0], cv_body, cv_n, transcript, thash_n);
+
+    const int have_pin = pol && ((pol->pcs && pol->pcs[0]) || (pol->pks && pol->pks[0]));
+    const char *names = pol && pol->vcn && pol->vcn[0] ? pol->vcn : host;
+    struct sc_roots *pinned_ca = NULL;
+    int leaf_pinned = 0;
+
+    if (have_pin) {
+        unsigned char h[32];
+        /* Лист: и по сертификату, и по ключу (sing-box). Совпал — доверие дано закреплением. */
+        if (sc_hash(SC_SHA256, der[0], der_n[0], h) == 0 && pin_listed(pol->pcs, h)) leaf_pinned = 1;
+        if (!leaf_pinned && pol->pks && pol->pks[0]) {
+            const unsigned char *sp;
+            size_t sn;
+            if (spki_of(der[0], der_n[0], &sp, &sn) == 0 && sc_hash(SC_SHA256, sp, sn, h) == 0 &&
+                pin_listed(pol->pks, h))
+                leaf_pinned = 1;
+        }
+        if (!leaf_pinned) {
+            /* Промежуточный или корень: Xray берёт его хранилищем корней, если он CA (verifyChain).
+             * Не CA не загрузится в хранилище центров — то же «не нашёл». */
+            for (size_t i = 1; i < count && !pinned_ca; i++)
+                if (sc_hash(SC_SHA256, der[i], der_n[i], h) == 0 && pin_listed(pol->pcs, h))
+                    if (sc_roots_load_der(&pinned_ca, der[i], der_n[i]) != 0) pinned_ca = NULL;
+            if (!pinned_ca) return CERTV_EPIN;
+        }
+    }
+
+    if (!leaf_pinned) {
+        struct sc_roots *store = pinned_ca;
+        if (!store) {
+            g_roots_path = roots;
+            pthread_once(&g_roots_once, roots_load);
+            if (g_roots_rc != 0) return CERTV_ENOROOTS;
+            store = g_roots;
+        }
         /* ИМЯ ПРОВЕРЯЕТСЯ ЗДЕСЬ ЖЕ, вместе с цепочкой: отдельной проверкой оно оказалось бы
          * вторым местом, где живёт разбор SAN, и разошлось бы с библиотечным. */
-        int vr = sc_chain_verify(g_roots, der, der_n, count, host);
-        if (vr == SC_EPARSE) rc = CERTV_EPARSE;
-        else if (vr != 0) rc = CERTV_ECHAIN;
+        rc = chain_by_names(store, der, der_n, count, names);
+        if (pinned_ca) sc_roots_free(pinned_ca);
+        if (rc) return rc;
     }
-    if (rc == 0) rc = check_signature(der[0], der_n[0], cv_body, cv_n, transcript, thash_n);
-    return rc;
+    return check_signature(der[0], der_n[0], cv_body, cv_n, transcript, thash_n);
 }
 
 /* ---- Reality: сервер доказывает подлинность нам ------------------------------------
@@ -403,6 +506,7 @@ const char *cert_verify_strerror(int rc) {
         case CERTV_ENOROOTS: return "нет хранилища корней (нужен пакет ca-bundle)";
         case CERTV_ECHAIN:   return "сертификат не сошёлся с корнями или выдан не на это имя";
         case CERTV_ESIG:     return "подпись сервера неверна";
+        case CERTV_EPIN:     return "отпечаток сертификата не закреплён (pcs)";
         case CERTV_EALG:     return "сервер подписал алгоритмом, которого мы не предлагали";
         /* Формулировка про ключ, а не про сервер: узел жив и отвечает, просто нас на нём не
          * узнали — почти всегда это разошедшиеся pbk/sid или чужая подписка. */

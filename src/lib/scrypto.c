@@ -630,6 +630,27 @@ int sc_roots_load(struct sc_roots **out, const unsigned char *pem, size_t n) {
     return 0;
 }
 
+/* Хранилище из ОДНОГО сертификата в DER — закреплённый отпечатком центр (Xray pinnedPeerCertSha256,
+ * когда отпечаток совпал с промежуточным или корнем цепочки). Отличается от sc_roots_load форматом и
+ * тем, что запись должна разобраться: сертификат, который не годится в центры (нет признака CA,
+ * алгоритма нет в сборке), — отказ SC_EPARSE, и вызывающий трактует его как «отпечаток не нашёл
+ * центра», ровно как Xray (в его verifyChain закрепление работает только для cert.IsCA). */
+int sc_roots_load_der(struct sc_roots **out, const unsigned char *der, size_t n) {
+    *out = NULL;
+    if (!der || !n || n > INT32_MAX) return SC_EINVAL;
+    pthread_once(&g_init_once, lib_init);
+    if (g_init_rc != 0) return SC_ECRYPTO;
+    struct sc_roots *r = calloc(1, sizeof(*r));
+    if (!r) return SC_ENOMEM;
+    r->store = wolfSSL_X509_STORE_new();
+    if (!r->store) { free(r); return SC_ENOMEM; }
+    pthread_mutex_init(&r->mu, NULL);
+    int rc = wolfSSL_CertManagerLoadCABuffer(r->store->cm, der, (long)n, WOLFSSL_FILETYPE_ASN1);
+    if (rc != WOLFSSL_SUCCESS) { sc_roots_free(r); return SC_EPARSE; }
+    *out = r;
+    return 0;
+}
+
 void sc_roots_free(struct sc_roots *r) {
     if (!r) return;
     wolfSSL_X509_STORE_free(r->store);

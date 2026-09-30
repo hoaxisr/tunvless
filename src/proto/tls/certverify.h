@@ -39,6 +39,37 @@ int cert_verify_server(const unsigned char *cert_body, size_t cert_n,
                        const unsigned char *transcript, size_t thash_n,
                        const char *host, const char *roots);
 
+#define CERTV_EPIN     (-77)   /* сертификат не совпал ни с одним закреплённым отпечатком */
+
+/* Правила проверки сертификата узла сверх умолчания «цепочка до корней и имя SNI».
+ *
+ * Повторяют клиентскую сторону Xray-core (transport/internet/tls/config.go, verifyPeerCert):
+ *
+ *   pcs — pinnedPeerCertSha256: SHA-256 (hex, через запятую) сертификата целиком (DER). Совпал ЛИСТ —
+ *         сервер принят без проверки цепочки, срока и имени: закрепление и есть доверие. Совпал
+ *         промежуточный или корень, который является CA, — цепочка проверяется, но до ЭТОГО
+ *         сертификата, а не до системных корней. Не совпало ничего — отказ, до корней дело не доходит.
+ *   pks — то же для sing-box (certificate_public_key_sha256): SHA-256 от SubjectPublicKeyInfo листа.
+ *         Совпал — сервер принят так же, как при совпавшем листе pcs.
+ *   vcn — verifyPeerCertByName: имена через запятую, против которых проверяется цепочка ВМЕСТО SNI;
+ *         годится любое из них.
+ *   insecure — цепочка, имя, срок и закрепления не проверяются вовсе. Остаётся подпись
+ *         CertificateVerify (Go тоже проверяет её до вызова своего VerifyPeerCertificate): без неё
+ *         собеседник даже не доказывает, что владеет ключом присланного сертификата. Включается
+ *         только явным ключом выхода `insecure`, подписка этого не делает.
+ *
+ * Строки pcs и pks приходят уже приведёнными (sub.c): 64 знака hex строчными, через запятую. */
+struct cert_policy {
+    const char *pcs, *pks, *vcn;
+    int insecure;
+};
+
+/* cert_verify_server с правилами; pol == NULL — прежнее поведение. */
+int cert_verify_server_ex(const unsigned char *cert_body, size_t cert_n,
+                          const unsigned char *cv_body, size_t cv_n,
+                          const unsigned char *transcript, size_t thash_n,
+                          const char *host, const char *roots, const struct cert_policy *pol);
+
 #define CERTV_ENOTREALITY (-75) /* сервер не доказал, что он Reality: не признал нас */
 #define CERTV_EPQ         (-76) /* Reality признал, но подпись ML-DSA-65 (pqv) отсутствует или неверна */
 

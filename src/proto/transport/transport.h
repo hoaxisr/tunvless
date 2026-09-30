@@ -87,6 +87,11 @@ struct tr_node {
     /* Reality: открытый ключ ML-DSA-65 для проверки подписи сертификата, base64url (1952 байта в
      * бинарном виде), или NULL. Поле mldsa65Verify конфига Xray, `pqv` ссылки. */
     const char *pqv;
+    /* security=tls: клиентская проверка сертификата узла (Xray: pinnedPeerCertSha256, verifyPeerCertByName;
+     * sing-box: certificate_public_key_sha256) и явный отказ от неё. Строки — как в vless_node; NULL — нет.
+     * insecure — ключ выхода, не подписка. */
+    const char *pcs, *pks, *vcn;
+    int insecure;
     /* VLESS encryption: строка `encryption` узла без изменений (mlkem768x25519plus.…) или NULL —
      * шифрования нет. Разбирает и исполняет vlenc.c поверх готовой связи. */
     const char *encryption;

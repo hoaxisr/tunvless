@@ -230,6 +230,8 @@ int sc_cert_verify_sig(const unsigned char *cert_der, size_t cert_n,
  * одного экзотического. Ни одного корня — SC_EPARSE. */
 struct sc_roots;
 int  sc_roots_load(struct sc_roots **out, const unsigned char *pem, size_t n);
+/* Хранилище из одного сертификата DER (закреплённый центр); не годится в центры — SC_EPARSE. */
+int  sc_roots_load_der(struct sc_roots **out, const unsigned char *der, size_t n);
 void sc_roots_free(struct sc_roots *r);
 
 /* Проверить цепочку сервера: der[0] — лист, дальше — промежуточные в любом порядке и с

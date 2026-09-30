@@ -27,6 +27,7 @@ static int vless_parse(struct output *o, const struct out_keys *k, struct err *e
     o->vless.nodes = k->nodes;
     o->vless.nodes_n = k->nodes_n;
     o->vless.transports = k->transports;
+    o->vless.insecure = k->insecure;
     if (!o->vless.sub_file[0]) {
         char msg[160];
         snprintf(msg, sizeof(msg), "outputs.%s: kind vless нужен %s с подпиской", o->name,
@@ -53,6 +54,7 @@ static void vless_keys_of(const struct output *o, struct out_keys *k) {
     k->nodes = o->vless.nodes;
     k->nodes_n = o->vless.nodes_n;
     k->transports = o->vless.transports;
+    k->insecure = o->vless.insecure;
     char dev[32];
     snprintf(dev, sizeof(dev), "%.15s", o->name);
     k->device_derived = !strcmp(dev, o->device);
@@ -72,6 +74,22 @@ static void vless_status(FILE *out, const struct spec *sp, const struct output *
     for (size_t d = 0; d < o->vless.nodes_n; d++)
         fprintf(out, "%s%d", d ? "," : "", o->vless.nodes[d]);
     fprintf(out, "]");
+    /* Проверка сертификата выключена явно — видно в status, пока ключ включён. Печатается только
+     * тогда: вывод выходов без ключа остаётся прежним. */
+    if (o->vless.insecure) fprintf(out, ",\"insecure\":true");
+}
+
+/* `insecure` выхода: проверка сертификата узлов TLS выключена по решению человека. warn, а не fail:
+ * туннель работает, но подмену сервера на пути никто не заметит — об этом надо напоминать, пока
+ * ключ включён. */
+static void vless_diag(kind_diag_fn *put, const struct spec *sp, const struct output *o) {
+    (void)sp;
+    if (!o->vless.insecure) return;
+    char what[160];
+    snprintf(what, sizeof(what), "выход %.40s: сертификат узла не проверяется", o->name);
+    put("insecure", "warn", what,
+        "у выхода стоит insecure: цепочку, имя и срок сертификата узла (security=tls) никто не "
+        "сверяет — уберите ключ или закрепите сертификат (pcs в ссылке узла)");
 }
 
 /* Помощник — клиент туннеля. В подпись — файл подписки, его СОДЕРЖИМОЕ и выбор узлов (helper_sig,
@@ -99,6 +117,8 @@ static int vless_helper(const struct spec *sp, const struct output *o, struct ki
     /* И выбор транспортов — по той же причине, что номера узлов: клиент читает его при старте. */
     if (o->vless.transports)
         kind_sig_mix(&h->sig, &o->vless.transports, sizeof(o->vless.transports));
+    /* И insecure: клиент читает его при старте, смена без перезапуска не вступила бы в силу. */
+    if (o->vless.insecure) kind_sig_mix(&h->sig, "insecure", 8);
     return 0;
 }
 
@@ -134,5 +154,6 @@ const struct kind_ops kind_vless = {
     .parse = vless_parse,
     .keys_of = vless_keys_of,
     .status = vless_status,
+    .diag = vless_diag,
     .helper = vless_helper,
 };
