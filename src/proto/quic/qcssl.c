@@ -71,6 +71,41 @@ void *qcssl_ctx_server(const uint8_t *cert_der, size_t cert_n, const uint8_t *ke
 }
 #endif
 
+/* Новый билет: DER-запись сессии — обёртке (qc_session_new). Возврат 0: сессию колбэк себе не забирает,
+ * wolfSSL освободит её сам. Соединение находится по прикладным данным — там conn_ref (qcssl_new). */
+static int on_new_session(WOLFSSL *ssl, WOLFSSL_SESSION *sess) {
+    ngtcp2_crypto_conn_ref *ref = wolfSSL_get_app_data(ssl);
+    if (!ref || !ref->user_data) return 0;
+    int n = wolfSSL_i2d_SSL_SESSION(sess, NULL);
+    if (n <= 0 || n > 8192) return 0;                  /* билет DoQ — сотни байт; больше — не наш случай */
+    unsigned char *buf = malloc((size_t)n), *p = buf;
+    if (!buf) return 0;
+    if (wolfSSL_i2d_SSL_SESSION(sess, &p) == n) qc_session_new(ref->user_data, buf, (size_t)n);
+    free(buf);
+    return 0;
+}
+
+void qcssl_ctx_sessions(void *ctx) {
+    wolfSSL_CTX_UseSessionTicket(ctx);
+    wolfSSL_CTX_sess_set_new_cb(ctx, on_new_session);
+}
+
+int qcssl_set_session(void *ssl, const uint8_t *der, size_t n) {
+    const unsigned char *p = der;
+    WOLFSSL_SESSION *s = wolfSSL_d2i_SSL_SESSION(NULL, &p, (long)n);
+    if (!s) return -1;
+    int ok = wolfSSL_set_session(ssl, s) == WOLFSSL_SUCCESS;
+    int early = ok && wolfSSL_SESSION_get_max_early_data(s) != 0;
+    wolfSSL_SESSION_free(s);
+    if (!ok) return -1;
+    if (early) wolfSSL_set_quic_early_data_enabled(ssl, 1);
+    return early ? 1 : 0;
+}
+
+int qcssl_early_accepted(void *ssl) {
+    return wolfSSL_get_early_data_status(ssl) == WOLFSSL_EARLY_DATA_ACCEPTED;
+}
+
 void qcssl_ctx_free(void *ctx) {
     if (ctx) wolfSSL_CTX_free(ctx);
 }

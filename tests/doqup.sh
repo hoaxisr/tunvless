@@ -411,6 +411,70 @@ LPORT=15310
 check "dns-log: счётчики doq" "1" "$([ "$(dnslog doq sent)" -gt 100 ] && [ "$(dnslog doq ok)" -gt 100 ] && echo 1 || echo 0)"
 check "dns-log: доп. апстрим без выхода — via None" "None" "$(dnslog doqd via)"
 
+# ---- 9. 0-RTT: первый вопрос после переподключения ---------------------------------------------------------
+# Отдельный резолвер на одном прямом апстриме DoQ; простой соединения сокращён до 1,5 с (STEER_DNSD_IDLE_MS —
+# только для стендов), чтобы соединение закрылось само, а билет сессии остался в памяти процесса.
+#   а) вопрос, пауза (соединение закрылось), вопрос: второй уходит в 0-RTT — счётчик early в dns-log,
+#      отказов нет; время переподключения печатается рядом со временем без 0-RTT (STEER_DOQ_EARLY_DATA=0:
+#      билетов нет, полное рукопожатие). Время — справка, не проверка: без задержки пути (DOQUP_DELAY) разница
+#      в доли миллисекунды и тонет в шуме;
+#   б) то же, но между вопросами сервер перезапущен: ключи билетов у нового процесса другие, 0-RTT отвергнут —
+#      вопрос обязан дойти всё равно (возврат в очередь), счётчик early_rejected == 1.
+printf 'e.early.test\nf.early.test\ng.early.test\n' > "$tmp/early.lst"
+cat > "$tmp/spec4.yaml" <<EOF
+version: 2
+lan: { devices: [lo] }
+lists:
+  le: { domains_file: $tmp/early.lst }
+outputs:
+  direct: { kind: direct }
+rules:
+  - { name: re, to: [le], out: direct, resolve: realip, dns: { url: "quic://dns.test", ips: [192.0.2.53] } }
+EOF
+early_dnsd() {   # каталог состояния, порт, переменные окружения…
+    sd=$1; ep=$2; shift 2
+    mkdir -p "$sd"
+    env STEER_DNSD_IDLE_MS=1500 "$@" "$BIN" dnsd --spec "$tmp/spec4.yaml" --state-dir "$sd" --listen-port "$ep" \
+        --upstream-port 15353 --ca-file "$c/ca.pem" 2>"$sd/err" &
+    echo $! > "$sd/pid"
+    sleep 1
+}
+early_log() {    # каталог состояния, поле
+    "$BIN" dns-log --state-dir "$1" 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print(d["upstreams"][0].get(sys.argv[1], 0))' "$2"
+}
+early_stop() { kill "$(cat "$1/pid")" 2>/dev/null; sleep 0.3; }
+askms() { python3 "$tmp/ask.py" "$1" "$2" 1 ms; }
+
+early_dnsd "$tmp/st4" 15314
+askms 15314 e.early.test >/dev/null
+sleep 4
+E_ON=$(askms 15314 f.early.test)
+check "0-RTT: второй вопрос после закрытия соединения получил ответ" "1" "$([ "$E_ON" != timeout ] && echo 1 || echo 0)"
+check "  вопрос ушёл в 0-RTT (early в dns-log)" "1" "$([ "$(early_log "$tmp/st4" early)" -ge 1 ] && echo 1 || echo 0)"
+check "  сервер принял 0-RTT (отказов нет)" "0" "$(early_log "$tmp/st4" early_rejected)"
+early_stop "$tmp/st4"
+
+early_dnsd "$tmp/st5" 15315 STEER_DOQ_EARLY_DATA=0
+askms 15315 e.early.test >/dev/null
+sleep 4
+E_OFF=$(askms 15315 f.early.test)
+check "0-RTT выключен ключом: вопрос после переподключения получил ответ" "1" "$([ "$E_OFF" != timeout ] && echo 1 || echo 0)"
+check "  в 0-RTT ничего не ушло" "0" "$(early_log "$tmp/st5" early)"
+early_stop "$tmp/st5"
+echo "  справка: вопрос после переподключения — с 0-RTT ${E_ON} мс, без ${E_OFF} мс (задержка пути DOQUP_DELAY=${DOQUP_DELAY:-0ms} в каждую сторону)"
+
+early_dnsd "$tmp/st6" 15316
+askms 15316 e.early.test >/dev/null
+sleep 4
+proxy_stop; proxy_start; sleep 0.5
+E_REJ=$(askms 15316 g.early.test)
+check "0-RTT отвергнут (сервер перезапущен): вопрос всё равно получил ответ" "1" "$([ "$E_REJ" != timeout ] && echo 1 || echo 0)"
+check "  отказ 0-RTT засчитан" "1" "$(early_log "$tmp/st6" early_rejected)"
+early_stop "$tmp/st6"
+
 # ---- замер -----------------------------------------------------------------------------------------------
 # Отдельный резолвер на четырёх прямых апстримах к одному dnsproxy (UDP, DoT, DoH, DoQ), кэша нет,
 # имена каждый раз новые: «холодный» — первый вопрос (bootstrap, connect, рукопожатие), «тёплый» —

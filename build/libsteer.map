@@ -24,6 +24,7 @@ LIBSTEER_1 {
     dnsurl_parse;
     dom6_ok;
     dupq_close;
+    dupq_early_ready;
     dupq_fd;
     dupq_free;
     dupq_on_readable;

@@ -80,6 +80,12 @@
 #define HAVE_SNI
 #define HAVE_ALPN
 #define HAVE_SESSION_TICKET
+/* 0-RTT (early data) у клиента QUIC: DoQ отправляет первый вопрос в пакетах 0-RTT по билету прошлой
+ * сессии (RFC 9250 разрешает — вопрос DNS идемпотентен), см. src/proto/quic/quic.c. Без этого
+ * определения wolfSSL_set_quic_early_data_enabled и max_early_data билета в библиотеке нет. Цена —
+ * разбор расширения early_data и хранение лимита в билете, порядка килобайта кода; серверной половины
+ * (приём 0-RTT) в поставляемой сборке нет по-прежнему. */
+#define WOLFSSL_EARLY_DATA
 #define WOLFSSL_QUIC
 #define HAVE_EX_DATA
 #define OPENSSL_EXTRA

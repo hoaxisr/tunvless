@@ -32,6 +32,8 @@ struct dupq_ops {
     void (*on_stream_data)(void *user, int64_t sid, const uint8_t *d, size_t n, int fin);
     void (*on_stream_close)(void *user, int64_t sid, uint64_t app_err);
     void (*on_closed)(void *user, int reason, const char *why);
+    /* Сервер не принял 0-RTT: вопросы, ушедшие раньше рукопожатия, потеряны — повторить на новых потоках. */
+    void (*on_early_rejected)(void *user);
 };
 
 struct dupq_cfg {
@@ -40,6 +42,9 @@ struct dupq_cfg {
     const char *sni;                        /* имя апстрима: SNI и проверка сертификата */
     uint32_t sock_mark;                     /* метка пути выхода; 0 — не метить */
     unsigned handshake_ms, idle_ms;
+    /* Вопрос можно отправить до конца рукопожатия (0-RTT), если для этого сервера есть билет прошлой
+     * сессии. Вопрос DNS идемпотентен, повтор на пути ничего не портит (RFC 9250, раздел 5.5). */
+    int early_data;
 };
 
 /* Приготовить контекст TLS (корни разбираются один раз на процесс). Блокирует — зовётся из потока
@@ -56,6 +61,8 @@ int dupq_fd(const struct dupq *q);
 int dupq_timeout_ms(struct dupq *q);
 int dupq_on_readable(struct dupq *q);
 int dupq_on_timer(struct dupq *q);
+/* Рукопожатие идёт, но по билету потоки уже можно открывать и слать в них (0-RTT). */
+int dupq_early_ready(const struct dupq *q);
 int dupq_stream_open(struct dupq *q, int64_t *sid);
 ssize_t dupq_stream_send(struct dupq *q, int64_t sid, const uint8_t *d, size_t n, int fin);
 int dupq_stream_reset(struct dupq *q, int64_t sid, uint64_t app_err);

@@ -20,6 +20,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -134,10 +135,31 @@ struct qc {
     int       pin_on;
     uint8_t   pin[32];
     const char *why;
+    /* 0-RTT (quic.h, cfg.early_data). skey — ключ записи в кэше билетов общего контекста (sni:порт);
+     * early_tried — билет с разрешением early data поставлен и параметры транспорта прошлой сессии
+     * применены, то есть слать можно до рукопожатия; early_ok — это ещё действует (сбрасывается, когда
+     * рукопожатие завершилось: дальше потоки открываются как обычно, либо отказ сервера). */
+    char      skey[160];
+    int       want_sess;        /* билеты этого соединения запоминаются */
+    int       early_tried, early_ok;
+};
+
+/* Кэш билетов сессий для 0-RTT: одна запись на сервер. der — сессия wolfSSL (i2d), tp — параметры
+ * транспорта сервера, которые ngtcp2 нужны, чтобы открывать потоки до рукопожатия (ngtcp2 без них не
+ * знает лимитов). Без билета, разрешающего early data, запись бесполезна и не хранится. Под замком:
+ * DoQ-соединения одного процесса открываются из потока резолвера, но контекст общий по определению. */
+struct qc_sess {
+    char     key[160];
+    uint8_t *der, *tp;
+    size_t   der_n, tp_n;
 };
 
 struct qc_tls {
     void *ctx;
+    int early;
+    pthread_mutex_t mu;
+    struct qc_sess sess[QC_SESS_MAX];
+    unsigned next;              /* кого вытеснять, когда серверов больше QC_SESS_MAX */
 };
 
 static uint64_t now_ns(void) {
@@ -158,6 +180,79 @@ static void fill_random(uint8_t *p, size_t n) {
         p += r;
         n -= (size_t)r;
     }
+}
+
+/* ---- кэш билетов 0-RTT ----------------------------------------------------------------------- */
+
+static void sess_clear(struct qc_sess *e) {
+    free(e->der);
+    free(e->tp);
+    memset(e, 0, sizeof *e);
+}
+
+/* Положить (заменить) запись сервера key. Копии принадлежат кэшу. */
+static void sess_put(struct qc_tls *t, const char *key, const uint8_t *der, size_t der_n,
+                     const uint8_t *tp, size_t tp_n) {
+    uint8_t *d = malloc(der_n), *p = malloc(tp_n);
+    if (!d || !p) { free(d); free(p); return; }
+    memcpy(d, der, der_n);
+    memcpy(p, tp, tp_n);
+    pthread_mutex_lock(&t->mu);
+    struct qc_sess *e = NULL;
+    for (unsigned i = 0; i < QC_SESS_MAX; i++)
+        if (t->sess[i].der && !strcmp(t->sess[i].key, key)) { e = &t->sess[i]; break; }
+    if (!e)
+        for (unsigned i = 0; i < QC_SESS_MAX; i++)
+            if (!t->sess[i].der) { e = &t->sess[i]; break; }
+    if (!e) { e = &t->sess[t->next++ % QC_SESS_MAX]; }
+    sess_clear(e);
+    snprintf(e->key, sizeof e->key, "%s", key);
+    e->der = d; e->der_n = der_n;
+    e->tp = p; e->tp_n = tp_n;
+    pthread_mutex_unlock(&t->mu);
+}
+
+/* Копия записи сервера key (кучные буферы вызывающему) или 0. */
+static int sess_get(struct qc_tls *t, const char *key, uint8_t **der, size_t *der_n, uint8_t **tp, size_t *tp_n) {
+    int ok = 0;
+    pthread_mutex_lock(&t->mu);
+    for (unsigned i = 0; i < QC_SESS_MAX; i++) {
+        struct qc_sess *e = &t->sess[i];
+        if (!e->der || strcmp(e->key, key)) continue;
+        *der = malloc(e->der_n);
+        *tp = malloc(e->tp_n);
+        if (*der && *tp) {
+            memcpy(*der, e->der, e->der_n);
+            memcpy(*tp, e->tp, e->tp_n);
+            *der_n = e->der_n;
+            *tp_n = e->tp_n;
+            ok = 1;
+        } else { free(*der); free(*tp); }
+        break;
+    }
+    pthread_mutex_unlock(&t->mu);
+    return ok;
+}
+
+/* Забыть запись сервера key: билет, который сервер не принял (или принял без 0-RTT), повторно не
+ * предлагается — иначе каждое соединение начиналось бы с отказа. */
+static void sess_drop(struct qc_tls *t, const char *key) {
+    pthread_mutex_lock(&t->mu);
+    for (unsigned i = 0; i < QC_SESS_MAX; i++)
+        if (t->sess[i].der && !strcmp(t->sess[i].key, key)) sess_clear(&t->sess[i]);
+    pthread_mutex_unlock(&t->mu);
+}
+
+/* Пришёл новый билет соединения (колбэк wolfSSL, qcssl.c). Хранится вместе с параметрами транспорта,
+ * которые ngtcp2 нужны для 0-RTT: снять их можно только с живого соединения, а билет приходит уже
+ * после рукопожатия — то есть в этот самый момент. */
+void qc_session_new(void *user, const uint8_t *der, size_t n) {
+    struct qc *q = user;
+    if (!q->want_sess || !q->shared || !q->conn) return;
+    uint8_t tp[512];
+    ngtcp2_ssize tn = ngtcp2_conn_encode_0rtt_transport_params2(q->conn, tp, sizeof tp);
+    if (tn <= 0) return;
+    sess_put(q->shared, q->skey, der, n, tp, (size_t)tn);
 }
 
 /* ---- потоки ---------------------------------------------------------------------------------- */
@@ -250,7 +345,24 @@ static int new_cid_cb(ngtcp2_conn *conn, ngtcp2_cid *cid, ngtcp2_stateless_reset
 
 static int handshake_completed_cb(ngtcp2_conn *conn, void *ud) {
     struct qc *q = ud;
-    (void)conn;
+    if (q->early_tried) {
+        /* 0-RTT был предложен: принят или нет, известно только теперь. Принят — потоки, открытые до
+         * рукопожатия, продолжаются как есть. Отвергнут — ngtcp2 выбрасывает пакеты 0-RTT и все
+         * исходящие потоки (номера начнутся с нуля), а наш буфер потоков (qc_stream) хранит уже
+         * несуществующие: его очищаем, билет забываем (сервер его не принял — предлагать снова
+         * значило бы получать отказ на каждом соединении), потребителю сообщаем — он повторит запросы. */
+        q->early_ok = 0;
+        if (!qcssl_early_accepted(q->ssl)) {
+            while (q->streams) stream_drop(q, q->streams);
+            ngtcp2_conn_tls_early_data_rejected(conn);
+            if (q->shared) sess_drop(q->shared, q->skey);
+            if (q->ops.on_early_rejected) {
+                q->in_cb++;
+                q->ops.on_early_rejected(q->user);
+                q->in_cb--;
+            }
+        }
+    }
     if (q->pin_on) {
         /* Отпечаток листа — вместо цепочки (так у эталона: pinSHA256 заменяет проверку, а не
          * дополняет её). Сравнение не за постоянное время: отпечаток не секрет. */
@@ -488,7 +600,8 @@ static ngtcp2_ssize write_pkt_cb(ngtcp2_conn *conn, ngtcp2_path *path, ngtcp2_pk
     size_t cnt = 0;
     for (struct qc_stream *t = q->streams; t; t = t->next) cnt++;
     struct qc_stream *s = q->rr ? q->rr : q->streams;
-    for (size_t i = 0; i < cnt && s && q->hs_done; i++, s = s->next ? s->next : q->streams) {
+    /* До рукопожатия потоки отдаются только при 0-RTT: ngtcp2 положит их в пакеты 0-RTT. */
+    for (size_t i = 0; i < cnt && s && (q->hs_done || q->early_ok); i++, s = s->next ? s->next : q->streams) {
         uint64_t avail = s->total - s->sent;
         int want_fin = s->fin_req && !s->fin_sent;
         if ((avail == 0 && !want_fin) || s->blocked) continue;
@@ -783,12 +896,21 @@ struct qc_tls *qc_tls_new(int insecure, const uint8_t *ca_pem, size_t ca_pem_n, 
     if (!t) return NULL;
     t->ctx = qcssl_ctx_client(insecure, ca_pem, ca_pem_n, ca_file);
     if (!t->ctx) { free(t); return NULL; }
+    pthread_mutex_init(&t->mu, NULL);
     return t;
+}
+
+void qc_tls_early(struct qc_tls *t) {
+    if (!t || t->early) return;
+    qcssl_ctx_sessions(t->ctx);
+    t->early = 1;
 }
 
 void qc_tls_free(struct qc_tls *t) {
     if (!t) return;
     qcssl_ctx_free(t->ctx);
+    for (unsigned i = 0; i < QC_SESS_MAX; i++) sess_clear(&t->sess[i]);
+    pthread_mutex_destroy(&t->mu);
     free(t);
 }
 
@@ -942,6 +1064,30 @@ int qc_open(const struct qc_cfg *cfg, const struct qc_ops *ops, void *user, stru
     if (cfg->keepalive_ms)
         ngtcp2_conn_set_keep_alive_timeout(q->conn, (uint64_t)cfg->keepalive_ms * NGTCP2_MILLISECONDS);
 
+    /* 0-RTT: билет прошлой сессии этого сервера (sni и порт), если он разрешает early data, ставится
+     * в TLS ДО первого пакета, а параметры транспорта той сессии — в ngtcp2 (без них он не знает
+     * лимитов потоков и не даст открыть поток до рукопожатия). Билет без early data всё равно
+     * ставится: рукопожатие по PSK короче и не тащит сертификат. Отказ на любом шаге — обычное
+     * рукопожатие: 0-RTT ускорение, а не условие. */
+    if (cfg->early_data && cfg->tls && cfg->tls->early) {
+        q->shared = cfg->tls;
+        q->want_sess = 1;
+        snprintf(q->skey, sizeof q->skey, "%s:%u", cfg->sni && cfg->sni[0] ? cfg->sni : cfg->host,
+                 (unsigned)cfg->port);
+        uint8_t *der = NULL, *tpb = NULL;
+        size_t der_n = 0, tp_n = 0;
+        if (sess_get(cfg->tls, q->skey, &der, &der_n, &tpb, &tp_n)) {
+            int er = qcssl_set_session(q->ssl, der, der_n);
+            if (er == 1 && ngtcp2_conn_decode_and_set_0rtt_transport_params(q->conn, tpb, tp_n) == 0) {
+                q->early_tried = q->early_ok = 1;
+            } else if (er < 0) {
+                sess_drop(cfg->tls, q->skey);          /* запись негодна — не мешать следующему соединению */
+            }
+            free(der);
+            free(tpb);
+        }
+    }
+
     /* Первый пакет рукопожатия. Отказ отправки здесь — отказ открытия, а не «закрыто потом»:
      * потребитель ещё не получил объект, on_closed ему не нужен. */
     int rv = flush(q);
@@ -956,11 +1102,12 @@ fail:
 /* ---- потоки, датаграммы, закрытие ------------------------------------------------------------- */
 
 int qc_handshake_done(const struct qc *q) { return q && q->hs_done; }
+int qc_early_ready(const struct qc *q) { return q && q->early_ok && !q->hs_done && !q->closed; }
 int qc_fd(const struct qc *q) { return q->fd; }
 
 int qc_stream_open(struct qc *q, int64_t *sid) {
     if (!q || q->closed) return QC_ECLOSED;
-    if (!q->hs_done) return QC_EAGAIN;
+    if (!q->hs_done && !q->early_ok) return QC_EAGAIN;
     int rv = ngtcp2_conn_open_bidi_stream(q->conn, sid, NULL);
     if (rv == NGTCP2_ERR_STREAM_ID_BLOCKED) return QC_EAGAIN;
     if (rv != 0) return QC_EQUIC;

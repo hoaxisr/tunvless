@@ -67,6 +67,7 @@ extern int dupq_timeout_ms(struct dupq *q) __attribute__((weak));
 extern int dupq_on_readable(struct dupq *q) __attribute__((weak));
 extern int dupq_on_timer(struct dupq *q) __attribute__((weak));
 extern int dupq_stream_open(struct dupq *q, int64_t *sid) __attribute__((weak));
+extern int dupq_early_ready(const struct dupq *q) __attribute__((weak));
 extern ssize_t dupq_stream_send(struct dupq *q, int64_t sid, const uint8_t *d, size_t n, int fin) __attribute__((weak));
 extern int dupq_stream_reset(struct dupq *q, int64_t sid, uint64_t app_err) __attribute__((weak));
 
@@ -111,7 +112,20 @@ static int dup_conn_limit(void) {
  * подтвердить пакет хотя бы на канале в сотни миллисекунд. Соединение пересоздаётся, вопрос
  * уходит на новом (один раз, как при любом обрыве). */
 #define DUP_QUIC_DEAD_MS 1500
-#define DUP_IDLE_MS 300000L
+/* Срок простоя первого соединения. Пять минут; STEER_DNSD_IDLE_MS (не меньше 200) — только для стендов:
+ * 0-RTT виден лишь на соединении, которое закрылось само, и ждать ради этого пять минут в тесте незачем
+ * (tests/doqup.sh). */
+#define DUP_IDLE_MS_DEFAULT 300000L
+static long dup_idle_ms(void) {
+    static long v;
+    if (!v) {
+        const char *e = getenv("STEER_DNSD_IDLE_MS");
+        long n = e ? atol(e) : 0;
+        v = n >= 200 ? n : DUP_IDLE_MS_DEFAULT;
+    }
+    return v;
+}
+#define DUP_IDLE_MS dup_idle_ms()
 #define DUP_DIAL_MS 6000
 #define DUP_RBUF_MAX (70 * 1024)
 #define DUP_BACKOFF_MAX 30000
@@ -131,6 +145,7 @@ struct dconn {
     int qfd;
     long qrx_ms;                /* когда от сервера в последний раз пришёл хоть один пакет */
     int qhs;                    /* on_handshake сработал */
+    int qerej;                  /* on_early_rejected сработал: вопросы, ушедшие до рукопожатия, потеряны */
     int qclosed;                /* on_closed сработал: qc больше не пригоден, только qc_free */
     int qreason;                /* QC_CLOSE_* */
     char qwhy[64];
@@ -176,6 +191,7 @@ struct dup {
     char err[192];
     long err_ms, ok_ms;
     unsigned long q_sent, q_ok, q_fail;
+    unsigned long q_early, q_early_rej;   /* DoQ: вопросов ушло в 0-RTT; соединений, где сервер его отверг */
     uint16_t next_id;
 };
 
@@ -466,6 +482,7 @@ static int conn_send(struct dup *up, struct dconn *c, struct dreq *r) {
         c->busy++;
         c->last_ms = now_ms();
         up->q_sent++;
+        up->q_early += c->st == CS_QHS;        /* до рукопожатия: 0-RTT (pick_conn пускает сюда только с билетом) */
         return 0;
     }
     r->ci = cidx(c);
@@ -712,6 +729,7 @@ static void dial_event_cb(struct dial *d) {
 /* ---- DoQ: соединение QUIC и потоки вопросов --------------------------------------------------- */
 
 static void q_on_hs(void *u) { ((struct dconn *)u)->qhs = 1; }
+static void q_on_early_rej(void *u) { ((struct dconn *)u)->qerej = 1; }
 
 static void q_on_data(void *u, int64_t sid, const uint8_t *d, size_t n, int fin) {
     struct dconn *c = u;
@@ -796,8 +814,27 @@ static void quic_after(struct dconn *c) {
     struct dup *up = c->up;
     if (!c->qc) return;
     if (c->st == CS_QHS && c->qhs && !c->qclosed) {
+        if (c->qerej) {
+            /* Сервер отверг 0-RTT (билет устарел, ключи билетов сменились): ушедшие до рукопожатия
+             * вопросы пропали вместе с потоками. Вопрос DNS идемпотентен — они возвращаются в очередь и
+             * уходят заново на этом же соединении, ставшем готовым; попытка не тратится, это не сбой
+             * вопроса. Ответа на них не будет, поэтому ждать его нельзя. */
+            int i = cidx(c);
+            for (int k = 0; k < g_req_cap; k++) {
+                struct dreq *r = &RQ(k);
+                if (!r->used || r->up != up || r->ci != i) continue;
+                r->ci = -1;
+                r->sid = -1;
+                free(r->rx);
+                r->rx = NULL;
+                r->rxn = r->rxcap = 0;
+                r->rxfin = r->rxbad = 0;
+            }
+            c->busy = 0;
+            c->qerej = 0;
+            up->q_early_rej++;
+        }
         c->st = CS_READY;
-        c->busy = 0;
         c->last_ms = now_ms();
         up->backoff_ms = 0;
         up->retry_at_ms = 0;
@@ -865,9 +902,11 @@ static void quic_start(struct dup *up, struct dconn *c, const struct sockaddr_st
          * DOQ_NO_ERROR; срок QUIC чуть длиннее, чтобы он не сработал первым молча. Сервер вправе
          * договориться о меньшем: тогда соединение уйдёт раньше и пересоздастся вопросом. */
         cfg.idle_ms = (unsigned)DUP_IDLE_MS + 30000u;
+        cfg.early_data = 1;                    /* 0-RTT по билету, если он есть (dupq_early_ready) */
         struct dupq_ops ops = { .on_handshake = q_on_hs, .on_stream_data = q_on_data,
-                                .on_stream_close = q_on_sclose, .on_closed = q_on_closed };
-        c->qhs = c->qclosed = 0;
+                                .on_stream_close = q_on_sclose, .on_closed = q_on_closed,
+                                .on_early_rejected = q_on_early_rej };
+        c->qhs = c->qclosed = c->qerej = 0;
         c->qerr = DOQ_NO_ERROR;
         c->qwhy[0] = '\0';
         int rc = dupq_open(&cfg, &ops, c, &c->qc);
@@ -901,7 +940,11 @@ static void quic_start(struct dup *up, struct dconn *c, const struct sockaddr_st
         up_err(up, "DoQ: сокет не встал в epoll");
         up_backoff(up);
         fail_waiting(up);
+        return;
     }
+    /* Ждущие вопросы уходят сразу, если по билету разрешён 0-RTT (pick_conn); без билета соединение
+     * ещё не готово, и up_kick ничего не сделает — вопросы уйдут по завершении рукопожатия (quic_after). */
+    up_kick(up);
 }
 
 /* ---- диспетчер ожидающих --------------------------------------------------------------------- */
@@ -910,7 +953,10 @@ static struct dconn *pick_conn(struct dup *up) {
     struct dconn *best = NULL;
     for (int i = 0; i < up->c_n; i++) {
         struct dconn *c = CN(up, i);
-        if (c->st != CS_READY) continue;
+        /* DoQ: соединение, у которого рукопожатие ещё идёт, но по билету прошлой сессии разрешён 0-RTT,
+         * годится для вопроса уже сейчас — первый вопрос после переподключения не ждёт рукопожатия. */
+        int early = c->st == CS_QHS && c->qc && !c->qclosed && dupq_early_ready && dupq_early_ready(c->qc);
+        if (c->st != CS_READY && !early) continue;
         if (up->cfg.u.proto == DNSP_DOH) { if (!c->busy) return c; }
         else if (!best || c->busy < best->busy) best = c;
     }
@@ -1200,6 +1246,7 @@ static void up_reset_state(struct dup *up) {
     up->err[0] = '\0';
     up->dialing = 0;
     up->q_sent = up->q_ok = up->q_fail = 0;
+    up->q_early = up->q_early_rej = 0;
 }
 
 static void up_retire(struct dup *up) {
@@ -1550,6 +1597,9 @@ void dup_render(FILE *f) {
         fprintf(f, ",\"state\":\"%s\",\"conns\":%d,\"inflight\":%d,\"sent\":%lu,\"ok\":%lu,\"failed\":%lu,"
                    "\"last_ok_ago\":", up_state(up), conns, queued, up->q_sent, up->q_ok, up->q_fail);
         if (up->ok_ms) fprintf(f, "%ld", (now - up->ok_ms) / 1000); else fputs("null", f);
+        /* DoQ: сколько вопросов ушло в 0-RTT и сколько раз сервер его отверг. Только когда 0-RTT был. */
+        if (up->q_early || up->q_early_rej)
+            fprintf(f, ",\"early\":%lu,\"early_rejected\":%lu", up->q_early, up->q_early_rej);
         fputs(",\"error\":", f);
         if (up->err[0]) {
             fputc('"', f);
