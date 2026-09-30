@@ -204,6 +204,20 @@ $CC -O1 -g -w $STEER_INC -o "$BUILD/vencprobe" tests/vencprobe.c \
 	$MODEL_SRC $KINDS_SRC $CRYPTO -lpthread
 BUILD="$BUILD" sh tests/venc.sh
 
+# xudpprobe + xudp.sh — UDP к vision-записи (Mux.Cool и XUDP поверх Vision) против настоящих серверов:
+# Xray-core (XRAY=бинарник) и sing-box (SINGBOX=бинарник); нет обоих — громкий пропуск внутри xudp.sh.
+# Дайлер (vldial.c) — тот же, что в работе; стек подменён заглушками в самом стенде.
+echo "ext-test: собираю xudpprobe и прогоняю xudp.sh (UDP по vision против Xray-core и sing-box)..."
+$CC -O1 -g -w $STEER_INC -o "$BUILD/xudpprobe" tests/xudpprobe.c src/proto/vless/vldial.c \
+	src/proto/vless/client.c src/proto/transport/transport.c src/proto/transport/trsec.c \
+	src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c src/proto/transport/trdial.c src/proto/tls/roots.c \
+	src/proto/transport/trupgrade.c src/proto/transport/trws.c src/proto/transport/trpath.c \
+	src/proto/transport/trvenc.c \
+	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
+	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
+	$MODEL_SRC $KINDS_SRC $CRYPTO -lpthread
+BUILD="$BUILD" sh tests/xudp.sh
+
 # androidroots — склейка каталога корней Android в файл для certverify (cert_roots в
 # src/proto/tls/roots.c — стенд его включает — на платформе с системным хранилищем корней;
 # до шага 2 выпуска 1.10 склейка жила в client.c). Платформа — телефон (умолчание сборки),

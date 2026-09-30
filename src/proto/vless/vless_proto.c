@@ -187,6 +187,10 @@ size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
         out[i++] = 0;                         /* дополнительных данных нет */
     }
     out[i++] = (unsigned char)cmd;
+    /* У Mux (команда 3) порта и адреса в заголовке НЕТ: служба v1.mux.cool:666 подразумевается самой
+     * командой, и Xray-core (proxy/vless/encoding, EncodeRequestHeader), и sing-box (vless.ReadRequest)
+     * дальше команды заголовок не читают — лишние байты стали бы началом потока Mux. */
+    if (cmd == VLESS_CMD_MUX) return i;
     out[i++] = (unsigned char)(port >> 8);
     out[i++] = (unsigned char)port;
 
