@@ -670,6 +670,49 @@ int cmd_diag(const char *spec) {
  * раскладки `nft -c` — и всё это ещё и ребёнком демона. Теперь ядро спрашивается по netlink
  * (nftquery.c, src/lib/nftdump.c, src/lib/rtnl.c), а процессы — обходом /proc
  * (src/lib/procscan.c), и демон отвечает в своём процессе. */
+/* Входит ли именованный выход sp->out[i] членом в какую-нибудь группу. */
+static int diag_is_member(const struct spec *sp, size_t i) {
+    for (size_t g = 0; g < sp->out_n; g++) {
+        const struct group_cfg *gc = out_group(&sp->out[g]);
+        if (!gc) continue;
+        for (size_t k = 0; k < gc->members_n; k++)
+            if (gc->members[k] == i) return 1;
+    }
+    return 0;
+}
+
+/* Устройство этого выхода уже проверяется строкой ДРУГОГО выхода — своей строки ему не нужно.
+ *
+ * splify2 пишет пул v2 группой из именованных обёрток «<пул>.<устройство>» вида interface, а
+ * устройство обёртки часто создаёт другой выход — туннель части пула. Раздел 7 проверял каждое
+ * устройство и у туннеля, и у обёртки, а группу ещё раз по её нынешнему устройству: на роутере
+ * владельца шесть строк на три устройства («выход wg0-1: вне зоны» и тут же «выход wg0.wg0-1: вне
+ * зоны»). Поэтому:
+ *   - член группы молчит, если его устройство есть у выхода вне групп (не члена и не группы):
+ *     у того строка и так будет, и приговор тот же — вопрос задаётся устройству;
+ *   - группа молчит, если её нынешнее устройство — у её же именованного члена: тот отчитается
+ *     сам. У пула v1 члены безымянные (sp->anon, в раздел 7 не попадают), и там строка группы —
+ *     единственная, поэтому правило их не касается (tests/diagmatch.sh, «пул»). */
+static int diag_dup_device(const struct spec *sp, size_t i) {
+    const struct output *o = &sp->out[i];
+    if (!o->device[0]) return 0;
+    const struct group_cfg *gc = out_group(o);
+    if (gc) {
+        for (size_t k = 0; k < gc->members_n; k++) {
+            if (!spec_is_named(gc->members[k])) continue;
+            const struct output *m = spec_out(sp, gc->members[k]);
+            if (out_has_device(m) && !strcmp(m->device, o->device)) return 1;
+        }
+        return 0;
+    }
+    if (!diag_is_member(sp, i)) return 0;
+    for (size_t j = 0; j < sp->out_n; j++) {
+        if (j == i || out_group(&sp->out[j]) || diag_is_member(sp, j)) continue;
+        if (out_has_device(&sp->out[j]) && !strcmp(sp->out[j].device, o->device)) return 1;
+    }
+    return 0;
+}
+
 int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
     g_diag_out = out;
     g_diag_first = 1;
@@ -898,6 +941,7 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
      *    в status это поля, и какие из них важны, человек угадывал сам. */
     for (size_t i = 0; i < sp->out_n; i++) {
         if (!out_has_device(&sp->out[i])) continue;
+        if (diag_dup_device(sp, i)) continue;
         char path[128];
         snprintf(path, sizeof(path), "/sys/class/net/%s/operstate", sp->out[i].device);
         int present = access(path, R_OK) == 0;

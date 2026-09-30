@@ -462,6 +462,45 @@ else
     echo "diagmatch: dummy-устройства или IPv6 нет — проверка IPv6 пропущена"
 fi
 
+# ---- группа из обёрток: устройство проверяется ОДИН раз ----------------------------------
+#
+# splify2 пишет пул v2 группой, члены которой — именованные выходы-обёртки «<пул>.<устройство>»
+# вида interface, а устройство такой обёртки часто создаёт другой выход (туннель части пула).
+# Диагностика проверяла каждое устройство дважды — у туннеля и у обёртки, — а группу ещё и
+# третий раз по её нынешнему устройству: на роутере владельца шесть строк на три устройства,
+# «выход wg0-1: … вне зоны» и тут же «выход wg0.wg0-1: … вне зоны». Обёртка, чьё устройство
+# есть у выхода вне группы, и группа, чьё нынешнее устройство — у её же именованного члена,
+# отдельной строки не получают.
+if ip link add gd1 type dummy 2>/dev/null && ip link add gd2 type dummy 2>/dev/null &&
+   ip link set gd1 up && ip link set gd2 up; then
+    cat > "$tmp/grp.json" <<GRP
+{
+  "version": 2,
+  "outputs": {
+    "direct": { "kind": "direct" },
+    "t1":     { "kind": "interface", "device": "gd1" },
+    "g":      { "kind": "group", "pick": "order", "members": ["g.gd1", "g.gd2"], "on_fail": "drop" },
+    "g.gd1":  { "kind": "interface", "device": "gd1" },
+    "g.gd2":  { "kind": "interface", "device": "gd2" }
+  },
+  "lists": { "cf": { "prefixes_file": ["$tmp/cf.lst"] } },
+  "rules": [ { "name": "cf", "to": ["cf"], "out": "g" } ]
+}
+GRP
+    outg="$($DIAG diag --spec "$tmp/grp.json" 2>/dev/null)"
+    check "группа: устройство туннеля — строкой его выхода" "1" \
+          "$(printf '%s' "$outg" | grep -c '"what":"выход t1: ')"
+    check "группа: обёртка того же устройства строки не получает" "0" \
+          "$(printf '%s' "$outg" | grep -c '"what":"выход g.gd1: ')"
+    check "группа: сама группа по устройству члена строки не получает" "0" \
+          "$(printf '%s' "$outg" | grep -c '"what":"выход g: ')"
+    check "группа: член со своим устройством проверяется" "1" \
+          "$(printf '%s' "$outg" | grep -c '"what":"выход g.gd2: ')"
+    ip link del gd1; ip link del gd2
+else
+    echo "diagmatch: dummy-устройств нет — проверка группы из обёрток пропущена"
+fi
+
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
 printf '\nвсе проверки прошли\n'
