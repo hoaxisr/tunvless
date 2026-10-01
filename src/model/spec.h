@@ -203,6 +203,18 @@ struct hy2_cfg {
     size_t nodes_n;
 };
 
+/* Протоколы прокси (kind: tunnel, protocol: trojan|shadowsocks|socks|http|vmess) — модуль
+ * steer-proxy. Узлы из подписки, как у vless; транспорт берётся из ссылки узла (у trojan/vmess он
+ * есть, у ss/socks/http — голый tcp), поэтому ключа `transport` у выхода нет. proto — enum px_proto
+ * (хранится числом: spec.h не знает proxy.h). Пять видов делят одну настройку. */
+struct proxy_cfg {
+    int proto;                  /* enum px_proto */
+    char sub_file[256];
+    int *nodes;
+    size_t nodes_n;
+    int insecure;               /* не проверять сертификат узлов security=tls (trojan/vmess/http) */
+};
+
 /* Транспорты узла туннеля — имена как в ссылке узла (type=) и биты для vless_cfg.transports. */
 enum { TT_TCP = 1u << 0, TT_GRPC = 1u << 1, TT_XHTTP = 1u << 2, TT_WS = 1u << 3,
        TT_HTTPUPGRADE = 1u << 4, TT_COUNT = 5 };
@@ -420,6 +432,7 @@ struct output {
         struct iface_cfg iface;
         struct vless_cfg vless;
         struct hy2_cfg hy2;
+        struct proxy_cfg proxy;
         struct xsteer_cfg xs;
         struct awg_cfg awg;
         struct zapret_cfg zp;

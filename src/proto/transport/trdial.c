@@ -265,3 +265,28 @@ int tr_dial(const char *host, uint16_t port, int timeout_s) {
     if (g_tcp_dial) return g_tcp_dial(host, port, timeout_s);
     return tcp_connect(host, port, timeout_s);
 }
+
+/* Сокет UDP к узлу — для протоколов, у которых датаграммы идут датаграммами (shadowsocks, SOCKS5 UDP
+ * ASSOCIATE; src/proto/proxy). Та же метка, что у TCP (`over`/`via`), и тем же правилом: метка
+ * обязательна — без неё сокет не открывается. Первый адрес IPv4 имени: перебора, как у TCP, нет —
+ * у UDP нет рукопожатия, по которому мёртвый адрес видно сразу. Дескриптор неблокирующий и
+ * соединённый (connect), либо отрицательный код TR_*. */
+int tr_dial_udp(const char *host, uint16_t port) {
+    char portstr[8];
+    snprintf(portstr, sizeof(portstr), "%u", port);
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM };
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return TR_EDNS;
+    struct sockaddr_in sa = *(struct sockaddr_in *)res->ai_addr;
+    freeaddrinfo(res);
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return TR_ESOCK;
+    if (g_sock_mark &&
+        setsockopt(fd, SOL_SOCKET, SO_MARK, &g_sock_mark, sizeof(g_sock_mark)) != 0 &&
+        g_sock_mark_req) {
+        close(fd);
+        return TR_ESOCK;
+    }
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) { close(fd); return TR_ECONNECT; }
+    return fd;
+}

@@ -116,16 +116,16 @@ int main(void) {
         /* Одинокий байт продолжения после ASCII снимается сам, а буква перед ним остаётся
          * (I-326): до правки «ab\x80» становилось «a». */
         char s1[] = "ab\x80";
-        utf8_trim_tail(s1);
+        sl_utf8_trim_tail(s1);
         check("utf8: одинокое продолжение после ASCII", "ab", s1);
         char s2[] = "ab\xC3";
-        utf8_trim_tail(s2);
+        sl_utf8_trim_tail(s2);
         check("utf8: ведущий байт без продолжения", "ab", s2);
         char s3[] = "a\xC3\xA9";
-        utf8_trim_tail(s3);
+        sl_utf8_trim_tail(s3);
         check("utf8: целая буква не трогается", "a\xC3\xA9", s3);
         char s4[] = "a\xE2\x82";
-        utf8_trim_tail(s4);
+        sl_utf8_trim_tail(s4);
         check("utf8: недобитая трёхбайтовая снимается целиком", "a", s4);
     }
 

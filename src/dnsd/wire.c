@@ -136,6 +136,33 @@ int parse_query(const uint8_t *pkt, size_t len, char *out_qname,
     return 0;
 }
 
+/* Есть ли в запросе опция EDNS «не пересылать» (DNSD_OPT_NOFORWARD, dnsd_int.h). Ищется в записи
+ * OPT дополнительной секции — сразу за вопросом (qend): в запросе секций ответа и полномочий нет.
+ * Испорченная запись — «нет»: тогда вопрос идёт прежним путём. */
+int query_noforward(const uint8_t *pkt, size_t len, size_t qend) {
+    if (len < 12 || ((pkt[6] | pkt[7] | pkt[8] | pkt[9]) != 0)) return 0;
+    unsigned ar = (unsigned)((pkt[10] << 8) | pkt[11]);
+    size_t p = qend;
+    for (unsigned i = 0; i < ar; i++) {
+        if (p + 11 > len) return 0;
+        if (pkt[p] != 0) return 0;                      /* имя OPT — корень */
+        uint16_t type = (uint16_t)((pkt[p + 1] << 8) | pkt[p + 2]);
+        uint16_t rdlen = (uint16_t)((pkt[p + 9] << 8) | pkt[p + 10]);
+        size_t rd = p + 11;
+        if (rd + rdlen > len) return 0;
+        if (type == 41) {
+            for (size_t o = rd; o + 4 <= rd + rdlen;) {
+                uint16_t code = (uint16_t)((pkt[o] << 8) | pkt[o + 1]);
+                uint16_t ol = (uint16_t)((pkt[o + 2] << 8) | pkt[o + 3]);
+                if (code == DNSD_OPT_NOFORWARD) return 1;
+                o += 4 + ol;
+            }
+        }
+        p = rd + rdlen;
+    }
+    return 0;
+}
+
 /* Ответ, собранный из ЗАПРОСА, обязан сам выставить флаги ответа — в отличие от
  * ответа, собранного из ответа upstream, где они уже стоят. QR — это ответ; opcode
  * и RD переносятся из запроса; RA — рекурсию даёт upstream, и мы отвечаем за него;

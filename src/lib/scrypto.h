@@ -61,13 +61,17 @@
 
 /* Отпечаток сборки библиотеки: сколько полей в steer_wolfssl_abi (build/wolfssl/abi.c) — версия
  * wolfSSL, размеры структур, размеры хранилищ. Порядок полей — sc_abi_expect в scrypto.c. */
-#define SC_ABI_N 11
+#define SC_ABI_N 13
 
 /* ---- хеши ---------------------------------------------------------------------------------- */
 
-enum sc_hash { SC_SHA256 = 1, SC_SHA384 = 2, SC_SHA512 = 3 };
+/* SHA-1, SHA-224 и MD5 — не для своей криптографии, а для чужих протоколов модуля steer-proxy,
+ * которые зашили их в формат провода и вывод ключей: shadowsocks (ключ из пароля — EVP_BytesToKey
+ * на MD5, подключ сессии — HKDF-SHA1), trojan (пароль на проводе — hex SHA-224), VMess (cmdKey и
+ * ключ ChaCha20 тела — MD5). Свой TLS и прочие протоколы их не берут. */
+enum sc_hash { SC_SHA256 = 1, SC_SHA384 = 2, SC_SHA512 = 3, SC_SHA1 = 4, SC_SHA224 = 5, SC_MD5 = 6 };
 #define SC_HASH_MAX 64
-/* Длина вывода: 32, 48 или 64; 0 — алгоритма нет. */
+/* Длина вывода: 32, 48, 64, 20, 28 или 16; 0 — алгоритма нет. */
 size_t sc_hash_len(enum sc_hash h);
 
 /* Размер хранилища: SHA-512 (он же SHA-384) у wolfSSL — 224-232 байта в зависимости от
@@ -145,6 +149,49 @@ struct sc_aesctr {
 int  sc_aesctr_init(struct sc_aesctr *c, const unsigned char key[32], const unsigned char iv[16]);
 int  sc_aesctr_xor(struct sc_aesctr *c, const unsigned char *in, unsigned char *out, size_t n);
 void sc_aesctr_free(struct sc_aesctr *c);
+
+/* ---- AES одним блоком (ECB) --------------------------------------------------------------- */
+
+/* Один блок AES-128 или AES-256 (key_n — 16 или 32) на шифрование или расшифровку. Нужен там,
+ * где протокол прячет блоком короткий заголовок: идентификатор VMess AEAD (AuthID), отдельный
+ * заголовок UDP и заголовки личности shadowsocks 2022. Без контекста: ключ разворачивается на
+ * каждый вызов — блок шифруется раз на соединение (VMess) или на датаграмму (shadowsocks 2022),
+ * и развёртка рядом с AEAD самой датаграммы ничего не стоит, а хранилище на каждое соединение
+ * стоило бы килобайт. */
+int sc_aes_block(const unsigned char *key, size_t key_n, int decrypt,
+                 const unsigned char in[16], unsigned char out[16]);
+
+/* ---- XChaCha20-Poly1305 ------------------------------------------------------------------- */
+
+/* AEAD с 24-байтовым nonce (draft-irtf-cfrg-xchacha) — датаграммы shadowsocks
+ * 2022-blake3-chacha20-poly1305: у каждой свой случайный nonce, а ключ — сам PSK. Одним вызовом:
+ * ключ на каждую датаграмму свой подключом HChaCha20, разворачивать заранее нечего. Тег — 16 байт
+ * сразу за данными: seal пишет n + 16 байт в out, open читает n байт (с тегом) и пишет n - 16. */
+int sc_xchacha_seal(const unsigned char key[32], const unsigned char nonce[24],
+                    const void *aad, size_t aad_n, const unsigned char *in, size_t n,
+                    unsigned char *out);
+int sc_xchacha_open(const unsigned char key[32], const unsigned char nonce[24],
+                    const void *aad, size_t aad_n, const unsigned char *in, size_t n,
+                    unsigned char *out);
+
+/* ---- SHAKE128 (FIPS 202) потоком ---------------------------------------------------------- */
+
+/* Маска длины кусков VMess (ChunkMasking): каждый кусок тела берёт из SHAKE128(IV) два байта
+ * маски длины и, при GlobalPadding, ещё два на длину набивки — и так до конца соединения, то есть
+ * вывод бесконечный и читается понемногу. Вход один и короткий (16 байт IV) — он поглощается при
+ * заведении. Хранилище — wc_Shake wolfSSL (около 430 байт; размер сверяют scrypto.c и
+ * build/wolfssl/abi.c), плюс выжатый, но ещё не отданный блок. */
+#define SC_SHAKE_CTX_SIZE 512
+#define SC_SHAKE128_RATE 168
+struct sc_shake {
+    int ready;
+    uint16_t pos;                              /* сколько байт blk уже отдано */
+    unsigned char blk[SC_SHAKE128_RATE];
+    SC_ALIGN unsigned char st[SC_SHAKE_CTX_SIZE];
+};
+int  sc_shake128_init(struct sc_shake *s, const void *in, size_t n);
+int  sc_shake128_read(struct sc_shake *s, unsigned char *out, size_t n);
+void sc_shake128_free(struct sc_shake *s);
 
 /* ---- X25519 (RFC 7748) -------------------------------------------------------------------- */
 

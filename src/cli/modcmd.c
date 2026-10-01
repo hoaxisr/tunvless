@@ -56,6 +56,10 @@ int cmd_hysteria2(const char *spec_path, const char *out_name) __attribute__((we
 int cmd_hysteria2_nodes(const char *spec_path, const char *out_name) __attribute__((weak));
 int cmd_hysteria2_probe(const char *spec_path, const char *out_name, int node,
                         int timeout_s) __attribute__((weak));
+int cmd_proxy(const char *spec_path, const char *out_name) __attribute__((weak));
+int cmd_proxy_nodes(const char *spec_path, const char *out_name) __attribute__((weak));
+int cmd_proxy_probe(const char *spec_path, const char *out_name, int node,
+                    int timeout_s) __attribute__((weak));
 int cmd_sub_fetch(const char *url, const char *out_path, const char *info_path) __attribute__((weak));
 int cmd_sub_quota(const char *url, const char *info_path) __attribute__((weak));
 int cmd_xsteer_key(void) __attribute__((weak));
@@ -74,6 +78,8 @@ int modcmd_builtin(const char *cmd) {
         return cmd_vless != NULL;
     if (!strcmp(cmd, "hysteria2") || !strcmp(cmd, "hysteria2-nodes") || !strcmp(cmd, "hysteria2-probe"))
         return cmd_hysteria2 != NULL;
+    if (!strcmp(cmd, "proxy") || !strcmp(cmd, "proxy-nodes") || !strcmp(cmd, "proxy-probe"))
+        return cmd_proxy != NULL;
     if (!strcmp(cmd, "xsteer") || !strcmp(cmd, "xsteer-peers")) return cmd_xsteer != NULL;
     if (!strcmp(cmd, "tgws") || !strcmp(cmd, "tgws-probe")) return cmd_tgws != NULL;
     if (!strcmp(cmd, "obfs") || !strcmp(cmd, "obfs-server")) return cmd_obfs != NULL;
@@ -96,8 +102,8 @@ static int absent(const char *cmd, const char *what, int argc, char **argv) {
             return 2;
         }
     }
-    /* steer-extended ставит остальные модули, но не hysteria2: ему отдельный пакет. */
-    int in_ext = !mod || strcmp(mod, "steer-hysteria2") != 0;
+    /* steer-extended ставит остальные модули, но не hysteria2 и не proxy: у них отдельные пакеты. */
+    int in_ext = !mod || (strcmp(mod, "steer-hysteria2") != 0 && strcmp(mod, "steer-proxy") != 0);
     fprintf(stderr, "steer: %s в этой сборке отсутствует — нужен пакет %s%s\n",
             what, mod ? mod : "steer-extended", in_ext ? " (входит в steer-extended)" : "");
     return 2;
@@ -105,6 +111,7 @@ static int absent(const char *cmd, const char *what, int argc, char **argv) {
 
 #define ABSENT_VLESS  absent(cmd, "клиент VLESS", argc, argv)
 #define ABSENT_HY2    absent(cmd, "клиент hysteria2", argc, argv)
+#define ABSENT_PROXY  absent(cmd, "клиент прокси", argc, argv)
 #define ABSENT_XS     absent(cmd, "клиент xsteer", argc, argv)
 #define ABSENT_XSADM  absent(cmd, "служебные команды xsteer", argc, argv)
 #define ABSENT_TGWS   absent(cmd, "мост Telegram", argc, argv)
@@ -161,6 +168,11 @@ int modcmd_run(const char *cmd, int argc, char **argv, const struct cli_args *a,
         return cmd_hysteria2_nodes ? cmd_hysteria2_nodes(spec, arg) : ABSENT_HY2;
     if (!strcmp(cmd, "hysteria2-probe"))
         return cmd_hysteria2_probe ? cmd_hysteria2_probe(spec, arg, a->node, a->timeout) : ABSENT_HY2;
+    if (!strcmp(cmd, "proxy")) return cmd_proxy ? cmd_proxy(spec, arg) : ABSENT_PROXY;
+    if (!strcmp(cmd, "proxy-nodes"))
+        return cmd_proxy_nodes ? cmd_proxy_nodes(spec, arg) : ABSENT_PROXY;
+    if (!strcmp(cmd, "proxy-probe"))
+        return cmd_proxy_probe ? cmd_proxy_probe(spec, arg, a->node, a->timeout) : ABSENT_PROXY;
     if (!strcmp(cmd, "sub-fetch"))
         return cmd_sub_fetch ? cmd_sub_fetch(arg, a->out_file, a->info_file) : ABSENT_VLESS;
     if (!strcmp(cmd, "sub-quota"))

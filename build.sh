@@ -220,7 +220,7 @@ pkg_deps() {  # ФАЙЛ_БИНАРНИКА ВИД (core|mod|tun) -> "nftables i
 # обновить один, оставив другой (apk — `имя=версия`, opkg — `имя (= версия)`). Чужие пакеты
 # (nftables, kmod-…) остаются без версии. Демон дополнительно проверяет версию при запуске модуля
 # (hello, docs/ctl.md) — на случай установки файлами мимо менеджера.
-OURS=" steer-core steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steer-extended "
+OURS=" steer-core steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steer-proxy steer-extended "
 dep_apk() {  # ИМЕНА через пробел -> "имя=версия ..." для наших
     for _d in $1; do
         case "$OURS" in *" $_d "*) printf '%s=%s-r1 ' "$_d" "$VERSION" ;; *) printf '%s ' "$_d" ;; esac
@@ -439,19 +439,46 @@ for spec in $ISAS; do
     #          состав помощников зависят от того, какие модули лежат рядом с движком, и демон
     #          видит их, только стартуя заново; службу не включает и не выключает — это дело ядра;
     #   noop   библиотеки и мета-пакет: делать нечего.
+    #
+    # При steer-box-connector движок ведёт коннектор (sing-box) своим экземпляром, и служба steer
+    # рядом с ним делила бы таблицы маршрутизации и поле метки. Поэтому ядро и модули проверяют,
+    # чья служба /etc/init.d/sing-box: при коннекторе службу steer не включают и не запускают, а
+    # перезапускают запущенный sing-box. Без этой проверки обновление ядра на роутере с
+    # коннектором поднимало службу steer по оставшейся спеке (так было 2026-10-01 на 10.8.1.1:
+    # около минуты по спеке splify2). Скрипты пишутся здесь, а не лежат файлами: правка файла в
+    # build/scripts затирается первой же сборкой. Метка /var/run/steer-box-installing — для первой
+    # установки: в одной транзакции ядро встаёт раньше коннектора, и /etc/init.d/sing-box ещё
+    # чужой; метку ставит install.sh тестового набора на время установки.
     mkdir -p build/scripts
-    {
-        printf '#!/bin/sh\n[ -n "${IPKG_INSTROOT}" ] && exit 0\n'
-        printf '/etc/init.d/steer enable 2>/dev/null\n/etc/init.d/steer restart 2>/dev/null\nexit 0\n'
-    } > build/scripts/steer.postinst
+    cat > build/scripts/steer.postinst <<'EOF'
+#!/bin/sh
+[ -n "${IPKG_INSTROOT}" ] && exit 0
+if grep -q steer-box-connector /etc/init.d/sing-box 2>/dev/null || [ -e /var/run/steer-box-installing ]; then
+	/etc/init.d/steer stop 2>/dev/null
+	/etc/init.d/steer disable 2>/dev/null
+	/etc/init.d/sing-box running 2>/dev/null && /etc/init.d/sing-box restart 2>/dev/null
+	exit 0
+fi
+/etc/init.d/steer enable 2>/dev/null
+/etc/init.d/steer restart 2>/dev/null
+exit 0
+EOF
     {
         printf '#!/bin/sh\n[ -n "${IPKG_INSTROOT}" ] && exit 0\n'
         printf '/etc/init.d/steer stop 2>/dev/null\n/etc/init.d/steer disable 2>/dev/null\nexit 0\n'
     } > build/scripts/steer.prerm
-    {
-        printf '#!/bin/sh\n[ -n "${IPKG_INSTROOT}" ] && exit 0\n'
-        printf '[ -x /etc/init.d/steer ] && /etc/init.d/steer restart 2>/dev/null\nexit 0\n'
-    } > build/scripts/mod.postinst
+    # Модуль: при коннекторе — перезапуск запущенного sing-box; иначе — службы steer, только если
+    # она включена (restart поднимает и выключенную).
+    cat > build/scripts/mod.postinst <<'EOF'
+#!/bin/sh
+[ -n "${IPKG_INSTROOT}" ] && exit 0
+if grep -q steer-box-connector /etc/init.d/sing-box 2>/dev/null || [ -e /var/run/steer-box-installing ]; then
+	/etc/init.d/sing-box running 2>/dev/null && /etc/init.d/sing-box restart 2>/dev/null
+elif [ -x /etc/init.d/steer ] && /etc/init.d/steer enabled 2>/dev/null; then
+	/etc/init.d/steer restart 2>/dev/null
+fi
+exit 0
+EOF
     cp build/scripts/mod.postinst build/scripts/mod.postrm
     printf '#!/bin/sh\nexit 0\n' > build/scripts/mod.prerm
     printf '#!/bin/sh\nexit 0\n' > build/scripts/noop.postinst
@@ -515,9 +542,9 @@ for spec in $ISAS; do
     # Модули: по одному бинарнику в usr/sbin рядом со steerd, где их находит движок (src/lib/
     # module.c). Зависимость от steer-core — точной версии: ядро и модуль общаются линией событий,
     # формат которой между выпусками не обещан (hello в docs/ctl.md).
-    # steer-hysteria2 — тоже модуль, но в steer-extended он НЕ входит: отдельный пакет, который
-    # ставят сознательно (см. мета-пакет ниже).
-    for m in vless xsteer obfs tgws hysteria2; do
+    # steer-hysteria2 и steer-proxy — тоже модули, но в steer-extended они НЕ входят: отдельные
+    # пакеты, которые ставят сознательно (см. мета-пакет ниже).
+    for m in vless xsteer obfs tgws hysteria2 proxy; do
         mroot="build/pkg/$arch-$m"
         rm -rf "$mroot"
         mkdir -p "$mroot/usr/sbin"
@@ -529,10 +556,38 @@ for spec in $ISAS; do
             obfs)   md="steer-obfs: обфускатор WireGuard для steer (модуль)"; mk=mod ;;
             tgws)   md="steer-tgws: мост Telegram для steer (модуль)"; mk=mod ;;
             hysteria2) md="steer-hysteria2: клиент hysteria2 (QUIC, Brutal) для steer (модуль)"; mk=tun ;;
+            proxy)  md="steer-proxy: клиенты trojan, shadowsocks, socks, http, vmess для steer (модуль)"; mk=tun ;;
         esac
         mdeps="steer-core $(pkg_deps "$mroot/usr/sbin/steer-$m" "$mk")"
         pack "steer-$m" "$mroot" "$mdeps" "$md" mod
     done
+
+    # steer-box-connector: sing-box для podkop и forkop на движке steer (src/box). Отдельный пакет,
+    # а не модуль движка: он ставится ВМЕСТО пакетов sing-box (их бинарник /usr/bin/sing-box и
+    # служба /etc/init.d/sing-box — то, что зовут podkop и forkop), поэтому конфликтует с ними и
+    # заменяет их файлы. Зависит от steer-core той же версии: коннектор — модуль, линкуется с
+    # libsteer.so и ведёт свой экземпляр steerd. Страница LuCI (Services → Steer Connector) — в
+    # том же пакете: без коннектора ей нечего показывать.
+    broot="build/pkg/$arch-box"
+    rm -rf "$broot"
+    mkdir -p "$broot/usr/bin" "$broot/etc/init.d" "$broot/etc/config" "$broot/usr/libexec/rpcd" \
+        "$broot/usr/share/nftables.d/chain-pre/forward" "$broot/www"
+    cp "$libs/sing-box" "$broot/usr/bin/sing-box"
+    cp files/box/etc/init.d/sing-box "$broot/etc/init.d/sing-box"
+    cp files/box/etc/config/sing-box "$broot/etc/config/sing-box"
+    cp files/box/etc/config/steer-box "$broot/etc/config/steer-box"
+    cp files/box/usr/libexec/rpcd/steer-box "$broot/usr/libexec/rpcd/steer-box"
+    cp files/box/usr/share/nftables.d/chain-pre/forward/50-steer-box.nft \
+        "$broot/usr/share/nftables.d/chain-pre/forward/50-steer-box.nft"
+    cp -a luci-box/htdocs/. "$broot/www/"
+    cp -a luci-box/root/. "$broot/"
+    find "$broot" -type d -exec chmod 0755 {} +
+    find "$broot" -type f -exec chmod 0644 {} +
+    chmod 0755 "$broot/usr/bin/sing-box" "$broot/etc/init.d/sing-box" "$broot/usr/libexec/rpcd/steer-box"
+    bdeps="steer-core $(pkg_deps "$broot/usr/bin/sing-box" mod)"
+    pack steer-box-connector "$broot" "$bdeps" \
+        "steer-box-connector: sing-box для podkop и forkop на движке steer (вместо пакета sing-box)" box \
+        "sing-box sing-box-tiny sing-box-extended" "sing-box"
 
     # Мета-пакет steer-extended (устарел, оставлен на переход): ядро и модули vless, xsteer, obfs,
     # tgws; hysteria2 не входит. Пустой пакет менеджеры не любят, поэтому в нём один маленький

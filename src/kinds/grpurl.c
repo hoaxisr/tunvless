@@ -10,7 +10,7 @@
  * ноль, и это и есть ответ «HTTPS нет». */
 extern const int steer_urltls_present __attribute__((weak));
 
-/* Процесс, который спеку только читает (модуль: steer-vless, steer-xsteer, steer-hysteria2, obfs,
+/* Процесс, который спеку только читает (модуль: steer-vless, steer-xsteer, steer-hysteria2, steer-proxy, obfs,
  * tgws). Замер групп ведёт один steerd, и есть ли в системе HTTPS для замера, решает он: символ
  * steer_urltls_present в бинарник модуля не попадает (urltls.c нужен только замеру), и слабая ссылка
  * там всегда нулевая — не потому, что TLS в системе нет, а потому, что модулю он ни к чему. Раньше

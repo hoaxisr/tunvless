@@ -25,6 +25,9 @@
 #include <wolfssl/ssl.h>
 #include <wolfssl/wolfcrypt/sha256.h>
 #include <wolfssl/wolfcrypt/sha512.h>
+#include <wolfssl/wolfcrypt/sha.h>
+#include <wolfssl/wolfcrypt/md5.h>
+#include <wolfssl/wolfcrypt/sha3.h>
 #include <wolfssl/wolfcrypt/hmac.h>
 #include <wolfssl/wolfcrypt/aes.h>
 #include <wolfssl/wolfcrypt/chacha.h>
@@ -52,6 +55,11 @@ _Static_assert(sizeof(wc_Sha512) <= SC_HASH_CTX_SIZE && _Alignof(wc_Sha512) <= 1
 _Static_assert(sizeof(wc_Sha384) <= SC_HASH_CTX_SIZE && _Alignof(wc_Sha384) <= 16, "SC_HASH_CTX_SIZE мал для wc_Sha384");
 _Static_assert(sizeof(Aes) <= SC_AEAD_CTX_SIZE && _Alignof(Aes) <= 16, "SC_AEAD_CTX_SIZE мал для Aes");
 _Static_assert(sizeof(Aes) <= SC_AESCTR_CTX_SIZE, "SC_AESCTR_CTX_SIZE мал для Aes");
+/* Хеши протоколов steer-proxy (scrypto.h). wc_Sha224 у wolfSSL — тот же тип, что wc_Sha256. */
+_Static_assert(sizeof(wc_Sha) <= SC_HASH_CTX_SIZE && _Alignof(wc_Sha) <= 16, "SC_HASH_CTX_SIZE мал для wc_Sha");
+_Static_assert(sizeof(wc_Sha224) <= SC_HASH_CTX_SIZE && _Alignof(wc_Sha224) <= 16, "SC_HASH_CTX_SIZE мал для wc_Sha224");
+_Static_assert(sizeof(wc_Md5) <= SC_HASH_CTX_SIZE && _Alignof(wc_Md5) <= 16, "SC_HASH_CTX_SIZE мал для wc_Md5");
+_Static_assert(sizeof(wc_Shake) <= SC_SHAKE_CTX_SIZE && _Alignof(wc_Shake) <= 16, "SC_SHAKE_CTX_SIZE мал для wc_Shake");
 
 /* ChaCha20-Poly1305: развёрнутый ключ ChaCha плюс рабочий Poly1305 (его ключ свой на каждую
  * запись, RFC 8439 §2.6). Лежат рядом в одном хранилище. */
@@ -69,6 +77,9 @@ size_t sc_hash_len(enum sc_hash h) {
         case SC_SHA256: return 32;
         case SC_SHA384: return 48;
         case SC_SHA512: return 64;
+        case SC_SHA1:   return 20;
+        case SC_SHA224: return 28;
+        case SC_MD5:    return 16;
     }
     return 0;
 }
@@ -79,6 +90,9 @@ static int wc_type(enum sc_hash h) {
         case SC_SHA256: return WC_SHA256;
         case SC_SHA384: return WC_SHA384;
         case SC_SHA512: return WC_SHA512;
+        case SC_SHA1:   return WC_SHA;
+        case SC_SHA224: return WC_SHA224;
+        case SC_MD5:    return WC_MD5;
     }
     return -1;
 }
@@ -87,6 +101,9 @@ static enum wc_HashType wc_htype(enum sc_hash h) {
         case SC_SHA256: return WC_HASH_TYPE_SHA256;
         case SC_SHA384: return WC_HASH_TYPE_SHA384;
         case SC_SHA512: return WC_HASH_TYPE_SHA512;
+        /* Хеши протоколов steer-proxy (scrypto.h) подписей не проверяют: цепочке и PSS они не
+         * отдаются, и подпись SHA-1 по-прежнему отвергается. */
+        case SC_SHA1: case SC_SHA224: case SC_MD5: break;
     }
     return WC_HASH_TYPE_NONE;
 }
@@ -98,6 +115,9 @@ int sc_hash_init(struct sc_hash_ctx *c, enum sc_hash h) {
         case SC_SHA256: rc = wc_InitSha256_ex((wc_Sha256 *)c->st, NULL, INVALID_DEVID); break;
         case SC_SHA384: rc = wc_InitSha384_ex((wc_Sha384 *)c->st, NULL, INVALID_DEVID); break;
         case SC_SHA512: rc = wc_InitSha512_ex((wc_Sha512 *)c->st, NULL, INVALID_DEVID); break;
+        case SC_SHA1:   rc = wc_InitSha_ex((wc_Sha *)c->st, NULL, INVALID_DEVID); break;
+        case SC_SHA224: rc = wc_InitSha224_ex((wc_Sha224 *)c->st, NULL, INVALID_DEVID); break;
+        case SC_MD5:    rc = wc_InitMd5_ex((wc_Md5 *)c->st, NULL, INVALID_DEVID); break;
         default: return SC_EINVAL;
     }
     if (rc != 0) return SC_ECRYPTO;
@@ -112,6 +132,9 @@ int sc_hash_update(struct sc_hash_ctx *c, const void *d, size_t n) {
         case SC_SHA256: rc = wc_Sha256Update((wc_Sha256 *)c->st, d, (word32)n); break;
         case SC_SHA384: rc = wc_Sha384Update((wc_Sha384 *)c->st, d, (word32)n); break;
         case SC_SHA512: rc = wc_Sha512Update((wc_Sha512 *)c->st, d, (word32)n); break;
+        case SC_SHA1:   rc = wc_ShaUpdate((wc_Sha *)c->st, d, (word32)n); break;
+        case SC_SHA224: rc = wc_Sha224Update((wc_Sha224 *)c->st, d, (word32)n); break;
+        case SC_MD5:    rc = wc_Md5Update((wc_Md5 *)c->st, d, (word32)n); break;
         default: return SC_EINVAL;
     }
     return rc == 0 ? 0 : SC_ECRYPTO;
@@ -123,6 +146,9 @@ int sc_hash_final(struct sc_hash_ctx *c, unsigned char *out) {
         case SC_SHA256: rc = wc_Sha256Final((wc_Sha256 *)c->st, out); break;
         case SC_SHA384: rc = wc_Sha384Final((wc_Sha384 *)c->st, out); break;
         case SC_SHA512: rc = wc_Sha512Final((wc_Sha512 *)c->st, out); break;
+        case SC_SHA1:   rc = wc_ShaFinal((wc_Sha *)c->st, out); break;
+        case SC_SHA224: rc = wc_Sha224Final((wc_Sha224 *)c->st, out); break;
+        case SC_MD5:    rc = wc_Md5Final((wc_Md5 *)c->st, out); break;
         default: return SC_EINVAL;
     }
     return rc == 0 ? 0 : SC_ECRYPTO;
@@ -147,6 +173,18 @@ int sc_hash_clone(struct sc_hash_ctx *dst, const struct sc_hash_ctx *src) {
             rc = wc_InitSha512_ex((wc_Sha512 *)dst->st, NULL, INVALID_DEVID);
             if (rc == 0) rc = wc_Sha512Copy((wc_Sha512 *)src->st, (wc_Sha512 *)dst->st);
             break;
+        case SC_SHA1:
+            rc = wc_InitSha_ex((wc_Sha *)dst->st, NULL, INVALID_DEVID);
+            if (rc == 0) rc = wc_ShaCopy((wc_Sha *)src->st, (wc_Sha *)dst->st);
+            break;
+        case SC_SHA224:
+            rc = wc_InitSha224_ex((wc_Sha224 *)dst->st, NULL, INVALID_DEVID);
+            if (rc == 0) rc = wc_Sha224Copy((wc_Sha224 *)src->st, (wc_Sha224 *)dst->st);
+            break;
+        case SC_MD5:
+            rc = wc_InitMd5_ex((wc_Md5 *)dst->st, NULL, INVALID_DEVID);
+            if (rc == 0) rc = wc_Md5Copy((wc_Md5 *)src->st, (wc_Md5 *)dst->st);
+            break;
         default: return SC_EINVAL;
     }
     if (rc != 0) return SC_ECRYPTO;
@@ -159,6 +197,9 @@ void sc_hash_free(struct sc_hash_ctx *c) {
         case SC_SHA256: wc_Sha256Free((wc_Sha256 *)c->st); break;
         case SC_SHA384: wc_Sha384Free((wc_Sha384 *)c->st); break;
         case SC_SHA512: wc_Sha512Free((wc_Sha512 *)c->st); break;
+        case SC_SHA1:   wc_ShaFree((wc_Sha *)c->st); break;
+        case SC_SHA224: wc_Sha224Free((wc_Sha224 *)c->st); break;
+        case SC_MD5:    wc_Md5Free((wc_Md5 *)c->st); break;
         default: return;
     }
     c->alg = 0;
@@ -335,6 +376,89 @@ void sc_aesctr_free(struct sc_aesctr *c) {
     wc_AesFree((Aes *)c->st);
     wc_ForceZero(c->st, sizeof(Aes));
     c->ready = 0;
+}
+
+/* ---- AES одним блоком ------------------------------------------------------------------------ */
+
+/* Aes — под килобайт, поэтому в куче: зовут и потоки соединителей стека, у которых стек скромный
+ * (довод — у sc_hmac2). Прямой блок (WOLFSSL_AES_DIRECT в user_settings.h) — без режима и IV. */
+int sc_aes_block(const unsigned char *key, size_t key_n, int decrypt,
+                 const unsigned char in[16], unsigned char out[16]) {
+    if (key_n != 16 && key_n != 32) return SC_EINVAL;
+    Aes *aes = malloc(sizeof(*aes));
+    if (!aes) return SC_ENOMEM;
+    int rc = wc_AesInit(aes, NULL, INVALID_DEVID);
+    if (rc == 0) {
+        rc = wc_AesSetKey(aes, key, (word32)key_n, NULL, decrypt ? AES_DECRYPTION : AES_ENCRYPTION);
+        if (rc == 0) rc = decrypt ? wc_AesDecryptDirect(aes, out, in) : wc_AesEncryptDirect(aes, out, in);
+        wc_AesFree(aes);
+    }
+    wc_ForceZero(aes, sizeof(*aes));
+    free(aes);
+    return rc == 0 ? 0 : SC_ECRYPTO;
+}
+
+/* ---- XChaCha20-Poly1305 --------------------------------------------------------------------- */
+
+int sc_xchacha_seal(const unsigned char key[32], const unsigned char nonce[24],
+                    const void *aad, size_t aad_n, const unsigned char *in, size_t n,
+                    unsigned char *out) {
+    static const unsigned char empty[1];
+    if (n > UINT32_MAX - 16 || aad_n > UINT32_MAX) return SC_EINVAL;
+    int rc = wc_XChaCha20Poly1305_Encrypt(out, n + 16, n ? in : empty, n, aad_n ? aad : empty,
+                                          aad_n, nonce, 24, key, 32);
+    return rc == 0 ? 0 : SC_ECRYPTO;
+}
+
+int sc_xchacha_open(const unsigned char key[32], const unsigned char nonce[24],
+                    const void *aad, size_t aad_n, const unsigned char *in, size_t n,
+                    unsigned char *out) {
+    static const unsigned char empty[1];
+    if (n < 16 || n > UINT32_MAX || aad_n > UINT32_MAX) return SC_EINVAL;
+    int rc = wc_XChaCha20Poly1305_Decrypt(out, n - 16 ? n - 16 : 1, in, n, aad_n ? aad : empty,
+                                          aad_n, nonce, 24, key, 32);
+    if (rc == WC_NO_ERR_TRACE(MAC_CMP_FAILED_E)) return SC_EAUTH;
+    return rc == 0 ? 0 : SC_ECRYPTO;
+}
+
+/* ---- SHAKE128 потоком ----------------------------------------------------------------------- */
+
+/* Absorb wolfSSL поглощает вход и сразу закрывает его набивкой SHAKE (0x1f), после чего
+ * SqueezeBlocks отдаёт блоки по 168 байт подряд — ровно поток вывода XOF. Блок отдаётся
+ * вызывающему кусками, остаток лежит в s->blk до следующего чтения. */
+int sc_shake128_init(struct sc_shake *s, const void *in, size_t n) {
+    static const unsigned char empty[1];
+    s->ready = 0;
+    s->pos = SC_SHAKE128_RATE;
+    if (n > UINT32_MAX) return SC_EINVAL;
+    wc_Shake *k = (wc_Shake *)s->st;
+    if (wc_InitShake128(k, NULL, INVALID_DEVID) != 0) return SC_ECRYPTO;
+    if (wc_Shake128_Absorb(k, n ? in : empty, (word32)n) != 0) { wc_Shake128_Free(k); return SC_ECRYPTO; }
+    s->ready = 1;
+    return 0;
+}
+
+int sc_shake128_read(struct sc_shake *s, unsigned char *out, size_t n) {
+    if (!s->ready) return SC_EINVAL;
+    while (n) {
+        if (s->pos >= SC_SHAKE128_RATE) {
+            if (wc_Shake128_SqueezeBlocks((wc_Shake *)s->st, s->blk, 1) != 0) return SC_ECRYPTO;
+            s->pos = 0;
+        }
+        size_t take = SC_SHAKE128_RATE - s->pos;
+        if (take > n) take = n;
+        memcpy(out, s->blk + s->pos, take);
+        s->pos = (uint16_t)(s->pos + take);
+        out += take;
+        n -= take;
+    }
+    return 0;
+}
+
+void sc_shake128_free(struct sc_shake *s) {
+    if (!s->ready) return;
+    wc_Shake128_Free((wc_Shake *)s->st);
+    wc_ForceZero(s, sizeof(*s));
 }
 
 /* ---- X25519 --------------------------------------------------------------------------------- */
@@ -596,6 +720,7 @@ __attribute__((constructor)) static void sc_abi_check(void) {
         sizeof(Aes), sizeof(struct chachapoly_sz),
         SC_HASH_CTX_SIZE, SC_AEAD_CTX_SIZE, SC_AESCTR_CTX_SIZE,
         sizeof(WOLFSSL_X509_STORE), offsetof(WOLFSSL_X509_STORE, cm),
+        sizeof(wc_Shake), SC_SHAKE_CTX_SIZE,
     };
     for (int i = 0; i < SC_ABI_N; i++) {
         if (steer_wolfssl_abi[i] == want[i]) continue;

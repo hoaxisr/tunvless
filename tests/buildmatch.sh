@@ -51,11 +51,11 @@ words() { tr ' ' '\n' | grep -v '^$'; }
 # входит — базовой сборке криптография не нужна, и wolfSSL в ней нет.
 # Вид hysteria2 (KINDS_HY2_SRC) — того же рода, но только для раскладки с libsteer.so: в статические
 # профили он не входит (телефон отложен), запись вида есть в libsteer, а модуль — steer-hysteria2.
-m_base="$( { profile_src base; echo; profile_var KINDS_EXT_SRC; echo; profile_var KINDS_HY2_SRC; echo; profile_var CRYPTO_SRC; } | words | names)"
+m_base="$( { profile_src base; echo; profile_var KINDS_EXT_SRC; echo; profile_var KINDS_HY2_SRC; echo; profile_var KINDS_PROXY_SRC; echo; profile_var CRYPTO_SRC; } | words | names)"
 # Профили разделяемой раскладки (шаг 4 выпуска 1.10: libsteer, steerd, четыре модуля) — тоже
 # профили: точки входа модулей (src/modules/main_*.c) существуют только в них.
 m_ext="$( { profile_src extended; echo; profile_src server; echo; profile_src tgws; echo
-            for p in libsteer steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2; do profile_src "$p"; echo; done; } |
+            for p in libsteer steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy mod_box; do profile_src "$p"; echo; done; } |
           words | grep -E "^($(profile_var EXT_DIRS | tr ' ' '|'))/" | names)"
 check "sources.mk: профиль base (с видами расширенной части) — это все каталоги ядра"  "$disk_base" "$m_base"
 check "sources.mk: профили покрывают всю расширенную часть" "$disk_ext" "$m_ext"
@@ -363,8 +363,8 @@ check "pack пишет конфликты как !имя (apk) и Conflicts (opk
     "$(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c '_dall="\$_dall !\$_c"') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c "Conflicts: ")"
 check "pack пишет Replaces и Provides в обоих форматах" "1 1 1 1" \
     "$(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c -- '--info replaces:') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c -- '--info provides:') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c 'Replaces: ') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c 'Provides: ')"
-check "build.sh упаковывает модули по кругу vless xsteer obfs tgws hysteria2" "1 1" \
-    "$(grep -c '^ *pack "steer-\$m" ' build.sh) $(grep -c '^    for m in vless xsteer obfs tgws hysteria2; do' build.sh)"
+check "build.sh упаковывает модули по кругу vless xsteer obfs tgws hysteria2 proxy" "1 1" \
+    "$(grep -c '^ *pack "steer-\$m" ' build.sh) $(grep -c '^    for m in vless xsteer obfs tgws hysteria2 proxy; do' build.sh)"
 check "pack зовёт apk mkpkg и mk_ipk из одного дерева" "1 1" \
     "$(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c 'apk mkpkg') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c 'mk_ipk ')"
 # Мета-пакет steer-extended ставит ядро и четыре модуля (имя ждёт splify2, пакет устарел), а
@@ -377,9 +377,11 @@ check "steer-extended помечен устаревшим в описании" "
 # отвечает «требует пакет steer-hysteria2», а не отсылкой к steer-extended.
 check "steer-extended не включает steer-hysteria2" "0" \
     "$(grep 'pack steer-extended' build.sh | grep -c hysteria2)"
+check "steer-extended не включает steer-proxy" "0" \
+    "$(grep 'pack steer-extended' build.sh | grep -c steer-proxy)"
 check "модули зависят от steer-core" "1" "$(grep -c 'mdeps="steer-core \$(pkg_deps' build.sh)"
 check "список наших пакетов — новая раскладка (steer-core, модули, мета)" "1" \
-    "$(grep -c '^OURS=" steer-core steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steer-extended "$' build.sh)"
+    "$(grep -c '^OURS=" steer-core steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steer-proxy steer-extended "$' build.sh)"
 # Зависимости между нашими пакетами — точной версии (формат линии событий и ABI libsteer между
 # выпусками не обещаны).
 check "наши пакеты зависят друг от друга точной версией (apk и opkg)" "1 1" \
@@ -846,19 +848,19 @@ check "src/tunnel и src/proto не зовут маршрутизацию дем
 # модулей одно — cli/modcmd.c: он входит в каждый бинарник, потому что слабые ссылки на cmd_*
 # решаются компоновкой, а не загрузчиком.
 sd="$(mktemp -d)"
-for p in libsteer steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 extended; do
+for p in libsteer steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy extended; do
     profile_src "$p" | words | sort -u > "$sd/$p"
 done
 modcmd="$(profile_var MODCMD_SRC)"
-for a in steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2; do
+for a in steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy; do
     check "раскладка: в libsteer и $a нет общих файлов" "" \
         "$(comm -12 "$sd/libsteer" "$sd/$a" | tr '\n' ' ')"
 done
-for a in mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2; do
+for a in mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy; do
     check "раскладка: у steerd и $a общий один файл — modcmd.c" "$modcmd " \
         "$(comm -12 "$sd/steerd" "$sd/$a" | tr '\n' ' ')"
 done
-set -- mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2
+set -- mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy
 while [ $# -gt 1 ]; do
     a="$1"; shift
     for b in "$@"; do
@@ -868,7 +870,7 @@ while [ $# -gt 1 ]; do
 done
 # Модуль не несёт ни демона, ни модели: демон (failover.c, supd.c, dnsd…) — в steerd, модель и виды —
 # в libsteer. В списках модулей нет ничего из каталогов демона, резолвера, компилятора и моделей.
-for a in mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2; do
+for a in mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy; do
     check "раскладка: в $a нет файлов демона, компилятора, резолвера и модели" "" \
         "$(grep -E '^src/(daemon|dnsd|compile|model|kinds|platform)/' "$sd/$a" | tr '\n' ' ')"
 done
@@ -877,14 +879,14 @@ check "раскладка: libsteer не несёт демона, компиля
     "$(grep -E '^src/(daemon|dnsd|compile)/' "$sd/libsteer" | grep -v 'src/compile/nftcompat.c' | tr '\n' ' ')"
 # Всё, что было в статическом расширенном профиле, есть в раскладке (кроме файла профиля), а лишнее —
 # только четыре точки входа модулей.
-cat "$sd/libsteer" "$sd/steerd" "$sd/mod_vless" "$sd/mod_xsteer" "$sd/mod_obfs" "$sd/mod_tgws" "$sd/mod_hysteria2" | sort -u > "$sd/all"
+cat "$sd/libsteer" "$sd/steerd" "$sd/mod_vless" "$sd/mod_xsteer" "$sd/mod_obfs" "$sd/mod_tgws" "$sd/mod_hysteria2" "$sd/mod_proxy" | sort -u > "$sd/all"
 check "раскладка покрывает расширенный профиль (кроме файла профиля)" "src/profile/extended.c " \
     "$(comm -23 "$sd/extended" "$sd/all" | tr '\n' ' ')"
 # (Обёртка QUIC src/proto/quic — в libsteer, в статическом профиле её нет: потребителя нет, телефону — шаг 6.)
-check "  и добавляет только точки входа модулей, обёртку QUIC и модуль hysteria2 с его видом" "src/kinds/hysteria2.c src/modules/main_hysteria2.c src/modules/main_obfs.c src/modules/main_tgws.c src/modules/main_vless.c src/modules/main_xsteer.c src/proto/hysteria2/hy2conn.c src/proto/hysteria2/hy2dial.c src/proto/hysteria2/hy2main.c src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2wire.c src/proto/quic/qcdoq.c src/proto/quic/qcssl.c src/proto/quic/quic.c " \
+check "  и добавляет только точки входа модулей, обёртку QUIC и модули hysteria2 и proxy с их видами" "src/kinds/hysteria2.c src/kinds/proxy.c src/modules/main_hysteria2.c src/modules/main_obfs.c src/modules/main_proxy.c src/modules/main_tgws.c src/modules/main_vless.c src/modules/main_xsteer.c src/proto/hysteria2/hy2conn.c src/proto/hysteria2/hy2dial.c src/proto/hysteria2/hy2main.c src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2wire.c src/proto/proxy/pxdial.c src/proto/proxy/pxhttp.c src/proto/proxy/pxmain.c src/proto/proxy/pxsocks.c src/proto/proxy/pxss.c src/proto/proxy/pxsub.c src/proto/proxy/pxtrojan.c src/proto/proxy/pxvmess.c src/proto/proxy/pxwire.c src/proto/quic/qcdoq.c src/proto/quic/qcssl.c src/proto/quic/quic.c " \
     "$(comm -13 "$sd/extended" "$sd/all" | tr '\n' ' ')"
 # Точка входа — единственный main() модуля; steerd свой main держит в daemon/main.c.
-for a in vless xsteer obfs tgws hysteria2; do
+for a in vless xsteer obfs tgws hysteria2 proxy; do
     check "src/modules/main_$a.c зовёт steer_module_main с именем модуля" "1" \
         "$(grep -c "steer_module_main(argc, argv, \"$a\", STEER_VERSION)" src/modules/main_$a.c)"
 done
@@ -903,7 +905,7 @@ check "build-libs.sh берёт списки файлов из манифест�
     "$(grep -v '^[[:space:]]*#' build/build-libs.sh | grep -oE 'src/[a-z0-9_/]+\.c' | tr '\n' ' ')"
 # Размеры хранилищ слоя — ABI между libsteer и libsteer-wolfssl: и в сборке (abi.c), и при загрузке
 # (scrypto.c, sc_abi_check) они сверяются с настоящими sizeof.
-check "abi.c сверяет хранилища слоя со структурами wolfSSL при сборке библиотеки" "6" \
+check "abi.c сверяет хранилища слоя со структурами wolfSSL при сборке библиотеки" "8" \
     "$(grep -c '^_Static_assert' build/wolfssl/abi.c)"
 check "отпечаток библиотеки и его сверка при загрузке — одного размера" "1" \
     "$([ "$(grep -c '^#define SC_ABI_N' src/lib/scrypto.h)" = 1 ] && grep -q 'steer_wolfssl_abi\[SC_ABI_N\]' src/lib/scrypto.c build/wolfssl/abi.c && echo 1 || echo 0)"

@@ -62,6 +62,7 @@ filegroup {
         "wolfcrypt/src/hmac.c",
         "wolfcrypt/src/kdf.c",
         "wolfcrypt/src/logging.c",
+        "wolfcrypt/src/md5.c",
         "wolfcrypt/src/memory.c",
         "wolfcrypt/src/poly1305.c",
         "wolfcrypt/src/random.c",

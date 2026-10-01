@@ -424,6 +424,9 @@ int tr_ws_parse(struct ws_rx *r, const unsigned char *in, size_t n,
 
 /* TCP до узла по всем адресам имени (trdial.c). Дескриптор либо отрицательный код TR_*. */
 int tr_dial(const char *host, uint16_t port, int timeout_s);
+/* Соединённый неблокирующий сокет UDP к узлу с той же меткой, что у TCP (trdial.c): датаграммы
+ * протоколов прокси (shadowsocks, SOCKS5). Дескриптор либо отрицательный код TR_*. */
+int tr_dial_udp(const char *host, uint16_t port);
 
 /* Безопасность по полю ссылки: none, tls, иначе reality (trsec.c). */
 const struct security_ops *tr_security(const char *name);

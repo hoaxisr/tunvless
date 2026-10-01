@@ -26,39 +26,13 @@
 #include "vless_proto.h"
 #include "vision.h"
 #include "client.h"
-
-/* Узел подписки глазами транспорта: указатели в узел, без копий. */
-static void tr_node_of(const struct vless_node *n, struct tr_node *t) {
-    t->host = n->host;
-    t->port = n->port;
-    t->type = n->type;
-    t->security = n->security;
-    t->sni = n->sni;
-    t->fp = n->fp;
-    t->pbk = n->pbk;
-    t->sid = n->sid;
-    t->path = n->path;
-    t->service = n->service;
-    t->mode = n->mode;
-    t->pad_from = n->pad_from;
-    t->pad_to = n->pad_to;
-    t->http_host = n->http_host;
-    t->headers = n->headers;
-    t->pqv = n->pqv;
-    /* Проверка сертификата — только у security=tls; у reality эти поля ничего не значат. */
-    int tls = !strcmp(n->security, "tls");
-    t->pcs = tls ? n->pcs : NULL;
-    t->pks = tls ? n->pks : NULL;
-    t->vcn = tls ? n->vcn : NULL;
-    t->ech = tls ? n->ech : NULL;
-    t->insecure = tls && n->insecure;
-    t->encryption = n->encryption;
-}
+/* Узел глазами транспорта (sl_tr_node) — общий с модулем steer-proxy. */
+#include "sublink.h"
 
 /* Полное установление: TCP + безопасность + транспорт. Возвращает 0 и заполняет conn. */
 int vless_connect(const struct vless_node *node, struct transport *conn, int timeout_s) {
     struct tr_node tn;
-    tr_node_of(node, &tn);
+    sl_tr_node(node, &tn);
     return transport_open(conn, &tn, timeout_s);
 }
 

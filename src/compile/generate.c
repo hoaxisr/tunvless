@@ -1050,6 +1050,36 @@ static void build_failopen(struct nft_table *t, const struct spec *sp) {
     ir_comment(r, "steer-failopen");
 }
 
+/* ВОЗВРАТ РЕШЕНИЯ ПОСЛЕ ЧУЖОЙ ПЕРЕЗАПИСИ (STEER_MARK_RESTORE=1 в окружении apply).
+ *
+ * Нужен экземпляру steer-box-connector — sing-box для podkop и forkop. Их цепочки ставят метку
+ * пакету ЦЕЛИКОМ (`meta mark set 0x04000000`) на тех же хуках и приоритетах, что наша разметка:
+ * forkop — `mangle + 1`, как prerouting_mark (порядок цепочек одного приоритета не определён), и
+ * ещё на dstnat, уже по настоящему адресу после подмены fake-IP. Снято на стенде: первый пакет
+ * соединения (SYN) терял наше поле и уходил напрямую, а следующие (forkop пропускает их по
+ * `ct status dnat`) — в туннель; соединение разрывалось надвое, сервер отвечал сбросом.
+ *
+ * Решение уже записано в метку соединения (prerouting_mark: `ct mark set mark`), поэтому
+ * последним перед выбором маршрута (dstnat + 10 — после nat и после чужих dstnat) пакет, у
+ * которого наше поле пусто, а у соединения нет, получает поле и бит пропуска zapret обратно.
+ * Пакет с непустым полем не трогается: у failopen бит zapret снят нарочно. Без переменной
+ * цепочки нет, и набор правил прежний до байта. */
+static void build_mark_restore(struct nft_table *t) {
+    const char *e = getenv("STEER_MARK_RESTORE");
+    if (!e || strcmp(e, "1")) return;
+    struct nft_rule *r = ir_rule(ir_base_chain_add(t, "prerouting_restore", "filter",
+                                                   "prerouting", "dstnat", 10));
+    /* Только прямое направление: ответ, который стек туннеля отдаёт клиенту из своего
+     * устройства, несёт ту же метку соединения, и вернуть ему поле значило бы увести его по
+     * таблице выхода обратно в туннель — петля (снято на стенде: миллионы пакетов в sbx0). */
+    ir_x(r, "ct direction original");
+    ir_x(r, "meta mark and 0x%08x == 0", STEER_MARK_MASK);
+    ir_x(r, "ct mark and 0x%08x != 0", STEER_MARK_MASK);
+    ir_markset(r, "meta mark set ct mark and 0x%08x", STEER_MARK_MASK | ZAPRET_SKIP_MARK);
+    ir_counter(r, 0, 0);
+    ir_comment(r, "steer-restore");
+}
+
 /* Встречный путь — только чтобы его было ЧЕМ ПОСЧИТАТЬ. Метку здесь не ставим и
  * решений не принимаем: маршрут ответным пакетам не нужен, их ведёт conntrack.
  *
@@ -1619,7 +1649,7 @@ static void local_dns_redirect(struct nft_chain *c, const struct spec *sp) {
 void nft_emit_output_dns(struct nft_rs *rs, const struct spec *sp, const struct groups *gr) {
     struct nft_chain *c = ir_base_chain_add(inet_table(rs), "output_dns", "nat", "output",
                                             "dstnat", 0);
-    local_dns_redirect(c, sp);
+    if (plat()->local_dns) local_dns_redirect(c, sp);
     if (!has_fakeip(gr)) return;
     struct nft_rule *r = ir_rule(c);
     ir_rule_fam(r, 4);
@@ -1905,6 +1935,7 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
     if (plat()->local_channels && has_local(gr) && nft_emit_output_mark(rs, sp, gr, e) != 0)
         return -1;
     build_failopen(t, sp);
+    build_mark_restore(t);
     build_postrouting_down(t, sp, gr);
     build_forward_v6(t, sp, gr);
     build_guard(t, sp, gr);

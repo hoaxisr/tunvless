@@ -58,6 +58,12 @@ struct platform_ops {
 
     /* ---- что на платформе есть ---------------------------------------------------------- */
     unsigned local_channels : 1;      /* каналы на само устройство: from self / uid:N */
+    /* DNS самого устройства — в резолвер движка (цепочка output_dns, local_dns_redirect). Телефон —
+     * да: приложения спрашивают netd, и иначе имена под правилами им не достались бы. Роутер с
+     * каналами на себя (STEER_ROUTER_SELF, platform.c) — нет: его DNS — это dnsmasq, а dnsmasq у
+     * podkop и forkop спрашивает 127.0.0.42, то есть коннектор, который сам спрашивает dnsd; заворот
+     * отправил бы вопрос dnsmasq в dnsd, а имя вне правил — обратно в dnsmasq, по кругу. */
+    unsigned local_dns : 1;
     unsigned zapret : 1;              /* kind zapret и on_fail zapret */
     unsigned fw4 : 1;                 /* firewall4: проверки зоны и masquerade после apply */
     unsigned netifd : 1;              /* сторож оживляет интерфейс ifdown/ifup и procd */

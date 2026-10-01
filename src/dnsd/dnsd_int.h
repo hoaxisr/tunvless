@@ -329,7 +329,16 @@ void dch_del(size_t i, const char *domain, uint32_t addr_host);
 int dch_add6(size_t i, const char *domain, const uint8_t addr[16], uint32_t ttl);
 void dch_del6(size_t i, const char *domain, const uint8_t addr[16]);
 
+/* Опция EDNS «не пересылать» (код из частного диапазона RFC 6891, 65001..65534). Её ставит
+ * steer-box-connector — sing-box для podkop и forkop, — когда спрашивает у резолвера имя, которому
+ * его правила DNS дают fake-IP (BOX_CONNECTOR.md в хабе, S3). Имя вне доменных каналов получает
+ * REFUSED сразу, а не уходит прежним путём наверх: путь наверх на роутере — dnsmasq, а dnsmasq у
+ * podkop смотрит на 127.0.0.42, то есть обратно в коннектор, и вопрос ходил бы по кругу.
+ * Принимается только с петли: снаружи этот флаг ничего не значит. */
+#define DNSD_OPT_NOFORWARD 65001
+
 /* wire.c */
+int query_noforward(const uint8_t *pkt, size_t len, size_t qend);
 int parse_query(const uint8_t *pkt, size_t len, char *out_qname,
                  size_t qname_len, uint16_t *out_qtype, size_t *out_qend);
 /* ips6/max_ips6/n6 — записи AAAA ответа (ips6 == NULL — не нужны; *n6 — сколько найдено). */

@@ -1033,9 +1033,10 @@ static int start_one(struct helper *h, void *arg) {
                 h->st.known = 1;
                 h->st.said_down = 1;
                 if (!h->nomod_logged) {
-                    /* steer-extended ставит остальные модули, но не hysteria2: у него отдельный пакет. */
+                    /* steer-extended ставит остальные модули, но не hysteria2 и не proxy: у них свои пакеты. */
+                    int in_ext = strcmp(h->prog, "steer-hysteria2") != 0 && strcmp(h->prog, "steer-proxy") != 0;
                     fprintf(stderr, LOG_SW "%s %s — модуля нет: нужен пакет %s%s\n", h->cmd, h->name,
-                            h->prog, strcmp(h->prog, "steer-hysteria2") ? " (входит в steer-extended)" : "");
+                            h->prog, in_ext ? " (входит в steer-extended)" : "");
                     h->nomod_logged = 1;
                 }
                 return -1;
@@ -1340,7 +1341,7 @@ int supd_restart(struct supd *s, const char *out, const char *cmd) {
 /* Помощник перебирает узлы подписки и рассказывает о переборе событиями node/nonode/down: vless и
  * hysteria2 говорят одним языком, и память демона отвечает про обоих одинаково. */
 static int cmd_picks_nodes(const char *cmd) {
-    return !strcmp(cmd, "vless") || !strcmp(cmd, "hysteria2");
+    return !strcmp(cmd, "vless") || !strcmp(cmd, "hysteria2") || !strcmp(cmd, "proxy");
 }
 
 /* То же, что записал бы клиент (probe_report в src/proto/vless/vlmain.c), — по его событиям:

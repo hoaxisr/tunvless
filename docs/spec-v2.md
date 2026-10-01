@@ -172,7 +172,7 @@ rules:
 |---|---|---|
 | `direct` | — | не маршрутизировать: трафик идёт обычным путём |
 | `interface` | `device`, `obfs: { mode, server, listen }` | устройство системы (wireguard, pppoe…); `obfs` — WireGuard поверх поддельного TCP: `server` и `listen` — `адрес:порт` литералами, `mode` — `wg-over-tcp` (умолчание) |
-| `tunnel` | `protocol: vless` или `hysteria2`, `subscription`, `nodes`, `device`, `transport` | туннель по подписке; `subscription` — файл подписки (v1: `sub_file`), `nodes` — номера пригодных узлов по предпочтению (пусто — первый рабочий); `transport` — какими транспортами узлов ходить (ниже; только у vless) |
+| `tunnel` | `protocol: vless`, `hysteria2`, `trojan`, `shadowsocks`, `socks`, `http` или `vmess`; `subscription`, `nodes`, `device`, `transport` | туннель по подписке; `subscription` — файл подписки (v1: `sub_file`), `nodes` — номера пригодных узлов по предпочтению (пусто — первый рабочий); `transport` — какими транспортами узлов ходить (ниже; только у vless) |
 | `xsteer` | `conf`, `stream`, `stream_port`, `device` | xsteer; `conf` — файл в стиле wg (умолчание `{etc}/xsteer/<имя>.conf`) |
 | `awg` | `conf`, `device` | AmneziaWG, устройство заводит движок; `conf` — умолчание `{etc}/awg/<имя>.conf` |
 | `zapret` | `strategy` | обход DPI через nfqws; `strategy` — файл ключей nfqws (v1: `opts_file`, умолчание `{etc}/zapret/<имя>.opts`); не на телефоне |
@@ -189,6 +189,13 @@ rules:
 Ключи те же, что у vless, кроме `transport`: у hysteria2 транспорта нет, и ключ — ошибка разбора.
 Узлы подписки — ссылки `hysteria2://` / `hy2://` либо конфиг Xray-core
 ([docs/hysteria2.md](hysteria2.md)). В v1 тот же выход пишется `kind: hysteria2`.
+
+`protocol: trojan`, `shadowsocks`, `socks`, `http`, `vmess` — клиенты протоколов прокси
+(podkop/forkop поверх steer через коннектор sing-box), только с пакетом `steer-proxy` (в
+`steer-extended` он не входит; без него — «kind … требует пакет steer-proxy»). Узлы из подписки:
+стандартные share-ссылки `trojan://`, `ss://`, `socks*://`, `http(s)://`, `vmess://`
+([docs/proxy.md](proxy.md)). Ключа `transport` нет (транспорт берётся из ссылки узла); `insecure`
+есть у trojan, vmess и http (есть TLS), у ss и socks его нет.
 
 **`transport` туннеля** — `tcp`, `grpc`, `xhttp`, `ws`, `httpupgrade`, одно имя или список
 (`transport: ws`, `transport: [ws, httpupgrade]`); ключа нет — любые. Это **фильтр** узлов

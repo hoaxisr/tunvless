@@ -46,7 +46,7 @@ wolfssl_c_files() {
     # ge_operations.c — групповая математика Ed25519: X25519 берёт её для открытого ключа там, где
     # у кривой свой ассемблер (aarch64, CURVED25519_ASM_64BIT); на остальных целях файл пуст.
     for f in aes asn chacha chacha20_poly1305 coding cpuid curve25519 ecc error fe_operations \
-             ge_operations hash hmac kdf logging memory poly1305 random rsa sha sha256 sha3 sha512 \
+             ge_operations hash hmac kdf logging md5 memory poly1305 random rsa sha sha256 sha3 sha512 \
              sp_int wc_encrypt wc_mldsa wc_mlkem wc_mlkem_poly wc_port wolfmath; do
         echo "wolfcrypt/src/$f.c"
     done

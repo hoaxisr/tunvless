@@ -191,7 +191,7 @@ $CC -O1 -g -w $STEER_INC -Itests $ASAN -DSTEER_HAVE_X509WRITE -o "$BUILD/vlessma
 	src/proto/transport/trupgrade.c src/proto/transport/trws.c src/proto/transport/trpath.c \
 	src/proto/transport/trvenc.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
-	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
+	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c src/proto/vless/sublink.c \
 	$MODEL_SRC $KINDS_SRC $CERTGEN $CRYPTO -lpthread
 "$BUILD/vlessmatch"
 
@@ -205,7 +205,7 @@ $CC -O1 -g -w $STEER_INC -o "$BUILD/vencprobe" tests/vencprobe.c \
 	src/proto/transport/trupgrade.c src/proto/transport/trws.c src/proto/transport/trpath.c \
 	src/proto/transport/trvenc.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
-	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
+	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c src/proto/vless/sublink.c \
 	$MODEL_SRC $KINDS_SRC $CRYPTO -lpthread
 BUILD="$BUILD" sh tests/venc.sh
 
@@ -219,7 +219,7 @@ $CC -O1 -g -w $STEER_INC -o "$BUILD/xudpprobe" tests/xudpprobe.c src/proto/vless
 	src/proto/transport/trupgrade.c src/proto/transport/trws.c src/proto/transport/trpath.c \
 	src/proto/transport/trvenc.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
-	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
+	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c src/proto/vless/sublink.c \
 	$MODEL_SRC $KINDS_SRC $CRYPTO -lpthread
 BUILD="$BUILD" sh tests/xudp.sh
 
@@ -238,7 +238,7 @@ $CC -O1 -g -w $STEER_INC -Itests -DSTEER_HAVE_X509WRITE -DSTEER_DEFAULT_PLATFORM
 	'-DSTEER_ANDROID_CA_DIRS="/tmp/steer-androidroots/nope","/tmp/steer-androidroots/empty","/tmp/steer-androidroots/cacerts"' \
 	-o "$BUILD/androidroots" tests/androidroots.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
-	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
+	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c src/proto/vless/sublink.c \
 	src/proto/transport/trpath.c \
 	$MODEL_SRC $KINDS_SRC $CERTGEN $CRYPTO -lpthread
 "$BUILD/androidroots"
@@ -262,7 +262,7 @@ echo "ext-test: собираю и прогоняю devupmatch..."
 $CC -O2 -w $STEER_INC -o "$BUILD/devupmatch" tests/devupmatch.c \
 	src/tunnel/stack.c src/tunnel/rtx.c src/tunnel/tun.c \
 	src/proto/vless/vldial.c src/proto/vless/vlwatch.c src/proto/vless/client.c \
-	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/vless/sub.c \
+	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/vless/sub.c src/proto/vless/sublink.c \
 	src/proto/transport/transport.c src/proto/transport/trdial.c src/proto/transport/trsec.c src/proto/tls/ech.c \
 	src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c src/proto/tls/roots.c \
 	src/proto/transport/trupgrade.c src/proto/transport/trws.c src/proto/transport/trpath.c \
@@ -271,6 +271,34 @@ $CC -O2 -w $STEER_INC -o "$BUILD/devupmatch" tests/devupmatch.c \
 	src/lib/jsonw.c src/lib/evline.c \
 	$MODEL_SRC $KINDS_SRC $CRYPTO -lpthread
 "$BUILD/devupmatch"
+
+# pxmatch — вывод ключей и провод протоколов прокси (src/proto/proxy/pxwire.c) против векторов, и
+# разбор ссылок (pxsub.c). Крипто настоящее, поэтому здесь, а не в make test.
+echo "ext-test: собираю и прогоняю pxmatch..."
+$CC -O1 -g -w $STEER_INC -Itests -o "$BUILD/pxmatch" tests/pxmatch.c \
+	src/proto/proxy/pxwire.c src/proto/proxy/pxsub.c \
+	src/proto/vless/sublink.c src/proto/vless/sub.c src/proto/vless/vless_proto.c \
+	src/proto/transport/trpath.c $CRYPTO -lpthread
+"$BUILD/pxmatch"
+
+# pxprobe + run-proxy.sh — протоколы прокси (trojan, ss, socks, http, vmess) против настоящего
+# Xray-core (XRAY=бинарник; нет — громкий пропуск внутри run-proxy.sh). Дайлеры (src/proto/proxy) —
+# те же, что в работе; стек подменён заглушками в самом стенде.
+echo "ext-test: собираю pxprobe и прогоняю run-proxy.sh (прокси против Xray-core)..."
+$CC -O1 -g -w $STEER_INC -o "$BUILD/pxprobe" tests/pxprobe.c \
+	src/proto/proxy/pxwire.c src/proto/proxy/pxsub.c src/proto/proxy/pxdial.c src/proto/proxy/pxtrojan.c \
+	src/proto/proxy/pxss.c src/proto/proxy/pxsocks.c src/proto/proxy/pxhttp.c src/proto/proxy/pxvmess.c \
+	src/proto/vless/sublink.c src/proto/vless/sub.c src/proto/vless/vless_proto.c src/proto/vless/vision.c \
+	src/proto/vless/client.c \
+	src/proto/transport/transport.c src/proto/transport/trsec.c src/proto/tls/ech.c \
+	src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c src/proto/transport/trdial.c src/proto/tls/roots.c \
+	src/proto/transport/trupgrade.c src/proto/transport/trws.c src/proto/transport/trpath.c \
+	src/proto/transport/trvenc.c \
+	src/tunnel/tun.c src/tunnel/rtx.c src/proto/tls/chello.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
+	src/proto/tls/reality.c src/proto/tls/h2.c \
+	src/lib/jsonw.c src/lib/evline.c \
+	$MODEL_SRC $KINDS_SRC $CRYPTO -lpthread
+BUILD="$BUILD" sh tests/run-proxy.sh
 
 # probe — активное зондирование настоящим openssl s_client. Здесь, а не отдельной целью
 # Makefile: библиотека уже собрана выше, а второй экземпляр её сборки разошёлся бы с первым.

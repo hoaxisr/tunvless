@@ -122,7 +122,7 @@ int aggregate_main(int argc, char **argv);
  * один, и расходиться инструментам с движком негде. */
 static const char *const TOOLS[] = {
     "fit", "srs-read", "obfs-server", "sub-fetch", "sub-quota", "sub-hwid", "dev-id",
-    "tls-probe", "tgws-probe", "vless-nodes", "xsteer-key", "xsteer-link", "xsteer-check",
+    "tls-probe", "tgws-probe", "vless-nodes", "proxy-nodes", "xsteer-key", "xsteer-link", "xsteer-check",
     "xsteer-hub", "dnsd-table", NULL,
 };
 

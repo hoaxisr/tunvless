@@ -581,6 +581,17 @@ static void pending_arm(struct pending *p, const struct sockaddr_storage *from, 
 
 /* Каналы, которым принадлежит вопрос. Для A — только каналы с IPv4 (DCH_V4): канал «6» из
  * таблицы (без набора IPv4) ответ A не забирает. Остальные типы — все совпавшие. */
+static int from_loopback(const struct sockaddr_storage *a) {
+    if (a->ss_family == AF_INET)
+        return (ntohl(((const struct sockaddr_in *)a)->sin_addr.s_addr) >> 24) == 127;
+    if (a->ss_family == AF_INET6) {
+        const struct in6_addr *v6 = &((const struct sockaddr_in6 *)a)->sin6_addr;
+        if (IN6_IS_ADDR_LOOPBACK(v6)) return 1;
+        return IN6_IS_ADDR_V4MAPPED(v6) && v6->s6_addr[12] == 127;
+    }
+    return 0;
+}
+
 static chm_t match_for(const char *qname, uint16_t qtype) {
     chm_t m = dch_match_mask(qname);
     if (qtype == DNS_TYPE_A && m)
@@ -674,6 +685,16 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
         /* В журнал — каждый разобранный вопрос, до быстрого пути: ответ из быстрого пути —
          * тоже запрос приложения. Сюда приходят и UDP, и TCP (tcpc_read зовёт эту же функцию). */
         dlog_note(qname, hit);
+        if (hit < 0 && from_loopback(&from) && query_noforward(buf, (size_t)n, qend)) {
+            /* «Не пересылать» (DNSD_OPT_NOFORWARD): имени нет ни в одном канале — отказ сразу. */
+            uint8_t out[512];
+            size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 0, 0);
+            if (len) {
+                out[3] = (uint8_t)((out[3] & 0xF0) | 5);   /* RCODE REFUSED */
+                reply_client(out, len, &from, fromlen, &local, have_local);
+            }
+            return 1;
+        }
         /* AAAA имени под правилом без половины IPv6 (хоть один совпавший канал без DCH_V6) —
          * пустой ответ в любом режиме: клиент с двумя стеками сразу идёт по IPv4. */
         int aaaa_empty = hit >= 0 && qtype == DNS_TYPE_AAAA && !dch_all_v6(sets);

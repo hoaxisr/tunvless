@@ -172,7 +172,7 @@ mkdir -p "$bad"
 cp "$L"/libsteer.so.* "$bad/"
 cat > "$bad/abi.c" <<'EOF'
 __attribute__((visibility("default")))
-const unsigned long steer_wolfssl_abi[11] = { 0x05009004, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+const unsigned long steer_wolfssl_abi[13] = { 0x05009004, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
 EOF
 WLIB="$(ls "$L"/wolfssl-pic/*/libwolfssl.a | head -1)"
 $CC -shared -fPIC -o "$bad/libsteer-wolfssl.so.$WVER" "$bad/abi.c" \

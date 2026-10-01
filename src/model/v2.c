@@ -45,7 +45,7 @@
  * вид выхода движка (kinds/vless.c); общий помощник steer-tunnel с дайлерами — выпуск 1.10, и
  * запись спеки к нему уже готова. xsteer туннелем в этом смысле не является (везёт пакеты, а не
  * потоки) и остаётся своим видом. */
-static const char *const TUNNEL_PROTOS[] = { "vless", "hysteria2", NULL };
+static const char *const TUNNEL_PROTOS[] = { "vless", "hysteria2", "trojan", "shadowsocks", "socks", "http", "vmess", NULL };
 
 int v2_tunnel_proto(const char *name) {
     for (size_t i = 0; TUNNEL_PROTOS[i]; i++)
@@ -627,10 +627,10 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
     int tunnel = !strcmp(kname, "tunnel");
     if (tunnel) {
         snprintf(w, sizeof(w), "%s.protocol", where);
-        if (!pn) return fail(x, val, "%s: kind: tunnel нужен protocol (сейчас есть vless, hysteria2)", where);
+        if (!pn) return fail(x, val, "%s: kind: tunnel нужен protocol (сейчас есть vless, hysteria2, trojan, shadowsocks, socks, http, vmess)", where);
         if (str_of(x, pn, w, &proto)) return -1;
         if (!v2_tunnel_proto(proto))
-            return fail(x, pn, "%s: протокол «%s» не знаю (сейчас есть vless, hysteria2)", w, proto);
+            return fail(x, pn, "%s: протокол «%s» не знаю (сейчас есть vless, hysteria2, trojan, shadowsocks, socks, http, vmess)", w, proto);
         kd = kind_by_name(proto);
     } else if (v2_tunnel_proto(kname)) {
         return fail(x, kn, "%s: в спеке v2 туннель пишется kind: tunnel, protocol: %s", where, kname);

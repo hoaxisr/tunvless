@@ -29,7 +29,7 @@ CORE_DIRS := src/lib src/model src/platform src/compile src/daemon src/kinds src
 # PLATFORM_SRC); остальные — по одному на профиль, у base своего файла нет. Отдельно от ядра и
 # от расширенной части, потому что файл профиля не входит ни в одну сборку, кроме своей.
 PROFILE_DIRS := src/profile
-EXT_DIRS  := src/tunnel src/proto/tls src/proto/transport src/proto/vless src/proto/xsteer src/proto/tgws src/proto/quic src/proto/hysteria2 src/modules
+EXT_DIRS  := src/tunnel src/proto/tls src/proto/transport src/proto/vless src/proto/xsteer src/proto/tgws src/proto/quic src/proto/hysteria2 src/proto/proxy src/box src/modules
 # Клиент сокета `steer` (src/client) — отдельный бинарник, не профиль движка: CLIENT_SRC ниже.
 CLIENT_DIRS := src/client
 # Сторонний код (src/third_party) — не слой движка: файлы в нём не правятся (см. UPSTREAM в
@@ -38,10 +38,11 @@ CLIENT_DIRS := src/client
 # yaml.h, ровно чтобы имена заголовков оставались уникальными (tests/buildmatch.sh).
 THIRD_DIRS := src/third_party/libyaml
 INC_DIRS  := $(CORE_DIRS) $(PROFILE_DIRS) $(EXT_DIRS) $(CLIENT_DIRS) $(THIRD_DIRS)
-# Каталоги, которых нет в сборке телефона (Android.bp их не подключает: hysteria2 в профиль android
-# не входит, телефон не собирает ни QUIC-клиента, ни его модуль). tests/buildmatch.sh сверяет
+# Каталоги, которых нет в сборке телефона (Android.bp их не подключает: hysteria2 и протоколы прокси
+# в профиль android не входят, телефон не собирает ни QUIC-клиента, ни модули steer-hysteria2 и
+# steer-proxy). tests/buildmatch.sh сверяет
 # Android.bp с INC_DIRS за вычетом этого списка.
-PHONE_SKIP_DIRS := src/proto/hysteria2
+PHONE_SKIP_DIRS := src/proto/hysteria2 src/proto/proxy src/box
 # Определения, которых ждёт сторонний код: yaml_private.h подключает config.h (номер версии
 # libyaml) только при HAVE_CONFIG_H. Ключ идёт во ВСЕ пути сборки движка — Makefile, build.sh,
 # build/build-ext*.sh (там он читается отсюда), в Android.bp — флагом библиотеки libsteer_yaml;
@@ -204,6 +205,10 @@ XS_COMMON_SRC := src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/x
 #   VLESS_MOD_SRC  протокол: подкоманды vless*, дайлер, слежка за узлом, проверка узла,
 #                  заголовок и Vision — в бинарник модуля steer-vless.
 # sub.c (разбор подписки) — не в модуле: его зовёт и `steer-tools sub-fetch` (subfetch.c).
+#   SUBLINK_SRC    ссылка узла в форме Xray (строки ссылки, поля транспорта и безопасности, их
+#                  годность): половина разбора sub.c, которую с ним делит модуль steer-proxy
+#                  (trojan://, vmess://), — в libsteer, как и сам транспорт.
+SUBLINK_SRC := src/proto/vless/sublink.c
 STACK_SRC := src/tunnel/stack.c src/tunnel/rtx.c
 TRANSPORT_SRC := src/proto/transport/transport.c src/proto/transport/trdial.c \
                  src/proto/transport/trsec.c src/proto/tls/ech.c src/proto/transport/trgrpc.c \
@@ -212,7 +217,7 @@ TRANSPORT_SRC := src/proto/transport/transport.c src/proto/transport/trdial.c \
                  src/proto/transport/trvenc.c
 VLESS_MOD_SRC := src/proto/vless/vlmain.c src/proto/vless/vldial.c src/proto/vless/vlwatch.c \
                  src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/vless/vision.c
-EXT_ROUTER_SRC := src/proto/vless/sub.c $(VLESS_MOD_SRC) $(STACK_SRC) $(TRANSPORT_SRC) \
+EXT_ROUTER_SRC := src/proto/vless/sub.c $(SUBLINK_SRC) $(VLESS_MOD_SRC) $(STACK_SRC) $(TRANSPORT_SRC) \
                   src/proto/xsteer/xsclient.c src/proto/vless/subfetch.c src/proto/tgws/tgws.c src/proto/tls/tlsprobe.c \
                   src/proto/tls/urltls.c
 EXT_SERVER_SRC := src/proto/xsteer/xshub.c
@@ -281,7 +286,21 @@ QUIC_STAND_SRC := tests/qcbench.c
 KINDS_HY2_SRC := src/kinds/hysteria2.c
 HY2_MOD_SRC := src/proto/hysteria2/hy2wire.c src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2conn.c \
                src/proto/hysteria2/hy2dial.c src/proto/hysteria2/hy2main.c
-LIBSTEER_SRC := $(LIBSTEER_BASE_SRC) $(KINDS_EXT_SRC) $(KINDS_HY2_SRC) $(STACK_SRC) $(TRANSPORT_SRC) \
+# Протоколы прокси (модуль steer-proxy, docs/proxy.md): trojan, shadowsocks, socks, http, vmess —
+# пять видов `kind: tunnel` одной записью вида (kinds/proxy.c) и один бинарник. По тому же доводу,
+# что hysteria2, — НЕ в статических профилях (extended, android): телефон и стенды несут модули
+# в себе, а этот модуль — ответ на вопрос роутера (коннектор sing-box для podkop), и в прошивку
+# телефона без потребителя он лёг бы мёртвым весом; вид там отвечает записью отказа (kind.c).
+# Дайлеры — по файлу на протокол поверх стека и транспорта (src/tunnel, src/proto/transport):
+# pxtrojan.c, pxss.c, pxsocks.c, pxhttp.c, pxvmess.c; узлы — pxsub.c (ссылки, общие поля
+# транспорта — sublink.c); общее дайлеров (сокет UDP, проба узла, слежка) — pxdial.c; команды —
+# pxmain.c.
+KINDS_PROXY_SRC := src/kinds/proxy.c
+PROXY_MOD_SRC := src/proto/proxy/pxwire.c src/proto/proxy/pxsub.c src/proto/proxy/pxdial.c src/proto/proxy/pxtrojan.c \
+                 src/proto/proxy/pxss.c src/proto/proxy/pxsocks.c src/proto/proxy/pxhttp.c \
+                 src/proto/proxy/pxvmess.c src/proto/proxy/pxmain.c
+LIBSTEER_SRC := $(LIBSTEER_BASE_SRC) $(KINDS_EXT_SRC) $(KINDS_HY2_SRC) $(KINDS_PROXY_SRC) $(SUBLINK_SRC) \
+                $(STACK_SRC) $(TRANSPORT_SRC) \
                 src/tunnel/tun.c src/proto/tls/chello.c src/proto/tls/tls13.c \
                 src/proto/tls/certverify.c src/proto/tls/reality.c src/proto/tls/h2.c $(CRYPTO_SRC) \
                 $(QUIC_SRC)
@@ -295,6 +314,7 @@ XSTEER_MODULE_SRC := src/proto/xsteer/xsclient.c src/proto/xsteer/xswire.c src/p
 OBFS_MODULE_SRC := $(OBFS_MOD_SRC) $(MODCMD_SRC) src/modules/main_obfs.c
 TGWS_MODULE_SRC := src/proto/tgws/tgws.c $(MODCMD_SRC) src/modules/main_tgws.c
 HY2_MODULE_SRC := $(HY2_MOD_SRC) $(MODCMD_SRC) src/modules/main_hysteria2.c
+PROXY_MODULE_SRC := $(PROXY_MOD_SRC) $(MODCMD_SRC) src/modules/main_proxy.c
 
 PROFILE_libsteer   := $(LIBSTEER_SRC)
 PROFILE_steerd     := $(STEERD_DYN_SRC)
@@ -303,6 +323,13 @@ PROFILE_mod_xsteer := $(XSTEER_MODULE_SRC)
 PROFILE_mod_obfs   := $(OBFS_MODULE_SRC)
 PROFILE_mod_tgws   := $(TGWS_MODULE_SRC)
 PROFILE_mod_hysteria2 := $(HY2_MODULE_SRC)
+PROFILE_mod_proxy  := $(PROXY_MODULE_SRC)
+# steer-box-connector: бинарник sing-box для podkop и forkop поверх steer (перевод конфига sing-box в
+# спеку, DNS, Clash API, mixed, наборы правил). Свой main (src/box/main.c) и свой разбор командной
+# строки sing-box — modcmd ему не нужен, но link_app кладёт modcmd.o всем, и --as-needed его
+# выбрасывает. Только роутер: на телефоне нет ни podkop, ни forkop.
+BOX_MODULE_SRC := src/box/bconn.c src/box/boxcli.c src/box/boxrun.c src/box/clash.c src/box/dns.c src/box/dnsmsg.c src/box/dnsup.c src/box/evloop.c src/box/fetch.c src/box/gen.c src/box/json.c src/box/main.c src/box/mixed.c src/box/net.c src/box/ruleset_cli.c src/box/rulesets.c src/box/sbconf.c src/box/steerctl.c src/box/translate.c
+PROFILE_mod_box    := $(BOX_MODULE_SRC)
 
 # Два бинарника на пакет (docs/architecture.md, раздел 4а, «Бинарники»): профиль — это движок
 # steerd (демон, компилятор, apply, помощники, инструменты; ссылка steer-tools на него же), а

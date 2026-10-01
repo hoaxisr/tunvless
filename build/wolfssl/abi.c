@@ -23,6 +23,9 @@
 #include <wolfssl/ssl.h>
 #include <wolfssl/wolfcrypt/sha256.h>
 #include <wolfssl/wolfcrypt/sha512.h>
+#include <wolfssl/wolfcrypt/sha.h>
+#include <wolfssl/wolfcrypt/md5.h>
+#include <wolfssl/wolfcrypt/sha3.h>
 #include <wolfssl/wolfcrypt/aes.h>
 #include <wolfssl/wolfcrypt/chacha.h>
 #include <wolfssl/wolfcrypt/poly1305.h>
@@ -41,6 +44,9 @@ _Static_assert(sizeof(Aes) <= SC_AEAD_CTX_SIZE && _Alignof(Aes) <= 16, "SC_AEAD_
 _Static_assert(sizeof(Aes) <= SC_AESCTR_CTX_SIZE, "SC_AESCTR_CTX_SIZE мал для Aes");
 _Static_assert(sizeof(struct chachapoly_abi) <= SC_AEAD_CTX_SIZE && _Alignof(struct chachapoly_abi) <= 16,
                "SC_AEAD_CTX_SIZE мал для ChaCha+Poly1305");
+/* Хеши протоколов steer-proxy (wc_Sha224 — тот же тип, что wc_Sha256) и поток SHAKE128 VMess. */
+_Static_assert(sizeof(wc_Sha) <= SC_HASH_CTX_SIZE && sizeof(wc_Md5) <= SC_HASH_CTX_SIZE, "SC_HASH_CTX_SIZE мал для wc_Sha/wc_Md5");
+_Static_assert(sizeof(wc_Shake) <= SC_SHAKE_CTX_SIZE && _Alignof(wc_Shake) <= 16, "SC_SHAKE_CTX_SIZE мал для wc_Shake");
 
 /* Поля: версия wolfSSL, потом размеры структур в порядке scrypto.c (sc_abi_expect). Массив
  * данных, а не функция: ему не нужно ни вызова, ни библиотеки для чтения. */
@@ -53,4 +59,6 @@ const unsigned long steer_wolfssl_abi[SC_ABI_N] = {
     /* Хранилище корней: scrypto.c берёт у WOLFSSL_X509_STORE поле cm напрямую (sc_roots_load), то
      * есть смещение поля тоже часть ABI. */
     sizeof(WOLFSSL_X509_STORE), offsetof(WOLFSSL_X509_STORE, cm),
+    /* Поток SHAKE128 (struct sc_shake): wc_Shake лежит в хранилище, которое размещает libsteer. */
+    sizeof(wc_Shake), SC_SHAKE_CTX_SIZE,
 };

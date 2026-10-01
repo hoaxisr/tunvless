@@ -187,6 +187,7 @@ const struct platform_ops plat_android = {
     /* Каналы на сам телефон — решение владельца: «каналы и на весь телефон, и на
      * приложение». zapret не нужен: «zapret не надо». */
     .local_channels = 1,
+    .local_dns = 1,
     .zapret = 0,
     /* fw4 нет: трафик раздачи транслирует netd через iptables, и проверки зоны и masquerade по
      * дампу nftables говорили бы «устройство не упомянуто в firewall» на каждом apply. */

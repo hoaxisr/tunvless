@@ -24,7 +24,7 @@ include build/sources.mk
 CORE_HDR := $(wildcard $(addsuffix /*.h,$(CORE_DIRS) $(PROFILE_DIRS) $(THIRD_DIRS)))
 # Точки входа модулей (src/modules, шаг 4 выпуска 1.10) — тоже расширенная часть: их main живёт
 # только в разделяемой раскладке, и ни один статический профиль их не компилирует.
-EXT_ALL_SRC := $(sort $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(EXT_SERVER_SRC) $(EXT_TGWS_SRC) $(HY2_MOD_SRC) $(KINDS_HY2_SRC) $(wildcard src/modules/*.c))
+EXT_ALL_SRC := $(sort $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(EXT_SERVER_SRC) $(EXT_TGWS_SRC) $(HY2_MOD_SRC) $(KINDS_HY2_SRC) $(PROXY_MOD_SRC) $(KINDS_PROXY_SRC) $(wildcard src/modules/*.c))
 # Модель для стендов, которые компонуют её отдельным списком: разбор спрашивает вид у реестра, поэтому
 # вместе с моделью идут виды (src/kinds). Без awg.c: он тянет run_quiet из lib/run.c, а стенды
 # подменяют run_quiet своим — awg.c берут только те, кому нужен сам вид awg (specmatch, awgmatch).
@@ -66,9 +66,9 @@ $(BUILD)/steer: $(CLIENT_SRC) src/platform/platform.h | $(BUILD)/steerd
 # wolfSSL. Помощников стенд подменяет швом STEER_SUPERVISE_EXE, поэтому клиенты туннелей (и
 # криптобиблиотека) демону не нужны: хватает файлов видов — реестр видов (kind.c) ссылается на них слабо.
 # Не пакет и не профиль: в build/sources.mk его нет нарочно.
-$(BUILD)/steer-xk: $(CORE_SRC) $(KINDS_EXT_SRC) $(KINDS_HY2_SRC) $(CORE_HDR) VERSION
+$(BUILD)/steer-xk: $(CORE_SRC) $(KINDS_EXT_SRC) $(KINDS_HY2_SRC) $(KINDS_PROXY_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(DEFS) -o $@ $(CORE_SRC) $(KINDS_EXT_SRC) $(KINDS_HY2_SRC)
+	$(CC) $(CFLAGS) $(DEFS) -o $@ $(CORE_SRC) $(KINDS_EXT_SRC) $(KINDS_HY2_SRC) $(KINDS_PROXY_SRC)
 
 # Сборка под Android — тот же движок и те же исходники, у которого только умолчание выбора
 # платформы при запуске — телефон (-DSTEER_DEFAULT_PLATFORM=android, src/platform/platform.c):
@@ -81,12 +81,14 @@ $(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_DEFAULT_PLATFORM=android -o $@ $(CORE_SRC)
 
-test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/dupconnmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/hy2match $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool $(BUILD)/b3match $(BUILD)/subpq
+test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/dupconnmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool $(BUILD)/b3match $(BUILD)/subpq
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/snapshot.sh
 	@sh tests/v2match.sh
 	@sh tests/tgwsmark.sh
+	@BUILD=$(BUILD) sh tests/noforward.sh
+	@BUILD=$(BUILD) sh tests/boxenv.sh
 	@sh tests/climatch.sh
 	@sh tests/dnsproxy.sh
 	@sh tests/dnsnft.sh
@@ -133,6 +135,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@$(BUILD)/submatch
 	@$(BUILD)/subfetchmatch
 	@$(BUILD)/hy2match
+	@$(BUILD)/pxsubmatch
 	@$(BUILD)/fwmatch
 	@$(BUILD)/obfsmatch
 	@$(BUILD)/visionmatch
@@ -477,19 +480,20 @@ $(BUILD)/visionmatch: tests/visionmatch.c src/proto/vless/vision.c src/proto/vle
 #
 # trpath.c — отдельным объектом: путь ws и httpupgrade подписка отбраковывает тем же правилом, по
 # которому транспорт собирает запрос (src/proto/transport/trpath.h), а сам файл — чистые строки.
-$(BUILD)/submatch: tests/submatch.c src/proto/vless/sub.c src/proto/vless/vless.h src/proto/transport/vencp.h \
+$(BUILD)/submatch: tests/submatch.c src/proto/vless/sub.c src/proto/vless/sublink.c src/proto/vless/sublink.h \
+                  src/proto/vless/vless.h src/proto/transport/vencp.h \
                   src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h \
                   src/proto/transport/trpath.c src/proto/transport/trpath.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/submatch.c src/proto/transport/trpath.c
+	$(CC) $(CFLAGS) -o $@ tests/submatch.c src/proto/vless/sublink.c src/proto/transport/trpath.c
 
 # Постквантовые поля подписки (encryption, pqv / mldsa65Verify): tests/subpq.c, образцы значений Xray-core
 # 26.9.9 — tests/sub-pq-samples.h. Библиотеки нет; sub.c линкуется объектом, а не включается (предел на
 # стенды с #include .c из src — buildmatch).
-$(BUILD)/subpq: tests/subpq.c tests/sub-pq-samples.h src/proto/vless/sub.c src/proto/vless/vless.h \
+$(BUILD)/subpq: tests/subpq.c tests/sub-pq-samples.h src/proto/vless/sub.c src/proto/vless/sublink.c src/proto/vless/vless.h \
                 src/proto/transport/vencp.h src/proto/vless/vless_proto.c src/proto/transport/trpath.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests -o $@ tests/subpq.c src/proto/vless/sub.c src/proto/vless/vless_proto.c \
+	$(CC) $(CFLAGS) -Itests -o $@ tests/subpq.c src/proto/vless/sub.c src/proto/vless/sublink.c src/proto/vless/vless_proto.c \
 		src/proto/transport/trpath.c
 
 # Скачивание и обработка подписки. Стенд включает исходник и подставляет две вещи: свой
@@ -498,10 +502,10 @@ $(BUILD)/subpq: tests/subpq.c tests/sub-pq-samples.h src/proto/vless/sub.c src/p
 # при том что до переноса вся эта работа жила в оболочке объекта rpcd и не проверялась ничем.
 $(BUILD)/subfetchmatch: tests/subfetchmatch.c src/proto/vless/subfetch.c src/proto/vless/subfetch.h \
                   src/tools/hwid.c src/tools/hwid.h src/lib/jsonw.c src/lib/jsonw.h \
-                  src/proto/vless/sub.c src/proto/vless/vless.h src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h \
+                  src/proto/vless/sub.c src/proto/vless/sublink.c src/proto/vless/vless.h src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h \
                   src/proto/transport/trpath.c src/proto/transport/trpath.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/subfetchmatch.c src/lib/jsonw.c src/proto/transport/trpath.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) -o $@ tests/subfetchmatch.c src/lib/jsonw.c src/proto/vless/sublink.c src/proto/transport/trpath.c $(PLATFORM_SRC)
 
 # Провод hysteria2 и узлы (src/proto/hysteria2/hy2wire.c, hy2sub.c): целые QUIC, запрос
 # авторизации QPACK и разбор ответа, TCPRequest/Response, UDPMessage, Salamander и BLAKE2b на
@@ -510,6 +514,14 @@ $(BUILD)/hy2match: tests/hy2match.c src/proto/hysteria2/hy2wire.c src/proto/hyst
                    src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/hy2match.c src/proto/hysteria2/hy2wire.c src/proto/hysteria2/hy2sub.c
+
+# Разбор ссылок и подписки прокси (src/proto/proxy/pxsub.c) — без сети и криптографии, как submatch.
+# sublink.c, sub.c, vless_proto.c и trpath.c — те же общие части, что у разбора vless.
+$(BUILD)/pxsubmatch: tests/pxsubmatch.c src/proto/proxy/pxsub.c src/proto/proxy/proxy.h src/proto/proxy/pxwire.h \
+                   src/proto/vless/sublink.c src/proto/vless/sub.c src/proto/vless/vless_proto.c src/proto/transport/trpath.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Itests -o $@ tests/pxsubmatch.c src/proto/proxy/pxsub.c src/proto/vless/sublink.c \
+		src/proto/vless/sub.c src/proto/vless/vless_proto.c src/proto/transport/trpath.c
 
 # Арифметика провода xsteer: заголовок записи, вывод nonce, окно приёма, пределы
 # соединения. Всё, что она считает, ломается МОЛЧА — пакет отбрасывается стеком той
@@ -622,7 +634,7 @@ $(BUILD)/yamlmatch: tests/yamlmatch.c tests/unit.h $(YAML_SRC) src/lib/ynode.h s
 # только артефакты: то, что здесь же и собирается, плюс упаковка из build.sh.
 clean:
 	rm -rf $(BUILD)/steer $(BUILD)/steerd $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext \
-	       $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/hy2match $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/b3match $(BUILD)/subpq \
+	       $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/b3match $(BUILD)/subpq \
 	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
 	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
 	       $(BUILD)/diagsim $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/yamlmatch $(BUILD)/wolfssl-host \

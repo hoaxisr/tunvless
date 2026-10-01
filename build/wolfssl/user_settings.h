@@ -22,7 +22,7 @@
  * ЧЕГО НЕТ НАМЕРЕННО. Ни opensslall, ни stunnel, ни lighty (их включает пакет libwolfssl
  * OpenWrt ради чужих программ); ни TLS 1.2 и старше в wolfSSL (наш TLS 1.2 для точки
  * web.telegram.org свой, в tls13.c), ни сервера TLS (QUIC у нас только клиент), ни DH, DSA,
- * DES, RC4, MD4, MD5, PSK, PBKDF; ни файловой системы (корни читает certverify.c сам, буфером) и
+ * DES, RC4, MD4, PSK, PBKDF; ни файловой системы (корни читает certverify.c сам, буфером) и
  * ни сокетного ввода-вывода (WOLFSSL_USER_IO: QUIC отдаёт байты через ngtcp2, а не сокет).
  * Ed25519 не нужен: сертификат REALITY разбирается своим кодом и сверяется HMAC-SHA512
  * (certverify.c), а не подписью.
@@ -185,11 +185,18 @@
 #define WOLFSSL_ALT_NAMES
 #define WOLFSSL_IP_ALT_NAME
 
+/* MD5, SHA-224 и XChaCha20-Poly1305 — ради протоколов модуля steer-proxy, а не своей
+ * криптографии (src/lib/scrypto.h): MD5 зашит в вывод ключей shadowsocks (EVP_BytesToKey) и VMess
+ * (cmdKey, ключ ChaCha20 тела), SHA-224 — в пароль trojan на проводе, XChaCha20-Poly1305 — в
+ * датаграммы shadowsocks 2022-blake3-chacha20-poly1305. В TLS MD5 не попадает: старые версии TLS,
+ * где он был частью рукопожатия, сняты (NO_OLD_TLS выше). */
+#define WOLFSSL_SHA224
+#define HAVE_XCHACHA
+
 #define NO_DSA
 #define NO_DH
 #define NO_RC4
 #define NO_MD4
-#define NO_MD5
 #define NO_DES3
 #define NO_DES3_TLS_SUITES
 #define NO_PSK

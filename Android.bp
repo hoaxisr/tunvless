@@ -240,6 +240,7 @@ cc_binary {
         // wolfSSL headers (they come with libsteer_wolfssl below, with -DWOLFSSL_USER_SETTINGS).
         "src/lib/scrypto.c",
         "src/proto/vless/sub.c",
+        "src/proto/vless/sublink.c",
         // The VLESS module (VLESS_MOD_SRC), the tunnel stack (STACK_SRC) and the transports
         // (TRANSPORT_SRC) — see build/sources.mk for which of them go to libsteer later.
         "src/proto/vless/vlmain.c",

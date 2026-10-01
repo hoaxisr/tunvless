@@ -39,6 +39,7 @@ xsteer — [docs/xsteer.md](xsteer.md).
 | `steer-obfs` | `OBFS_MODULE_SRC` | точка входа обфускатора (`obfsmain.c`); сам `obfs.c` — в `libsteer`, его зовёт и xsteer |
 | `steer-tgws` | `TGWS_MODULE_SRC` | мост Telegram (`tgws.c`); правила перехвата пишет ядро (`kinds/tgws.c`) |
 | `steer-hysteria2` | `HY2_MODULE_SRC` | клиент hysteria2 ([docs/hysteria2.md](hysteria2.md)): провод (`hy2wire`), узлы и подписка (`hy2sub`), соединение QUIC и мультиплексор потоков (`hy2conn`), дайлер стека (`hy2dial`), команды и слежка (`hy2main`); запись вида — `kinds/hysteria2.c` в `libsteer` (`KINDS_HY2_SRC`); в статические профили и в телефон не входит |
+| `steer-proxy` | `PROXY_MODULE_SRC` | клиенты прокси ([docs/proxy.md](proxy.md)): trojan, shadowsocks, socks, http, vmess одним бинарником — провод и вывод ключей (`pxwire`), узлы и подписка (`pxsub`), общее дайлеров (`pxdial`), по файлу на протокол (`pxtrojan`, `pxss`, `pxsocks`, `pxhttp`, `pxvmess`), команды и слежка (`pxmain`); дайлеры — поверх стека `src/tunnel` и транспорта `src/proto/transport`, как vless; записи пяти видов — `kinds/proxy.c` в `libsteer` (`KINDS_PROXY_SRC`); в статические профили и в телефон не входит (как hysteria2) |
 
 Каждый модуль — свой `main` (`src/modules/main_<имя>.c`) и `src/cli/modcmd.c`; линкуется он с
 `libsteer.so`, thread-local таблицы туннеля живут в куче потока (раздел «Туннели»). В модуле нет
@@ -62,7 +63,7 @@ xsteer — [docs/xsteer.md](xsteer.md).
 `steer-core` (`steerd`, `steer`, `steer-tools` — ссылка на `steerd`, `steer-nfqws`, обе библиотеки
 в `/usr/lib`, init-скрипт, hotplug, `keep.d`; зависит только от чужих `nftables`, `ip-full`,
 `conntrack`, `kmod-nft-queue`), `steer-vless`, `steer-xsteer`, `steer-obfs`, `steer-tgws`,
-`steer-hysteria2` (по одному бинарнику `usr/sbin/steer-<имя>`; зависят от `steer-core (= версия)`,
+`steer-hysteria2`, `steer-proxy` (по одному бинарнику `usr/sbin/steer-<имя>`; зависят от `steer-core (= версия)`,
 модули с собственным TUN — ещё от `kmod-tun`) и мета-пакет `steer-extended` (устаревший: ядро и
 первые четыре модуля; `steer-hysteria2` в него не входит). Библиотеки лежат внутри `steer-core`, а
 не в своих пакетах: `steerd` сам ходит по HTTPS (замер групп, `urltls.c`) и по DoH, DoT и DoQ (резолвер),
@@ -210,6 +211,7 @@ src/
               srs.c, srsplan.c (наборы sing-box)
   kinds/      kind.h и kind.c (struct kind_ops, биты свойств, реестр),
               direct.c interface.c awg.c vless.c xsteer.c zapret.c tgws.c group.c grpurl.c
+              hysteria2.c proxy.c (записи видов модулей steer-hysteria2 и steer-proxy)
   platform/   platform.h, platform.c, openwrt.c, android.c
   profile/    profile.h, profile.c (умолчания), extended.c, server.c, tgws.c — данные профиля
   compile/    groups.c, balance.c, generate.c, print.c, legacy.c (раскладка ядра 4.9),
@@ -223,8 +225,8 @@ src/
   client/     main.c — steer, клиент сокета
   cli/        cli.c — таблица команд и разбор командной строки; modcmd.c — команды модулей
               (заглушки в steerd, настоящие ветки в модуле) и main модуля (steer_module_main)
-  modules/    main_vless.c, main_xsteer.c, main_obfs.c, main_tgws.c — main бинарников модулей
-              (только разделяемая раскладка)
+  modules/    main_vless.c, main_xsteer.c, main_obfs.c, main_tgws.c, main_hysteria2.c, main_proxy.c
+              — main бинарников модулей (только разделяемая раскладка)
   tools/      aggregate.c (fit), srsread.c, hwid.c
   tunnel/     стек туннеля без протокола: tun.c (TUN: очереди, разгрузка, запись пакетов),
               rtx.c (кольцо повтора), stack.c и stack.h (TCP/UDP ↔ потоки к узлу, таблица
@@ -237,7 +239,10 @@ src/
               httpupgrade; trws.c — кадры WebSocket; trpath.c — путь запроса Upgrade)
               vless/ (vlmain.c — подкоманды vless*, vldial.c — дайлер стека, vlwatch.c — слежка
               за узлом, client.c — vless_connect и проверка узла, vless_proto, vision, sub,
-              subfetch)
+              subfetch; sublink.c — ссылка узла и поля транспорта, общие с модулем steer-proxy)
+              proxy/ (trojan, shadowsocks, socks, http, vmess: pxwire, pxsub, pxdial, pxtrojan,
+              pxss, pxsocks, pxhttp, pxvmess, pxmain — модуль steer-proxy, docs/proxy.md)
+              hysteria2/ (клиент hysteria2 на QUIC — модуль steer-hysteria2, docs/hysteria2.md)
               xsteer/ (xswire, xshake, xsepoch, xsconf, xslink, xsconn, xsroute, xsstream,
               xsclient, xshub, xsadmin)   tgws/   obfs/ (WG поверх поддельного TCP: помощник и
               obfs-server)
@@ -361,9 +366,10 @@ ingress не разбирал: устройство без хука, клиен�
   `stack_run(выход, дайлер, ready, arg)` (`stack.h`), а обратный вызов `ready` получает имя
   поднятого устройства;
 - **дайлер** — протокол поверх транспорта: заголовок запроса, обёртки, разбор ответа, обрамление
-  датаграмм. Дайлер один — VLESS (`src/proto/vless/vldial.c`: заголовок VLESS, Vision, UDP
-  командой 2). Подкоманды `steer vless*`, выбор узла и слежка за ним — там же, в модуле протокола
-  (`vlmain.c`, `vlwatch.c`);
+  датаграмм. Дайлеры — VLESS (`src/proto/vless/vldial.c`: заголовок VLESS, Vision, UDP командой 2) и
+  протоколы прокси (`src/proto/proxy`: trojan, shadowsocks, socks, http, vmess — по файлу на
+  протокол; docs/proxy.md), а hysteria2 ходит своим путём (QUIC, `src/proto/hysteria2`). Подкоманды
+  `steer vless*` / `steer proxy*`, выбор узла и слежка — в модуле протокола (`vlmain.c`/`pxmain.c`);
 - **транспорт** (`src/proto/transport`): как поток дайлера едет до узла — сокет по всем адресам
   имени с меткой `over` (`trdial.c`), безопасность `security=` — none, tls, reality (`trsec.c`) —
   и транспорт `type=` — tcp, grpc, xhttp, ws, httpupgrade (`transport.c`, `trgrpc.c`, `trxhttp.c`,
@@ -430,9 +436,12 @@ struct security_ops {            /* none, tls, reality */
   обращение — одна загрузка из GOT. На musl TLS потока лежит в его же отображении, нулевые страницы
   не трогаются, пока буфер не использован; резидентной остаётся только используемая часть.
 
-Новый протокол поверх потоков — это файл дайлера, стек не трогается. Новый транспорт — таблица
-`transport_ops` без правки дайлера и стека (так устроены `ws` и `httpupgrade`: `tr_ws` в `trws.c`,
-`tr_httpupgrade` в `trupgrade.c`).
+Новый протокол поверх потоков — это файл дайлера, стек не трогается (так добавлены trojan, vmess и
+http модуля steer-proxy). UDP самим протоколом по датаграммам (shadowsocks, socks5 UDP ASSOCIATE)
+ложится в ту же таблицу без правки стека: бит `DC_UDP_OWN` говорит, что у потока UDP своя связь —
+сокет UDP к узлу, а не поток, и стек не берёт для него запасную связь пула (dialer.h). Новый
+транспорт — таблица `transport_ops` без правки дайлера и стека (так устроены `ws` и `httpupgrade`:
+`tr_ws` в `trws.c`, `tr_httpupgrade` в `trupgrade.c`).
 
 **xsteer** на этот стек не ложится: он везёт IP-пакеты, а не потоки — TUN ↔ записи своего
 протокола (Noise IK в облике TLS, `xshake.c`) поверх UDP или своего TCP (`xsstream.c`), без

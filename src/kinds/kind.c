@@ -33,6 +33,11 @@ extern const struct kind_ops kind_zapret __attribute__((weak));
 extern const struct kind_ops kind_tgws __attribute__((weak));
 extern const struct kind_ops kind_awg __attribute__((weak));
 extern const struct kind_ops kind_hysteria2 __attribute__((weak));
+extern const struct kind_ops kind_trojan __attribute__((weak));
+extern const struct kind_ops kind_shadowsocks __attribute__((weak));
+extern const struct kind_ops kind_socks __attribute__((weak));
+extern const struct kind_ops kind_http __attribute__((weak));
+extern const struct kind_ops kind_vmess __attribute__((weak));
 
 /* ТЕКСТ ОТКАЗА «НУЖЕН ПАКЕТ» — из одного места: здесь. С выпуска 1.10 у каждого модуля свой пакет
  * (steer-vless, steer-xsteer), а прежнее имя steer-extended осталось пакетом, который ставит их
@@ -49,6 +54,13 @@ static const struct kind_ops no_awg       = { .name = "awg",    .absent = "kind 
 /* hysteria2 — единственный вид, которого нет в steer-extended: у него свой пакет, и текст не
  * отсылает к мета-пакету. */
 static const struct kind_ops no_hysteria2 = { .name = "hysteria2", .absent = "kind hysteria2 требует пакет steer-hysteria2" };
+/* Протоколы прокси — пакет steer-proxy (коннектор sing-box для podkop/forkop); как hysteria2, не в
+ * steer-extended. Текст — один на пять, имя вида подставляет kind_absent. */
+static const struct kind_ops no_trojan      = { .name = "trojan",      .absent = "kind trojan требует пакет steer-proxy" };
+static const struct kind_ops no_shadowsocks = { .name = "shadowsocks", .absent = "kind shadowsocks требует пакет steer-proxy" };
+static const struct kind_ops no_socks       = { .name = "socks",       .absent = "kind socks требует пакет steer-proxy" };
+static const struct kind_ops no_http        = { .name = "http",        .absent = "kind http требует пакет steer-proxy" };
+static const struct kind_ops no_vmess       = { .name = "vmess",       .absent = "kind vmess требует пакет steer-proxy" };
 
 /* Порядок — прежний порядок видов (им же печатается справка о видах и идут проверки diag по
  * видам, см. cmd_diag). */
@@ -60,8 +72,14 @@ static const struct { const struct kind_ops *have, *none; const char *module; } 
     { &kind_zapret,    &no_zapret,    NULL },
     { &kind_tgws,      &no_tgws,      NULL },
     { &kind_awg,       &no_awg,       NULL },
-    /* Последним: порядок реестра — порядок правил видов и проверок diag, а у hysteria2 правил нет. */
+    /* Последними: порядок реестра — порядок правил видов и проверок diag, а у hysteria2 и
+     * протоколов прокси правил нет. */
     { &kind_hysteria2, &no_hysteria2, "steer-hysteria2" },
+    { &kind_trojan,      &no_trojan,      "steer-proxy" },
+    { &kind_shadowsocks, &no_shadowsocks, "steer-proxy" },
+    { &kind_socks,       &no_socks,       "steer-proxy" },
+    { &kind_http,        &no_http,        "steer-proxy" },
+    { &kind_vmess,       &no_vmess,       "steer-proxy" },
 };
 #define REG_N (sizeof(REG) / sizeof(REG[0]))
 

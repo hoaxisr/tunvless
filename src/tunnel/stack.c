@@ -1644,7 +1644,9 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
         }
 
         int qr;
-        if (g_spare_want > 0 && spare_checkout(SESS(c)) == 0) {
+        /* DC_UDP_OWN: у потока UDP своя связь — сокет UDP, а запасная сессия несёт поток TCP
+         * (dialer.h). */
+        if (g_spare_want > 0 && !(g_dl->ops->caps & DC_UDP_OWN) && spare_checkout(SESS(c)) == 0) {
             c->fd = g_dl->ops->fd(SESS(c));
             TR("UDP: взята запасная сессия\n");
         } else if ((qr = conn_submit(c)) == 0) {

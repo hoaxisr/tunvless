@@ -232,7 +232,8 @@ void kind_emit_all(struct nft_rs *rs, const struct spec *sp);
  * принятая с ним, значила бы то, чего v1 не обещал), своих правил и проверок у неё нет, а
  * собирает её перевод v1 (model/v1.c) напрямую. Разбор v2 находит её через kind_by_name_v2. */
 extern const struct kind_ops kind_direct, kind_interface, kind_vless, kind_xsteer, kind_zapret,
-                             kind_tgws, kind_awg, kind_group, kind_hysteria2;
+                             kind_tgws, kind_awg, kind_group, kind_hysteria2,
+                             kind_trojan, kind_shadowsocks, kind_socks, kind_http, kind_vmess;
 
 /* Вид обнулённого выхода (kind == NULL; так их собирают стенды) — direct, как у нулевого
  * значения прежнего перечня видов. Читает его kind_of в spec.h. */
@@ -374,6 +375,11 @@ size_t out_node_list(const struct output *o, size_t usable, int *dst, size_t max
 const struct hy2_cfg *out_hysteria2(const struct output *o);
 size_t out_hy2_node_list(const struct output *o, size_t usable, int *dst, size_t max);
 int out_hy2_node_named(const struct output *o);
+/* Протоколы прокси (trojan, shadowsocks, socks, http, vmess): те же вопросы, с тем же смыслом
+ * (kinds/proxy.c). out_proxy — настройка любого из пяти видов, иначе NULL. */
+const struct proxy_cfg *out_proxy(const struct output *o);
+size_t out_proxy_node_list(const struct output *o, size_t usable, int *dst, size_t max);
+int out_proxy_node_named(const struct output *o);
 /* Назван ли узел ЧЕЛОВЕКОМ — то есть выбирать не из чего и перебор не нужен.
  *
  * Отдельным вопросом, а не длиной списка кандидатов, потому что это разные вещи. Кандидат
