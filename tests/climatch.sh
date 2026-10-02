@@ -198,6 +198,23 @@ ext_marker "splify2: vless-probe --node -1 --timeout 6 доходит до ко�
     "$BIN" vless-probe v --node -1 --timeout 6 --spec "$tmp/spec.json"
 ext_marker "splify2: vless-probe --node 0 доходит до команды" -- \
     "$BIN" vless-probe v --node 0 --timeout 6 --spec "$tmp/spec.json"
+# --insecure у перечня и проверки узлов ПО ФАЙЛУ подписки: узлы с allowInsecure входят в перечень с
+# той же нумерацией, что у выхода с insecure: true. Разбор флаг пропускает до команды (в базовой
+# сборке — до отказа «нужен пакет»); с именем выхода флаг — отказ разбора кодом 2 и словами: у выхода
+# решает его собственный ключ insecure, и молча взять флаг значило бы показать не те номера.
+printf 'vless://x@h.example:443#n\n' > "$tmp/sub.txt"
+for c in vless-nodes vless-probe hysteria2-nodes hysteria2-probe proxy-nodes proxy-probe; do
+    out="$("$BIN" $c "$tmp/sub.txt" --insecure 2>&1 >/dev/null)"
+    check "$c /файл --insecure доходит до команды" "1" "$(printf '%s' "$out" | grep -c 'нужен пакет')"
+    out="$("$BIN" $c v --insecure --spec "$tmp/spec.json" 2>&1 >/dev/null)"; rc=$?
+    check "$c выход --insecure: отказ кодом 2" "2" "$rc"
+    check "  и словами «только с файлом подписки», а не «нужен пакет»" "1 0" \
+        "$(printf '%s' "$out" | grep -c 'только с файлом подписки') $(printf '%s' "$out" | grep -c 'нужен пакет')"
+done
+out="$("$BIN" vless-probe "$tmp/sub.txt" --node 0 --timeout 6 --insecure 2>&1 >/dev/null)"
+check "vless-probe /файл --node --timeout --insecure доходит до команды" "1" \
+    "$(printf '%s' "$out" | grep -c 'нужен пакет')"
+code "--insecure у команды без узлов — отказ разбора" 2 -- "$BIN" status --insecure
 # Подписка: те же вызовы, какими её зовёт splify2. Проверяется, что разбор аргументов их
 # ПРОПУСКАЕТ и отказ приходит от самой команды: --out и --info — новые флаги, и опечатка в
 # их имени выглядела бы как «подписка не скачалась», причём молча.

@@ -138,6 +138,21 @@ static enum ss_method ss_method_by_name(const char *m) {
     return (enum ss_method)-1;
 }
 
+/* Имя метода для вывода (proxy-nodes, поле method): каноническое, как в ss:// и sing-box, — у
+ * «chacha20-poly1305» это «chacha20-ietf-poly1305», у «plain» — «none». */
+const char *px_ss_method_name(enum ss_method m) {
+    switch (m) {
+    case SS_NONE:              return "none";
+    case SS_AES128_GCM:        return "aes-128-gcm";
+    case SS_AES256_GCM:        return "aes-256-gcm";
+    case SS_CHACHA20_POLY1305: return "chacha20-ietf-poly1305";
+    case SS_2022_AES128:       return "2022-blake3-aes-128-gcm";
+    case SS_2022_AES256:       return "2022-blake3-aes-256-gcm";
+    case SS_2022_CHACHA20:     return "2022-blake3-chacha20-poly1305";
+    }
+    return "";
+}
+
 static size_t ss_keylen(enum ss_method m) {
     switch (m) {
     case SS_AES128_GCM: case SS_2022_AES128: return 16;
@@ -335,15 +350,22 @@ static int http_parse(const char *url, struct px_node *n, int tls) {
     snprintf(n->vn.security, sizeof(n->vn.security), tls ? "tls" : "none");
     if (tls && !n->vn.sni[0] && sl_host_is_name(n->vn.host))
         sl_set_field(n->vn.sni, sizeof(n->vn.sni), n->vn.host, strlen(n->vn.host));
-    if (tls && !n->vn.sni[0] && !n->vn.insecure) {
-        snprintf(n->skip_reason, sizeof(n->skip_reason), "https по адресу без sni: нечем сверить");
-        /* insecure выхода ставится до разбора (px как у vless): если он задан, узел годен. */
-    }
     if (sl_host_leads_nowhere(n->vn.host)) {
         snprintf(n->skip_reason, sizeof(n->skip_reason), "%.20s: отвечать некому", n->vn.host);
         return 1;
     }
-    if (tls) { n->vn.insecure = vless_insecure(); if (sl_link_usable_post(&n->vn)) { snprintf(n->skip_reason, sizeof n->skip_reason, "%s", n->vn.skip_reason); return 1; } }
+    /* https — обе половины общей годности, как у trojan и vmess. Прежде здесь была одна вторая, и
+     * allowInsecure подписки (первая половина, sl_link_usable_pre) у https не решал ничего: узел
+     * оставался в перечне при любом insecure выхода, а его номер не зависел от ключа, от которого
+     * у trojan и vmess зависит. Теперь он, как у них, пригоден только при insecure (ключ выхода либо
+     * `--insecure` по файлу), а иначе пропущен с причиной. Адрес без sni отбраковывает вторая
+     * половина («tls по адресу без sni: нечем сверить»). */
+    if (tls) {
+        if (sl_link_usable_pre(&n->vn) || sl_link_usable_post(&n->vn)) {
+            snprintf(n->skip_reason, sizeof n->skip_reason, "%s", n->vn.skip_reason);
+            return 1;
+        }
+    }
     return 0;
 }
 
@@ -375,6 +397,19 @@ static int vj_get(const char *json, const char *key, char *out, size_t cap) {
     }
     out[0] = '\0';
     return 0;
+}
+
+/* Шифр тела vmess для вывода (proxy-nodes, поле cipher): как в scy ссылки. none и zero узлом не
+ * бывают — такой узел непригоден (vmess_parse). */
+const char *px_vmess_sec_name(enum vmess_sec v) {
+    switch (v) {
+    case VMESS_AUTO:              return "auto";
+    case VMESS_AES128_GCM:        return "aes-128-gcm";
+    case VMESS_CHACHA20_POLY1305: return "chacha20-poly1305";
+    case VMESS_NONE:              return "none";
+    case VMESS_ZERO:              return "zero";
+    }
+    return "";
 }
 
 static int vmess_parse(const char *url, struct px_node *n) {

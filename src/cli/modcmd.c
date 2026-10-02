@@ -49,17 +49,17 @@ int cmd_tgws_probe(int dc, int media, int direct, int timeout_s) __attribute__((
 int cmd_tls_probe(const char *host, const char *addr, int port, int local_port,
                   int quiet) __attribute__((weak));
 int cmd_vless(const char *spec_path, const char *out_name) __attribute__((weak));
-int cmd_vless_nodes(const char *spec_path, const char *out_name) __attribute__((weak));
+int cmd_vless_nodes(const char *spec_path, const char *out_name, int insecure) __attribute__((weak));
 int cmd_vless_probe(const char *spec_path, const char *out_name, int node,
-                    int timeout_s) __attribute__((weak));
+                    int timeout_s, int insecure) __attribute__((weak));
 int cmd_hysteria2(const char *spec_path, const char *out_name) __attribute__((weak));
-int cmd_hysteria2_nodes(const char *spec_path, const char *out_name) __attribute__((weak));
+int cmd_hysteria2_nodes(const char *spec_path, const char *out_name, int insecure) __attribute__((weak));
 int cmd_hysteria2_probe(const char *spec_path, const char *out_name, int node,
-                        int timeout_s) __attribute__((weak));
+                        int timeout_s, int insecure) __attribute__((weak));
 int cmd_proxy(const char *spec_path, const char *out_name) __attribute__((weak));
-int cmd_proxy_nodes(const char *spec_path, const char *out_name) __attribute__((weak));
+int cmd_proxy_nodes(const char *spec_path, const char *out_name, int insecure) __attribute__((weak));
 int cmd_proxy_probe(const char *spec_path, const char *out_name, int node,
-                    int timeout_s) __attribute__((weak));
+                    int timeout_s, int insecure) __attribute__((weak));
 int cmd_sub_fetch(const char *url, const char *out_path, const char *info_path) __attribute__((weak));
 int cmd_sub_quota(const char *url, const char *info_path) __attribute__((weak));
 int cmd_xsteer_key(void) __attribute__((weak));
@@ -158,21 +158,33 @@ int modcmd_run(const char *cmd, int argc, char **argv, const struct cli_args *a,
         return cmd_tgws_probe(a->node > 0 ? a->node : 2, arg && !strcmp(arg, "media"),
                               a->direct, a->timeout);
     }
+    /* --insecure — только у перечня и проверки узлов ПО ФАЙЛУ подписки (разбор пускает флаг лишь к
+     * *-nodes и *-probe). С именем выхода пригодность узлов с allowInsecure решает ключ insecure
+     * самого выхода: флаг поверх него показал бы номера, которых у поднятого выхода нет. Проверка
+     * здесь, до модуля: отказ один и в сборке без модуля, и в самом модуле. */
+    if (a->insecure && !(arg && arg[0] == '/')) {
+        fprintf(stderr, "steer: %s: --insecure — только с файлом подписки (путь с «/»); у выхода "
+                "узлы с allowInsecure решает его ключ insecure\n", cmd);
+        return 2;
+    }
     if (!strcmp(cmd, "vless")) return cmd_vless ? cmd_vless(spec, arg) : ABSENT_VLESS;
     if (!strcmp(cmd, "vless-nodes"))
-        return cmd_vless_nodes ? cmd_vless_nodes(spec, arg) : ABSENT_VLESS;
+        return cmd_vless_nodes ? cmd_vless_nodes(spec, arg, a->insecure) : ABSENT_VLESS;
     if (!strcmp(cmd, "vless-probe"))
-        return cmd_vless_probe ? cmd_vless_probe(spec, arg, a->node, a->timeout) : ABSENT_VLESS;
+        return cmd_vless_probe ? cmd_vless_probe(spec, arg, a->node, a->timeout, a->insecure)
+                               : ABSENT_VLESS;
     if (!strcmp(cmd, "hysteria2")) return cmd_hysteria2 ? cmd_hysteria2(spec, arg) : ABSENT_HY2;
     if (!strcmp(cmd, "hysteria2-nodes"))
-        return cmd_hysteria2_nodes ? cmd_hysteria2_nodes(spec, arg) : ABSENT_HY2;
+        return cmd_hysteria2_nodes ? cmd_hysteria2_nodes(spec, arg, a->insecure) : ABSENT_HY2;
     if (!strcmp(cmd, "hysteria2-probe"))
-        return cmd_hysteria2_probe ? cmd_hysteria2_probe(spec, arg, a->node, a->timeout) : ABSENT_HY2;
+        return cmd_hysteria2_probe ? cmd_hysteria2_probe(spec, arg, a->node, a->timeout, a->insecure)
+                                   : ABSENT_HY2;
     if (!strcmp(cmd, "proxy")) return cmd_proxy ? cmd_proxy(spec, arg) : ABSENT_PROXY;
     if (!strcmp(cmd, "proxy-nodes"))
-        return cmd_proxy_nodes ? cmd_proxy_nodes(spec, arg) : ABSENT_PROXY;
+        return cmd_proxy_nodes ? cmd_proxy_nodes(spec, arg, a->insecure) : ABSENT_PROXY;
     if (!strcmp(cmd, "proxy-probe"))
-        return cmd_proxy_probe ? cmd_proxy_probe(spec, arg, a->node, a->timeout) : ABSENT_PROXY;
+        return cmd_proxy_probe ? cmd_proxy_probe(spec, arg, a->node, a->timeout, a->insecure)
+                               : ABSENT_PROXY;
     if (!strcmp(cmd, "sub-fetch"))
         return cmd_sub_fetch ? cmd_sub_fetch(arg, a->out_file, a->info_file) : ABSENT_VLESS;
     if (!strcmp(cmd, "sub-quota"))

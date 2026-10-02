@@ -23,8 +23,9 @@ static int stub(const char *who) {
 }
 
 int cmd_vless(const char *spec_path, const char *out_name);
-int cmd_vless_nodes(const char *spec_path, const char *out_name);
-int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int timeout_s);
+int cmd_vless_nodes(const char *spec_path, const char *out_name, int insecure);
+int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int timeout_s,
+                    int insecure);
 int cmd_tgws(const char *spec_path, const char *out_name);
 int cmd_tgws_probe(int dc, int media, int direct, int timeout_s);
 int cmd_tls_probe(const char *host, const char *addr, int port, int local_port, int quiet);
@@ -47,12 +48,13 @@ int cmd_tgws(const char *spec_path, const char *out_name) {
     return 2;
 }
 
-int cmd_vless_nodes(const char *spec_path, const char *out_name) {
-    (void)spec_path; (void)out_name;
+int cmd_vless_nodes(const char *spec_path, const char *out_name, int insecure) {
+    (void)spec_path; (void)out_name; (void)insecure;
     return stub("vless-nodes");
 }
-int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int timeout_s) {
-    (void)spec_path; (void)out_name; (void)node; (void)timeout_s;
+int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int timeout_s,
+                    int insecure) {
+    (void)spec_path; (void)out_name; (void)node; (void)timeout_s; (void)insecure;
     return stub("vless-probe");
 }
 

@@ -82,6 +82,17 @@ static void node_json(const struct px_node *n, int index) {
     jsonw_str(stdout, n->vn.security[0] ? n->vn.security : "none");
     printf(",\"transport\":");
     jsonw_str(stdout, n->vn.type[0] ? n->vn.type : "tcp");
+    /* Для бейджей конфигурации — только у тех узлов, где поле что-то значит, поэтому прежние поля
+     * прежних узлов не меняются. method — шифр shadowsocks; cipher — шифр тела vmess (scy: auto,
+     * aes-128-gcm, chacha20-poly1305); fp — отпечаток браузера в ClientHello у узлов с TLS/Reality;
+     * insecure — узел TLS несёт allowInsecure (в перечне он есть лишь при insecure выхода или
+     * `--insecure` по файлу, и сертификат его не проверяется). */
+    if (n->proto == PX_SS) { printf(",\"method\":"); jsonw_str(stdout, px_ss_method_name(n->ss_method)); }
+    if (n->proto == PX_VMESS) { printf(",\"cipher\":"); jsonw_str(stdout, px_vmess_sec_name(n->vmess_sec)); }
+    if (n->vn.fp[0] && n->vn.security[0] && strcmp(n->vn.security, "none") != 0) {
+        printf(",\"fp\":"); jsonw_str(stdout, n->vn.fp);
+    }
+    if (n->vn.allow_insecure && !strcmp(n->vn.security, "tls")) printf(",\"insecure\":true");
     printf("}");
 }
 
@@ -99,11 +110,16 @@ static void skipped_json(const struct px_sub_stats *st) {
     if (st->reasons_dropped) printf(",\"skipped_other\":%zu", st->reasons_dropped);
 }
 
-int cmd_proxy_nodes(const char *spec_path, const char *out_name) {
+int cmd_proxy_nodes(const char *spec_path, const char *out_name, int insecure) {
     struct output *o = NULL;
     size_t cnt = 0;
     struct px_sub_stats st;
     int by_file = out_name && out_name[0] == '/';
+    /* Пригодность узла TLS с allowInsecure решает insecure выхода (общий ключ sublink.c, как у vless);
+     * без выхода — `--insecure`, тем же вызовом до того же разбора, что в load_nodes. Номера по файлу
+     * с флагом поэтому совпадают с номерами выхода с `insecure: true` (у файла — сквозные по пяти
+     * протоколам, у выхода — внутри его протокола: порядок внутри протокола один и тот же). */
+    if (by_file) vless_set_insecure(insecure);
     int rc = by_file ? load_nodes_file(out_name, 0, &cnt, &st)
                      : load_nodes(spec_new(), spec_path, out_name, &o, &cnt, &st);
     if (rc) return rc;
@@ -122,11 +138,13 @@ int cmd_proxy_nodes(const char *spec_path, const char *out_name) {
     return 0;
 }
 
-int cmd_proxy_probe(const char *spec_path, const char *out_name, int node, int timeout_s) {
+int cmd_proxy_probe(const char *spec_path, const char *out_name, int node, int timeout_s,
+                    int insecure) {
     struct output *o = NULL;
     size_t cnt = 0;
     struct px_sub_stats st;
     int by_file = out_name && out_name[0] == '/';
+    if (by_file) vless_set_insecure(insecure);         /* как у proxy-nodes: номера те же */
     struct spec *sp = spec_new();
     int rc = by_file ? load_nodes_file(out_name, 0, &cnt, &st)
                      : load_nodes(sp, spec_path, out_name, &o, &cnt, &st);

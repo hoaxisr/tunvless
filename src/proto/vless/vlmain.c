@@ -135,6 +135,12 @@ static void node_json(const struct vless_node *n, int index) {
         printf(",\"encryption\":"); jsonw_str(stdout, mode);
     }
     if (n->pqv) printf(",\"pqv\":true");
+    /* Для бейджей конфигурации, тоже только где заданы. fp — отпечаток браузера в ClientHello (у
+     * security=none он ни на что не влияет и не печатается). insecure — узел в подписке несёт
+     * allowInsecure (только у security=tls: у reality он ничего не значит); в перечне такой узел
+     * есть лишь при insecure выхода или `--insecure` по файлу, и сертификат его не проверяется. */
+    if (n->fp[0] && strcmp(n->security, "none") != 0) { printf(",\"fp\":"); jsonw_str(stdout, n->fp); }
+    if (n->allow_insecure && !strcmp(n->security, "tls")) printf(",\"insecure\":true");
     printf("}");
 }
 
@@ -180,7 +186,7 @@ static void skipped_json(const struct vless_sub_stats *st) {
  * непригодные, человек выбрал бы номер 5, а поднялся бы другой узел — и понять это было
  * бы невозможно, потому что оба списка выглядят правдоподобно. Непригодные считаются
  * отдельно и объясняются причиной, но номеров не занимают. */
-int cmd_vless_nodes(const char *spec_path, const char *out_name) {
+int cmd_vless_nodes(const char *spec_path, const char *out_name, int insecure) {
     struct output *o = NULL;
     size_t cnt = 0;
     struct vless_sub_stats st;
@@ -188,6 +194,11 @@ int cmd_vless_nodes(const char *spec_path, const char *out_name) {
      * состоят из [A-Za-z0-9_.-] (см. name_ok), и косая черта в них невозможна, так что
      * спутать нечего. Тогда спека не нужна вовсе, а `chosen` пуст: выбора ещё не было. */
     int by_file = out_name && out_name[0] == '/';
+    /* Номера — среди пригодных, а пригодность узла с allowInsecure решает ключ insecure выхода
+     * (vless_set_insecure, sublink.c). Без выхода его заменяет `--insecure`: тот же вызов до того же
+     * разбора, что в load_nodes, — поэтому перечень по файлу с флагом нумерует узлы ровно как выход
+     * с `insecure: true`, а без флага — как выход без него. */
+    if (by_file) vless_set_insecure(insecure);
     int rc = by_file ? load_nodes_file(out_name, &cnt, &st)
                      : load_nodes(spec_new(), spec_path, out_name, &o, &cnt, &st);
     if (rc) return rc;
@@ -222,7 +233,8 @@ int cmd_vless_nodes(const char *spec_path, const char *out_name) {
  * По одному узлу за вызов не случайно: проверка узла упирается в таймаут, и «проверить
  * все» на подписке из двадцати шести узлов заняло бы минуты — дольше, чем живёт вызов
  * ubus. Интерфейс спрашивает по одному и заполняет таблицу постепенно. */
-int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int timeout_s) {
+int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int timeout_s,
+                    int insecure) {
     struct output *o = NULL;
     size_t cnt = 0;
     struct vless_sub_stats st;
@@ -234,6 +246,7 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
     int by_file = out_name && out_name[0] == '/';
     /* Спека нужна и пробе файла: метку «мимо каналов» underlay_setup спрашивает у неё же. */
     struct spec *sp = spec_new();
+    if (by_file) vless_set_insecure(insecure);       /* как у vless-nodes: номера те же */
     int rc = by_file ? load_nodes_file(out_name, &cnt, &st)
                      : load_nodes(sp, spec_path, out_name, &o, &cnt, &st);
     if (rc) return rc;

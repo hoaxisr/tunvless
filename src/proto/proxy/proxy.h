@@ -100,6 +100,10 @@ struct px_node *px_load_sub(const char *path, enum px_proto want, size_t *cnt,
 const char *px_proto_name(enum px_proto p);
 enum px_proto px_proto_by_name(const char *s);
 
+/* Имена шифров для вывода узла (proxy-nodes): метод shadowsocks и шифр тела vmess. */
+const char *px_ss_method_name(enum ss_method m);
+const char *px_vmess_sec_name(enum vmess_sec v);
+
 /* Отнести непригодный узел к причине (как у vless/hy2). */
 void px_skip_note(struct px_sub_stats *st, const struct px_node *n, const char *reason);
 

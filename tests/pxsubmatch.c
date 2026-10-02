@@ -97,10 +97,60 @@ static void test_sub(void) {
     got = px_parse_sub(longsub, out, 16, 0, &st);
     check("подписка: строка длиннее 8192 — узел разобран", 2, (long)got);
     check("подписка: длинная строка не чужая", 0, (long)st.foreign);
+
+    /* Причины пропуска доходят до skipped_reasons подписки непустыми: в собранных ранее пакетах
+     * у socks4 с паролем и ss с plugin= было "reason":"" (копирование skip_reason в самого себя). */
+    const char *bad =
+        "socks4://u:p@h1.example:1080#s4\n"
+        "ss://aes-128-gcm:p@h2.example:1?plugin=obfs#pl\n";
+    got = px_parse_sub(bad, out, 16, 0, &st);
+    check("подписка с негодными: пригодных 0", 0, (long)got);
+    check("  пропущено 2 двумя причинами", 22, (long)(st.skipped * 10 + st.reasons_n));
+    check_str("  причина socks4 названа", "socks4 не знает пароля", st.reasons[0].reason);
+    check_str("  и пример — имя узла", "s4", st.reasons[0].example);
+    check_str("  причина ss plugin= названа", "plugin= не поддержан", st.reasons[1].reason);
+}
+
+/* allowInsecure у узлов с TLS: подписка сама проверку сертификата не выключает (как у vless, sublink.c)
+ * — узел пригоден только при insecure (ключ выхода либо `--insecure` у перечня и проверки по файлу), и
+ * номера узлов с ним и без него различаются ровно на такие узлы. */
+static void test_insecure(void) {
+    struct px_node n;
+    vless_set_insecure(0);
+    check("https с allowInsecure без insecure — негоден", 1,
+          px_parse_url("https://u:p@h.example:443?sni=s.example&allowInsecure=1", &n, 0));
+    check_str("  причина названа", "allowInsecure: включите insecure у выхода явно", n.skip_reason);
+    check("trojan с allowInsecure без insecure — негоден", 1,
+          px_parse_url("trojan://p@h.example:443?security=tls&sni=s&allowInsecure=1", &n, 0));
+    vless_set_insecure(1);
+    check("https с allowInsecure при insecure — пригоден", 0,
+          px_parse_url("https://u:p@h.example:443?sni=s.example&allowInsecure=1", &n, 0));
+    check("  и помечен: подписка просит, сертификат не проверяется", 11,
+          (long)(n.vn.allow_insecure * 10 + n.vn.insecure));
+    check("trojan с allowInsecure при insecure — пригоден", 0,
+          px_parse_url("trojan://p@h.example:443?security=tls&sni=s&allowInsecure=1", &n, 0));
+
+    struct px_sub_stats st;
+    struct px_node out[8];
+    const char *sub =
+        "trojan://p@h1.example:443?security=tls&sni=a#t1\n"
+        "trojan://p@h2.example:443?security=tls&sni=a&allowInsecure=1#t2\n"
+        "ss://aes-128-gcm:q@h3.example:1234#s3\n";
+    vless_set_insecure(0);
+    size_t got = px_parse_sub(sub, out, 8, 0, &st);
+    check("без insecure: узел с allowInsecure пропущен, s3 — номер 1", 21,
+          (long)(got * 10 + (got == 2 && !strcmp(out[1].name, "s3"))));
+    vless_set_insecure(1);
+    got = px_parse_sub(sub, out, 8, 0, &st);
+    check("с insecure: все три, t2 — номер 1, s3 — номер 2", 3, (long)got);
+    check_str("  номер 1 — t2", "t2", out[1].name);
+    check_str("  номер 2 — s3", "s3", out[2].name);
+    vless_set_insecure(0);
 }
 
 int main(void) {
     test_parse();
     test_sub();
+    test_insecure();
     return unit_done("pxsubmatch");
 }

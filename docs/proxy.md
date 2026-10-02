@@ -72,7 +72,9 @@ trojan://пароль@хост:порт?security=tls&sni=&type=&path=&host=&…#
 Та же форма и те же параметры транспорта, что у `vless://` ([docs/vless.md](vless.md)): `type` (tcp,
 grpc, xhttp, ws, httpupgrade), `security` (tls, reality: `pbk`, `sid`), `sni`, `fp`, `path`, `host`,
 `serviceName`, `pcs`/`vcn` (проверка сертификата), `allowInsecure`. Пароль — весь userinfo до `@`, с
-процентным кодированием. trojan без TLS не бывает.
+процентным кодированием. trojan без TLS не бывает. Узел с `allowInsecure` пригоден, только если у выхода
+стоит `insecure: true`, иначе пропускается с причиной «allowInsecure: включите insecure у выхода явно» —
+как у VLESS.
 
 ### shadowsocks (SIP002)
 
@@ -102,6 +104,10 @@ http://[user:pass@]хост:порт#имя
 https://[user:pass@]хост:порт?sni=#имя     (CONNECT поверх TLS)
 ```
 
+У `https://` — те же параметры проверки сертификата, что у trojan (`sni`, `pcs`/`vcn`, `allowInsecure`), и
+то же правило для `allowInsecure`: узел пригоден только при `insecure: true` у выхода. Без `sni` имя
+берётся из адреса; адрес-IP без `sni` — пропуск («tls по адресу без sni: нечем сверить»).
+
 ### vmess (v2rayN)
 
 ```
@@ -110,7 +116,8 @@ vmess://base64(JSON)
 
 JSON v2rayN: `add`, `port`, `id`, `aid` (только 0), `scy` (auto, aes-128-gcm, chacha20-poly1305),
 `net` (tcp, ws, grpc, httpupgrade; `h2` читается как xhttp), `type`, `host`, `path`, `tls`, `sni`,
-`fp`, `alpn`, `ps` (имя).
+`fp`, `ps` (имя). `alpn` не читается. Признака `allowInsecure` у ссылки vmess ядро не читает: сертификат
+узла vmess не проверяется только при `insecure: true` у выхода.
 
 ## Выход в спеке
 
@@ -135,8 +142,14 @@ outputs:
 проба раз в минуту, после двух неудач подряд — `down` с причиной, круг проб, при переключении —
 перезапуск процесса.
 
-Команды: `steer proxy-nodes <выход|/файл>` — узлы подписки JSON-ом; `steer proxy-probe <выход|/файл>
-[--node N] [--timeout С]` — проверка узлов с задержкой и причиной отказа.
+Команды: `steer proxy-nodes <выход|/файл> [--insecure]` — узлы подписки JSON-ом; `steer proxy-probe
+<выход|/файл> [--node N] [--timeout С] [--insecure]` — проверка узлов с задержкой и причиной отказа.
+По файлу номера узлов сквозные по пяти протоколам, у выхода — внутри его протокола (порядок внутри
+протокола один). `--insecure` — только с файлом: узлы trojan и https с `allowInsecure` входят в
+перечень, как у выхода с `insecure: true`, и номера совпадают с его номерами; с именем выхода — отказ.
+У узла печатаются, кроме общих полей, `transport`, у shadowsocks — `method` (шифр), у vmess — `cipher`
+(шифр тела), у узлов с TLS или Reality — `fp`, если задан, и `"insecure":true` у узла с `allowInsecure`
+([contract-v1.md](contract-v1.md), раздел 6).
 
 ## status и diag
 

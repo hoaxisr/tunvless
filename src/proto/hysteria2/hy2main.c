@@ -115,7 +115,11 @@ static void skipped_json(const struct hy2_sub_stats *st) {
     if (st->reasons_dropped) printf(",\"skipped_other\":%zu", st->reasons_dropped);
 }
 
-int cmd_hysteria2_nodes(const char *spec_path, const char *out_name) {
+/* insecure — `--insecure` по файлу. У hysteria2 он ничего не меняет и принимается ради единого вызова
+ * у всех протоколов: `insecure=1` здесь параметр ссылки узла, а не ключ выхода (kinds/hysteria2.c),
+ * поэтому такие узлы пригодны всегда и номера по файлу с флагом и без него те же, что у выхода. */
+int cmd_hysteria2_nodes(const char *spec_path, const char *out_name, int insecure) {
+    (void)insecure;
     struct output *o = NULL;
     size_t cnt = 0;
     struct hy2_sub_stats st;
@@ -141,7 +145,9 @@ int cmd_hysteria2_nodes(const char *spec_path, const char *out_name) {
     return 0;
 }
 
-int cmd_hysteria2_probe(const char *spec_path, const char *out_name, int node, int timeout_s) {
+int cmd_hysteria2_probe(const char *spec_path, const char *out_name, int node, int timeout_s,
+                        int insecure) {
+    (void)insecure;                                    /* см. cmd_hysteria2_nodes */
     struct output *o = NULL;
     size_t cnt = 0;
     struct hy2_sub_stats st;

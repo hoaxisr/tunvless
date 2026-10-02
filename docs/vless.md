@@ -165,7 +165,10 @@ Reality аутентифицирует клиента внутри изменё�
   пропускается с причиной «allowInsecure: включите insecure у выхода явно». Отказ от проверки
   включается только ключом `insecure: true` у выхода ([spec-v2.md](spec-v2.md)); тогда цепочка, имя,
   срок и закрепления не проверяются (остаётся подпись CertificateVerify), а `steer diag` пишет
-  предупреждение, `steer status` — `"insecure":true`.
+  предупреждение, `steer status` — `"insecure":true`. Номера узлов считаются среди пригодных, поэтому
+  у такого выхода они включают узлы с `allowInsecure`; перечень по файлу подписки с теми же номерами
+  даёт `steer vless-nodes /путь --insecure` (и `vless-probe /путь --insecure`), а узел с
+  `allowInsecure` несёт в нём `"insecure":true` ([contract-v1.md](contract-v1.md), раздел 6).
 
 В подписках отпечаток читается из `pcs` ссылки, `pinnedPeerCertSha256`/`verifyPeerCertByName` в
 `tlsSettings` конфига Xray, `fingerprint` Clash (SHA-256 сертификата) и `certificate_public_key_sha256`

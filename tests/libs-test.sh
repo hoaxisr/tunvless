@@ -145,6 +145,82 @@ check "модуль читает спеку с https-группой: не отк
 out="$("$L/steerd" apply --dry-run --spec "$L/httpsspec/spec.yaml" --state-dir "$L/httpsspec/st" 2>&1)"
 check "  и steerd такую же спеку принимает (замер ведёт он)" "0" \
     "$(printf '%s' "$out" | grep -c 'https:// в этой сборке нет')"
+# ---- --insecure у перечня и проверки узлов по файлу; поля узла для бейджей ------------------------
+# Узел TLS с allowInsecure пригоден только при insecure: у выхода — его ключ, у файла — `--insecure`.
+# Номера узлов по файлу с флагом обязаны совпасть с номерами выхода с insecure: true (иначе интерфейс
+# выбирает в редакторе один узел, а поднимается другой), без флага — с номерами выхода без него.
+names() { grep -o '"index":[0-9]*,"name":"[^"]*"' | sed 's/.*"name":"\([^"]*\)"/\1/' | tr '\n' ' '; }
+node_of() { # ИМЯ — объект узла с этим именем
+    grep -o '{"index":[0-9]*,"name":"'"$1"'"[^}]*}'
+}
+mkdir -p "$L/insec"
+# Путь к файлу — абсолютный: команды отличают файл подписки от имени выхода по ведущей «/».
+IN="$(cd "$L/insec" && pwd)"
+U=11111111-2222-3333-4444-555555555555
+cat > "$IN/vl.txt" <<SUB
+vless://$U@a.test:443?security=tls&sni=a.test&fp=chrome#A
+vless://$U@b.test:443?security=tls&sni=b.test&allowInsecure=1#B
+vless://$U@c.test:443?security=reality&pbk=K4ALTVxNnrDTywBj_Stb5bomQ21QlSWOlGGT44n9Nng&sid=0123&sni=c.test&fp=firefox#C
+SUB
+VM="$(printf '{"v":"2","ps":"V","add":"v.test","port":"443","id":"%s","aid":"0","scy":"chacha20-poly1305","net":"tcp","tls":"tls","sni":"v.test"}' "$U" | base64 | tr -d '\n')"
+cat > "$IN/px.txt" <<SUB
+trojan://p@t1.test:443?security=tls&sni=t1.test&fp=chrome#T1
+trojan://p@t2.test:443?security=tls&sni=t2.test&allowInsecure=1#T2
+ss://2022-blake3-aes-128-gcm:AAAAAAAAAAAAAAAAAAAAAA==@s.test:8388#S
+vmess://$VM
+SUB
+printf 'hysteria2://p@h.test:443/?sni=h.test&insecure=1#H\n' > "$IN/hy.txt"
+cat > "$L/insec/spec.yaml" <<SPEC
+version: 2
+outputs:
+  vl:  { kind: tunnel, protocol: vless, subscription: vl.txt, insecure: true }
+  vl0: { kind: tunnel, protocol: vless, subscription: vl.txt }
+  tj:  { kind: tunnel, protocol: trojan, subscription: px.txt, insecure: true }
+SPEC
+SI="--spec $L/insec/spec.yaml --state-dir $L/insec/st"
+f_plain="$("$L/steer-vless" vless-nodes "$IN/vl.txt" 2>/dev/null)"
+f_ins="$("$L/steer-vless" vless-nodes "$IN/vl.txt" --insecure 2>/dev/null)"
+o_ins="$("$L/steer-vless" vless-nodes vl $SI 2>/dev/null)"
+o_plain="$("$L/steer-vless" vless-nodes vl0 $SI 2>/dev/null)"
+check "vless-nodes /файл: узел с allowInsecure пропущен (как у выхода без insecure)" "A C |A C " \
+    "$(printf '%s' "$f_plain" | names)|$(printf '%s' "$o_plain" | names)"
+check "vless-nodes /файл --insecure: номера как у выхода с insecure: true" "A B C |A B C " \
+    "$(printf '%s' "$f_ins" | names)|$(printf '%s' "$o_ins" | names)"
+check "  узел B помечен insecure, без fp" '{"index":1,"name":"B","host":"b.test","port":443,"type":"tcp","security":"tls","vision":false,"insecure":true}' \
+    "$(printf '%s' "$f_ins" | node_of B)"
+check "  у A и C — fp, без insecure" '"fp":"chrome"}|"fp":"firefox"}' \
+    "$(printf '%s' "$f_ins" | node_of A | grep -o '"fp".*')|$(printf '%s' "$f_ins" | node_of C | grep -o '"fp".*')"
+o="$("$L/steer-vless" vless-probe "$IN/vl.txt" --node 9 --insecure 2>/dev/null)"
+check "vless-probe /файл --insecure: узлов столько же, сколько в перечне с флагом" "1" \
+    "$(printf '%s' "$o" | grep -c 'всего 3')"
+o="$("$L/steer-vless" vless-probe "$IN/vl.txt" --node 9 2>/dev/null)"
+check "  и без флага — как без него" "1" "$(printf '%s' "$o" | grep -c 'всего 2')"
+o="$("$L/steer-vless" vless-nodes vl --insecure $SI 2>&1)"; rc=$?
+check "vless-nodes выход --insecure: отказ кодом 2 со словами" "2 1" \
+    "$rc $(printf '%s' "$o" | grep -c 'только с файлом подписки')"
+
+f_plain="$("$L/steer-proxy" proxy-nodes "$IN/px.txt" 2>/dev/null)"
+f_ins="$("$L/steer-proxy" proxy-nodes "$IN/px.txt" --insecure 2>/dev/null)"
+o_ins="$("$L/steer-proxy" proxy-nodes tj $SI 2>/dev/null)"
+check "proxy-nodes /файл: trojan с allowInsecure пропущен" "T1 S V " "$(printf '%s' "$f_plain" | names)"
+check "proxy-nodes /файл --insecure: все четыре; trojan в том же порядке, что у выхода" "T1 T2 S V |T1 T2 " \
+    "$(printf '%s' "$f_ins" | names)|$(printf '%s' "$o_ins" | names)"
+check "  T1: fp, без insecure" '"fp":"chrome"}' "$(printf '%s' "$f_ins" | node_of T1 | grep -o '"fp".*')"
+check "  T2: insecure" '"insecure":true}' "$(printf '%s' "$f_ins" | node_of T2 | grep -o '"insecure".*')"
+check "  S: method" '"transport":"tcp","method":"2022-blake3-aes-128-gcm"}' \
+    "$(printf '%s' "$f_ins" | node_of S | grep -o '"transport".*')"
+check "  V: cipher" '"transport":"tcp","cipher":"chacha20-poly1305"}' \
+    "$(printf '%s' "$f_ins" | node_of V | grep -o '"transport".*')"
+o="$("$L/steer-proxy" proxy-probe "$IN/px.txt" --node 9 --insecure 2>/dev/null)"
+check "proxy-probe /файл --insecure: узлов столько же, сколько в перечне с флагом" "1" \
+    "$(printf '%s' "$o" | grep -c 'всего 4')"
+
+f_plain="$("$L/steer-hysteria2" hysteria2-nodes "$IN/hy.txt" 2>/dev/null)"
+f_ins="$("$L/steer-hysteria2" hysteria2-nodes "$IN/hy.txt" --insecure 2>/dev/null)"
+check "hysteria2-nodes /файл --insecure: принят и ничего не меняет (insecure=1 — параметр узла)" \
+    "$f_plain" "$f_ins"
+check "  узел с insecure=1 в перечне и помечен" "1" "$(printf '%s' "$f_ins" | grep -c '"name":"H".*"insecure":true')"
+
 # С модулем: steerd передаёт командную строку модулю, ответ тот же байт в байт.
 cp "$L/steer-vless" "$empty/steer-vless"
 a="$(STEER_MODULE_DIR="$empty" "$L/steerd" vless-nodes nosuch --spec /nonexistent 2>&1; echo "rc=$?")"
