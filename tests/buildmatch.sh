@@ -669,7 +669,7 @@ check "идентификаторы проверок diag совпадают с 
 
 # Документация на русском — проект для русскоязычных пользователей. Проверяется наличие
 # кириллицы, а не отсутствие латиницы: имена команд, полей и флагов остаются как есть.
-for d in README.md docs/contract-v1.md docs/vless.md server/README.md; do
+for d in README.md docs/guide.md docs/contract-v1.md docs/vless.md docs/proxy.md docs/hysteria2.md server/README.md; do
     check "$d написан по-русски" "yes" \
         "$(grep -qP '[А-Яа-я]' "$d" && echo yes || echo no)"
 done
@@ -677,18 +677,26 @@ done
 # Номер версии в документации устаревает молча к следующему же релизу: примеры команд
 # обязаны быть с подстановкой, а не с числом.
 stale=""
-for d in README.md docs/contract-v1.md docs/vless.md server/README.md; do
+for d in README.md docs/guide.md docs/contract-v1.md docs/vless.md docs/proxy.md docs/hysteria2.md server/README.md; do
     grep -qE 'steer(-extended|-obfs)?-[0-9]+\.[0-9]+\.[0-9]+' "$d" && stale="$stale$d "
 done
 check "в документации нет зашитых номеров версии" "" "$stale"
 
-# Команды, обещанные в README, обязаны существовать в движке: README читают раньше, чем
-# `steer help`, и несуществующая команда там — это отказ на первом же шаге.
+# Таблица пакетов docs/guide.md — по составу build.sh (OURS): пакет, которого в таблице нет,
+# человек не найдёт вовсе (так из неё однажды выпал steer-proxy).
+no_pkg=""
+for p in $(sed -n 's/^OURS="\(.*\)"$/\1/p' build.sh); do
+    grep -q "^| \`$p\` |" docs/guide.md || no_pkg="$no_pkg$p "
+done
+check "все пакеты build.sh есть в таблице docs/guide.md" "" "$no_pkg"
+
+# Команды, обещанные в README и docs/guide.md (таблица команд живёт там), обязаны существовать в
+# ядре: их читают раньше, чем `steer help`, и несуществующая команда там — отказ на первом же шаге.
 if [ -x ./build/steer ]; then
     bad_cmd=""
     for c in apply status diag explain outputs needs-dnsd dnsd failover fit vless \
              vless-nodes vless-probe obfs obfs-server; do
-        grep -q "\`$c" README.md || continue
+        cat README.md docs/guide.md | grep -q "\`$c" || continue
         ./build/steer help "$c" >/dev/null 2>&1 || bad_cmd="$bad_cmd$c "
     done
     check "все команды из README существуют" "" "$bad_cmd"
