@@ -156,7 +156,7 @@ static int tj_udp_down(struct trojan_sess *s, const unsigned char *d, size_t n,
                 d++; n--;
                 s->ahdr = 1;
                 s->alen = atyp == 1 ? 4 + 2 : atyp == 4 ? 16 + 2 : 0;
-                if (atyp == 3) { s->alen = 0; s->rx = TJ_SKIP; s->dg_skip = 0; s->ahdr = 2; }  /* домен: длина в след. байте */
+                if (atyp == 3) s->ahdr = 2;   /* домен: его длина — в следующем байте (ниже) */
                 break;
             }
             if (s->ahdr == 2) { s->dg_skip = (uint32_t)d[0] + 2; d++; n--; s->ahdr = 1; s->rx = TJ_SKIP; break; }
