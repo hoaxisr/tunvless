@@ -149,7 +149,8 @@ struct qc_cfg {
 
     /* Пределы; нули — умолчания. */
     unsigned    idle_ms;            /* max_idle_timeout, по умолчанию 30000 */
-    unsigned    keepalive_ms;       /* PING при молчании; 0 — не слать */
+    unsigned    keepalive_ms;       /* PING при молчании; 0 — не слать. После рукопожатия — не реже
+                                     * трети меньшего из двух сроков простоя (свой и сервера) */
     unsigned    handshake_ms;       /* по умолчанию 10000 */
     uint64_t    max_data;           /* окно приёма соединения, по умолчанию 8 МиБ */
     uint64_t    max_stream_data;    /* окно приёма потока, по умолчанию 2 МиБ */

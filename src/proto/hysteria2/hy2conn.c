@@ -24,11 +24,16 @@
  * Обратное направление — qc_stream_send принимает не всё, остаток ждёт в потоке и досылается после
  * каждого события QUIC, пока не освободится буфер.
  *
- * ЖИЗНЬ СОЕДИНЕНИЯ. Открывается сразу при запуске и заново по требованию, если оборвалось: запрос
- * потока, пришедший при упавшем соединении, поднимает его и ждёт (в пределах срока запроса).
- * После неудачного подъёма следующая попытка не раньше чем через секунду — иначе серия SYN
- * клиентов стучалась бы в мёртвый узел с частотой SYN. Без единого потока соединение закрывается
- * через IDLE_CLOSE_S: не держим радио и узел ради молчания (PING шлёт QUIC, пока потоки есть).
+ * ЖИЗНЬ СОЕДИНЕНИЯ. Открывается сразу при запуске и держится, сколько живёт процесс, — с потоками и
+ * без: PING QUIC (keepalive, quic.c) не даёт ему умереть по сроку простоя. Прежде соединение без
+ * единого потока закрывалось через минуту, и это стоило дорого (живой роутер, туннель в группе,
+ * которая выбрала другой выход): переподключение раз в 1,5–3 минуты, диагностика «соединение не
+ * поднято» у здорового узла, а замер задержки группы ловил рукопожатие следующего потока и прыгал
+ * втрое, переключая группу между туннелями. Оборвалось — поднимается снова само (bg_*: первая
+ * попытка через секунду, дальше пауза удваивается до BG_MAX_MS, пока узел не ответит), и запрос
+ * потока, пришедший при упавшем соединении, тоже поднимает его и ждёт (в пределах срока запроса).
+ * После неудачного подъёма запрос не повторяет попытку раньше чем через секунду — иначе серия SYN
+ * клиентов стучалась бы в мёртвый узел с частотой SYN.
  *
  * ЧТО ДЕЛАЕТ СЕРВЕР С ПОТОКОМ. TCP: клиент пишет TCPRequest (адрес назначения), сервер отвечает
  * TCPResponse (статус, сообщение) и дальше поток — прозрачный байтовый канал. UDP: датаграммы QUIC
@@ -76,8 +81,8 @@
 #define RFRAG_MAX   64
 #define AUTH_S      10          /* срок ответа на авторизацию */
 #define REQ_S       15          /* срок ответа на запрос TCP */
-#define IDLE_CLOSE_S 60
 #define RETRY_MS    1000
+#define BG_MAX_MS   30000       /* потолок паузы между попытками поднять упавшее соединение */
 
 /* ---- запрос потока (поток установщика → мультиплексор) ------------------------------------------ */
 
@@ -157,7 +162,10 @@ static struct {
     int dead;                       /* on_closed сработал: разобрать после возврата из qc_* */
     int dead_reason;
     char dead_why[160];
-    uint64_t state_at_ms, next_try_ms, up_at_ms, last_flow_ms;
+    uint64_t state_at_ms, next_try_ms, up_at_ms;
+    uint64_t bg_try_ms;             /* когда поднимать упавшее соединение без запроса (want_up) */
+    unsigned bg_ms;                 /* текущая пауза этих попыток: растёт при отказах, 0 — после подъёма */
+    uint64_t rx_at_ms;              /* последний пакет от узла (hy2c_alive); пишет мультиплексор */
     struct obfs_state *ob;          /* обфускация текущего соединения (make_cfg) */
     int64_t auth_sid;
     uint8_t abuf[4096];
@@ -518,7 +526,6 @@ static void flow_free(struct flow *f, int rc, const char *msg) {
     free(f->rbuf);
     free(f);
     E.gen++;
-    E.last_flow_ms = now_ms();
 }
 
 static void status_up(int up) {
@@ -839,6 +846,7 @@ static void auth_data(const uint8_t *d, size_t n) {
     }
     E.state = S_UP;
     E.up_at_ms = now_ms();
+    E.bg_ms = 0;
     uint64_t eff = apply_cc(E.qc, E.node, &r);
     pthread_mutex_lock(&E.mu);
     E.st.up = 1;
@@ -978,16 +986,26 @@ static const struct qc_ops G_OPS = {
 
 /* ---- жизнь соединения ------------------------------------------------------------------------- */
 
+/* Следующая попытка поднять соединение без запроса: сразу после обрыва — через секунду, после
+ * отказа подъёма — с удвоенной паузой, до BG_MAX_MS. */
+static void bg_schedule(int failed) {
+    if (!failed) E.bg_ms = RETRY_MS;
+    else E.bg_ms = E.bg_ms ? (E.bg_ms * 2 > BG_MAX_MS ? BG_MAX_MS : E.bg_ms * 2) : RETRY_MS;
+    E.bg_try_ms = now_ms() + E.bg_ms;
+    E.want_up = 1;
+}
+
 static int connect_now(void) {
     char ip[64];
     if (cached_ip(ip, sizeof ip) != 0) {
         set_err("адрес узла %s не разрешился", E.node->host);
         E.next_try_ms = now_ms() + RETRY_MS;
+        bg_schedule(1);
         return -1;
     }
     struct qc_cfg c;
     E.ob = calloc(1, sizeof *E.ob);
-    if (!E.ob) { set_err("нет памяти"); E.next_try_ms = now_ms() + RETRY_MS; return -1; }
+    if (!E.ob) { set_err("нет памяти"); E.next_try_ms = now_ms() + RETRY_MS; bg_schedule(1); return -1; }
     make_cfg(E.node, ip, &c, E.ob, E.mark, E.mark_req);
     E.dead = 0;
     E.dead_why[0] = '\0';
@@ -996,6 +1014,7 @@ static int connect_now(void) {
     if (rc != 0) {
         set_err("QUIC не открылся (%d)", rc);
         E.next_try_ms = now_ms() + RETRY_MS;
+        bg_schedule(1);
         E.qc = NULL;
         hy2_gecko_free(&E.ob->gk);
         free(E.ob);
@@ -1013,6 +1032,7 @@ static int connect_now(void) {
         E.ob = NULL;
         set_err("сокет QUIC не встал в epoll");
         E.next_try_ms = now_ms() + RETRY_MS;
+        bg_schedule(1);
         return -1;
     }
     E.state = S_HS;
@@ -1034,6 +1054,10 @@ static void queue_fail_all(int rc, const char *msg) {
 }
 
 static void process_queue(uint64_t now) {
+    /* Соединение закрыто в этом же проходе (срок авторизации в expire, отказ в колбэке), а разбор —
+     * в следующем: открыть на нём поток значило бы получить отказ QUIC и ответить запросу «нет
+     * свободных потоков» (HY2E_BUSY), хотя потоки ни при чём. Запросы ждут разбора. */
+    if (E.dead) return;
     for (;;) {
         pthread_mutex_lock(&E.mu);
         struct req *r = E.qh;
@@ -1112,12 +1136,6 @@ static void expire(uint64_t now) {
         snprintf(E.dead_why, sizeof E.dead_why, "узел не ответил на авторизацию за %d с", AUTH_S);
         qc_close(E.qc, 0x101);
     }
-    if (E.state == S_UP && !E.nfl && now - (E.last_flow_ms > E.up_at_ms ? E.last_flow_ms : E.up_at_ms) > IDLE_CLOSE_S * 1000u && E.qc) {
-        qc_close(E.qc, 0x100);
-        E.dead = 1;
-        E.dead_reason = QC_CLOSE_LOCAL;
-        snprintf(E.dead_why, sizeof E.dead_why, "нет потоков — соединение закрыто");
-    }
 }
 
 static void eng_flush_blocked(void) {
@@ -1140,6 +1158,9 @@ static void *engine(void *arg) {
         if (E.qc) {
             int t = qc_timeout_ms(E.qc);
             tmo = t < 0 ? 1000 : (t > 1000 ? 1000 : t);
+        } else if (E.want_up) {
+            uint64_t t = now_ms();
+            tmo = E.bg_try_ms <= t ? 0 : (E.bg_try_ms - t > 1000 ? 1000 : (int)(E.bg_try_ms - t));
         }
         pthread_mutex_lock(&E.mu);
         int queued = E.qh != NULL;
@@ -1147,13 +1168,14 @@ static void *engine(void *arg) {
         if (queued && (tmo < 0 || tmo > 200)) tmo = 200;
         int n = epoll_wait(E.epfd, evs, 64, tmo);
         unsigned gen0 = E.gen;
-        if (E.want_up && E.state == S_IDLE && !E.dead) {
+        if (E.want_up && E.state == S_IDLE && !E.dead && now_ms() >= E.bg_try_ms) {
             E.want_up = 0;
             (void)connect_now();
         }
         for (int i = 0; i < n; i++) {
             void *p = evs[i].data.ptr;
             if (p == &E.epfd) {                         /* сокет QUIC */
+                if (E.qc) __atomic_store_n(&E.rx_at_ms, now_ms(), __ATOMIC_RELAXED);
                 if (E.qc && qc_on_readable(E.qc) == QC_ECLOSED) E.dead = E.dead ? E.dead : 1;
             } else if (p == &E.wake) {
                 uint64_t v;
@@ -1183,9 +1205,11 @@ static void *engine(void *arg) {
             else if (E.state != S_UP && E.state != S_IDLE)
                 fprintf(stderr, LOG_W2 "hysteria2: узел %s не принял соединение: %s\n", E.node->name, why);
             teardown(why);
-            /* Пауза перед повтором — только после провала подъёма или обрыва; тихое закрытие по
-             * простою повтора не ждёт. */
+            /* Пауза перед повтором — только после провала подъёма или обрыва; своё закрытие
+             * поднятого соединения повтора не ждёт. Без запроса соединение поднимается снова само
+             * (bg_schedule): туннель держит связь с узлом всё время, а не по первому потоку. */
             E.next_try_ms = (wasup && reason == QC_CLOSE_LOCAL) ? 0 : now_ms() + RETRY_MS;
+            bg_schedule(!wasup);
             queue_fail_all(HY2E_DOWN, why);
             E.dead_why[0] = '\0';
             E.dead_reason = 0;
@@ -1290,6 +1314,19 @@ int hy2c_open(int udp, const char *host, uint16_t port, int timeout_s) {
         return rc;
     }
     return sv[0];
+}
+
+int hy2c_alive(void) {
+    if (!E.started) return 0;
+    /* Окно — два PING с запасом: на каждый узел отвечает ACK, так что живое соединение без
+     * трафика получает пакет не реже срока PING (make_cfg; после рукопожатия он бывает и короче). */
+    unsigned ka = g_idle_ms / 3 < 10000 ? g_idle_ms / 3 : 10000;
+    uint64_t within_ms = 2ull * ka + 1000;
+    pthread_mutex_lock(&E.mu);
+    int up = E.st.up;
+    pthread_mutex_unlock(&E.mu);
+    uint64_t rx = __atomic_load_n(&E.rx_at_ms, __ATOMIC_RELAXED);
+    return up && rx && now_ms() - rx <= within_ms;
 }
 
 void hy2c_status(struct hy2c_status *st) {

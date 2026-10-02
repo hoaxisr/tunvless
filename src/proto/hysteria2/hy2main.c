@@ -353,7 +353,11 @@ static void *nw_thread(void *arg) {
         nw_wait(due, up);
         pthread_mutex_unlock(&g_nw.mu);
         if (up) {
-            if (hy2_probe(cur, NW_TIMEOUT_S, why, sizeof(why), &hs) == 0) {
+            /* Соединение туннеля с узлом живо (поднято, и узел отвечает на PING) — это и есть
+             * ответ проверки: отдельное рукопожатие и авторизация раз в interval ничего к нему не
+             * прибавили бы, а узлу — лишнее соединение каждую минуту. Проба — когда соединения
+             * нет или узел замолчал. */
+            if (hy2c_alive() || hy2_probe(cur, NW_TIMEOUT_S, why, sizeof(why), &hs) == 0) {
                 fails = 0;
                 pthread_mutex_lock(&g_nw.mu);
                 g_nw.streak = 0;

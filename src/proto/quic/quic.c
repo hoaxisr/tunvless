@@ -106,6 +106,8 @@ struct qc {
     char      alpn[32];
     uint64_t  brutal_bps, max_data, max_stream_data, max_streams;
     unsigned  idle_ms;
+    unsigned  keepalive_ms;     /* PING при молчании (cfg.keepalive_ms); 0 — не слать */
+    unsigned  idle_local_ms;    /* свой max_idle_timeout: с ним сверяется срок сервера (keepalive_tune) */
 
     struct qc_stream *streams;
     struct qc_stream *rr;       /* с кого продолжать обход потоков */
@@ -343,6 +345,23 @@ static int new_cid_cb(ngtcp2_conn *conn, ngtcp2_cid *cid, ngtcp2_stateless_reset
     return 0;
 }
 
+/* Срок PING — по сроку простоя, о котором договорились, а не только по своему. Действует меньший
+ * из двух max_idle_timeout (RFC 9000, 10.1), а сервер вправе объявить свой короче нашего (у apernet
+ * quic.maxIdleTimeout от 4 с): PING раз в 10 с при сроке сервера 5 с — соединение, которое молча
+ * умирает на каждой паузе, хотя узел жив. Поэтому после рукопожатия, когда срок сервера известен,
+ * PING идёт не реже трети меньшего срока (и не реже заданного keepalive_ms). Три PING на срок —
+ * запас на потерю двух подряд. */
+static void keepalive_tune(struct qc *q) {
+    if (!q->keepalive_ms || !q->conn) return;
+    const ngtcp2_transport_params *rp = ngtcp2_conn_get_remote_transport_params2(q->conn);
+    uint64_t idle = (uint64_t)q->idle_local_ms * NGTCP2_MILLISECONDS;
+    if (rp && rp->max_idle_timeout && (!idle || rp->max_idle_timeout < idle)) idle = rp->max_idle_timeout;
+    uint64_t ka = (uint64_t)q->keepalive_ms * NGTCP2_MILLISECONDS;
+    if (idle && idle / 3 < ka) ka = idle / 3;
+    if (ka < 500 * NGTCP2_MILLISECONDS) ka = 500 * NGTCP2_MILLISECONDS;
+    ngtcp2_conn_set_keep_alive_timeout(q->conn, ka);
+}
+
 static int handshake_completed_cb(ngtcp2_conn *conn, void *ud) {
     struct qc *q = ud;
     if (q->early_tried) {
@@ -373,6 +392,7 @@ static int handshake_completed_cb(ngtcp2_conn *conn, void *ud) {
         }
     }
     q->hs_done = 1;
+    keepalive_tune(q);
     if (q->ops.on_handshake) {
         q->in_cb++;
         q->ops.on_handshake(q->user);
@@ -1063,6 +1083,8 @@ int qc_open(const struct qc_cfg *cfg, const struct qc_ops *ops, void *user, stru
      * без байта (ssh, долгий запрос). Эталон шлёт keepalive раз в 10 с. */
     if (cfg->keepalive_ms)
         ngtcp2_conn_set_keep_alive_timeout(q->conn, (uint64_t)cfg->keepalive_ms * NGTCP2_MILLISECONDS);
+    q->keepalive_ms = cfg->keepalive_ms;
+    q->idle_local_ms = cfg->idle_ms ? cfg->idle_ms : 30000;
 
     /* 0-RTT: билет прошлой сессии этого сервера (sni и порт), если он разрешает early data, ставится
      * в TLS ДО первого пакета, а параметры транспорта той сессии — в ngtcp2 (без них он не знает
