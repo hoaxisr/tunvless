@@ -21,6 +21,12 @@ typedef void (*stack_ready_fn)(void *arg, const char *dev);
  * Возвращает всегда 1: успешного выхода у цикла нет (см. конец stack_run). */
 int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, void *arg);
 
+/* Набор активных узлов изменился (пул узлов, pool.c): соединения, чей узел больше не активен
+ * (dialer_ops.stale), стек сбрасывает — RST клиенту, — чтобы приложения переподключались сразу, а не
+ * ждали своего таймаута на повисшем соединении. Зовётся из любого потока; поток цикла замечает это на
+ * ближайшем витке (не позже секунды). */
+void stack_nodes_changed(void);
+
 /* Поднять устройство и дать ему адрес из таблицы выхода. Каждый отказ `ip` называется в
  * журнале своим тоном (I-114). Отдельно от stack_run — ради стенда devupmatch. */
 void tun_bring_up(const char *dev, int table);

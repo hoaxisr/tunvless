@@ -43,8 +43,11 @@
 #include <sys/eventfd.h>
 #include <time.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 
 #include "tun.h"
 #include "rtx.h"
@@ -268,6 +271,11 @@ struct conn {
     /* Клиент прислал FIN и принят он по порядку: от клиента больше данных не будет, но
      * ответ сервера ему ещё идёт (I-319). */
     uint8_t client_fin;
+    /* Связь с узлом оборвана, а не закрыта (ядро не дождалось узла, узел сбросил связь) или узел
+     * соединения больше не активен (dialer_ops.stale): клиенту — RST из общего прохода, а не FIN.
+     * FIN сказал бы «ответ кончился», и обрезанная закачка выглядела бы целой. Ставится вместе с
+     * srv_closed. */
+    uint8_t aborted;
 };
 
 /* Горячая запись обязана оставаться маленькой — в этом весь смысл разделения. Проверка
@@ -544,6 +552,58 @@ static __thread int16_t *g_bucket;
  * только читается — потому и не __thread: установщикам он нужен тот же, что циклу. */
 static const struct dialer *g_dl;
 
+/* Набор активных узлов менялся столько раз (stack_nodes_changed): поток цикла сверяет со своим
+ * счётом и, разойдясь, спрашивает у дайлера про каждое соединение (stale). Счётчик, а не флаг: потоков
+ * цикла может быть несколько, и каждый обязан заметить перемену сам. */
+static unsigned g_nodes_epoch;
+
+void stack_nodes_changed(void) { __atomic_add_fetch(&g_nodes_epoch, 1, __ATOMIC_RELEASE); }
+
+/* Поток цикла один (STEER_TUN_THREADS не задан): тогда соединения, которого нет в таблице, нет вовсе,
+ * и на его данные можно ответить RST (handle_packet). При нескольких потоках половина соединения
+ * бывает в чужой очереди (см. worker_count), и RST убил бы живое. */
+static int g_one_worker = 1;
+
+/* ПОРОГ МОЛЧАНИЯ УЗЛА (struct dialer, silence_s) — сокету связи, как только связь отдана соединению.
+ *
+ * Мерит ядро, а не мы, и это решает главное — ложные срабатывания. «Отправили и ждём» на уровне
+ * приложения не отличить от долгого опроса: запрос ушёл, ответ придёт через минуту, и это норма. На
+ * уровне TCP отличить можно: живой узел ПОДТВЕРЖДАЕТ принятое сразу, даже когда ответа ещё нет. Отсюда
+ * два правила ядра:
+ *   - TCP_USER_TIMEOUT: отправленное к узлу не подтверждено дольше порога — связь оборвана (узел
+ *     умер под загрузкой на узел, звонком, ТСПУ режет поток после N КБ);
+ *   - SO_KEEPALIVE с TCP_KEEPIDLE = порог: от узла ничего дольше порога — проверка keepalive, и
+ *     без ответа на неё связь оборвана через четверть порога (с TCP_USER_TIMEOUT ядро обрывает по
+ *     сроку, а не по счёту проверок). Это закачка, под которой узел умер: клиент ничего не шлёт,
+ *     «отправленного» нет, и без проверки соединение висело бы до таймаута приложения. Долгий опрос
+ *     и простаивающее соединение на проверку отвечают — живой узел подтверждает её сам, без
+ *     приложения, — и не трогаются.
+ * Плата — одна пустая проверка TCP на соединение за порог простоя (52 байта), и только пока соединение
+ * живёт (простаивающие убирает IDLE_EVICT_S).
+ *
+ * Сокет не TCP (у hysteria2 связь — пара SOCK_SEQPACKET к мультиплексору) — первый же setsockopt
+ * откажет, и дальше не пробуем: у QUIC своё время простоя. */
+static void node_sock_silence(int fd) {
+    int t = g_dl->silence_s;
+    if (t <= 0 || fd < 0) return;
+    unsigned ms = (unsigned)t * 1000u;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &ms, sizeof ms) != 0) return;
+    int one = 1, idle = t, intvl = t / 4 ? t / 4 : 1;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof intvl);
+}
+
+/* Связь оборвана, а не закрыта: сокет TCP в CLOSE — ядро оборвало её по сроку (порог молчания выше)
+ * или узел прислал RST. Закрытие узлом (FIN) оставляет CLOSE_WAIT, ошибка разбора протокола — живой
+ * ESTABLISHED; ни то ни другое обрывом не считается. Не TCP — не знаем, и 0. */
+static int node_sock_aborted(int fd) {
+    struct tcp_info ti;
+    socklen_t tl = sizeof ti;
+    if (fd < 0 || getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &tl) != 0) return 0;
+    return ti.tcpi_state == TCP_CLOSE;
+}
+
 /* Одно отображение на поток цикла: горячая таблица, списки и корзины, за ними — сессии. */
 struct conn_tables {
     struct conn conns[MAX_CONNS];
@@ -682,9 +742,10 @@ static void stats_dump(uint64_t window_ns) {
 static int g_trace;
 #define TR(...) do { if (g_trace) fprintf(stderr, "tun: " __VA_ARGS__); } while (0)
 
-/* Слежка за узлом (клиент под демоном сам говорит, жив ли узел) жила здесь и переехала в модуль
- * протокола — proto/vless/vlwatch.c: её мера — проверка VLESS, кандидаты — узлы подписки. Исходы
- * рукопожатий установщика доходят до неё через дайлер (connect в vldial.c). */
+/* Слежка за узлом (клиент под демоном сам говорит, жив ли узел) жила здесь, переехала в модуль
+ * протокола (proto/vless/vlwatch.c), а оттуда — в пул узлов выхода (tunnel/pool.c): N активных узлов,
+ * мера — проверка протокола (у VLESS — vless_probe), исходы рукопожатий и обрывы связи доходят до неё
+ * через дайлер пула (connect, lost). */
 
 /* ---- пул установщиков ------------------------------------------------------
  *
@@ -901,6 +962,15 @@ static int spare_checkout(void *out) {
             sp->state = SPARE_EMPTY;
             continue;
         }
+        /* Узлов несколько (пул, pool.c): запасная связь — к своему узлу, и годится не всякому
+         * соединению; связь к узлу, который больше не активен, — выбросить. */
+        int m = d->match ? d->match(g_dl->ctx, out, sp->sess) : 1;
+        if (m < 0) {
+            d->close(sp->sess);
+            sp->state = SPARE_EMPTY;
+            continue;
+        }
+        if (!m) continue;
         if (!best || sp->born_ns < best->born_ns) best = sp;
     }
     /* Переселение связи — у дайлера: что в сессии связь, а что состояние потока, и какие в
@@ -1271,12 +1341,30 @@ static void send_synack(struct conn *c, const struct tun_dev *tun) {
 static void conn_reset(struct conn *c, const struct tun_dev *tun) {
     if (c->is_udp) { conn_drop(c); return; }
     unsigned char rst[64];
+    /* Клиент принимает RST только с номером, РАВНЫМ ожидаемому (RFC 5961); номер внутри окна, но не
+     * тот, — повод для «challenge ACK», а соединение у него остаётся. Пока в пути есть
+     * неподтверждённое, ожидаемый — либо our_seq (всё дошло, подтверждение в пути), либо client_ack
+     * (не дошло ничего): сначала RST вторым номером, потом первым. Дошла часть — клиент ответит
+     * challenge ACK, а на подтверждение без соединения ответит RST handle_packet. */
+    if (c->client_ack != c->our_seq) {
+        size_t rl = tcp_build(rst, sizeof(rst), c->key.dst, c->key.src, c->key.dport, c->key.sport,
+                              c->client_ack, c->client_seq, TCP_RST | TCP_ACK, NULL, 0, 0, 0, -1);
+        if (rl) tun_write_ctl(tun, rst, rl);
+    }
     size_t rl = tcp_build(rst, sizeof(rst), c->key.dst, c->key.src,
                           c->key.dport, c->key.sport,
                           c->our_seq, c->client_seq, TCP_RST | TCP_ACK,
                           NULL, 0, 0, 0, -1);
     if (rl) tun_write_ctl(tun, rst, rl);
     conn_drop(c);
+}
+
+/* Связь соединения с узлом кончилась ошибкой: если она оборвана (node_sock_aborted), сказать дайлеру
+ * — у слежки за узлом это повод проверить его сейчас. 1 — оборвана. */
+static int conn_node_lost(struct conn *c) {
+    if (!node_sock_aborted(c->fd)) return 0;
+    if (g_dl->ops->lost) g_dl->ops->lost(g_dl->ctx, SESS(c));
+    return 1;
 }
 
 /* Отдать серверу ранние данные. 0 — буфер пуст и освобождён; 1 — остался хвост (окно
@@ -1648,6 +1736,7 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
          * (dialer.h). */
         if (g_spare_want > 0 && !(g_dl->ops->caps & DC_UDP_OWN) && spare_checkout(SESS(c)) == 0) {
             c->fd = g_dl->ops->fd(SESS(c));
+            node_sock_silence(c->fd);
             TR("UDP: взята запасная сессия\n");
         } else if ((qr = conn_submit(c)) == 0) {
             c->pending = 1;
@@ -1820,6 +1909,7 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         /* Запасная сессия: рукопожатие сделано заранее, поток готов уже сейчас. */
         if (g_spare_want > 0 && spare_checkout(SESS(c)) == 0) {
             c->fd = g_dl->ops->fd(SESS(c));
+            node_sock_silence(c->fd);
             send_synack(c, tun);
             spare_refill();
             TR("SYN: взята запасная сессия\n");
@@ -1873,7 +1963,24 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
     }
 
 
-    if (!c) return;                                 /* данные без соединения — игнор */
+    if (!c) {
+        /* Сегмент без соединения. Так бывает после перезапуска клиента выхода (соединения приложений
+         * пережили прежний процесс, а в нашей таблице их нет) и после нашего RST, который клиент не
+         * принял: номер не совпал с ожидаемым, и он ответил «challenge ACK» (RFC 5961, см.
+         * conn_reset). Молчать значит оставить приложение ждать своего таймаута на соединении,
+         * которого больше нет; RST по правилу TCP (RFC 793: номер — его подтверждение, на RST не
+         * отвечаем) — и оно переподключится сразу. Подтверждение нашего же FIN после закрытия
+         * тоже получит RST — клиент в это время уже дочитал поток, и закрыть его раньше срока
+         * TIME_WAIT ничего не ломает. Только при одном потоке цикла (g_one_worker). */
+        if (g_one_worker && !(k.tcp_flags & TCP_RST) && (k.tcp_flags & TCP_ACK)) {
+            unsigned char rst[64];
+            size_t rl = tcp_build(rst, sizeof(rst), k.dst, k.src, k.dport, k.sport,
+                                  k.ack, 0, TCP_RST, NULL, 0, 0, 0, -1);
+            if (rl) tun_write_ctl(tun, rst, rl);
+            TR("данные без соединения — RST\n");
+        }
+        return;
+    }
     c->last = g_now_s;
 
     /* Учитываем подтверждения и окно клиента с ЛЮБОГО его пакета, включая чистые ACK: без
@@ -2002,8 +2109,10 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         return;
     }
     if (sr != SEND_OK) {
+        /* RST, а не молча: приложение иначе ждало бы ответа на соединении, которого больше нет. */
         TR("отправка серверу не удалась\n");
-        conn_drop(c);
+        conn_node_lost(c);
+        conn_reset(c, tun);
         return;
     }
     c->client_seq += (uint32_t)data_n;
@@ -2124,6 +2233,8 @@ static void drain_conn(struct conn *c, const struct tun_dev *tun) {
              * закрыв соединение, мы уничтожим и кольцо. FIN уйдёт из общего прохода. */
             c->srv_closed = 1;
             c->closed_at = g_now_ns;
+            /* Оборвана, а не закрыта — клиенту RST из общего прохода (поле aborted). */
+            if (conn_node_lost(c) && !c->is_udp) c->aborted = 1;
             TR("сервер закрыл conn#%ld, ждём подтверждения %u байт\n",
                (long)(c - g_conns), c->rtx.len);
             return;
@@ -2148,6 +2259,159 @@ static void drain_conn(struct conn *c, const struct tun_dev *tun) {
     }
 }
 
+/* Установщик доложил по соединению c (done): связь готова или нет. Зовёт проход цикла по заявкам
+ * (worker_loop); отдельной функцией — ради стенда (tests/poolmatch.c). 1 — соединение закрыто (его
+ * место в g_live занял другой), 0 — поток готов. */
+static int conn_ready(struct conn *c, const struct tun_dev *tun) {
+    const struct dialer_ops *d = g_dl->ops;
+    c->pending = 0;
+    c->fd = d->fd(SESS(c));
+    if (c->rc == 0) node_sock_silence(c->fd);
+    if (c->client_gone) {
+        /* Клиент передумал, пока шло рукопожатие. Отвечать некому — просто
+         * закрываем и поток к узлу, и запись. */
+        conn_drop(c);
+        return 1;
+    }
+    if (c->rc != 0) {
+        /* С причиной, а не «не открылся»: код различает «TCP не соединился»,
+         * «сервер не признал ключ» и «сервер не согласился на HTTP/2». */
+        fprintf(stderr, LOG_W "поток к %s не открылся: %s (rc=%d)\n",
+                d->peer_of ? d->peer_of(g_dl->ctx, SESS(c)) : d->peer(g_dl->ctx),
+                d->strerror(c->rc), c->rc);
+        /* RST, а не молчание: клиент иначе ждёт до таймаута. Молчать я пробовал —
+         * страница с видео перестала открываться вовсе, потому что браузер
+         * использует быстрый отказ лучше, чем ожидание. */
+        conn_reset(c, tun);
+        return 1;
+    }
+    /* Пока шло рукопожатие, узел соединения перестал быть активным (заменён): нести через
+     * него нечего, клиент переподключится к живому. */
+    if (d->stale && d->stale(g_dl->ctx, SESS(c))) {
+        conn_reset(c, tun);
+        return 1;
+    }
+    /* Ранние данные, которые клиент успел прислать за время рукопожатия, —
+     * серверу, первым делом и до любых свежих пакетов. */
+    if (c->early && early_flush(c) < 0) {
+        conn_reset(c, tun);
+        return 1;
+    }
+    c->last = g_now_s;
+    TR("поток готов (conn#%ld), ранние данные ушли\n", (long)(c - g_conns));
+    return 0;
+}
+
+/* Набор узлов сменился (stack_nodes_changed): соединения через узел, который больше не активен, — в
+ * сброс ближайшим проходом сроков (aborted: RST, а не FIN). Приложение переподключится сразу и
+ * попадёт на живой узел, а не будет ждать своего таймаута на повисшем. seen — счёт перемен, уже
+ * разобранных этим потоком цикла. */
+static void nodes_sweep(unsigned *seen, uint64_t now) {
+    unsigned ep_now = __atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE);
+    if (ep_now == *seen) return;
+    *seen = ep_now;
+    const struct dialer_ops *d = g_dl->ops;
+    for (int li = 0; d->stale && li < g_live_n; li++) {
+        struct conn *c = &g_conns[g_live[li]];
+        if (c->pending || c->aborted || !d->stale(g_dl->ctx, SESS(c))) continue;
+        c->srv_closed = 1;
+        c->aborted = 1;
+        c->closed_at = now;
+    }
+}
+
+/* Сроки одного соединения — повтор, хвост ранних данных, закрытие после сервера или обрыва, уборка
+ * задержавшихся. Один проход цикла на все соединения зовёт это по живым (worker_loop); отдельной
+ * функцией — ради стенда (tests/poolmatch.c): сроки видны снаружи только пакетами в устройство. 1 —
+ * соединение закрыто (его место в g_live занял другой), 0 — живо. */
+static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t now) {
+    /* Хвост ранних данных, не поместившийся в окно h2 на готовности потока:
+     * дослать. Новых данных клиента может и не быть — досылать больше некому. */
+    if (c->early && early_flush(c) < 0) {
+        conn_reset(c, tun);
+        return 1;
+    }
+
+    /* Истёкшие сроки — повторяем. После обработки пакетов, а не до: подтверждение,
+     * приехавшее в этом же витке, могло снять надобность. */
+    if (c->rtx.len && c->rtx_at &&
+        (now - c->rtx_at) / 1000000 >= c->rto_ms)
+        rtx_resend(c, tun, "истёк таймаут");
+
+    /* Оборванная связь или узел, который больше не активен: RST клиенту сразу, без
+     * дожидания подтверждений — данных за обрывом всё равно не будет (у UDP — просто
+     * закрытие). */
+    if (c->srv_closed && c->aborted) {
+        TR("conn#%ld: связь с узлом оборвана — RST клиенту\n", (long)(c - g_conns));
+        conn_reset(c, tun);
+        return 1;
+    }
+
+    /* Поток UDP, закрытый узлом: ждать нечего и прощаться нечем — ни кольца
+     * неподтверждённого, ни FIN у датаграмм не бывает. Освобождаем сразу; если
+     * клиент пришлёт ещё датаграмму, откроется новый поток. */
+    if (c->srv_closed && c->is_udp) {
+        TR("узел закрыл поток UDP conn#%ld\n", (long)(c - g_conns));
+        conn_drop(c);
+        return 1;
+    }
+
+    /* Клиент закрыл свою половину и замолчал, а сервер своей не закрывает (узнать
+     * о FIN клиента ему неоткуда): дальше ждать нечего — закрываем тем же путём,
+     * что и после сервера. */
+    if (c->client_fin && !c->srv_closed && g_now_s - c->last > CLOSE_DRAIN_MS / 1000) {
+        c->srv_closed = 1;
+        c->closed_at = now;
+    }
+
+    /* Закрытые сервером: как только клиент подтвердил всё — FIN и закрываем. Если не
+     * подтвердил за отведённое время, закрываем всё равно: клиент мог уйти совсем. */
+    if (c->srv_closed) {
+        int drained = c->rtx.len == 0;
+        if (!drained && (now - c->closed_at) / 1000000 < CLOSE_DRAIN_MS) return 0;
+        if (!drained)
+            TR("conn#%ld: клиент не подтвердил %u байт за %d мс, закрываю\n",
+               (long)(c - g_conns), c->rtx.len, CLOSE_DRAIN_MS);
+        /* FIN, иначе клиент будет ждать данных, которых больше не будет. */
+        unsigned char fin[64];
+        size_t fl = tcp_build(fin, sizeof(fin), c->key.dst, c->key.src,
+                              c->key.dport, c->key.sport,
+                              c->our_seq, c->client_seq, TCP_FIN | TCP_ACK,
+                              NULL, 0, 0, 0, -1);
+        if (fl) tun_write_ctl(tun, fin, fl);
+        conn_drop(c);
+        return 1;
+    }
+
+    /* Пустое кольцо отдаём обратно системе. Соединение при этом полностью рабочее:
+     * при следующих данных кольцо появится снова. Именно после простоя, а не сразу по
+     * опустошении, — иначе на каждом залпе подтверждений шли бы malloc и free. */
+    if (c->rtx.cap && !c->rtx.len && g_now_s - c->last > 5) rtx_done(&c->rtx);
+
+    /* Уборка задержавшихся: без неё таблица заполняется соединениями, которые клиент
+     * бросил без FIN, и новые перестают открываться.
+     *
+     * Порог — тот же IDLE_EVICT_S, что и у вытеснения: «мёртвое соединение» должно
+     * означать одно и то же в обоих местах. Пробовал шестьдесят, рассчитывая
+     * освобождать слоты раньше, — и получил RST по живым соединениям HTTP/2, которые
+     * браузер переиспользует после минуты простоя.
+     *
+     * RST обязателен. Прежде здесь было молчаливое conn_drop, и клиент оставался с
+     * соединением, которое считает открытым: следующий запрос по нему уходил в
+     * пустоту и ждал таймаута — то есть наша уборка выглядела как зависший сайт. */
+    if (g_now_s - c->last > IDLE_EVICT_S) {
+        /* Порог тот же, что у TCP, и это не экономия на константе. Простаивающий
+         * поток UDP — это, как правило, QUIC между запросами: у него свой таймаут
+         * простоя, и он короче нашего, то есть клиент бросит соединение первым.
+         * Убрав поток раньше него, мы поменяли бы у следующей датаграммы исходный
+         * порт НА СТОРОНЕ УЗЛА — для получателя это новый путь, и QUIC пришлось бы
+         * заново подтверждать его. Столько же держит и conntrack ядра. */
+        conn_reset(c, tun);                 /* у UDP это просто закрытие, без RST */
+        return 1;
+    }
+    return 0;
+}
+
 /* Что нужно потоку, чтобы работать: своя очередь устройства и свой номер. Больше ничего —
  * дайлер общий (g_dl), а остальное состояние у потока собственное (__thread и его таблицы). */
 struct worker {
@@ -2162,7 +2426,6 @@ struct worker {
 static void *worker_loop(void *arg) {
     struct worker *w = arg;
     struct tun_dev tun = w->tun;
-    const struct dialer_ops *dops = g_dl->ops;
     int tun_fd = tun.fd;
     g_worker = w->id;
 
@@ -2170,6 +2433,7 @@ static void *worker_loop(void *arg) {
     uint64_t stats_at = g_stats ? now_ns() : 0;
     uint64_t loop_at = 0;   /* когда вернулось прошлое ожидание — для оценки периода витка */
     uint64_t spare_at = 0;  /* когда последний раз выбрасывали протухший запас */
+    unsigned nodes_seen = __atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE);
     /* Таблицы потока — в куче (см. «таблицы потока» у g_conns). Прежде они были в TLS и
      * отказать не могли: не дали бы памяти — не создался бы сам поток. Теперь отказ свой, и
      * он такой же, как отказ epoll ниже: поток не запускается, очередь отдаётся остальным. */
@@ -2366,35 +2630,8 @@ static void *worker_loop(void *arg) {
         for (int li = 0; pend && li < g_live_n; ) {
             struct conn *c = &g_conns[g_live[li]];
             if (!c->pending || !__atomic_load_n(&c->done, __ATOMIC_ACQUIRE)) { li++; continue; }
-            c->pending = 0;
             pend--;
-            c->fd = dops->fd(SESS(c));
-            if (c->client_gone) {
-                /* Клиент передумал, пока шло рукопожатие. Отвечать некому — просто
-                 * закрываем и поток к узлу, и запись. */
-                conn_drop(c);
-                continue;                       /* слот занял другой — не двигаем индекс */
-            }
-            if (c->rc != 0) {
-                /* С причиной, а не «не открылся»: код различает «TCP не соединился»,
-                 * «сервер не признал ключ» и «сервер не согласился на HTTP/2». */
-                fprintf(stderr, LOG_W "поток к %s не открылся: %s (rc=%d)\n",
-                        dops->peer(g_dl->ctx), dops->strerror(c->rc), c->rc);
-                /* RST, а не молчание: клиент иначе ждёт до таймаута. Молчать я пробовал —
-                 * страница с видео перестала открываться вовсе, потому что браузер
-                 * использует быстрый отказ лучше, чем ожидание. */
-                conn_reset(c, &tun);
-                continue;
-            }
-            /* Ранние данные, которые клиент успел прислать за время рукопожатия, —
-             * серверу, первым делом и до любых свежих пакетов. */
-            if (c->early && early_flush(c) < 0) {
-                conn_reset(c, &tun);
-                continue;
-            }
-            c->last = g_now_s;
-            TR("поток готов (conn#%ld), ранние данные ушли\n", (long)(c - g_conns));
-            li++;
+            if (!conn_ready(c, &tun)) li++;
         }
 
         /* Готовность TUN ищем среди событий. Разбираем его ПЕРВЫМ, до чтения у серверов:
@@ -2482,86 +2719,11 @@ static void *worker_loop(void *arg) {
             spare_at = now;
             spare_sweep();
         }
+        nodes_sweep(&nodes_seen, now);
         for (int li = 0; li < g_live_n; ) {
             struct conn *c = &g_conns[g_live[li]];
-            if (c->pending) { li++; continue; }  /* установщик пишет в сессию — не трогать */
-
-            /* Хвост ранних данных, не поместившийся в окно h2 на готовности потока:
-             * дослать. Новых данных клиента может и не быть — досылать больше некому. */
-            if (c->early && early_flush(c) < 0) {
-                conn_reset(c, &tun);
-                continue;
-            }
-
-            /* Истёкшие сроки — повторяем. После обработки пакетов, а не до: подтверждение,
-             * приехавшее в этом же витке, могло снять надобность. */
-            if (c->rtx.len && c->rtx_at &&
-                (now - c->rtx_at) / 1000000 >= c->rto_ms)
-                rtx_resend(c, &tun, "истёк таймаут");
-
-            /* Поток UDP, закрытый узлом: ждать нечего и прощаться нечем — ни кольца
-             * неподтверждённого, ни FIN у датаграмм не бывает. Освобождаем сразу; если
-             * клиент пришлёт ещё датаграмму, откроется новый поток. */
-            if (c->srv_closed && c->is_udp) {
-                TR("узел закрыл поток UDP conn#%ld\n", (long)(c - g_conns));
-                conn_drop(c);
-                continue;                        /* на место этого встал другой */
-            }
-
-            /* Клиент закрыл свою половину и замолчал, а сервер своей не закрывает (узнать
-             * о FIN клиента ему неоткуда): дальше ждать нечего — закрываем тем же путём,
-             * что и после сервера. */
-            if (c->client_fin && !c->srv_closed && g_now_s - c->last > CLOSE_DRAIN_MS / 1000) {
-                c->srv_closed = 1;
-                c->closed_at = now;
-            }
-
-            /* Закрытые сервером: как только клиент подтвердил всё — FIN и закрываем. Если не
-             * подтвердил за отведённое время, закрываем всё равно: клиент мог уйти совсем. */
-            if (c->srv_closed) {
-                int drained = c->rtx.len == 0;
-                if (!drained && (now - c->closed_at) / 1000000 < CLOSE_DRAIN_MS) { li++; continue; }
-                if (!drained)
-                    TR("conn#%ld: клиент не подтвердил %u байт за %d мс, закрываю\n",
-                       (long)(c - g_conns), c->rtx.len, CLOSE_DRAIN_MS);
-                /* FIN, иначе клиент будет ждать данных, которых больше не будет. */
-                unsigned char fin[64];
-                size_t fl = tcp_build(fin, sizeof(fin), c->key.dst, c->key.src,
-                                      c->key.dport, c->key.sport,
-                                      c->our_seq, c->client_seq, TCP_FIN | TCP_ACK,
-                                      NULL, 0, 0, 0, -1);
-                if (fl) tun_write_ctl(&tun, fin, fl);
-                conn_drop(c);
-                continue;                        /* на место этого встал другой */
-            }
-
-            /* Пустое кольцо отдаём обратно системе. Соединение при этом полностью рабочее:
-             * при следующих данных кольцо появится снова. Именно после простоя, а не сразу по
-             * опустошении, — иначе на каждом залпе подтверждений шли бы malloc и free. */
-            if (c->rtx.cap && !c->rtx.len && g_now_s - c->last > 5) rtx_done(&c->rtx);
-
-            /* Уборка задержавшихся: без неё таблица заполняется соединениями, которые клиент
-             * бросил без FIN, и новые перестают открываться.
-             *
-             * Порог — тот же IDLE_EVICT_S, что и у вытеснения: «мёртвое соединение» должно
-             * означать одно и то же в обоих местах. Пробовал шестьдесят, рассчитывая
-             * освобождать слоты раньше, — и получил RST по живым соединениям HTTP/2, которые
-             * браузер переиспользует после минуты простоя.
-             *
-             * RST обязателен. Прежде здесь было молчаливое conn_drop, и клиент оставался с
-             * соединением, которое считает открытым: следующий запрос по нему уходил в
-             * пустоту и ждал таймаута — то есть наша уборка выглядела как зависший сайт. */
-            if (g_now_s - c->last > IDLE_EVICT_S) {
-                /* Порог тот же, что у TCP, и это не экономия на константе. Простаивающий
-                 * поток UDP — это, как правило, QUIC между запросами: у него свой таймаут
-                 * простоя, и он короче нашего, то есть клиент бросит соединение первым.
-                 * Убрав поток раньше него, мы поменяли бы у следующей датаграммы исходный
-                 * порт НА СТОРОНЕ УЗЛА — для получателя это новый путь, и QUIC пришлось бы
-                 * заново подтверждать его. Столько же держит и conntrack ядра. */
-                conn_reset(c, &tun);                /* у UDP это просто закрытие, без RST */
-                continue;
-            }
-            li++;
+            /* Заявка в работе — установщик пишет в сессию, не трогать. */
+            if (c->pending || !conn_deadlines(c, &tun, now)) li++;
         }
     }
     /* Сначала отпустить установщиков, только потом закрывать сессии: иначе закрываем то,
@@ -2654,6 +2816,7 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
     struct tun_dev queues[MAX_WORKERS];
     int want = worker_count();
     int n = tun_open(queues, want, dev);
+    g_one_worker = n == 1;
     /* Код выхода — ОДИН, и он положительный. Возвращая сюда -40 или -41, движок отдавал
      * их main, а тот отдавал ядру: отрицательное обрезается до байта, и procd получал 216
      * или 215. Число, которое ничего не значит ни для человека, ни для splify2. Причину
