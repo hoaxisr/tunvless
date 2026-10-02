@@ -23,6 +23,7 @@ import socket
 import socketserver
 import sys
 import threading
+import time
 
 ADDR_IPV4, ADDR_DOMAIN, ADDR_IPV6 = 1, 2, 3
 CMD_TCP, CMD_UDP = 1, 2
@@ -160,10 +161,20 @@ class Handler(socketserver.BaseRequestHandler):
         try:
             sock.sendall(head)
             chunk = 64 * 1024
+            # --kbps: отдавать не быстрее заданного — длинная закачка для стенда молчания узла
+            # (tests/run-silence.sh): узел «умирает» посреди передачи, а не после неё.
+            rate = self.server.kbps * 1024
+            if rate:
+                chunk = min(chunk, max(1024, rate // 10))
+            t0 = time.monotonic()
             while sent < body_n:
                 n = min(chunk, body_n - sent)
                 sock.sendall(self.server.filler[:n])
                 sent += n
+                if rate:
+                    ahead = sent / rate - (time.monotonic() - t0)
+                    if ahead > 0:
+                        time.sleep(ahead)
         except Exception as e:
             # Причину печатаем ВСЕГДА. Молчаливый обрыв тут выглядит как обрыв в туннеле —
             # именно на это и ушёл один заход отладки: сервер закрывал соединение сам, а
@@ -284,6 +295,7 @@ def main():
     # Стенду от этого доставалось заодно — туннель не поднимался вовсе, — поэтому сервер
     # стенда слушает на обычном адресе, который туннель считает законным узлом.
     ap.add_argument("--bind", default="127.0.0.1", help="адрес слушателя")
+    ap.add_argument("--kbps", type=int, default=0, help="предел отдачи, КБ/с (0 — без предела)")
     ap.add_argument("--udp-relay", action="store_true",
                     help="UDP (команда 2) пересылать по адресу из запроса, а не эхом")
     a = ap.parse_args()
@@ -292,6 +304,7 @@ def main():
     srv.uuid = bytes.fromhex(a.uuid.replace("-", ""))
     srv.body_n = a.mb * 1024 * 1024
     srv.udp_relay = a.udp_relay
+    srv.kbps = a.kbps
     # Наполнитель фиксированный: содержимое стенду безразлично, а генерация 64 КБ на
     # каждую порцию упиралась в питон, а не в туннель.
     srv.filler = bytes(i * 131 % 251 for i in range(64 * 1024))
