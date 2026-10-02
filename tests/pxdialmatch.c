@@ -144,6 +144,19 @@ static void test_trojan_udp(void) {
     trojan_deliver_bytes(dom, sizeof dom, sizeof dom);
     check("trojan udp: адрес-имя, затем IPv4 — две датаграммы", 2, (long)g_em_calls);
     check("trojan udp: нагрузка «pongok»", 1, g_em_n == 6 && !memcmp(g_em, "pongok", 6));
+    /* Неизвестный ATYP — поток UDP уже не разобрать: соединению конец, а не тихий сдвиг. */
+    {
+        const struct dialer_ops *ops = &proxy_trojan_dialer;
+        struct px_node node; memset(&node, 0, sizeof node);
+        void *sess = calloc(1, ops->sess_size);
+        ops->clear(sess);
+        struct flow_key k; memset(&k, 0, sizeof k);
+        ops->flow_open(&node, sess, &k, 1);
+        static const unsigned char bad[] = { 9, 0, 0, 0, 0, 0, 0, 0x00, 0x02, '\r', '\n', 'x', 'y' };
+        check("trojan udp: неизвестный ATYP — конец соединения", -1,
+              ops->deliver(&node, sess, 1, bad, sizeof bad, emit, NULL));
+        free(sess);
+    }
     trojan_deliver_bytes(dom, sizeof dom, 1);
     check("trojan udp: адрес-имя по байту — две датаграммы", 2, (long)g_em_calls);
     check("trojan udp: по байту — нагрузка «pongok»", 1, g_em_n == 6 && !memcmp(g_em, "pongok", 6));

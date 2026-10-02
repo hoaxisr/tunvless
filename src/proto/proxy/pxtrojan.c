@@ -153,6 +153,7 @@ static int tj_udp_down(struct trojan_sess *s, const unsigned char *d, size_t n,
         case TJ_ADDR:
             if (!s->ahdr) {
                 unsigned atyp = d[0];
+                if (atyp != 1 && atyp != 3 && atyp != 4) return -1;   /* границ дальше не найти */
                 d++; n--;
                 s->ahdr = 1;
                 s->alen = atyp == 1 ? 4 + 2 : atyp == 4 ? 16 + 2 : 0;
