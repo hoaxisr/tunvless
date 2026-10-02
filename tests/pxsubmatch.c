@@ -75,6 +75,16 @@ static void test_sub(void) {
     const char *one = "trojan://p@h.example:443?security=tls&sni=a";
     /* простое ручное base64 здесь не нужно — px_sub_text разворачивает; проверим список как есть */
     (void)b64; (void)one;
+
+    /* Строка длиннее прежнего буфера разбора (8192): узел обязан разобраться, а не уйти в «чужие»
+     * по неинициализированному буферу. Длину даёт имя узла — у живых подписок оно бывает длинным. */
+    static char longsub[20000];
+    size_t o = (size_t)snprintf(longsub, sizeof longsub, "trojan://p@h.example:443?security=tls&sni=a#");
+    while (o < 12000) longsub[o++] = 'n';
+    snprintf(longsub + o, sizeof longsub - o, "\nss://aes-128-gcm:q@h3.example:1234\n");
+    got = px_parse_sub(longsub, out, 16, 0, &st);
+    check("подписка: строка длиннее 8192 — узел разобран", 2, (long)got);
+    check("подписка: длинная строка не чужая", 0, (long)st.foreign);
 }
 
 int main(void) {

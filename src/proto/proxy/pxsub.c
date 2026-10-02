@@ -489,20 +489,17 @@ size_t px_parse_sub(const char *text, struct px_node *out, size_t max, enum px_p
         if (!*p) break;
         const char *e = p;
         while (*e && *e != '\n' && *e != '\r') e++;
-        size_t len = (size_t)(e - p);
-        char line[8192];
-        if (len && len < sizeof(line)) {
-            memcpy(line, p, len);
-            line[len] = '\0';
-            struct px_node node;
-            int rc = px_parse_url(line, &node, want);
-            if (rc == 0 && n < max) out[n++] = node;
-            else if (rc == 0) px_skip_note(st, &node, "узлов больше, чем помещается");
-            else if (rc > 0) px_skip_note(st, &node, node.skip_reason);
-            else if (strstr(line, "://") && st) st->foreign++;
-        } else if (len && strstr(line[0] ? line : p, "://") && st) {
-            st->foreign++;
-        }
+        /* Строка — в куче своей длины: буфер постоянного размера был пределом длины ссылки, а
+         * строка длиннее него читалась из неинициализированного буфера. */
+        char *line = strndup(p, (size_t)(e - p));
+        if (!line) break;
+        struct px_node node;
+        int rc = px_parse_url(line, &node, want);
+        if (rc == 0 && n < max) out[n++] = node;
+        else if (rc == 0) px_skip_note(st, &node, "узлов больше, чем помещается");
+        else if (rc > 0) px_skip_note(st, &node, node.skip_reason);
+        else if (strstr(line, "://") && st) st->foreign++;
+        free(line);
         p = e;
     }
     return n;
