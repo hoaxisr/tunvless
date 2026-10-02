@@ -34,12 +34,12 @@ xsteer — [docs/xsteer.md](xsteer.md).
 | `libsteer-wolfssl.so.<версия wolfSSL>` | `build/wolfssl/build.sh` | наша сборка wolfSSL (`build/wolfssl/user_settings.h`, QUIC включён) — только достижимое от экспорта; в `libsteer.so` — ещё ngtcp2 с патчем Brutal и обёртка `src/proto/quic` |
 | `libsteer.so.<версия ядра steer>` | `LIBSTEER_SRC` | модель спеки с libyaml, платформа, реестр и файлы видов, разбор командной строки, линия событий, обфускатор (`obfs.c`), слой примитивов, TLS 1.3, REALITY, h2, транспорты, стек TUN и `tun.c` |
 | `steerd` | `STEERD_DYN_SRC` = `DAEMON_SRC` + `urltls.c` | демон, компилятор правил, apply, сторож, супервизор, резолвер, заглушки команд модулей (`src/cli/modcmd.c`) |
-| `steer-vless` | `VLESS_MODULE_SRC` | клиент VLESS: `vlmain`, `vldial`, `vlwatch`, `client`, `vless_proto`, `vision`, разбор и скачивание подписки, проба TLS |
+| `steer-vless` | `VLESS_MODULE_SRC` | клиент VLESS: `vlmain`, `vldial`, `client`, `vless_proto`, `vision`, разбор и скачивание подписки, проба TLS; пул узлов и слежка (`src/tunnel/pool.c`) — в `libsteer`, со стеком |
 | `steer-xsteer` | `XSTEER_MODULE_SRC` | клиент звезды: `xsclient` и общая часть формата (`xswire`, `xsconf`, `xslink`, `xsroute`, `xsconn`, `xsstream`, `xsepoch`, `xshake`), служебные команды `xsadmin` |
 | `steer-obfs` | `OBFS_MODULE_SRC` | точка входа обфускатора (`obfsmain.c`); сам `obfs.c` — в `libsteer`, его зовёт и xsteer |
 | `steer-tgws` | `TGWS_MODULE_SRC` | мост Telegram (`tgws.c`); правила перехвата пишет ядро (`kinds/tgws.c`) |
 | `steer-hysteria2` | `HY2_MODULE_SRC` | клиент hysteria2 ([docs/hysteria2.md](hysteria2.md)): провод (`hy2wire`), узлы и подписка (`hy2sub`), соединение QUIC и мультиплексор потоков (`hy2conn`), дайлер стека (`hy2dial`), команды и слежка (`hy2main`); запись вида — `kinds/hysteria2.c` в `libsteer` (`KINDS_HY2_SRC`); в статические профили и в телефон не входит |
-| `steer-proxy` | `PROXY_MODULE_SRC` | клиенты прокси ([docs/proxy.md](proxy.md)): trojan, shadowsocks, socks, http, vmess одним бинарником — провод и вывод ключей (`pxwire`), узлы и подписка (`pxsub`), общее дайлеров (`pxdial`), по файлу на протокол (`pxtrojan`, `pxss`, `pxsocks`, `pxhttp`, `pxvmess`), команды и слежка (`pxmain`); дайлеры — поверх стека `src/tunnel` и транспорта `src/proto/transport`, как vless; записи пяти видов — `kinds/proxy.c` в `libsteer` (`KINDS_PROXY_SRC`); в статические профили и в телефон не входит (как hysteria2) |
+| `steer-proxy` | `PROXY_MODULE_SRC` | клиенты прокси ([docs/proxy.md](proxy.md)): trojan, shadowsocks, socks, http, vmess одним бинарником — провод и вывод ключей (`pxwire`), узлы и подписка (`pxsub`), общее дайлеров (`pxdial`), по файлу на протокол (`pxtrojan`, `pxss`, `pxsocks`, `pxhttp`, `pxvmess`), команды (`pxmain`), слежка — пул узлов `src/tunnel/pool.c`; дайлеры — поверх стека `src/tunnel` и транспорта `src/proto/transport`, как vless; записи пяти видов — `kinds/proxy.c` в `libsteer` (`KINDS_PROXY_SRC`); в статические профили и в телефон не входит (как hysteria2) |
 
 Каждый модуль — свой `main` (`src/modules/main_<имя>.c`) и `src/cli/modcmd.c`; линкуется он с
 `libsteer.so`, thread-local таблицы туннеля живут в куче потока (раздел «Туннели»). В модуле нет
@@ -230,15 +230,17 @@ src/
   tools/      aggregate.c (fit), srsread.c, hwid.c
   tunnel/     стек туннеля без протокола: tun.c (TUN: очереди, разгрузка, запись пакетов),
               rtx.c (кольцо повтора), stack.c и stack.h (TCP/UDP ↔ потоки к узлу, таблица
-              соединений, пул установщиков, запасные сессии), dialer.h (struct dialer_ops)
+              соединений, пул установщиков, запасные сессии), dialer.h (struct dialer_ops),
+              pool.c и pool.h (пул узлов выхода: N активных узлов, раздача соединений, слежка
+              за каждым и замена мёртвого без перезапуска — обёртка дайлера)
   proto/      tls/ (tls13, certverify, reality, chello, h2, roots — корни проверки сертификата,
               tlsprobe, urltls)
               transport/ (transport.h — struct transport_ops и security_ops; transport.c —
               сборка ярусов и транспорт tcp; trdial.c — сокет до узла; trsec.c — none, tls,
               reality; trgrpc.c; trxhttp.c; trupgrade.c — запрос Upgrade по HTTP/1.1 и
               httpupgrade; trws.c — кадры WebSocket; trpath.c — путь запроса Upgrade)
-              vless/ (vlmain.c — подкоманды vless*, vldial.c — дайлер стека, vlwatch.c — слежка
-              за узлом, client.c — vless_connect и проверка узла, vless_proto, vision, sub,
+              vless/ (vlmain.c — подкоманды vless*, vldial.c — дайлер стека, client.c —
+              vless_connect и проверка узла, vless_proto, vision, sub,
               subfetch; sublink.c — ссылка узла и поля транспорта, общие с модулем steer-proxy)
               proxy/ (trojan, shadowsocks, socks, http, vmess: pxwire, pxsub, pxdial, pxtrojan,
               pxss, pxsocks, pxhttp, pxvmess, pxmain — модуль steer-proxy, docs/proxy.md)
@@ -369,7 +371,9 @@ ingress не разбирал: устройство без хука, клиен�
   датаграмм. Дайлеры — VLESS (`src/proto/vless/vldial.c`: заголовок VLESS, Vision, UDP командой 2) и
   протоколы прокси (`src/proto/proxy`: trojan, shadowsocks, socks, http, vmess — по файлу на
   протокол; docs/proxy.md), а hysteria2 ходит своим путём (QUIC, `src/proto/hysteria2`). Подкоманды
-  `steer vless*` / `steer proxy*`, выбор узла и слежка — в модуле протокола (`vlmain.c`/`pxmain.c`);
+  `steer vless*` / `steer proxy*` и выбор первого узла — в модуле протокола (`vlmain.c`/`pxmain.c`),
+  а N активных узлов, раздача соединений и слежка — у пула узлов (`src/tunnel/pool.c`): он обёртка
+  дайлера, ctx протокола у него по-прежнему узел, только узел свой у каждого соединения;
 - **транспорт** (`src/proto/transport`): как поток дайлера едет до узла — сокет по всем адресам
   имени с меткой `over` (`trdial.c`), безопасность `security=` — none, tls, reality (`trsec.c`) —
   и транспорт `type=` — tcp, grpc, xhttp, ws, httpupgrade (`transport.c`, `trgrpc.c`, `trxhttp.c`,
@@ -393,6 +397,8 @@ struct dialer_ops {              /* src/tunnel/dialer.h */
     int  (*deliver)(const void *ctx, void *sess, int udp, const unsigned char *d, size_t n,
                     dialer_emit_fn emit, void *arg);   /* кусками потока или датаграммами */
     /* служебные: peer, describe, strerror, close, clear, fd, has_data */
+    /* узлов несколько (пул, pool.c; NULL — узел один): peer_of, match — годится ли запасная,
+     * stale — узел соединения больше не активен (RST), lost — связь оборвана ядром или узлом */
 };
 
 struct transport_ops {           /* src/proto/transport/transport.h — tcp, grpc, xhttp, ws, httpupgrade */
@@ -417,7 +423,8 @@ struct security_ops {            /* none, tls, reality */
   рукопожатием — после него у tls и reality одни и те же записи TLS 1.3, — поэтому у
   `security_ops` одна функция, а поток после рукопожатия общий. Вторая связь xhttp (stream-up,
   packet-up) поднимается тем же `tr_link_open`, что и основная.
-- **У дайлера нет своих `open_tcp`/`open_udp`.** Узел один на процесс, связь — одна на поток
+- **У дайлера нет своих `open_tcp`/`open_udp`.** Узел у протокола один на соединение (у пула узлов —
+  свой у каждого соединения, без пула — один на процесс), связь — одна на поток
   клиента, и открывает её установщик стека (`connect`); TCP и UDP различаются флагом в
   `flow_open`, `send` и `deliver` — у VLESS это одна связь с другой командой в заголовке.
   Датаграммы едут байтами потока (`dgram_frame`).
@@ -730,9 +737,9 @@ JSON (`src/daemon/ctl.c`). `status`, `diag`, `explain`, `conns`, `dns-log` де�
 для демона и `steer supervise`. Маршрут выхода к устройству помощника ставит демон: по первому `up`
 с `dev` за жизнь процесса он привязывает таблицу выхода к устройству (`bind_device`) в своём
 процессе; следующие `up` маршрут не трогают, после `down` и выхода процесса решает сторож
-(`on_fail`). Без демона маршрут выхода к устройству помощника не привязывает никто. Клиент VLESS под
-демоном сам следит за узлом (`src/proto/vless/vlwatch.c`), и сторож принимает его `up` и `down` без
-своей пробы.
+(`on_fail`). Без демона маршрут выхода к устройству помощника не привязывает никто. Клиент VLESS (и
+протоколов прокси) сам следит за своими активными узлами (`src/tunnel/pool.c`), и сторож принимает
+его `up` и `down` без своей пробы.
 
 **Apply-сверка** (`src/daemon/recon.c`). `apply` и `reload` строят план новой спеки в ребёнке
 (`apply-plan`: проверки dry-run и отпечатки частей) и применяют только изменившиеся части
