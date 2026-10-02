@@ -40,5 +40,5 @@ for a in "$@"; do apps="$apps ${a%%:*}:$(inside "${a#*:}")"; done
 docker run --rm -v "$MOUNT:/w" -w "$(inside "$STEER")" --entrypoint sh \
     -e CC="zig cc -target $target -mcpu=$mcpu" -e AR="zig ar" -e ZIG=1 \
     -e INTERP="$(interp_of "$target" "$mcpu")" -e STEER_EXT_APPS="${apps# }" -e STEER_EXT_ONLY=1 "$IMAGE" -c \
-    'build/build-libs.sh "$1" "$2" "$3"; rc=$?; rm -rf "$1/obj"; chown -R "$4" "$1"; exit $rc' _ \
+    'sh build/build-libs.sh "$1" "$2" "$3"; rc=$?; rm -rf "$1/obj"; chown -R "$4" "$1"; exit $rc' _ \
     "$(inside "$OUTD")" "$VERSION" "$REV" "$(id -u):$(id -g)"

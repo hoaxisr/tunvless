@@ -339,7 +339,7 @@ for spec in $ISAS; do
     if docker run --rm -v "$PWD:/src" -w /src --entrypoint sh \
             -e CC="zig cc -target $target -mcpu=$mcpu" -e AR="zig ar" -e ZIG=1 \
             -e INTERP="$(interp_of "$target" "$mcpu")" "$IMAGE" -c \
-            '/src/build/build-libs.sh "$1" "$2" "$3"; rc=$?; rm -rf "$1/obj"; chown -R "$4" "$1"; exit $rc' _ \
+            'sh /src/build/build-libs.sh "$1" "$2" "$3"; rc=$?; rm -rf "$1/obj"; chown -R "$4" "$1"; exit $rc' _ \
             "/src/$libs" "$VERSION" "$REV" "$(id -u):$(id -g)" \
             >"build/$arch-libs.log" 2>"build/$arch-libs.err"; then
         echo "libsteer $(stat -c %s "$libs"/libsteer.so.*) + wolfssl $(stat -c %s "$libs"/libsteer-wolfssl.so.*)" \
