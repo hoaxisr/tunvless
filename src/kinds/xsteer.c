@@ -35,7 +35,7 @@ static int xsteer_parse(struct output *o, const struct out_keys *k, struct err *
     /* Устройство у выхода ОДНО — его создаёт клиент этого выхода (довод тот же, что у vless и
      * awg): пул — это группа, `devices` у kind=interface. */
     if (k->devices_n > 1 || (k->devices_n == 1 && strcmp(o->device, k->devices[0]) != 0))
-        return err_set(e, "outputs.%s: у kind xsteer одно устройство — его заводит движок; пул "
+        return err_set(e, "outputs.%s: у kind xsteer одно устройство — его заводит ядро steer; пул "
             "собирается выходом kind=interface", o->name);
     if (!o->xs.conf[0])
         snprintf(o->xs.conf, sizeof(o->xs.conf), "%s/xsteer/%.200s.conf", plat()->etc_dir, o->name);

@@ -159,7 +159,7 @@ if [ -x "$XK" ]; then
         bad "пример раздела 3 на роутере — отказ «только на телефоне» с местом" "$out"; fi
     grep -v '^  tg:' "$tmp/arch.yaml" > "$tmp/arch2.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec arch2.yaml --state-dir "$tmp/state" 2>&1)"
-    if echo "$out" | grep -qF "ещё не поддерживается в этой версии движка"; then ok; else
+    if echo "$out" | grep -qF "ещё не поддерживается в этой версии ядра steer"; then ok; else
         bad "пример раздела 3 — отказ «ещё не поддерживается»" "$out"; fi
     # balance и IPv6: член без IPv6 (VLESS) — группа без IPv6; её IPv6 первым правилом цепочки
     # уходит в метку группы, а forward_v6 его отвергает (отказ, а не часть соединений мимо туннеля).

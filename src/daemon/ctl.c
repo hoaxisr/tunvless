@@ -966,7 +966,7 @@ static int job_start(struct conn *c, char *const argv[], int timeout_s, size_t o
 /* Общий случай: подкоманда целиком — её код и вывод. */
 static void sub_done(struct conn *c, int code) {
     struct job *j = &c->job;
-    if (code < 0) { resp_error(&c->resp, "internal", "не удалось дождаться движка"); conn_reply(c); return; }
+    if (code < 0) { resp_error(&c->resp, "internal", "не удалось дождаться ядра"); conn_reply(c); return; }
     resp_run(&c->resp, code, &j->out, &j->err);
     if (j->timed_out) resp_error(&c->resp, "timeout", "команда не уложилась в свой срок и остановлена");
     conn_reply(c);
@@ -976,7 +976,7 @@ static void st_sub(struct conn *c) {
     char *av[16];
     ctl_argv(&c->q, c->q.cmd->sub, av, sizeof(av) / sizeof(av[0]));
     if (job_start(c, av, c->q.cmd->timeout_s, CTL_OUT_MAX, CTL_ERR_MAX, sub_done) != 0) {
-        resp_error(&c->resp, "internal", "не удалось запустить движок");
+        resp_error(&c->resp, "internal", "не удалось запустить ядро");
         conn_reply(c);
     }
 }
@@ -1366,7 +1366,7 @@ static void dry_argv(struct conn *c, const char *path, char **av) {
 static void check_done(struct conn *c, int code) {
     struct cbuf none = {0};
     unlink(c->tmp);
-    if (code < 0) { resp_error(&c->resp, "internal", "не удалось дождаться движка"); conn_reply(c); return; }
+    if (code < 0) { resp_error(&c->resp, "internal", "не удалось дождаться ядра"); conn_reply(c); return; }
     resp_run(&c->resp, code, &none, &c->job.err);
     if (c->job.timed_out) resp_error(&c->resp, "timeout", "проверка не уложилась в свой срок и остановлена");
     conn_reply(c);
@@ -1390,7 +1390,7 @@ static void st_check(struct conn *c) {
     dry_argv(c, c->tmp, av);
     if (job_start(c, av, 120, 1, CTL_ERR_MAX, check_done) != 0) {
         unlink(c->tmp);
-        resp_error(&c->resp, "internal", "не удалось запустить движок");
+        resp_error(&c->resp, "internal", "не удалось запустить ядро");
         conn_reply(c);
     }
 }
@@ -1503,7 +1503,7 @@ static void apply_planned(struct conn *c, int code) {
     const char *spec = plat_spec_resolve(s->cf.spec);
     if (code != 0 || j->timed_out) {
         unlink(c->tmp);
-        if (code < 0) { resp_error(&c->resp, "internal", "не удалось дождаться движка"); conn_reply(c); return; }
+        if (code < 0) { resp_error(&c->resp, "internal", "не удалось дождаться ядра"); conn_reply(c); return; }
         resp_run(&c->resp, code, &none, &j->err);
         resp_bool(&c->resp, "saved", 0);
         resp_bool(&c->resp, "applied", 0);
@@ -1627,7 +1627,7 @@ static void st_apply(struct conn *c) {
     }
     if (plan_start(c, c->tmp, apply_planned) != 0) {
         unlink(c->tmp);
-        resp_error(&c->resp, "internal", "не удалось запустить движок");
+        resp_error(&c->resp, "internal", "не удалось запустить ядро");
         conn_reply(c);
     }
 }
@@ -1838,7 +1838,7 @@ static void st_reload(struct conn *c) {
     }
     if (plan_start(c, c->srv->cf.spec, reload_planned) != 0) {
         struct cbuf e = {0};
-        cb_str(&e, LOG_W "не удалось запустить движок\n");
+        cb_str(&e, LOG_W "не удалось запустить ядро\n");
         c->rcode = 127;
         c->watch = 1;
         recon_diff_free(&c->diff);
@@ -2070,7 +2070,7 @@ static void ctl_do_rm_file(struct conn *c, struct cbuf *r) {
 
 static void sub_check_done(struct conn *c, int code) {
     unlink(c->tmp);
-    if (code < 0) { resp_error(&c->resp, "internal", "не удалось дождаться движка"); conn_reply(c); return; }
+    if (code < 0) { resp_error(&c->resp, "internal", "не удалось дождаться ядра"); conn_reply(c); return; }
     resp_run(&c->resp, code, &c->job.out, &c->job.err);
     if (c->job.timed_out) resp_error(&c->resp, "timeout", "разбор подписки не уложился в свой срок и остановлен");
     conn_reply(c);
@@ -2099,7 +2099,7 @@ static void st_sub_check(struct conn *c) {
     char *av[4] = { c->srv->cf.exe, "vless-nodes", c->tmp, NULL };
     if (job_start(c, av, 15, CTL_OUT_MAX, CTL_ERR_MAX, sub_check_done) != 0) {
         unlink(c->tmp);
-        resp_error(&c->resp, "internal", "не удалось запустить движок");
+        resp_error(&c->resp, "internal", "не удалось запустить ядро");
         conn_reply(c);
     }
 }
@@ -2449,7 +2449,7 @@ static void srv_accept(struct loop *l, int fd, uint32_t ev, void *arg) {
         char who[320];
         if (!ctl_peer_ok(c, &s->cf, who, sizeof(who))) {
             fprintf(stderr, LOG_W "отказ: %s\n", who);
-            ctl_refuse_now(c, "denied", "этому процессу управлять движком нельзя");
+            ctl_refuse_now(c, "denied", "этому процессу управлять ядром steer нельзя");
             continue;
         }
         if (s->active >= CTL_CLIENTS_MAX) {
@@ -2711,7 +2711,7 @@ static void st_repair(struct conn *c) {
     av[n++] = "--masq-ensure";
     av[n] = NULL;
     if (job_start(c, av, 60, CTL_ERR_MAX, CTL_ERR_MAX, repair_done) != 0) {
-        fprintf(stderr, LOG_W "правила выходов (%s): не удалось запустить движок\n", c->tmp);
+        fprintf(stderr, LOG_W "правила выходов (%s): не удалось запустить ядро\n", c->tmp);
         conn_reply(c);
     }
 }
@@ -2852,7 +2852,7 @@ static void srv_kcheck(void *arg) {
     const char *why = "";
     int drift = recon_kernel_drift(&s->rec, &why);
     if (drift == 2 && srv_table_flushed(s)) {
-        why = "таблицы движка нет в ядре, а правила выходов стоят — её снял кто-то другой";
+        why = "таблицы ядра steer нет в ядре Linux, а правила выходов стоят — её снял кто-то другой";
         drift = 1;
     }
     if (drift != 1) return;

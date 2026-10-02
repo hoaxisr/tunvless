@@ -313,7 +313,7 @@ static void mod_hello(struct supd *s, struct helper *h, const struct evline *e) 
     snprintf(h->mver, sizeof(h->mver), "%s", ver);
     if (strcmp(ver, steer_engine_version()) != 0) {
         char why[160];
-        snprintf(why, sizeof(why), "версии %.16s, а движок %.16s — обновите пакеты steer вместе",
+        snprintf(why, sizeof(why), "версии %.16s, а ядро %.16s — обновите пакеты steer вместе",
                  ver, steer_engine_version());
         mod_reject(s, h, why);
         return;
@@ -332,7 +332,7 @@ static void ev_line(struct supd *s, struct helper *h, const char *line) {
         if (!h->hello) {
             if (!strcmp(e.ev, "hello")) mod_hello(s, h, &e);
             else mod_reject(s, h, "не назвал версию (первое сообщение — не hello): "
-                                  "нужен модуль того же выпуска, что движок");
+                                  "нужен модуль того же выпуска, что ядро");
             return;
         }
         if (!strcmp(e.ev, "hello")) return;

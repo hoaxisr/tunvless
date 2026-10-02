@@ -562,7 +562,7 @@ EOF
 	echo "  uci set network.xsteer_${SPOKE_NAME}.endpoint_port='${HUB_PORT}'"
 	echo "  uci commit network && ifup ${SPOKE_NAME}"
 	echo ""
-	echo "MTU задавать НЕ НУЖНО: движок согласует его сам и проверит путь пробами."
+	echo "MTU задавать НЕ НУЖНО: ядро согласует его само и проверит путь пробами."
 	unset SPOKE_NAME
 }
 

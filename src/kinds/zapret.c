@@ -160,9 +160,9 @@ static void zapret_diag(kind_diag_fn *diag, const struct spec *sp, const struct 
     snprintf(why, sizeof(why), "%s",
              alive ? ""
              : o->on_fail == FAIL_DROP
-               ? "перезапустите движок: /etc/init.d/steer restart. До тех пор трафик "
+               ? "перезапустите ядро steer: /etc/init.d/steer restart. До тех пор трафик "
                  "канала ОСТАНОВЛЕН — так выражен on_fail=drop, очередь стоит без bypass"
-               : "перезапустите движок: /etc/init.d/steer restart. До тех пор трафик "
+               : "перезапустите ядро steer: /etc/init.d/steer restart. До тех пор трафик "
                  "канала идёт без обхода — так выражен on_fail=direct");
     diag("zapret", alive ? "ok" : "fail", what, why);
 }

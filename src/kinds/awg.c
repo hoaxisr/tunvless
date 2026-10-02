@@ -1337,13 +1337,13 @@ static int awg_configure(const struct spec *sp, const struct output *o, int loud
     if (loud) {
         if (c.dns_n)
             fprintf(stderr, LOG_W "выход %s: DNS из файла не применяется — имена разрешает "
-                            "резолвер движка по каналам\n", o->name);
+                            "резолвер ядра steer по каналам\n", o->name);
         if (c.ignored & AWG_IGN_FWMARK)
             fprintf(stderr, LOG_W "выход %s: FwMark из файла не применяется — метку сокета "
-                            "туннеля выбирает движок\n", o->name);
+                            "туннеля выбирает ядро steer\n", o->name);
         if (c.ignored & AWG_IGN_TABLE)
             fprintf(stderr, LOG_W "выход %s: Table из файла не применяется — таблицу выхода "
-                            "ведёт движок\n", o->name);
+                            "ведёт ядро steer\n", o->name);
         if (c.ignored & AWG_IGN_SCRIPTS)
             fprintf(stderr, LOG_W "выход %s: PreUp/PostUp/PreDown/PostDown не исполняются\n",
                     o->name);
@@ -1379,7 +1379,7 @@ static int awg_configure(const struct spec *sp, const struct output *o, int loud
     int index = 0;
     int lq = link_query(dev, live_kind, sizeof live_kind, &index);
     if (lq == 0 && !is_our_kind(live_kind)) {
-        fprintf(stderr, LOG_W "выход %s: устройство %s уже есть, и это не туннель движка "
+        fprintf(stderr, LOG_W "выход %s: устройство %s уже есть, и это не туннель ядра steer "
                         "(вид «%s») — не трогаю\n", o->name, dev, live_kind[0] ? live_kind : "?");
         goto out;
     }
@@ -1773,7 +1773,7 @@ static int awg_parse(struct output *o, const struct out_keys *k, struct err *e) 
      * список здесь означал бы устройства, которые никто не создаст. */
     if (k->devices_n > 1 ||
         (k->devices_n == 1 && o->device[0] && strcmp(o->device, k->devices[0]) != 0))
-        return err_set(e, "outputs.%s: у kind awg одно устройство — его заводит движок; пул "
+        return err_set(e, "outputs.%s: у kind awg одно устройство — его заводит ядро steer; пул "
             "собирается выходом kind=interface", o->name);
     if (k->devices_n == 1 && !o->device[0])
         snprintf(o->device, sizeof(o->device), "%s", k->devices[0]);
@@ -1786,7 +1786,7 @@ static int awg_parse(struct output *o, const struct out_keys *k, struct err *e) 
             return err_set(e, "outputs.%s: имя устройства длиннее 15 символов", o->name);
         if (awg_ifname_conspicuous(o->device))
             return err_set(e, "outputs.%s: имя устройства выдаёт туннель (tun, wg, awg, ppp, vpn…) — "
-                "уберите device, и движок выберет имя сам", o->name);
+                "уберите device, и ядро steer выберет имя само", o->name);
     } else awg_default_ifname(o->name, o->device, sizeof(o->device));
     /* Путь к файлу — тем же порядком, что у xsteer: по умолчанию из имени выхода, иначе
      * абсолютный и годный к JSON (печатается в status и diag). */

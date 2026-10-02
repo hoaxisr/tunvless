@@ -150,7 +150,7 @@ int main(int argc, char **argv) {
     if (tools_role(argv[0]) && !is_tool(cmd) && strcmp(cmd, "help") && strcmp(cmd, "--help") &&
         strcmp(cmd, "-h") && strcmp(cmd, "version") && strcmp(cmd, "--version") &&
         strcmp(cmd, "-V")) {
-        fprintf(stderr, "steer-tools: %s — не инструмент, а команда движка: steer %s\n"
+        fprintf(stderr, "steer-tools: %s — не инструмент, а команда ядра: steer %s\n"
                         "       инструменты:", cmd, cmd);
         for (size_t i = 0; TOOLS[i]; i++) fprintf(stderr, " %s", TOOLS[i]);
         fputc('\n', stderr);
@@ -237,7 +237,7 @@ int main(int argc, char **argv) {
     /* Эти две исполняет демон, а посылает клиент steer (src/client/main.c). Сюда они доходят,
      * только если движок позвали напрямую или клиент не нашёл демона своей спеки. */
     if (!strcmp(cmd, "reload") || !strcmp(cmd, "subscribe")) {
-        fprintf(stderr, "steer: команду %s исполняет демон движка (steerd daemon), а посылает "
+        fprintf(stderr, "steer: команду %s исполняет демон ядра (steerd daemon), а посылает "
                         "ему клиент steer\n", cmd);
         return 2;
     }
@@ -373,7 +373,7 @@ int main(int argc, char **argv) {
     }
     /* Сюда попасть нельзя: имя нашлось в таблице, значит ветка для него есть. Если
      * всё-таки попали — в таблицу добавили команду и забыли про диспетчер. */
-    die("команда %s объявлена, но не подключена — это ошибка в движке", cmd);
+    die("команда %s объявлена, но не подключена — это ошибка в ядре steer", cmd);
     return 2;
 }
 

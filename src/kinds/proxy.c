@@ -63,7 +63,7 @@ static int proxy_parse(struct output *o, const struct out_keys *k, struct err *e
     }
     if (!o->device[0]) snprintf(o->device, sizeof(o->device), "%.15s", o->name);
     if (k->devices_n > 1 || (k->devices_n == 1 && strcmp(o->device, k->devices[0]) != 0)) {
-        snprintf(msg, sizeof(msg), "outputs.%s: у kind %s одно устройство — его заводит движок; пул "
+        snprintf(msg, sizeof(msg), "outputs.%s: у kind %s одно устройство — его заводит ядро steer; пул "
                  "собирается выходом kind=interface", o->name, kind_of(o)->name);
         return err_set(e, "%s", msg);
     }
@@ -114,7 +114,7 @@ static void proxy_diag(kind_diag_fn *put, const struct spec *sp, const struct ou
     char buf[512], what[200];
     if (state_read(o->name, buf, sizeof(buf)) != 0) {
         snprintf(what, sizeof(what), "выход %.40s: клиент %s не запущен", o->name, kind_of(o)->name);
-        put("proxy", "fail", what, "перезапустите движок: /etc/init.d/steer restart");
+        put("proxy", "fail", what, "перезапустите ядро steer: /etc/init.d/steer restart");
         return;
     }
     int up = strstr(buf, "\"up\":true") != NULL;

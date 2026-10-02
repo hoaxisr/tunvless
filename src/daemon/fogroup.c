@@ -561,7 +561,7 @@ int fog_select(struct spec *sp, struct fo_store *st, const char *gname, const ch
     snprintf(line, sizeof(line), "%s %s", gname, mname);
     rec_set(st, "select", gname, line);
     if (!route) {
-        fprintf(out, "steer: группа %s — выбран %s; движок выключен, выбор применится при "
+        fprintf(out, "steer: группа %s — выбран %s; ядро выключено, выбор применится при "
                      "включении\n", gname, mname);
         return 0;
     }

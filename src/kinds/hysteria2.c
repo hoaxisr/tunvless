@@ -48,7 +48,7 @@ static int hy2_parse(struct output *o, const struct out_keys *k, struct err *e) 
      * расходились бы, а пользы от различия нет. */
     if (!o->device[0]) snprintf(o->device, sizeof(o->device), "%.15s", o->name);
     if (k->devices_n > 1 || (k->devices_n == 1 && strcmp(o->device, k->devices[0]) != 0))
-        return err_set(e, "outputs.%s: у kind hysteria2 одно устройство — его заводит движок; пул "
+        return err_set(e, "outputs.%s: у kind hysteria2 одно устройство — его заводит ядро steer; пул "
             "собирается выходом kind=interface", o->name);
     return 0;
 }
@@ -100,7 +100,7 @@ static void hy2_diag(kind_diag_fn *put, const struct spec *sp, const struct outp
     char buf[512], what[200];
     if (state_read(o->name, buf, sizeof(buf)) != 0) {
         snprintf(what, sizeof(what), "выход %.40s: клиент hysteria2 не запущен", o->name);
-        put("hysteria2", "fail", what, "перезапустите движок: /etc/init.d/steer restart");
+        put("hysteria2", "fail", what, "перезапустите ядро steer: /etc/init.d/steer restart");
         return;
     }
     int up = strstr(buf, "\"up\":true") != NULL;

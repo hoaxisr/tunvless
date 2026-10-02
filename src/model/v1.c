@@ -719,7 +719,7 @@ static int parse_channels(struct js *j, struct spec *s, struct v1_ctx *x, struct
                              * адресов исчерпать нечем — 198.18.0.0/15 это 131072 адреса
                              * против полутора тысяч имён в самом большом списке. */
                             fprintf(stderr, "steer[warn] channel %s: mode=realip уходит из "
-                                    "движка — переведите канал на fakeip; сейчас режим ещё "
+                                    "ядра — переведите канал на fakeip; сейчас режим ещё "
                                     "работает\n", c.name);
                         }
                         else if (strcmp(m, "fakeip") != 0) return err_set(e, "channels: unknown mode %s (want fakeip or realip)", m);
@@ -952,7 +952,7 @@ static int v1_parse(const char *text, struct spec *s, struct err *e) {
                 char msg[400];
                 snprintf(msg, sizeof(msg),
                          "канал %.24s: proto и ports появились в schema 2, а в спеке "
-                         "schema 1. Поднимите \"schema\": 2 — иначе движок постарше поймёт "
+                         "schema 1. Поднимите \"schema\": 2 — иначе ядро постарше поймёт "
                          "спеку наполовину и канал заберёт больше, чем вы написали",
                          s->rule[i].name);
                 return err_set(e, "%s", msg);
@@ -1083,7 +1083,7 @@ static int v1_parse(const char *text, struct spec *s, struct err *e) {
                     return err_set(e, "%s", msg);
                 }
                 if (lo == 0)
-                    return err_set(e, "канал %s: uid:0 — это root, то есть сам движок и системные демоны; "
+                    return err_set(e, "канал %s: uid:0 — это root, то есть само ядро steer и системные демоны; "
                         "их трафик каналом не маршрутизируется", c->name);
                 /* Правило на устройство — на ОДНО приложение, диапазон тут был бы тем же
                  * «приоритет получила половина сети», что и подсеть у адресов. */

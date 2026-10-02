@@ -446,7 +446,7 @@ static void report_legacy_gaps(const struct spec *sp, const struct groups *gr) {
                         "промежуточные узлы будут видны как прежде\n");
     if (!prof()->no_resolver && !(g_nftc & NFTC_IP6NAT))
         fprintf(stderr, LOG_W "ядро не умеет nat для IPv6: запросы DNS клиентов по IPv6 идут "
-                        "мимо резолвера движка, и доменные каналы видят только тех, кто "
+                        "мимо резолвера ядра steer, и доменные каналы видят только тех, кто "
                         "спрашивает по IPv4\n");
     /* fake-IP v6 держится на dnat в ip6 (карта fakeip6): без него у доменных правил fake-IP
      * половины IPv6 нет (dom6_ok), и AAAA их имён резолвер гасит. */
@@ -456,7 +456,7 @@ static void report_legacy_gaps(const struct spec *sp, const struct groups *gr) {
                         "IPv4\n");
     if (plat()->local_channels && !(g_nftc & NFTC_IP6NAT) && has_local_domains(gr))
         fprintf(stderr, LOG_W "ядро не умеет nat для IPv6: запросы DNS приложений телефона по "
-                        "IPv6 идут мимо резолвера движка, и доменные каналы телефона их не "
+                        "IPv6 идут мимо резолвера ядра steer, и доменные каналы телефона их не "
                         "видят\n");
     /* На Android таблица nat iptables есть всегда, но PREROUTING в ней у netd — пустая
      * oem_nat_pre, и предупреждать там не о чем (plat()->warn_iptables_nat). Почему это вообще
@@ -469,7 +469,7 @@ static void report_legacy_gaps(const struct spec *sp, const struct groups *gr) {
         fclose(t);
         if (nat)
             fprintf(stderr, LOG_W "на этом ядре работает и nat iptables: для соединений, "
-                            "которые не забрал движок, его правила PREROUTING (пробросы "
+                            "которые не забрало ядро steer, его правила PREROUTING (пробросы "
                             "портов) не сработают — старое ядро не даёт двум таблицам nat "
                             "поделить один хук\n");
     }
@@ -592,7 +592,7 @@ static void apply_prepare(const char *spec, struct spec *cfg, struct groups *gr,
     for (size_t i = 0; prof()->no_resolver && i < gr->n; i++)
         if (gr->g[i].domains)
             die("канал «%s» доменный, а эта сборка резолвера не поднимает: разрешать имена "
-                "ей нечем. Переведите канал на адресный список или поставьте полный движок",
+                "ей нечем. Переведите канал на адресный список или поставьте полное ядро steer",
                 gr->g[i].name);
     /* Устройство выхода — то, что несёт трафик сейчас, а не первое в списке кандидатов.
      * Иначе применение настройки уводило бы таблицу с работающего запасного устройства на

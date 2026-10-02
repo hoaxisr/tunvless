@@ -42,7 +42,7 @@ static int vless_parse(struct output *o, const struct out_keys *k, struct err *e
      * туннелей — это группа (`devices` у kind=interface); список здесь означал бы устройства,
      * которые никто не создаст. */
     if (k->devices_n > 1 || (k->devices_n == 1 && strcmp(o->device, k->devices[0]) != 0))
-        return err_set(e, "outputs.%s: у kind vless одно устройство — его заводит движок; пул "
+        return err_set(e, "outputs.%s: у kind vless одно устройство — его заводит ядро steer; пул "
             "собирается выходом kind=interface", o->name);
     return 0;
 }

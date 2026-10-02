@@ -54,7 +54,7 @@ if [ -x "$here/steer" ]; then
     echo "беру готовый бинарник: $BIN"
 else
     [ -f "$root/Makefile" ] || {
-        echo "рядом нет ни готового бинарника steer, ни исходников движка."
+        echo "рядом нет ни готового бинарника steer, ни исходников ядра."
         echo "возьмите архив steer-obfs-*.tar.gz со страницы релизов либо клонируйте репозиторий."
         exit 1
     }
@@ -69,7 +69,7 @@ command -v nft >/dev/null 2>&1 || cat <<'EOF'
 EOF
 
 if [ "$BIN" = "$root/build/steer" ]; then
-    echo "собираю движок…"
+    echo "собираю ядро…"
     make -C "$root" -s all
 fi
 

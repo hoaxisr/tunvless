@@ -77,7 +77,7 @@ static void engine_path(void) {
 static void run_engine(void) {
     if (strchr(g_engine, '/')) execv(g_engine, g_argv);
     else execvp(g_engine, g_argv);
-    fprintf(stderr, "steer: не запустить движок %s: %s\n", g_engine, strerror(errno));
+    fprintf(stderr, "steer: не запустить ядро %s: %s\n", g_engine, strerror(errno));
     exit(127);
 }
 
@@ -238,7 +238,7 @@ int main(int argc, char **argv) {
     const char *g_sock = ctlcall_socket(NULL);
     if (!same_daemon(&c)) {
         if (kind == K_ROUTE) run_engine();
-        fprintf(stderr, "steer: %s: демон движка не отвечает на %s (или обслуживает другую "
+        fprintf(stderr, "steer: %s: демон ядра не отвечает на %s (или обслуживает другую "
                         "спеку) — %s исполняет только он\n", c.cmd, g_sock, c.cmd);
         return EXIT_NODAEMON;
     }
@@ -287,7 +287,7 @@ int main(int argc, char **argv) {
             free(raw);
             if (readonly || kind == K_ROUTE) {
                 if (!readonly) fprintf(stderr, "steer[warn] демон не ответил на %s — "
-                                               "исполняю движком\n", c.cmd);
+                                               "исполняю ядром\n", c.cmd);
                 free(body);
                 run_engine();
             }
@@ -320,7 +320,7 @@ int main(int argc, char **argv) {
     if (r.error.p)
         fprintf(stderr, "steer: %s: %s\n", c.cmd, r.message.p ? r.message.p : r.error.p);
     if (!strcmp(c.cmd, "apply") && r.applied == 0 && r.enabled == 0)
-        fputs("steer: движок выключен — спека сохранена, в ядро не применялась\n", stderr);
+        fputs("steer: ядро выключено — спека сохранена, в ядро Linux не применялась\n", stderr);
     fflush(stdout);
     return r.error.p && r.code == 0 ? 1 : r.code;
 }

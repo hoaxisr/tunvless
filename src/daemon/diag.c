@@ -726,7 +726,7 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
     /* 1. Таблица. Без неё всё остальное бессмысленно: apply не применялся или его снесли. */
     int table = nft_chain_here("prerouting_mark");
     diag("table", table ? "ok" : "fail",
-         table ? "правила движка в ядре" : "правил движка в ядре нет",
+         table ? "правила ядра steer в ядре Linux" : "правил ядра steer в ядре Linux нет",
          table ? "" : "apply не применялся или таблицу снесли — нажмите «Применить»");
 
     /* 2. Встречная цепочка. Её отсутствие не ломает маршрутизацию, но объёмы «внутрь»
@@ -735,7 +735,7 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
         int down = nft_chain_here("postrouting_down");
         diag("down_chain", down ? "ok" : "warn",
              down ? "скачанное считается" : "скачанное не считается",
-             down ? "" : "правила от старой версии движка — примените настройку заново");
+             down ? "" : "правила от старой версии ядра steer — примените настройку заново");
     }
 
     /* 3. Наборы. Пустой набор при непустом списке — самая частая настоящая поломка:
@@ -839,7 +839,7 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
                  "загружен br_netfilter и net.bridge.bridge-nf-call-iptables=1: запросы DNS "
                  "между клиентами одной LAN тоже заворачиваются на наш резолвер — правило "
                  "порта 53 смотрит на клиента, а не на получателя, поэтому DNS-сервер внутри "
-                 "сети (Pi-hole, второй роутер) перестаёт получать запросы. Движок эту "
+                 "сети (Pi-hole, второй роутер) перестаёт получать запросы. Ядро steer эту "
                  "настройку не трогает, она общесистемная (её ставят docker и libvirt); если "
                  "она вам не нужна: sysctl -w net.bridge.bridge-nf-call-iptables=0");
         else if (brnf == 0)
@@ -854,8 +854,8 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
          * (legacy.c, шаг 4), и узнаётся по самому правилу. */
         int redir = NFT_LEGACY ? nft_redirect_here(DNS_PORT) : nft_chain_here("prerouting_dns");
         diag("dns_redirect", redir ? "ok" : "fail",
-             redir ? "запросы DNS заворачиваются на движок"
-                   : "запросы DNS на движок не заворачиваются",
+             redir ? "запросы DNS заворачиваются на ядро steer"
+                   : "запросы DNS на ядро steer не заворачиваются",
              redir ? "" : "доменные каналы без этого не работают вовсе — примените настройку");
         /* Обходом /proc, а не pgrep: у демона резолвер — его ребёнок с argv[0] «…/steer»
          * (docs/architecture.md, «4а»), без демона — экземпляр procd с той же строкой. */
@@ -1007,7 +1007,7 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
                  * ветка не влезала в буфер, а обрезка кириллицы рвёт знак пополам. */
                 if (pr.total > 0)
                     snprintf(why, sizeof(why),
-                             "живого узла не нашлось. Причины по каждому движок пишет в "
+                             "живого узла не нашлось. Причины по каждому ядро steer пишет в "
                              "журнал; смените узел или обновите подписку");
                 else
                     snprintf(why, sizeof(why),
@@ -1019,7 +1019,7 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
             snprintf(what, sizeof(what), "выход %.40s: устройства %.24s нет",
                      sp->out[i].name, sp->out[i].device);
             snprintf(why, sizeof(why), "туннель не поднят — %s",
-                     out_engine_managed(po) ? "смотрите журнал движка"
+                     out_engine_managed(po) ? "смотрите журнал ядра steer"
                                             : "проверьте настройку интерфейса");
             diag("output", "fail", what, why);
             continue;

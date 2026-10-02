@@ -414,14 +414,14 @@ void recon_decide(const struct recon_state *st, const struct recon_plan *p, cons
         d->ruleset = 1;
         d->watch = 1;
         fprintf(stderr, LOG_W "набор правил в ядре изменён снаружи (цепочки, правила или наборы "
-                              "не те, что ставил движок) — ставлю набор правил заново\n");
+                              "не те, что ставило ядро steer) — ставлю набор правил заново\n");
     }
     /* Элементы статических наборов (шапка, «СВЕРКА ЭЛЕМЕНТОВ»): сводку ядра снял план. Нет её
      * у плана или у применённого — элементы не сверяются. */
     if (!d->ruleset && st->kel_ok && p->kel_ok && (p->kel != st->kel || p->kel_n != st->kel_n)) {
         d->ruleset = 1;
         d->watch = 1;
-        fprintf(stderr, LOG_W "элементы статических наборов в ядре не те, что ставил движок (в "
+        fprintf(stderr, LOG_W "элементы статических наборов в ядре не те, что ставило ядро steer (в "
                               "ядре %llu, после загрузки было %llu) — ставлю набор правил заново\n",
                 (unsigned long long)p->kel_n, (unsigned long long)st->kel_n);
     }
@@ -579,11 +579,11 @@ int recon_kernel_drift(const struct recon_state *st, const char **why) {
     if (kernel_fp(&t) != 0) return -1;
     if (!(t.fams & 1)) return 2;
     if (t.handle != st->handle) {
-        *why = "таблицу движка заменили мимо демона";
+        *why = "таблицу ядра steer заменили мимо демона";
         return 1;
     }
     if (t.fp != st->kfp) {
-        *why = "цепочки, правила или наборы не те, что ставил движок";
+        *why = "цепочки, правила или наборы не те, что ставило ядро steer";
         return 1;
     }
     return 0;

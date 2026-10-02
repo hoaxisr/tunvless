@@ -382,7 +382,7 @@ static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *v
             if (from_uid_range(one, &lo, &hi) != 0)
                 return fail(x, it, "%s: «%s» — не UID приложения (нужно N или N-M)", w, it->str);
             if (lo == 0)
-                return fail(x, it, "%s: uid 0 — это root, то есть сам движок и системные демоны; их "
+                return fail(x, it, "%s: uid 0 — это root, то есть само ядро steer и системные демоны; их "
                             "трафик правилом не маршрутизируется", w);
             if (lo != hi) f->hosts = 0;
             if (from_push(x, it, w, c, one)) return -1;
@@ -1525,6 +1525,6 @@ static int v2_parse_doc(const struct ydoc *d, struct spec *s, struct err *e) {
     if (spec_check_outputs(s, "over", &bad, e) != 0)
         return bad >= 0 && (size_t)bad < s->out_n && x.out_key[bad] ? wrap(&x, x.out_key[bad]) : -1;
     if (x.un_node)
-        return fail(&x, x.un_node, "ещё не поддерживается в этой версии движка: %s", x.un_what);
+        return fail(&x, x.un_node, "ещё не поддерживается в этой версии ядра steer: %s", x.un_what);
     return 0;
 }

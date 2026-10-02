@@ -105,7 +105,7 @@ static void iface_diag(kind_diag_fn *diag, const struct spec *sp, const struct o
     int alive = proc_cmdline_find(needle, 0);
     snprintf(what, sizeof(what), "выход %.40s: обфускатор %s", o->name, alive ? "работает" : "не запущен");
     diag("obfs", alive ? "ok" : "fail", what,
-         alive ? "" : "перезапустите движок: /etc/init.d/steer restart");
+         alive ? "" : "перезапустите ядро steer: /etc/init.d/steer restart");
 
     /* Правило живёт в соседней таблице steer_obfs, цепочкой o_<выход>. */
     char chain[48];

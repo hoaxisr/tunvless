@@ -432,7 +432,7 @@ static int spec_pick_default(const char **path, struct err *e) {
     int hj = access(js, F_OK) == 0, hy = access(ym, F_OK) == 0;
     if (hj && hy) {
         char msg[640];
-        snprintf(msg, sizeof(msg), "две спеки: %.255s и %.255s — движок не выбирает между ними, "
+        snprintf(msg, sizeof(msg), "две спеки: %.255s и %.255s — ядро не выбирает между ними, "
                  "оставьте одну", js, ym);
         return err_set(e, "%s", msg);
     }

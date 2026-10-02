@@ -5,7 +5,7 @@
 # stderr: steer[info] apply: ядро без nat в семействе inet — правила собраны для nftables старого ядра: таблицы inet и ip
 # stderr: steer[warn] apply: ядро не знает notrack: порождённые обработчиком zapret пакеты (подделки, куски разрезанного) остаются на учёте conntrack. Где firewall отбрасывает ct state invalid, обход выходов kind=zapret может не срабатывать
 # stderr: steer[warn] apply: ядро не знает notrack: traceroute_hops на нём не действует, промежуточные узлы будут видны как прежде
-# stderr: steer[warn] apply: ядро не умеет nat для IPv6: запросы DNS клиентов по IPv6 идут мимо резолвера движка, и доменные каналы видят только тех, кто спрашивает по IPv4
+# stderr: steer[warn] apply: ядро не умеет nat для IPv6: запросы DNS клиентов по IPv6 идут мимо резолвера ядра steer, и доменные каналы видят только тех, кто спрашивает по IPv4
 # stderr: steer[warn] apply: ядро не умеет nat для IPv6: у доменных правил fake-IP нет IPv6 — на запросы AAAA их имён ответ пустой, и клиенты ходят к этим сайтам по IPv4
 table inet steer {
     set vpn_dom {

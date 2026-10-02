@@ -2,9 +2,9 @@
 # exit: 0
 # env: STEER_NFT_COMPAT=legacy-min
 # stderr: steer[info] apply: ядро без nat в семействе inet — правила собраны для nftables старого ядра: таблицы inet и ip и ip6
-# stderr: steer[warn] apply: ядро не умеет nat для IPv6: запросы DNS клиентов по IPv6 идут мимо резолвера движка, и доменные каналы видят только тех, кто спрашивает по IPv4
+# stderr: steer[warn] apply: ядро не умеет nat для IPv6: запросы DNS клиентов по IPv6 идут мимо резолвера ядра steer, и доменные каналы видят только тех, кто спрашивает по IPv4
 # stderr: steer[warn] apply: ядро не умеет nat для IPv6: у доменных правил fake-IP нет IPv6 — на запросы AAAA их имён ответ пустой, и клиенты ходят к этим сайтам по IPv4
-# stderr: steer[warn] apply: ядро не умеет nat для IPv6: запросы DNS приложений телефона по IPv6 идут мимо резолвера движка, и доменные каналы телефона их не видят
+# stderr: steer[warn] apply: ядро не умеет nat для IPv6: запросы DNS приложений телефона по IPv6 идут мимо резолвера ядра steer, и доменные каналы телефона их не видят
 # stderr: steer[warn] awg: выход nl: /nonexistent/nl.conf: No such file or directory
 table inet steer {
     set vpn_ip_c1 {

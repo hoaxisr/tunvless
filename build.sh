@@ -516,7 +516,7 @@ EOF
     # steer, libsteer и libsteer-wolfssl — конфликтуют и заменяются (миграция, см. выше). Имя
     # `steer` идёт первым в ЗАМЕНЯЕТ: pack берёт первое как provides.
     deps="$(pkg_deps "$root/usr/sbin/steerd" core)"
-    pack steer-core "$root" "$deps" "steer-core: движок маршрутизации по политике (каналы на входе, nftables на выходе) и общая крипта" \
+    pack steer-core "$root" "$deps" "steer-core: ядро маршрутизации по политике (каналы на входе, nftables на выходе) и общая крипта" \
         steer "steer libsteer libsteer-wolfssl" "steer libsteer libsteer-wolfssl"
 
     # Модули: по одному бинарнику в usr/sbin рядом со steerd, где их находит движок (src/lib/
@@ -578,7 +578,7 @@ for arch in x86_64 aarch64_generic; do
     # движка. Имя внутри архива прежнее (steer): его зовут server/install.sh и человек.
     bin="build/steerd-$arch"
     if [ ! -f "$bin" ]; then
-        printf '  %-26s пропуск (движок не собрался)\n' "$arch"
+        printf '  %-26s пропуск (ядро не собралось)\n' "$arch"
         continue
     fi
     # Имя внутри архива — привычное человеку, а не имя цели OpenWrt: на VPS про

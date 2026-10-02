@@ -263,7 +263,7 @@ jobs:
             out/*.ipk
             out/*.tar.gz
           body: |
-            Движок маршрутизации по политикам для OpenWrt.
+            Ядро маршрутизации по политикам для OpenWrt.
 
             **Какой пакет брать.** Имя файла содержит архитектуру — ту же, что показывает
             `apk --print-arch` на роутере.
@@ -273,7 +273,7 @@ jobs:
               лежат внутри пакета). Заменяет прежние пакеты `steer`, `libsteer` и `libsteer-wolfssl`.
             * `steer-vless-*`, `steer-xsteer-*` — клиенты туннелей (VLESS/Reality с Vision,
               транспортами tcp/grpc/xhttp/ws/httpupgrade; звезда xsteer) — отдельные модули.
-              Нужны, только если туннель поднимает сам движок; для готового wireguard или
+              Нужны, только если туннель поднимает само ядро; для готового wireguard или
               amneziawg достаточно ядра.
             * `steer-obfs-*` (обфускатор WireGuard), `steer-tgws-*` (мост Telegram) и
               `steer-hysteria2-*` (клиент hysteria2) — модули.
