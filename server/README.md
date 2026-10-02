@@ -44,7 +44,7 @@ sudo sh install.sh --port 4567 --forward 127.0.0.1:51820
 Из исходников — если своей архитектуры в релизе нет:
 
 ```sh
-git clone https://github.com/xyzmean/steer && cd steer
+git clone https://github.com/splify2/steer && cd steer
 sudo sh server/install.sh --port 4567 --forward 127.0.0.1:51820
 ```
 

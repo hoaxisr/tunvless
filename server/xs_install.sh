@@ -47,9 +47,9 @@ NATUNIT=/etc/systemd/system/steer-xsteer-nat.service
 # ветка dist-vps через contents API: `Accept: application/vnd.github.raw` отдаёт байты прямо
 # с api.github.com, никуда не перенаправляя. Третий — то же самое на зеркале GitLab, на
 # случай, когда закрыт и сам GitHub.
-RELEASES=https://github.com/xyzmean/steer/releases/latest/download
+RELEASES=https://github.com/splify2/steer/releases/latest/download
 DIST_BRANCH=dist-vps
-DIST_API=https://api.github.com/repos/xyzmean/steer/contents
+DIST_API=https://api.github.com/repos/splify2/steer/contents
 DIST_MIRROR=https://gitlab.com/xyzmean/steer/-/raw/$DIST_BRANCH
 
 # Спросить с приглашением и значением по умолчанию.

@@ -40,7 +40,7 @@ steer решает, какой трафик уходит в туннель, а �
 ## Установка
 
 Возьмите пакет своей архитектуры из ветки [dist](https://gitlab.com/xyzmean/steer/-/tree/dist) или
-со страницы [релизов](https://github.com/xyzmean/steer/releases). Содержимое одинаковое; ветка
+со страницы [релизов](https://github.com/splify2/steer/releases). Содержимое одинаковое; ветка
 на зеркале нужна тем, у кого провайдер закрыл `githubusercontent.com` — прямая ссылка релиза
 ведёт именно туда и не откроется.
 Архитектура в имени файла — та же, что показывает `DISTRIB_ARCH` в `/etc/openwrt_release`.

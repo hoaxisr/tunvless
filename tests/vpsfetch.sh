@@ -64,7 +64,7 @@ try() {
 # должен становиться обычной дорогой.
 out="$(try 'releases/latest/download')"
 check "релиз отдал — взято с первой ступени" "1" \
-      "$(printf '%s\n' "$out" | grep -c 'взято: https://github.com/xyzmean/steer/releases')"
+      "$(printf '%s\n' "$out" | grep -c 'взято: https://github.com/splify2/steer/releases')"
 check "остальные источники не трогались" "1" "$(wc -l < "$tmp/log" | tr -d ' ')"
 check "файл на месте" "1" "$(grep -c 'полезная нагрузка' "$tmp/got")"
 
@@ -78,7 +78,7 @@ check "релиз закрыт — пошли в contents API" "1" \
 # Цвет в строке отказа стоит между словом и двоеточием, поэтому образец берёт слово и хост
 # по отдельности: точное «не отдал: https://…» не совпало бы никогда.
 check "первая ступень попробована и названа" "1" \
-      "$(printf '%s\n' "$out" | grep -c 'не отдал.*https://github.com/xyzmean/steer/releases')"
+      "$(printf '%s\n' "$out" | grep -c 'не отдал.*https://github.com/splify2/steer/releases')"
 check "запрошена именно ветка dist-vps" "1" "$(grep -c 'ref=dist-vps' "$tmp/log")"
 
 # ---- третья ступень: зеркало на GitLab ---------------------------------------
