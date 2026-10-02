@@ -373,6 +373,14 @@ case "$o" in
     *) check "hysteria2 против настоящего сервера: стенд tests/run-hy2.sh" "0" "$(printf '%s' "$o" | grep -c 'провалено [1-9]')"
        check "  и он дошёл до итога" "1" "$(printf '%s' "$o" | grep -c 'проверок пройдено')" ;;
 esac
+# Долгие соединения через вложенную группу с туннелями hysteria2 (демон раскладки, мост, fake-IP,
+# IPv6; клиент управляющего сокета — build/steer): то же условие пропуска.
+o="$(LIBS="$L" sh tests/nestlong.sh 2>&1 | tail -1)"
+case "$o" in
+    *пропуск*) echo "libs-test: $o" ;;
+    *) check "долгие соединения через вложенную группу: стенд tests/nestlong.sh" "1" \
+           "$(printf '%s' "$o" | grep -c '^nestlong: [0-9]* ok, 0 fail$')" ;;
+esac
 
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi

@@ -800,6 +800,23 @@ int main(void) {
           cmd_seen("conntrack -D"), 0);
     check("целое состояние — и через ctnetlink тоже", cmd_seen("ctnl evict"), 0);
 
+    /* Первая привязка прохода (записи сторожа нет: старт демона, apply с новым выходом), а таблицу
+     * в то же устройство уже поставил apply: маршрут не меняется — соединения не снимаются. Снятие
+     * здесь убивало долгие соединения, где сервер пишет первым после молчания (SSE): его ответ без
+     * записи conntrack обратно не развернуть (tests/nestlong.sh). */
+    out_set("lo", FAIL_DROP);
+    state_write("active", "");
+    tick(RULES_WITH, "default dev lo scope link \nblackhole default metric 65535 \n");
+    check("первая привязка в то же устройство — маршрут ставится",
+          cmd_seen("ip route replace default dev lo table 300"), 1);
+    check("  а соединения не снимаются", cmd_seen("ctnl evict") + cmd_seen("conntrack -D"), 0);
+    /* Контроль: первая привязка, а таблица вела в другое устройство — снимаются. */
+    out_set("lo", FAIL_DROP);
+    state_write("active", "");
+    tick(RULES_WITH, "default dev old0 scope link \nblackhole default metric 65535 \n");
+    check("первая привязка, таблица вела в другое устройство — соединения сняты",
+          cmd_seen("ctnl evict 1048576/267386880"), 1);
+
     /* 10. Мера здоровья принадлежит УСТРОЙСТВУ, а не виду выхода, который его назвал.
      *
      * Устройство туннеля, названное в `devices` выхода kind=interface, проверялось пробой
