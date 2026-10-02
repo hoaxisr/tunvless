@@ -532,4 +532,4 @@ steer распространяется под [GNU GPL v3](../LICENSE). Стор
 
 ---
 *Нужен готовый интерфейс с каталогом сервисов и автообновлением списков —
-[splify2](https://gitlab.com/xyzmean/splify2).*
+[splify2](https://github.com/splify2/splify2).*
