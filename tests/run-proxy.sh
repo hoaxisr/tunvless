@@ -28,6 +28,7 @@ BASE=$((26000 + $$ % 20000))
 HP=$BASE; UP=$((BASE+1))
 TR=$((BASE+2)); SS=$((BASE+3)); SS22=$((BASE+4)); SK=$((BASE+5)); HT=$((BASE+6)); VM=$((BASE+7))
 VMC=$((BASE+8)); SS22C=$((BASE+9)); SSN=$((BASE+10)); SK4=$((BASE+11)); VMWS=$((BASE+12)); SSMU=$((BASE+13))
+SINK=$((BASE+14))
 U=00000000-0000-0000-0000-000000000abc
 
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$W/k.pem" -out "$W/c.pem" \
@@ -47,6 +48,36 @@ import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", int(sys.argv[1])))
 while True:
     d, a = s.recvfrom(65535); s.sendto(b"echo:" + d, a)
+PY
+PIDS="$PIDS $!"
+
+# Медленный приёмник: читает понемногу (буферы по дороге заполняются — отправка клиента упирается
+# в полный сокет), счёт байт — в ответ «GOT n», когда пришло 4 МБ. Начало «05 01 00» — он же сам
+# сервер socks5 без авторизации: Xray перед ним вычитывал бы поток в свою память, и полного
+# сокета у клиента socks не случалось бы.
+python3 - "$SINK" <<'PY' &
+import socket, sys, threading, time
+def serve(c):
+    n = 0
+    try:
+        d = c.recv(3)
+        if d == b"\x05\x01\x00":
+            c.sendall(b"\x05\x00"); c.recv(10)
+            c.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00")
+        else:
+            n = len(d)
+        while True:
+            d = c.recv(16384)
+            if not d: break
+            n += len(d)
+            time.sleep(0.01)
+            if n >= 4000000: c.sendall(b"GOT %d\n" % n); break
+    finally:
+        c.close()
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(16)
+while True:
+    c, _ = s.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
 PY
 PIDS="$PIDS $!"
 
@@ -115,5 +146,18 @@ run "vmess aes-128-gcm tcp" "$(vmess_url $VM tcp '' aes-128-gcm)" tcp $HP
 run "vmess aes-128-gcm udp" "$(vmess_url $VM tcp '' aes-128-gcm)" udp $UP
 run "vmess chacha tcp"      "$(vmess_url $VMC tcp '' chacha20-poly1305)" tcp $HP
 run "vmess over ws tcp"     "$(vmess_url $VMWS ws /vm aes-128-gcm)" tcp $HP
+
+# Отправка под давлением: 4 МБ в медленный приёмник. Полный буфер сокета — не отказ: кусок либо
+# уходит целиком, либо SEND_AGAIN и повтор, но не SEND_FATAL посреди потока.
+run_up() { # название ссылка
+	if out=$(UPLOAD=4000000 timeout 60 "$PROBE" "$2" tcp 127.0.0.1 "$SINK" 2>&1); then
+		echo "  ok   $1"
+	else
+		echo "  FAIL $1"; echo "$out" | tail -3 | sed 's/^/       /'; FAILS=$((FAILS + 1))
+	fi
+}
+run_up "socks5 tcp: 4 МБ под давлением" "socks5://localhost:$SINK"
+run_up "ss aes-256-gcm tcp: 4 МБ под давлением" "ss://aes-256-gcm:sspass@localhost:$SS"
+run_up "http tcp: 4 МБ под давлением" "http://hu:hp@localhost:$HT"
 
 [ $FAILS = 0 ] && echo "proxy: все проверки прошли" || { echo "proxy: провалов: $FAILS"; sed -n '1,30p' "$W/x.log"; exit 1; }

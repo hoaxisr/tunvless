@@ -65,6 +65,30 @@ int main(int argc, char **argv) {
     if (ops->flow_open(&n, sess, &k, udp) != 0) { printf("flow_open: отказ\n"); return 3; }
     if (ops->connect(&n, sess, 10) != 0) { printf("connect: отказ\n"); return 3; }
 
+    if (!udp && getenv("UPLOAD")) {
+        /* UPLOAD=N: N байт потоком кусками по 16000, как их отдаёт стек (SEND_AGAIN — подождать
+         * и повторить тот же кусок, SEND_FATAL — провал); сервер за узлом читает медленно и в
+         * конце отвечает «GOT N». Проверяет отправку под давлением: полный буфер сокета. */
+        long total = atol(getenv("UPLOAD")), sent = 0;
+        static unsigned char chunk[16000];
+        memset(chunk, 'u', sizeof chunk);
+        while (sent < total) {
+            size_t c = total - sent < (long)sizeof chunk ? (size_t)(total - sent) : sizeof chunk;
+            int sr = ops->send(&n, sess, &k, 0, chunk, c);
+            if (sr == SEND_FATAL) { printf("upload: SEND_FATAL после %ld байт\n", sent); return 1; }
+            if (sr == SEND_AGAIN) {
+                struct pollfd w = { .fd = ops->fd(sess), .events = POLLOUT };
+                poll(&w, 1, 100);
+                continue;
+            }
+            sent += (long)c;
+        }
+        printf("upload: отправлено %ld\n", sent);
+        for (int i = 0; i < 300 && g_got == 0; i++) if (pump(ops, &n, sess, 0, 200) < 0) break;
+        ops->close(sess);
+        return g_got ? 0 : 1;
+    }
+
     if (!udp) {
         char req[256];
         int rl = snprintf(req, sizeof req, "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", argv[3]);

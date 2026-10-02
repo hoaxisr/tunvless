@@ -8,7 +8,6 @@
  * не знает — такой узел для UDP отклоняется. */
 #define _GNU_SOURCE
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -142,11 +141,6 @@ static int socks4_request(int fd, uint32_t dst, uint16_t dport, const char *user
     return 0;
 }
 
-static void set_nonblock(int fd) {
-    int fl = fcntl(fd, F_GETFL, 0);
-    if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-}
-
 static int sk_connect(const void *ctx, void *sess, int timeout_s) {
     const struct px_node *n = ctx;
     struct socks_sess *s = sess;
@@ -181,7 +175,8 @@ static int sk_connect(const void *ctx, void *sess, int timeout_s) {
         rc = s->udp ? PX_EPROTO : socks4_request(fd, s->dst, s->dport, n->user);
     }
     if (rc != 0) { close(fd); px_watch_seen(rc); return rc; }
-    set_nonblock(fd);
+    /* Сокет остаётся блокирующим со сроком SO_SNDTIMEO (tr_dial), как связь транспорта у
+     * остальных дайлеров: отправка (sk_send) пишет кусок целиком. Чтение — MSG_DONTWAIT. */
     s->cfd = fd;
     px_watch_seen(0);
     return 0;
@@ -204,10 +199,17 @@ static int sk_send(const void *ctx, void *sess, const struct flow_key *k, int ud
     (void)ctx; (void)k;
     struct socks_sess *s = sess;
     if (!udp) {
-        ssize_t w = send(s->cfd, data, n, MSG_DONTWAIT | MSG_NOSIGNAL);
-        if (w == (ssize_t)n) return SEND_OK;
-        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return SEND_AGAIN;
-        return SEND_FATAL;
+        /* Кусок — целиком или никак: SEND_AGAIN значит «ничего не ушло», а неблокирующий send
+         * при почти полном буфере сокета отдаёт часть, и хвост терялся бы. Поэтому запись
+         * блокирующая до конца куска, со сроком сокета — как tr_link_write у транспорта. */
+        size_t o = 0;
+        while (o < n) {
+            ssize_t w = send(s->cfd, data + o, n - o, MSG_NOSIGNAL);
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) return SEND_FATAL;
+            o += (size_t)w;
+        }
+        return SEND_OK;
     }
     /* data — череда [длина(2)][датаграмма]; каждая → пакет socks5 UDP. */
     const unsigned char *p = data;
