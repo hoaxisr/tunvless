@@ -102,7 +102,48 @@ static void test_trojan_udp(void) {
     check("trojan udp: по байту — нагрузка «pongok»", 1, g_em_n == 6 && !memcmp(g_em, "pongok", 6));
 }
 
+/* ---- http CONNECT ------------------------------------------------------------------------- */
+
+static void http_node(struct px_node *n, const char *user, const char *pass) {
+    memset(n, 0, sizeof *n);
+    n->proto = PX_HTTP;
+    snprintf(n->user, sizeof n->user, "%s", user);
+    snprintf(n->pass, sizeof n->pass, "%s", pass);
+}
+
+static int http_connect_with(const struct px_node *n, const char *resp, size_t resp_n, void **sessp) {
+    const struct dialer_ops *ops = &proxy_http_dialer;
+    void *sess = calloc(1, ops->sess_size);
+    ops->clear(sess);
+    struct flow_key k; memset(&k, 0, sizeof k);
+    inet_pton(AF_INET, "1.2.3.4", &k.dst); k.dport = 443;
+    ops->flow_open(n, sess, &k, 0);
+    feed_reset((const unsigned char *)resp, resp_n);
+    int rc = ops->connect(n, sess, 2);
+    if (sessp) *sessp = sess; else free(sess);
+    return rc;
+}
+
+static void test_http_long_auth(void) {
+    /* Имя и пароль наибольшей длины, какую держит узел: запрос обязан уйти целиком. */
+    char user[PX_USER_MAX], pass[PX_PASS_MAX];
+    memset(user, 'u', sizeof user - 1); user[sizeof user - 1] = 0;
+    memset(pass, 'p', sizeof pass - 1); pass[sizeof pass - 1] = 0;
+    struct px_node n;
+    http_node(&n, user, pass);
+    static const char ok[] = "HTTP/1.1 200 Connection established\r\n\r\n";
+    check("http: длинные имя и пароль — CONNECT прошёл", 0, http_connect_with(&n, ok, sizeof ok - 1, NULL));
+    g_tx[g_tx_n < sizeof g_tx ? g_tx_n : sizeof g_tx - 1] = 0;
+    check("http: запрос кончается пустой строкой", 1,
+          g_tx_n >= 4 && !memcmp(g_tx + g_tx_n - 4, "\r\n\r\n", 4));
+    /* base64 от «u…u:p…p»: 127 + 1 + 255 = 383 байта → 512 знаков. */
+    const char *b = strstr((const char *)g_tx, "Proxy-Authorization: Basic ");
+    size_t bl = b ? strcspn(b + 27, "\r") : 0;
+    check("http: Basic целиком (512 знаков)", 512, (long)bl);
+}
+
 int main(void) {
     test_trojan_udp();
+    test_http_long_auth();
     return unit_done("pxdialmatch");
 }

@@ -67,16 +67,20 @@ static int http_connect(const struct px_node *n, struct http_sess *s, int timeou
     char ip[INET_ADDRSTRLEN];
     struct in_addr a = { .s_addr = s->dst };
     inet_ntop(AF_INET, &a, ip, sizeof ip);
-    char req[512];
-    int rl = snprintf(req, sizeof req,
-                      "CONNECT %s:%u HTTP/1.1\r\nHost: %s:%u\r\n", ip, s->dport, ip, s->dport);
+    /* Буфер — под самые длинные имя и пароль узла: строка CONNECT (до 70 знаков), Basic от
+     * «имя:пароль» (до 4/3 от PX_USER_MAX + PX_PASS_MAX) и обрамление. Прежние 512 не вмещали
+     * длинный Basic, а длина снова прибавлялась к rl — следующий snprintf писал за буфер. */
+    char cred[PX_USER_MAX + PX_PASS_MAX + 2], b64[((PX_USER_MAX + PX_PASS_MAX + 2) * 4) / 3 + 8];
+    char req[128 + sizeof b64];
+    b64[0] = '\0';
     if (n->user[0]) {
-        char cred[PX_USER_MAX + PX_PASS_MAX + 2], b64[((PX_USER_MAX + PX_PASS_MAX + 2) * 4) / 3 + 8];
         int cl = snprintf(cred, sizeof cred, "%s:%s", n->user, n->pass);
         b64enc((const unsigned char *)cred, (size_t)cl, b64);
-        rl += snprintf(req + rl, sizeof req - rl, "Proxy-Authorization: Basic %s\r\n", b64);
     }
-    rl += snprintf(req + rl, sizeof req - rl, "\r\n");
+    int rl = snprintf(req, sizeof req, "CONNECT %s:%u HTTP/1.1\r\nHost: %s:%u\r\n%s%s%s\r\n",
+                      ip, s->dport, ip, s->dport, b64[0] ? "Proxy-Authorization: Basic " : "",
+                      b64, b64[0] ? "\r\n" : "");
+    if (rl < 0 || (size_t)rl >= sizeof req) return TR_EIO;
     if (transport_write(&s->t, (const unsigned char *)req, (size_t)rl)) return TR_EIO;
 
     char resp[1024];
