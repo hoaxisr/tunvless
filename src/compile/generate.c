@@ -1478,7 +1478,43 @@ static void build_dns_redirect(struct nft_table *t, const struct spec *sp) {
  * объявил этот диапазон маршрутом, и по умолчанию он его не объявляет. Из
  * локальной сети вопрос не встаёт вовсе — там роутер и есть шлюз. */
 static void fakeip_nomap_drop(struct nft_chain *c, int v6, const char *comment);
-static void build_fakeip(struct nft_table *t, int v6) {
+
+/* ПОДМЕНА ПОРТА (`override_port` списка, как route-options override_port у sing-box): поддельный
+ * адрес из набора группы — на настоящий адрес с портом из списка. Стоит в цепочке nat ПЕРЕД
+ * общим dnat по карте: ядро берёт первое совпавшее dnat, и общее правило подменило бы адрес с
+ * прежним портом. Набор у такой группы свой (подмена входит в сужение, groups.c), поэтому соседние
+ * имена того же выхода порт не теряют.
+ *
+ * Зачем это было нужно сразу: проверка FakeIP в браузере у podkop и forkop — запрос к
+ * https://fakeip.podkop.fyi/check, и их sing-box подменяет у этого имени порт на 8443; сервер на
+ * 8443 отвечает fakeip: true. Без подмены запрос шёл на 443, и проверка показывала, что FakeIP
+ * не работает, хотя он работал. */
+static void port_override_rules(struct nft_chain *c, const struct groups *gr, const char *comment) {
+    for (size_t i = 0; i < gr->n; i++) {
+        const struct group *g = &gr->g[i];
+        if (!g->domains || g->realip || !g->l4 || !g->l4->override_port || !group_has_set(g)) continue;
+        struct nft_rule *r = ir_rule(c);
+        ir_rule_fam(r, 4);
+        ir_x(r, "ip daddr @%s", g->name);
+        x_l4(r, g->l4, 0);
+        ir_counter(r, 0, 0);
+        ir_x(r, "dnat ip to ip daddr map @fakeip : %u", g->l4->override_port);
+        ir_comment(r, "%s:%s", comment, g->name);
+        if (g->dom6 && group_has_set6(g)) {
+            char n6[80];
+            group_set6_name(g, n6, sizeof(n6));
+            r = ir_rule(c);
+            ir_rule_fam(r, 6);
+            ir_x(r, "ip6 daddr @%s", n6);
+            x_l4(r, g->l4, 0);
+            ir_counter(r, 0, 0);
+            ir_x(r, "dnat ip6 to ip6 daddr map @fakeip6 : %u", g->l4->override_port);
+            ir_comment(r, "%s:%s", comment, g->name);
+        }
+    }
+}
+
+static void build_fakeip(struct nft_table *t, const struct groups *gr, int v6) {
     struct nft_set *m = ir_map_add(t, "fakeip", "ipv4_addr", "ipv4_addr");
     ir_gap(m);
     char path[512];
@@ -1494,6 +1530,7 @@ static void build_fakeip(struct nft_table *t, int v6) {
         if (m6 && have_path) ir_set_fakeip_state(m6, path);
     }
     struct nft_chain *c = ir_base_chain_add(t, "prerouting_dnat", "nat", "prerouting", "dstnat", 0);
+    port_override_rules(c, gr, "steer-port");
     struct nft_rule *r = ir_rule(c);
     ir_rule_fam(r, 4);
     ir_x(r, "ip daddr 198.18.0.0/15");
@@ -1651,6 +1688,7 @@ void nft_emit_output_dns(struct nft_rs *rs, const struct spec *sp, const struct 
                                             "dstnat", 0);
     if (plat()->local_dns) local_dns_redirect(c, sp);
     if (!has_fakeip(gr)) return;
+    port_override_rules(c, gr, "steer-port-local");
     struct nft_rule *r = ir_rule(c);
     ir_rule_fam(r, 4);
     ir_x(r, "ip daddr 198.18.0.0/15");
@@ -1925,6 +1963,12 @@ static void build_nat6(struct nft_table *t, const struct spec *sp) {
  * прежний до байта (снимок tests/golden/ruleset). */
 int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
               struct err *e) {
+    /* Подмена порта делается по карте fake-IP (port_override_rules): у канала realip поддельных
+     * адресов нет, и подмена молча не случилась бы. */
+    for (size_t i = 0; i < gr->n; i++)
+        if (gr->g[i].domains && gr->g[i].realip && gr->g[i].l4 && gr->g[i].l4->override_port)
+            return err_set(e, "группа %s: override_port у списка — только с dns.mode fakeip, а у "
+                           "канала realip", gr->g[i].name);
     struct nft_table *t = ir_table_add(rs, NFT_FAM_INET, nft_table());
     build_group_sets(t, gr);
     build_v6donor_set(t, sp);
@@ -1950,7 +1994,7 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
      * по СТОИМОСТИ, а не по смыслу, и переворачиваться он может свободно — ни один
      * чужой ключ от него не зависит. */
     if (has_domains(gr)) {
-        if (has_fakeip(gr)) build_fakeip(t, has_fakeip6(gr));
+        if (has_fakeip(gr)) build_fakeip(t, gr, has_fakeip6(gr));
         if (plat()->local_channels && has_local_domains(gr)) nft_emit_output_dns(rs, sp, gr);
         if (sp->traceroute_hops) build_traceroute_raw(t);
     }

@@ -588,12 +588,38 @@ void fakeip_route_set6(const char *domain, chm_t want) {
  * want, и fakeip_route_set молчал бы до конца дросселя, а клиент с поддельным адресом в кэше всё
  * это время шёл бы мимо выхода: пакет к поддельному адресу набор не метит, а карта dnat, которую
  * apply засевает из файла состояния, разворачивает его в настоящий адрес — напрямую. */
+/* Элемент уже стоит в наборе канала — засев набора правил положил его текстом (fpseed.c), и
+ * добавлять его заново значило бы транзакцию nftables впустую: на роутере их было по нескольку
+ * на имя, по десятку-другому миллисекунд каждая, и сотня имён держала резолвер (и DNS) секунд
+ * десять после каждой новой таблицы. У составного набора ключ — адрес с протоколом и портами,
+ * и одного GET мало: туда — как прежде, добавлением. */
+static int dch_present(size_t i, uint32_t addr_host) {
+    if (g_dch[i].composite) return 0;
+    uint32_t k = htonl(addr_host);
+    return nft_set_has(g_dch[i].set, &k, 4);
+}
+
+static int dch_present6(size_t i, const uint8_t addr[16]) {
+    if (g_dch[i].composite) return 0;
+    char s6[80];
+    dch_set6_name(i, s6, sizeof(s6));
+    return nft_set_has(s6, addr, 16);
+}
+
+/* Наборы каналов, которых в ядре нет (добавление ответило ENOENT), — на время одного прохода
+ * восстановления: стучаться в них за каждой следующей записью — по транзакции впустую. */
+static chm_t g_dch_missing, g_dch_missing6;
+
 static void route_reassert(struct fakeip_entry *e, chm_t want) {
     want = chm_upto(want, g_dch_n);
     for (size_t i = 0; i < g_dch_n; i++)
         if (chm_has(e->sets, i) && !chm_has(want, i)) dch_del(i, e->domain, e->addr);
-    for (size_t i = 0; i < g_dch_n; i++)
-        if (chm_has(want, i)) dch_add(i, e->domain, e->addr, 0);
+    for (size_t i = 0; i < g_dch_n; i++) {
+        if (!chm_has(want, i) || chm_has(g_dch_missing, i) || dch_present(i, e->addr)) continue;
+        nft_last_add_rc = 0;
+        dch_add(i, e->domain, e->addr, 0);
+        if (nft_last_add_rc == -ENOENT) g_dch_missing = chm_or(g_dch_missing, chm_one(i));
+    }
     e->sets = want;
     e->route_asserted = time(NULL);
 }
@@ -606,8 +632,12 @@ static void route_reassert6(struct fakeip_entry *e, chm_t want) {
     fakeip6_of(e->addr, f6);
     for (size_t i = 0; i < g_dch_n; i++)
         if (chm_has(e->sets6, i) && !chm_has(want, i)) dch_del6(i, e->domain, f6);
-    for (size_t i = 0; i < g_dch_n; i++)
-        if (chm_has(want, i)) dch_add6(i, e->domain, f6, 0);
+    for (size_t i = 0; i < g_dch_n; i++) {
+        if (!chm_has(want, i) || chm_has(g_dch_missing6, i) || dch_present6(i, f6)) continue;
+        nft_last_add_rc = 0;
+        dch_add6(i, e->domain, f6, 0);
+        if (nft_last_add_rc == -ENOENT) g_dch_missing6 = chm_or(g_dch_missing6, chm_one(i));
+    }
     e->sets6 = want;
     e->route6_asserted = time(NULL);
 }
@@ -664,10 +694,22 @@ size_t g_fakeip_fixed;
 size_t fakeip_rehydrate(int nk_open, size_t *routed_out) {
     size_t restored = 0, routed = 0;
     g_fakeip_fixed = 0;
+    /* ТАБЛИЦЫ НЕТ — В ЯДРО НЕ ХОДИТЬ. Резолвер, поднятый вместе с движком (steer restart, запуск
+     * коннектора), стартует раньше, чем демон загрузил набор правил: таблицы ещё нет, и каждая
+     * запись давала по нескольку отказов ENOENT. На роутере это было почти десять секунд (сотня
+     * имён), и всё это время резолвер не слушал ни DNS, ни свой управляющий сокет, а загрузчик
+     * набора правил ждал его засева по таймауту. ENOENT при добавлении в карту fake-IP значит
+     * «карты нет», а карта есть всегда, когда есть таблица с доменными каналами, — и остальные
+     * записи идут как без netlink: «знаем» остаётся, «стоит в ядре» — нет. Вернёт их этот же
+     * проход, когда демон загрузит таблицу (reassert после загрузки). Отдельный набор канала,
+     * которого нет (а таблица есть), таблицу отсутствующей не делает: он пропускается сам
+     * (g_dch_missing). */
+    int absent = 0;
+    g_dch_missing = g_dch_missing6 = 0;
     for (size_t i = 0; i < g_fakeip.n; i++) {
         struct fakeip_entry *e = &g_fakeip.entries[i];
         chm_t all = 0, m = 0;
-        if (nk_open == 0) {
+        if (nk_open == 0 && !absent) {
             /* Re-derive the channels for the stored domain and re-assert the permanent route
              * elements — БЕЗ дросселя и во все каналы, а не только в новые (route_reassert ниже):
              * этот проход зовут и после замены набора правил, когда наборы в ядре пересозданы
@@ -677,12 +719,16 @@ size_t fakeip_rehydrate(int nk_open, size_t *routed_out) {
             if (m || e->sets) route_reassert(e, m);
             if (m) routed++;
         }
+        int kern = nk_open == 0 && !absent;
+        if (!kern && absent) { e->sets = 0; e->sets6 = 0; }
         uint32_t want = e->real_host ? e->real_host : e->real_saved;
         if (want) {
             /* Что стоит в ядре, память не знает (засев из файла, карта, пережившая резолвер) —
              * спрашивается само ядро (см. выше, «ПО ЯДРУ»). Отказ гасит только «стоит в ядре»;
              * real_saved остаётся. */
-            int mrc = nk_open == 0 ? nft_map_ensure_element(g_fakeip_map, e->addr, want) : -1;
+            int mrc = kern ? nft_map_ensure_element(g_fakeip_map, e->addr, want) : -1;
+            /* Добавление в карту отвечает ENOENT, только если карты нет. */
+            if (kern && mrc == -ENOENT) absent = 1;
             if (mrc >= 0) {
                 e->real_host = e->real_saved = want;
                 restored++;
@@ -693,7 +739,7 @@ size_t fakeip_rehydrate(int nk_open, size_t *routed_out) {
             }
         }
         if (e->has_real6) e->has_real6_saved = 1;
-        if (nk_open != 0) {
+        if (!kern) {
             e->has_real6 = 0;
             continue;
         }

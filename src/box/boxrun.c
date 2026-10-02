@@ -738,10 +738,12 @@ static void stop_all(struct box_rt *rt) {
     dummies_stop(rt);
     if (rt->steerd > 0) {
         kill(rt->steerd, SIGTERM);
-        for (int i = 0; i < 100; i++) {
+        /* До 10 с, шагом 10 мс: steerd гасится за десятки миллисекунд, и шаг в 100 мс добавлял
+         * к каждой остановке (и к каждому перезапуску) почти столько же ожидания. */
+        for (int i = 0; i < 1000; i++) {
             int st;
             if (waitpid(rt->steerd, &st, WNOHANG) == rt->steerd) { rt->steerd = 0; break; }
-            usleep(100 * 1000);
+            usleep(10 * 1000);
         }
         if (rt->steerd > 0) { kill(rt->steerd, SIGKILL); waitpid(rt->steerd, NULL, 0); }
         rt->steerd = 0;

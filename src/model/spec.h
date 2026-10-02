@@ -82,13 +82,19 @@ struct l4match {
     enum chan_proto proto;
     struct port_range ports[L4_PORTS_MAX];
     size_t ports_n;
+    /* Подмена порта назначения (`override_port` списка, как route-options override_port у
+     * sing-box): соединение к поддельному адресу из этого списка уходит на настоящий адрес с
+     * этим портом. 0 — подмены нет. Живёт рядом с сужением, потому что так же разделяет каналы:
+     * список с подменой — своя группа и свой набор (имя с «_pN», как у сужения), иначе подмена
+     * задела бы соседние домены того же выхода. */
+    uint16_t override_port;
 };
 
 /* Сужения нет вовсе — то есть канал ведёт себя ровно как канал схемы 1. NULL считается
  * отсутствием сужения: так вызывающему, у которого сужения быть не может, не нужен
  * пустой объект на стеке. */
 static inline int l4match_empty(const struct l4match *m) {
-    return !m || (m->proto == CH_PROTO_ANY && m->ports_n == 0);
+    return !m || (m->proto == CH_PROTO_ANY && m->ports_n == 0 && !m->override_port);
 }
 
 /* Вид выхода — модуль в src/kinds (kind.h, docs/architecture.md, раздел 2, правило 1). Что

@@ -450,7 +450,7 @@ static int files_of(struct v2 *x, const struct ynode *n, const char *where, cons
 static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val) {
     struct spec *s = x->s;
     static const char *const K[] = { "srs", "prefixes_file", "domains_file", "domains", "prefixes",
-                                     "proto", "ports", "all", NULL };
+                                     "proto", "ports", "all", "override_port", NULL };
     if (spec_reserve_list(s, s->list_n + 1) != 0)
         return fail(x, key, "недостаточно памяти для спеки (списков: %zu)", s->list_n + 1);
     struct spec_list *l = &s->list[s->list_n];
@@ -534,6 +534,18 @@ static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val
                                 w, l->l4.ports[k].lo, l->l4.ports[k].hi, r->lo, r->hi);
             l->l4.ports_n++;
         }
+    }
+    if ((n = ynode_get(val, "override_port"))) {
+        long v;
+        snprintf(w, sizeof(w), "%s.override_port", where);
+        if (long_of(x, n, w, 1, 65535, &v)) return -1;
+        /* Подмена делается по карте fake-IP (поддельный адрес → настоящий с этим портом), то есть
+         * только для имён. Список с подсетями или наборами .srs (у них свои адреса и свои
+         * сужения в составном наборе) подменой не владеет. */
+        if (!l->domains_n || l->prefixes_n || l->srs_n || l->all)
+            return fail(x, n, "%s: подмена порта — только у списка имён (domains_file) без "
+                        "prefixes_file, srs и all", w);
+        l->l4.override_port = (uint16_t)v;
     }
     int files = l->srs_n || l->prefixes_n || l->domains_n;
     if (l->all && (files || inl))

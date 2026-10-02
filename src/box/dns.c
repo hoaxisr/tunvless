@@ -26,6 +26,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
+#include <poll.h>
 
 #define DNSD_OPT_NOFORWARD 65001
 #define DNSD_PORT 5300
@@ -63,6 +64,7 @@ struct dns_srv {
     int dnsd_fd;
     struct qctx *dnsd_wait[65536];
     uint16_t dnsd_seq;
+    uint64_t dnsd_retry;        /* таймер повтора вопросов к dnsd (он ещё не слушал) */
     struct upent *ups;
     size_t nups;
     const char *final;
@@ -88,6 +90,7 @@ struct qctx {
     int strategy;               /* -1 — по dns.strategy */
     int disable_cache;
     int must_fake;              /* спросили dnsd ради fakeip-сервера: отказ — к dns.final */
+    long long dnsd_since;       /* когда вопрос ушёл к dnsd (повтор после ECONNREFUSED) */
     char via[128];              /* сервер, которым отвечаем (для кэша) */
 };
 
@@ -290,6 +293,33 @@ static void resolve_with(struct qctx *c, const char *tag) {
 
 /* ---- dnsd ------------------------------------------------------------------------------- */
 
+/* Отвечает ли dnsd: вопрос «не пересылать» о несуществующем имени — ответ (REFUSED) приходит сразу,
+ * без похода наверх. Блокирующий, до ms; только при запуске частей. 0 — ответил. */
+static int dnsd_ready_wait(int fd, int ms) {
+    uint8_t q[300], qo[400];
+    struct dnsq dq;
+    size_t qn = dns_build_query("steer-box-ready.invalid", 1, 0x5b0c, q, sizeof q);
+    if (!qn || dnsq_parse(q, qn, &dq)) return -1;
+    size_t n = dns_add_opt(q, qn, &dq, DNSD_OPT_NOFORWARD, qo, sizeof qo);
+    if (!n) return -1;
+    long long until = ev_now_ms() + ms;
+    while (ev_now_ms() < until) {
+        if (send(fd, qo, n, 0) < 0 && errno != ECONNREFUSED) usleep(20 * 1000);
+        struct pollfd p = { fd, POLLIN, 0 };
+        if (poll(&p, 1, 50) <= 0) continue;
+        uint8_t r[600];
+        ssize_t m = recv(fd, r, sizeof r, 0);
+        if (m >= 12 && r[0] == 0x5b && r[1] == 0x0c) {
+            /* Ответы на прежние попытки — дочитать: номер 0x5b0c мог бы потом совпасть с номером
+             * настоящего вопроса. */
+            while (poll(&p, 1, 20) > 0 && recv(fd, r, sizeof r, 0) >= 0) {}
+            return 0;
+        }
+        if (m < 0) usleep(20 * 1000);       /* ECONNREFUSED: ещё не слушает */
+    }
+    return -1;
+}
+
 static void ask_dnsd(struct qctx *c, int must) {
     struct dns_srv *s = c->s;
     c->must_fake = must;
@@ -311,23 +341,51 @@ static void ask_dnsd(struct qctx *c, int must) {
     buf[0] = (uint8_t)(id >> 8);
     buf[1] = (uint8_t)id;
     s->dnsd_wait[id] = c;
+    c->dnsd_since = ev_now_ms();
     if (send(s->dnsd_fd, buf, n, 0) != (ssize_t)n) {
         s->dnsd_wait[id] = NULL;
         must ? resolve_with(c, s->final) : eval(c);
     }
 }
 
+/* ПОВТОР ВОПРОСОВ К DNSD. dnsd не слушает (steer только стартует, резолвер перезапускается) —
+ * ядро отвечает на вопрос ECONNREFUSED, и вопрос так и висел: клиент ждал своего повтора, около
+ * двух секунд (выбросы в замере перезапуска на роутере — 3 с вместо 1). Теперь ждущие вопросы
+ * уходят к dnsd снова через 50 мс; кто ждёт дольше двух секунд — идёт дальше по правилам, как при
+ * отказе dnsd. */
+#define DNSD_RETRY_MS 50
+#define DNSD_GIVEUP_MS 2000
+
+static void dnsd_resend(struct ev *ev, void *arg) {
+    (void)ev;
+    struct dns_srv *s = arg;
+    s->dnsd_retry = 0;
+    long long now = ev_now_ms();
+    for (unsigned id = 0; id < 65536; id++) {
+        struct qctx *c = s->dnsd_wait[id];
+        if (!c) continue;
+        uint8_t buf[700];
+        size_t n = now - c->dnsd_since < DNSD_GIVEUP_MS ?
+                   dns_add_opt(c->q, c->qn, &c->dq, DNSD_OPT_NOFORWARD, buf, sizeof buf) : 0;
+        if (n) {
+            buf[0] = (uint8_t)(id >> 8);
+            buf[1] = (uint8_t)id;
+            if (send(s->dnsd_fd, buf, n, 0) == (ssize_t)n) continue;
+        }
+        s->dnsd_wait[id] = NULL;
+        c->must_fake ? resolve_with(c, s->final) : eval(c);
+    }
+}
+
 static void dnsd_cb(struct ev *ev, int fd, uint32_t e, void *arg) {
-    (void)ev; (void)e;
+    (void)e;
     struct dns_srv *s = arg;
     uint8_t buf[4096];
     for (;;) {
         ssize_t n = recv(fd, buf, sizeof buf, 0);
         if (n < 0) {
             if (errno == ECONNREFUSED) {
-                /* dnsd ещё не поднят (steer стартует) или перезапускается: ждавшие вопросы идут
-                 * дальше по правилам — по одному на каждую ошибку достаточно редко, чтобы не
-                 * перебирать всю таблицу. */
+                if (!s->dnsd_retry) s->dnsd_retry = ev_timer(ev, DNSD_RETRY_MS, dnsd_resend, s);
                 continue;
             }
             return;
@@ -753,6 +811,10 @@ int dns_start(struct box_rt *rt) {
     da.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (fd >= 0 && !connect(fd, (struct sockaddr *)&da, sizeof da)) {
         s->dnsd_fd = fd;
+        /* Слушатели — когда dnsd уже отвечает: имя из списка, спрошенное раньше, получило бы не
+         * поддельный адрес, а ожидание (dnsd_resend). При запуске коннектора dnsd поднимается
+         * вместе с steerd, это доли секунды; при перезапуске частей он уже работает. */
+        if (dnsd_ready_wait(fd, 3000)) LOGW("dns: резолвер steer не ответил за 3 с — начинаю без него");
         ev_add(rt->ev, fd, EPOLLIN, dnsd_cb, s);
     } else if (fd >= 0) close(fd);
     /* Слушатели. */
@@ -812,6 +874,7 @@ void dns_stop(struct box_rt *rt) {
         close(s->ls[i].fd);
     }
     free(s->ls);
+    if (s->dnsd_retry) ev_timer_cancel(rt->ev, s->dnsd_retry);
     if (s->dnsd_fd >= 0) { ev_del(rt->ev, s->dnsd_fd); close(s->dnsd_fd); }
     /* Вопросы, ждавшие dnsd, — SERVFAIL: их соединения ещё открыты. Слушатели уже закрыты,
      * поэтому ответ по UDP уйдёт в закрытый сокет — это тот же исход, что потеря датаграммы. */

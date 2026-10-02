@@ -136,7 +136,32 @@ int cmd_down(void) {
     static const char *const tabs[][2] = {
         { "inet", NULL }, { "ip", NULL }, { "ip6", NULL }, { "inet", "steer_obfs" },
     };
-    for (size_t i = 0; i < sizeof tabs / sizeof tabs[0]; i++) {
+    /* Все таблицы — одним запуском nft и одной транзакцией: «table X» + «delete table X» (тот же
+     * приём, что у замены таблицы в apply) не отвергается и тогда, когда таблицы нет. Раньше —
+     * четыре запуска nft подряд, а на роутере каждый — десятки миллисекунд при каждой остановке
+     * и перезапуске. Файл не записался или nft его не принял — по таблице, как прежде. */
+    int one = -1;
+    {
+        char tmp[256];
+        steer_tmp_template(tmp, sizeof(tmp), "steer-down");
+        int fd = mkstemp(tmp);
+        FILE *f = fd >= 0 ? fdopen(fd, "w") : NULL;
+        if (f) {
+            for (size_t i = 0; i < sizeof tabs / sizeof tabs[0]; i++) {
+                const char *t = tabs[i][1] ? tabs[i][1] : nft_table();
+                fprintf(f, "table %s %s\ndelete table %s %s\n", tabs[i][0], t, tabs[i][0], t);
+            }
+            if (fclose(f) == 0) {
+                const char *load[] = { "nft", "-f", tmp, NULL };
+                one = run(load);
+            }
+            unlink(tmp);
+        } else if (fd >= 0) {
+            close(fd);
+            unlink(tmp);
+        }
+    }
+    for (size_t i = 0; one != 0 && i < sizeof tabs / sizeof tabs[0]; i++) {
         const char *del[] = { "nft", "delete", "table", tabs[i][0],
                               tabs[i][1] ? tabs[i][1] : nft_table(), NULL };
         run(del);

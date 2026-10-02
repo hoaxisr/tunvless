@@ -435,6 +435,8 @@ uint32_t set_ttl_clamp(uint32_t ttl) {
 }
 
 /* Общее тело nft_add_element и nft_add_element6: ключ в порядке сети, alen — 4 или 16. */
+int nft_last_add_rc;
+
 static int add_element(const char *set_name, const void *key_net, size_t alen, uint32_t ttl) {
     uint64_t timeout_ms;
     if (ttl == 0) {
@@ -453,6 +455,7 @@ static int add_element(const char *set_name, const void *key_net, size_t alen, u
          * маршрутизация не наполняется. */
         fprintf(stderr, "steer[warn] dnsd: %s rejected an interval element (-EINVAL) — "
                         "is it declared without `flags interval`?\n", set_name);
+    nft_last_add_rc = rc;
     /* Already there = already in the desired state. (A refreshed timeout would be
      * nicer, but the element only has to outlive the client's cached answer, and
      * a re-resolve after expiry re-adds it.) */
@@ -831,6 +834,17 @@ static int map_ensure(const char *table, const char *map_name, const void *k, co
         return rc == 0 ? 1 : rc;
     }
     return map_set(table, map_name, k, d, alen, 0);
+}
+
+/* Стоит ли в наборе g_nft_table элемент с ключом key (alen — 4 или 16, порядок сети); у
+ * интервального набора — отрезок, в который ключ попадает (ядро ищет по отрезкам). 1 — стоит,
+ * 0 — нет или ответа нет. GET — не транзакция: на роутере это доли миллисекунды, тогда как
+ * каждое добавление — своя транзакция nftables с фиксацией в десятки миллисекунд. Поэтому
+ * проход восстановления сначала спрашивает (fakeip.c, route_reassert). */
+int nft_set_has(const char *set_name, const void *key_net, size_t alen) {
+    uint8_t got[16];
+    int timed = 0;
+    return nftlk_get_bound(g_nft_table, set_name, key_net, alen, 0, got, &timed) == 0;
 }
 
 int nft_map_ensure_element(const char *map_name, uint32_t fake_host, uint32_t real_host) {

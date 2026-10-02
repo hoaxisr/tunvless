@@ -40,6 +40,7 @@ struct tr {
     int resolve_all;               /* resolve без условий — все следующие правила */
     int quic_reject;               /* reject protocol quic до правил в туннели */
     int self_used;                 /* заведён клиент router (self) */
+    long override_port;            /* правило route-options: подмена порта у списков правила */
 };
 
 static void tw(struct tr *t, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -429,6 +430,7 @@ static const char *emit_list(struct tr *t, struct pending_list *pl, const char *
             jarr_push(a, strchr(s, '-') ? jstr(s) : jint(strtol(s, NULL, 10)));
         jobj_set(l, "ports", a);
     }
+    if (t->override_port > 0) jobj_set(l, "override_port", jint(t->override_port));
     jobj_set(t->lists, name, l);
     return name;
 }
@@ -1087,7 +1089,7 @@ static int rule_keys_ok(struct tr *t, const struct jval *r, const char *where) {
     static const char *ok[] = { "inbound", "action", "outbound", "rule_set", "domain", "domain_suffix",
                                 "domain_keyword", "domain_regex", "ip_cidr", "ip_is_private",
                                 "source_ip_cidr", "network", "port", "port_range", "protocol",
-                                "ip_version", NULL };
+                                "ip_version", "override_port", NULL };
     for (size_t i = 0; i < jlen(r); i++) {
         const char *k = r->o[i].key;
         int good = 0;
@@ -1405,7 +1407,34 @@ int box_translate(const struct jval *cfg, const struct tr_opts *o, struct tr_res
             continue;
         }
         if (!strcmp(act, "route-options")) {
-            tw(&t, "%s: route-options (подмена порта) пока не переводится", where);
+            /* override_port — подмена порта у имён правила (podkop и forkop так ведут проверку
+             * FakeIP: fakeip.podkop.fyi на 8443). Правило маршрута не выбирает: соединение у
+             * sing-box идёт дальше по правилам. Имена route-options — проверочные, других правил
+             * у них нет, и дальше они уходят в route.final — туда же их ведёт и правило steer.
+             * Подмена — у списка (lists.*.override_port), по карте fake-IP, поэтому — только для
+             * имён: domain и domain_suffix. */
+            long op = jgeti(r, "override_port", 0);
+            int names_only = (jget(r, "domain") || jget(r, "domain_suffix")) && !jget(r, "rule_set") &&
+                             !jget(r, "ip_cidr") && !jget(r, "domain_keyword") && !jget(r, "domain_regex");
+            int other = 0;
+            for (size_t k = 0; k < jlen(r); k++) {
+                const char *key = r->o[k].key;
+                if (strcmp(key, "action") && strcmp(key, "override_port") && strcmp(key, "domain") &&
+                    strcmp(key, "domain_suffix") && strcmp(key, "inbound") && strcmp(key, "network"))
+                    other = 1;
+            }
+            if (op <= 0 || op > 65535 || !names_only || other) {
+                tw(&t, "%s: route-options переводится только как override_port у domain и "
+                   "domain_suffix — правило снято", where);
+                continue;
+            }
+            const char *fin = jgets(jget(cfg, "route"), "final");
+            const char *out = fin ? emit_output(&t, fin, 0) : ensure_direct(&t);
+            if (!out) out = ensure_direct(&t);
+            t.override_port = op;
+            int rc = emit_rule(&t, i, r, out, fin ? fin : "direct", 0);
+            t.override_port = 0;
+            if (rc) break;
             continue;
         }
         if (!strcmp(act, "reject")) {

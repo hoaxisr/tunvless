@@ -24,6 +24,10 @@ int nftlk_elem_msg(uint16_t nft_msg_type, const char *table,
                     uint64_t timeout_ms);
 uint32_t set_ttl_clamp(uint32_t ttl);
 int nft_add_element(const char *set_name, uint32_t key_host, uint32_t ttl);
+/* Ответ ядра на последнее добавление элемента (0, -EEXIST, -ENOENT…): nft_add_element сводит его
+ * к 0/-1, а восстановлению после старта нужно отличить «набора нет вовсе» (fakeip_rehydrate). */
+extern int nft_last_add_rc;
+int nft_set_has(const char *set_name, const void *key_net, size_t alen);
 /* Элемент составного набора `ipv4_addr . inet_proto . inet_service` (см. nftnl.c): адрес и
  * ящик «протоколы × порты». add — положить (ttl в секундах, 0 — навсегда) или убрать. 0 —
  * в ядре желаемое состояние (EEXIST при добавлении и ENOENT при удалении — тоже). */
