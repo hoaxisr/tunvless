@@ -261,6 +261,17 @@ contains "  с причиной" "$out" 'не совпал с pinSHA256'
 write_sub "hysteria2://hunter2@$SIP:4433/?sni=hy2.test#nocheck"
 out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
 contains "самоподписанный без insecure и без отпечатка: отказ" "$out" '"ok":false'
+# sni — адрес, а не имя (так Xray раздаёт узлы с сертификатом на IP): SNI не уходит, сертификат
+# сверяется с SAN IP. Прежде клиент отказывал ещё до первого пакета («QUIC не открылся (-4)»), здесь
+# рукопожатие обязано дойти до проверки сертификата — самоподписанный без insecure она не пропускает.
+write_sub "hysteria2://hunter2@$SIP:4433/?sni=$SIP&alpn=h3#ipsni"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+contains "sni=адрес: отказ проверкой сертификата" "$out" '"ok":false'
+case "$out" in *"QUIC не открылся"*) fail=$((fail + 1)); echo "  FAIL sni=адрес: QUIC не открылся до первого пакета";;
+    *) pass=$((pass + 1)); echo "  ok   sni=адрес: QUIC открылся, SNI-адрес не роняет TLS";; esac
+write_sub "hysteria2://hunter2@$SIP:4433/?sni=$SIP&alpn=h3&pinSHA256=$PIN#ippin"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+contains "sni=адрес и pinSHA256: узел принят" "$out" '"ok":true'
 
 # ---- 5. режим перегрузки ------------------------------------------------------------------------
 echo "5. режим перегрузки"

@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
 
 #include <wolfssl/ssl.h>
 #include <wolfssl/quic.h>
@@ -121,10 +122,20 @@ void *qcssl_new(void *ctx, void *conn_ref, const char *sni, const char *alpn, in
             goto fail;
     }
     if (!server && sni && sni[0]) {
-        if (wolfSSL_UseSNI(ssl, WOLFSSL_SNI_HOST_NAME, sni, (unsigned short)strlen(sni)) != WOLFSSL_SUCCESS)
-            goto fail;
-        if (verify_name && wolfSSL_check_domain_name(ssl, sni) != WOLFSSL_SUCCESS)
-            goto fail;
+        /* Адрес вместо имени (sni=31.76.69.65 у узлов Xray с сертификатом на IP): SNI не уходит
+         * вовсе — RFC 6066 запрещает в нём адрес, так же поступают Go и Xray, — а сертификат
+         * сверяется с SAN IP. Прежде адрес шёл в SNI и в проверку ДОМЕННОГО имени, wolfSSL
+         * отказывал, и соединение не открывалось ещё до первого пакета («QUIC не открылся (-4)»). */
+        unsigned char ip[16];
+        if (inet_pton(AF_INET, sni, ip) == 1 || inet_pton(AF_INET6, sni, ip) == 1) {
+            if (verify_name && wolfSSL_check_ip_address(ssl, sni) != WOLFSSL_SUCCESS)
+                goto fail;
+        } else {
+            if (wolfSSL_UseSNI(ssl, WOLFSSL_SNI_HOST_NAME, sni, (unsigned short)strlen(sni)) != WOLFSSL_SUCCESS)
+                goto fail;
+            if (verify_name && wolfSSL_check_domain_name(ssl, sni) != WOLFSSL_SUCCESS)
+                goto fail;
+        }
     }
     return ssl;
 fail:

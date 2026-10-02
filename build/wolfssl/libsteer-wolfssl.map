@@ -96,6 +96,7 @@
     wolfSSL_CertManagerLoadCABuffer;
     wolfSSL_CertManagerLoadCABuffer_ex;
     wolfSSL_check_domain_name;
+    wolfSSL_check_ip_address;
     wolfSSL_CTX_free;
     wolfSSL_CTX_load_verify_buffer;
     wolfSSL_CTX_new;
