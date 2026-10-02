@@ -26,6 +26,11 @@ static void test_parse(void) {
     check_str("ss plugin= — причина названа", "plugin= не поддержан", n.skip_reason);
     check("ss base64 userinfo", 0, px_parse_url("ss://YWVzLTEyOC1nY206cGFzcw==@h.example:1234", &n, 0));
     check("ss base64 method", (long)SS_AES128_GCM, (long)n.ss_method);
+    /* Старая форма ss://base64(метод:пароль@хост:порт): «@» в пароле законен, хост — после
+     * ПОСЛЕДНЕГО «@». */
+    check("ss старая форма, @ в пароле", 0, px_parse_url("ss://YWVzLTEyOC1nY206cEBzc0BoLmV4YW1wbGU6ODM4OA==#n", &n, 0));
+    check_str("ss старая форма: пароль с @", "p@ss", n.pass);
+    check_str("ss старая форма: хост", "h.example", n.vn.host);
     check("ss 2022 PSK не той длины — негоден", 1,
           px_parse_url("ss://2022-blake3-aes-128-gcm:c2hvcnQ=@h.example:1", &n, 0));
 

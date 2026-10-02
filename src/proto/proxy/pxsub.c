@@ -195,7 +195,7 @@ static int ss_parse(const char *url, struct px_node *n) {
         char dec[PX_PASS_MAX * 3];
         size_t dn = b64_decode(p, (size_t)(body_end - p), dec, sizeof(dec));
         dec[dn < sizeof(dec) ? dn : sizeof(dec) - 1] = '\0';
-        char *a2 = strchr(dec, '@');
+        char *a2 = strrchr(dec, '@');    /* «@» бывает в пароле, в хосте — нет */
         char *colon = strchr(dec, ':');
         if (!a2 || !colon || colon > a2) return -1;
         *colon = '\0';
