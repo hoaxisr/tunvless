@@ -169,6 +169,12 @@ if [ -x "$XK" ]; then
     if [ -n "$bm" ] && echo "$out" | grep -q "meta nfproto ipv6 goto mark_$bm comment \"steer-balance-v6:bal\"" &&
        echo "$out" | grep -q 'reject with icmpx type admin-prohibited comment "steer-v6drop:bal"'; then ok; else
         bad "balance с членом без IPv6 — IPv6 группы в отказ" "$(echo "$out" | grep -E 'bal_|v6' | head -n 8)"; fi
+    # by: site с членом без IPv6 — хеш только по IPv4, IPv6 группы — тот же отказ.
+    printf 'version: 2\noutputs:\n  a: { kind: interface, device: wg0 }\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl }\n  bal: { kind: group, pick: balance, by: site, members: [a, nl] }\nrules:\n  - { to: all, out: bal }\n' > "$tmp/bal6s.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec bal6s.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -q 'steer-balance-v6:bal' && echo "$out" | grep -q 'jhash ip daddr mod 120' &&
+       ! echo "$out" | grep -q 'jhash ip6'; then ok; else
+        bad "by: site с членом без IPv6 — jhash только IPv4" "$(echo "$out" | grep -E 'bal_|jhash|v6' | head -n 8)"; fi
     # hysteria2 (модуль steer-hysteria2): туннель по подписке, ключи как у vless, но без transport;
     # convert — неподвижная точка; `kind: hysteria2` в v2 — отказ с подсказкой.
     printf 'version: 2\noutputs:\n  hy: { kind: tunnel, protocol: hysteria2, subscription: sub/hy, nodes: [1, 0] }\n' > "$tmp/hy1.yaml"
@@ -375,6 +381,51 @@ outputs:
   bal: { kind: group, pick: balance, members: [wg0, wg1], weights: [1] }
 EOF
 refused "weights не по числу членов" "весов 1, а членов 2" 5
+
+# by: site и site_client — слот по хешу адресов вместо numgen (balance.c); convert печатает by, и
+# напечатанное — неподвижная точка; by не у balance и неверное значение — отказ с местом.
+y <<'EOF'
+version: 2
+outputs:
+  wg0: { kind: interface, device: wg0 }
+  wg1: { kind: interface, device: wg1 }
+  st:  { kind: group, pick: balance, by: site, members: [wg0, wg1] }
+  sc:  { kind: group, pick: balance, by: site_client, members: [wg0, wg1], weights: [1, 2] }
+rules:
+  - { name: s, to: all, out: st }
+  - { name: c, to: all, out: sc }
+EOF
+accepted "balance by: site и by: site_client"
+out="$("$BIN" apply --dry-run --spec "$tmp/s.yaml" $S 2>&1)"
+if echo "$out" | grep -q 'meta nfproto ipv4 jhash ip daddr mod 120 seed 0x[0-9a-f]* vmap @balmap_[0-9]* comment "steer-balance:st"' &&
+   echo "$out" | grep -q 'meta nfproto ipv6 jhash ip6 daddr mod 120 seed 0x[0-9a-f]* vmap @balmap_[0-9]* comment "steer-balance:st"' &&
+   echo "$out" | grep -q 'meta nfproto ipv4 jhash ip saddr . ip daddr mod 120 seed 0x[0-9a-f]* vmap @balmap_[0-9]* comment "steer-balance:sc"' &&
+   echo "$out" | grep -q 'meta nfproto ipv6 jhash ip6 saddr . ip6 daddr mod 120 seed 0x[0-9a-f]* vmap @balmap_[0-9]* comment "steer-balance:sc"' &&
+   ! echo "$out" | grep -q 'numgen'; then ok; else
+    bad "by: site/site_client — jhash по обоим семействам, без numgen" "$(echo "$out" | grep -E 'jhash|numgen' | head -n 8)"; fi
+"$BIN" spec convert --spec "$tmp/s.yaml" > "$tmp/by1.yaml" 2>&1
+"$BIN" spec convert --spec "$tmp/by1.yaml" > "$tmp/by2.yaml" 2>&1
+if grep -q 'pick: balance, members: \[wg0, wg1\], by: site }' "$tmp/by1.yaml" &&
+   grep -q 'weights: \[1, 2\], by: site_client }' "$tmp/by1.yaml" && cmp -s "$tmp/by1.yaml" "$tmp/by2.yaml"; then ok; else
+    bad "convert печатает by (неподвижная точка)" "$(grep -n balance "$tmp/by1.yaml")"; fi
+
+y <<'EOF'
+version: 2
+outputs:
+  wg0: { kind: interface, device: wg0 }
+  wg1: { kind: interface, device: wg1 }
+  o:   { kind: group, pick: order, members: [wg0, wg1], by: site }
+EOF
+refused "by не у balance — отказ" "by — как раздавать соединения, он есть только у pick: balance" 5
+
+y <<'EOF'
+version: 2
+outputs:
+  wg0: { kind: interface, device: wg0 }
+  wg1: { kind: interface, device: wg1 }
+  b:   { kind: group, pick: balance, members: [wg0, wg1], by: dst }
+EOF
+refused "by неверный — отказ" "«dst» — нужен connection, site или site_client" 5
 
 y <<'EOF'
 version: 2

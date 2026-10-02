@@ -673,6 +673,7 @@ v6-двойник (раздел «IPv6 правил» ниже), резолве�
   | `awg` | Выход `kind: awg` (§1): туннель AmneziaWG/WireGuard в ядре Linux, который заводит ядро steer; у выхода в `status` — поле `awg`. |
   | `failed` | Выход, который сторож признал неработающим (on_fail применён), отдаётся с `up: false` и `failed: true`, а не по состоянию устройства (см. `up` / `failed` ниже). |
   | `groups` | Группы спеки v2 (`kind: group`): `pick` order/latency/manual/balance, вложенные группы, команда `select`; у выхода-группы в `status` — объект `group` (ниже). |
+  | `balance_by` | Ключ `by` у группы `pick: balance` (docs/spec-v2.md): `connection`, `site`, `site_client` — раздача новых соединений случайно или хешем адресов. |
   | `spec_schema2` | Спека `schema: 2` — сужение канала по протоколу и портам (§1). |
   | `via` | Ключ `via` у выхода (§1) и поле `via` в `status` (ниже). |
   | `status_cache` | `status --fast` отдаёт запомненный ответ с `"cached": true` (§6, «Память состояния»). |

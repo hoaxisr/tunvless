@@ -217,30 +217,30 @@ const char *group_pick_name(int p) {
     return p >= 0 && (size_t)p < sizeof(N) / sizeof(N[0]) ? N[p] : "order";
 }
 
-/* РАЗДАЧА СЛОТОВ balance. Правило ядра — `numgen random mod GROUP_BAL_SLOTS vmap @карта`: число
- * слотов постоянное, а меняются только элементы карты. Иначе уход члена менял бы `mod N` в самом
- * правиле, то есть правило, а не элемент, — а переписывать правило сторож не должен (ни процесса
- * nft, ни перезагрузки набора на отказ туннеля). 120 делится на 1..6, 8, 10, 12, 15: у частых
- * случаев (2-6 равных членов) доли точные, у семи — 17 и 18 слотов, перекос долей ~6%.
+const char *group_by_name(int b) {
+    static const char *const N[] = { "connection", "site", "site_client" };
+    return b >= 0 && (size_t)b < sizeof(N) / sizeof(N[0]) ? N[b] : "connection";
+}
+
+/* РАЗДАЧА СЛОТОВ balance. Правило ядра — `numgen random mod GROUP_BAL_SLOTS vmap @карта` (у by: site
+ * и site_client — `jhash … mod GROUP_BAL_SLOTS`): число слотов постоянное, а меняются только
+ * элементы карты. Иначе уход члена менял бы `mod N` в самом правиле, то есть правило, а не элемент,
+ * — а переписывать правило сторож не должен (ни процесса nft, ни перезагрузки набора на отказ
+ * туннеля). 120 делится на 1..6, 8, 10, 12, 15: у частых случаев (2-6 равных членов) доли точные,
+ * у семи — 17 и 18 слотов, перекос долей ~6%.
  *
- * Доля — по весам живых членов методом наибольшего остатка; слоты раздаются подряд, по порядку
- * членов (порядок внутри карты для случайного numgen ничего не значит). Чистая функция: её зовут
- * компилятор (карта при apply — все члены живы) и сторож (карта по живым), а сверяет стенд. */
-void group_balance_slots(const struct group_cfg *g, const unsigned char *alive,
-                         unsigned char owner[GROUP_BAL_SLOTS]) {
-    size_t n = g->members_n;
-    memset(owner, 0xff, GROUP_BAL_SLOTS);
-    /* Рабочие массивы — по числу членов, одним куском (w, cnt, rem). Членов больше слотов у
-     * balance не бывает (group_seal), но функция чистая и от этого не зависит. */
-    unsigned *buf = n ? (unsigned *)calloc(3 * n, sizeof(unsigned)) : NULL;
-    if (!buf) return;
-    unsigned *w = buf, *cnt = buf + n, *rem = buf + 2 * n, total = 0;
-    for (size_t k = 0; k < n; k++) {
-        w[k] = !alive || alive[k] ? (g->weight[k] ? g->weight[k] : 1u) : 0u;
-        total += w[k];
-    }
-    if (!total) { free(buf); return; }
-    unsigned used = 0;
+ * Доля — по весам живых членов методом наибольшего остатка. Слоты при всех живых раздаются подряд,
+ * по порядку членов, — это ОСНОВНАЯ раскладка. Когда кто-то лёг, живые сохраняют свои слоты
+ * основной раскладки (сколько их влезает в новую долю), а добирают долю слотами ушедших. Для
+ * случайного numgen это всё равно, а у хеша (by: site) слот — это сайты: перекладка подряд по живым
+ * сдвигала бы границы, и сайты живых членов переезжали бы на соседа от чужого отказа. Вернулся член
+ * — карта снова основная, и его сайты — снова на нём. Чистая функция: её зовут компилятор (карта
+ * при apply — все члены живы) и сторож (карта по живым), а сверяет стенд. */
+static void bal_split(const unsigned *w, size_t n, unsigned *cnt, unsigned *rem) {
+    unsigned total = 0, used = 0;
+    for (size_t k = 0; k < n; k++) total += w[k];
+    memset(cnt, 0, n * sizeof(*cnt));
+    if (!total) return;
     for (size_t k = 0; k < n; k++) {
         cnt[k] = GROUP_BAL_SLOTS * w[k] / total;
         rem[k] = GROUP_BAL_SLOTS * w[k] % total;
@@ -255,9 +255,42 @@ void group_balance_slots(const struct group_cfg *g, const unsigned char *alive,
         rem[best] = 0;
         used++;
     }
+}
+
+void group_balance_slots(const struct group_cfg *g, const unsigned char *alive,
+                         unsigned char owner[GROUP_BAL_SLOTS]) {
+    size_t n = g->members_n;
+    memset(owner, 0xff, GROUP_BAL_SLOTS);
+    /* Рабочие массивы — по числу членов, одним куском (w, cnt, rem, keep). Членов больше слотов у
+     * balance не бывает (group_seal), но функция чистая и от этого не зависит. */
+    unsigned *buf = n ? (unsigned *)calloc(4 * n, sizeof(unsigned)) : NULL;
+    if (!buf) return;
+    unsigned *w = buf, *cnt = buf + n, *rem = buf + 2 * n, *keep = buf + 3 * n;
+    /* Основная раскладка: все живы. */
+    for (size_t k = 0; k < n; k++) w[k] = g->weight[k] ? g->weight[k] : 1u;
+    bal_split(w, n, cnt, rem);
     size_t s = 0;
     for (size_t k = 0; k < n; k++)
         for (unsigned c = 0; c < cnt[k] && s < GROUP_BAL_SLOTS; c++) owner[s++] = (unsigned char)k;
+    if (!alive) { free(buf); return; }
+    /* Доли живых; слоты основной раскладки остаются у хозяина, пока его доля не набрана. */
+    for (size_t k = 0; k < n; k++)
+        if (!alive[k]) w[k] = 0;
+    bal_split(w, n, cnt, rem);
+    for (s = 0; s < GROUP_BAL_SLOTS; s++) {
+        unsigned k = owner[s];
+        if (k < n && w[k] && keep[k] < cnt[k]) keep[k]++;
+        else owner[s] = 0xff;
+    }
+    /* Свободные слоты (ушедших и лишние) — недобравшим, по порядку членов. */
+    size_t k = 0;
+    for (s = 0; s < GROUP_BAL_SLOTS; s++) {
+        if (owner[s] != 0xff) continue;
+        while (k < n && keep[k] >= cnt[k]) k++;
+        if (k == n) break;
+        owner[s] = (unsigned char)k;
+        keep[k]++;
+    }
     free(buf);
 }
 

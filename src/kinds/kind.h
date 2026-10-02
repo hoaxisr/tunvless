@@ -293,13 +293,16 @@ void group_cfg_init(struct group_cfg *g);
 int group_named(const struct group_cfg *g);
 /* Имя pick (enum group_pick в spec.h), как пишется в спеке. */
 const char *group_pick_name(int p);
+/* Имя `by` группы balance (enum group_by в spec.h), как пишется в спеке. */
+const char *group_by_name(int b);
 /* Завести группе массивы на n членов в арене спеки: members, weight, alive, lat_ms, lat4_ms,
  * lat6_ms (замеры «не мерили», weight 0, никто не жив). n == 0 не выделяет ничего. 0 — есть;
  * -1 — нехватка памяти. Число членов константой не ограничено. */
 int group_members_alloc(struct spec *sp, struct group_cfg *g, size_t n);
-/* balance: карта ядра — GROUP_BAL_SLOTS слотов `numgen random mod N`; owner[s] — номер члена
- * слота s (0..members_n-1) по весам живых членов alive (байт на члена, 1 — жив; NULL — все
- * живы), 0xff — живых нет. Почему слоты, а не `mod <живых>` — у определения.
+/* balance: карта ядра — GROUP_BAL_SLOTS слотов `numgen random mod N` (by: site — `jhash … mod N`);
+ * owner[s] — номер члена слота s (0..members_n-1) по весам живых членов alive (байт на члена,
+ * 1 — жив; NULL — все живы), 0xff — живых нет. Слоты живых при уходе члена остаются на месте.
+ * Почему слоты, а не `mod <живых>`, — у определения.
  *
  * ЭТО НАСТОЯЩИЙ ПРЕДЕЛ balance, и он свойство карты, а не выбор кода: у члена без слота доли нет,
  * поэтому членов у группы pick: balance не больше слотов (group_seal отказывает с цифрой), а

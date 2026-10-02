@@ -655,6 +655,74 @@ static void t_balance(int nftc) {
     nft_rs_free(&rs);
 }
 
+/* by: site, site_client — слот по хешу адресов вместо numgen: по правилу на семейство, семя —
+ * номер таблицы группы (своё у каждой группы, постоянное между apply), карта и восстановление по
+ * метке соединения — те же. */
+static void t_balance_by(int nftc) {
+    printf("\n-- balance by: site и site_client — jhash по адресам (раскладка %d) --\n", nftc);
+    put("bal.lst", "203.0.113.0/24\n");
+    if (load("version: 2\n"
+             "lists:\n  l: { prefixes_file: TMP/bal.lst }\n  m: { prefixes_file: TMP/bal.lst }\n"
+             "outputs:\n"
+             "  a:   { kind: interface, device: wg0 }\n"
+             "  b:   { kind: interface, device: wg1 }\n"
+             "  c:   { kind: interface, device: wg2 }\n"
+             "  in:  { kind: group, pick: balance, by: site, members: [b, c] }\n"
+             "  st:  { kind: group, pick: balance, by: site, members: [a, in] }\n"
+             "  sc:  { kind: group, pick: balance, by: site_client, members: [a, b], weights: [1, 3] }\n"
+             "rules:\n  - { name: t, to: [l], out: st }\n  - { name: u, to: [m], out: sc }\n") < 0) return;
+    struct nft_rs rs;
+    if (build(&rs, nftc) < 0) return;
+    struct nft_table *t = ir_table_find(&rs, NFT_FAM_INET, NULL);
+    const struct output *st = oname("st"), *in = oname("in"), *sc = oname("sc");
+    char c_st[32], m_st[32], c_in[32], m_in[32], c_sc[32], m_sc[32];
+    group_bal_chain(st, c_st, sizeof(c_st));
+    group_bal_map(st, m_st, sizeof(m_st));
+    group_bal_chain(in, c_in, sizeof(c_in));
+    group_bal_map(in, m_in, sizeof(m_in));
+    group_bal_chain(sc, c_sc, sizeof(c_sc));
+    group_bal_map(sc, m_sc, sizeof(m_sc));
+    const struct nft_chain *ch = ir_chain_find(t, c_st);
+    int v4 = 0, v6 = 0, numgen = 0;
+    for (const struct nft_rule *q = ch ? ch->rules : NULL; q; q = q->next) {
+        if (q->fam == 4 && ir_rule_has(q, ir_printf(&rs, "jhash ip daddr mod %d seed 0x%x vmap @%s",
+                                                   GROUP_BAL_SLOTS, (unsigned)st->table, m_st))) v4++;
+        if (q->fam == 6 && ir_rule_has(q, ir_printf(&rs, "jhash ip6 daddr mod %d seed 0x%x vmap @%s",
+                                                   GROUP_BAL_SLOTS, (unsigned)st->table, m_st))) v6++;
+        if (ir_rule_has(q, "numgen")) numgen++;
+    }
+    check("by: site — jhash адреса назначения, IPv4 и IPv6 своим правилом, без numgen", 110,
+          v4 * 100 + v6 * 10 + numgen);
+    const struct nft_rule *last = ch ? ch->rules : NULL;
+    while (last && last->next) last = last->next;
+    check("  восстановление по метке соединения — до хеша, запасной goto — последним", 1,
+          ch && ir_rule_has(ch->rules, "ct mark and ") && last && ir_rule_has(last, "goto mark_"));
+    const struct nft_chain *ci = ir_chain_find(t, c_in);
+    int in4 = 0;
+    for (const struct nft_rule *q = ci ? ci->rules : NULL; q; q = q->next)
+        if (ir_rule_has(q, ir_printf(&rs, "jhash ip daddr mod %d seed 0x%x vmap @%s", GROUP_BAL_SLOTS,
+                                     (unsigned)in->table, m_in))) in4++;
+    check("вложенная by: site — своё семя (номер своей таблицы), а не внешней", 1,
+          in4 == 1 && in->table != st->table);
+    const struct nft_chain *cs = ir_chain_find(t, c_sc);
+    int sc4 = 0, sc6 = 0;
+    for (const struct nft_rule *q = cs ? cs->rules : NULL; q; q = q->next) {
+        if (q->fam == 4 && ir_rule_has(q, ir_printf(&rs, "jhash ip saddr . ip daddr mod %d seed 0x%x vmap @%s",
+                                                   GROUP_BAL_SLOTS, (unsigned)sc->table, m_sc))) sc4++;
+        if (q->fam == 6 && ir_rule_has(q, ir_printf(&rs, "jhash ip6 saddr . ip6 daddr mod %d seed 0x%x vmap @%s",
+                                                   GROUP_BAL_SLOTS, (unsigned)sc->table, m_sc))) sc6++;
+    }
+    check("by: site_client — хеш пары «клиент, назначение» по обоим семействам", 11, sc4 * 10 + sc6);
+    const struct nft_set *msc = ir_set_find(t, m_sc);
+    check("  карта та же: 120 слотов по весам 1:3 — 30/90", 3090,
+          els_with(msc, cm("goto ", "mark_")) == GROUP_BAL_SLOTS
+              ? els_with(msc, ir_printf(&rs, "goto mark_%d", oname("a")->table)) * 100L +
+                    els_with(msc, ir_printf(&rs, "goto mark_%d", oname("b")->table))
+              : -1);
+    check("отказа памяти не было", 0, rs.oom);
+    nft_rs_free(&rs);
+}
+
 static void t_tree(void) {
     printf("\n-- дерево: поиск и переделка --\n");
     struct nft_rs rs;
@@ -706,6 +774,8 @@ int main(void) {
         t_mixed_order();
         t_balance(0);
         t_balance(NFTC_LEGACY | NFTC_IP6NAT | NFTC_NOTRACK);
+        t_balance_by(0);
+        t_balance_by(NFTC_LEGACY | NFTC_IP6NAT | NFTC_NOTRACK);
         t_router_v6(0);
         t_router_v6(NFTC_LEGACY);
     } else {

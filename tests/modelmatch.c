@@ -340,6 +340,43 @@ static void t_groups_v2(void) {
     check("состояние сторожа до прохода — «нет»", 1,
           man && out_group(man)->cur == -1 && out_group(man)->sel == -1 && out_group(man)->lat_ms[0] == -1);
 
+    check("balance без by — случайно (connection)", BY_CONNECTION, bal ? out_group(bal)->by : -1);
+
+    /* by: как balance раздаёт новые соединения — случайно, по сайту, по сайту и устройству. */
+    check("balance: by: site и site_client — приняты", 0, load(
+        "version: 2\n"
+        "outputs:\n"
+        "  a:  { kind: interface, device: wg0 }\n"
+        "  b:  { kind: interface, device: wg1 }\n"
+        "  s:  { kind: group, pick: balance, by: site, members: [a, b] }\n"
+        "  sc: { kind: group, pick: balance, by: site_client, members: [a, b] }\n"
+        "  c:  { kind: group, pick: balance, by: connection, members: [a, b] }\n"));
+    if (g_msg[0]) printf("     %s\n", g_msg);
+    check("  by: site — BY_SITE", BY_SITE, out_by_name(&g_spec, "s") ? out_group(out_by_name(&g_spec, "s"))->by : -1);
+    check("  by: site_client — BY_SITE_CLIENT", BY_SITE_CLIENT,
+          out_by_name(&g_spec, "sc") ? out_group(out_by_name(&g_spec, "sc"))->by : -1);
+    check("  by: connection — BY_CONNECTION", BY_CONNECTION,
+          out_by_name(&g_spec, "c") ? out_group(out_by_name(&g_spec, "c"))->by : -1);
+    check("by не у balance — отказ", -1, load(
+        "version: 2\n"
+        "outputs:\n"
+        "  a: { kind: interface, device: wg0 }\n"
+        "  b: { kind: interface, device: wg1 }\n"
+        "  o: { kind: group, pick: order, by: site, members: [a, b] }\n"));
+    check("… с объяснением", 1, has("by — как раздавать соединения, он есть только у pick: balance"));
+    check("by неверный — отказ", -1, load(
+        "version: 2\n"
+        "outputs:\n"
+        "  a: { kind: interface, device: wg0 }\n"
+        "  b: { kind: interface, device: wg1 }\n"
+        "  x: { kind: group, pick: balance, by: random, members: [a, b] }\n"));
+    check("… со списком значений", 1, has("«random» — нужен connection, site или site_client"));
+    check("by у выхода не-группы — отказ", -1, load(
+        "version: 2\n"
+        "outputs:\n"
+        "  a: { kind: interface, device: wg0, by: site }\n"));
+    check("… ключ группы", 1, has("by есть только у kind: group"));
+
     check("balance членом order — отказ", -1, load(
         "version: 2\n"
         "outputs:\n"
@@ -375,6 +412,45 @@ static void t_groups_v2(void) {
     for (int s = 0; s < GROUP_BAL_SLOTS; s++) per[own[s]]++;
     for (int k = 0; k < 7; k++) { if (per[k] > mx) mx = per[k]; if (per[k] < mn) mn = per[k]; }
     check("слоты: семь равных — 17 или 18 у каждого", 1718, mn * 100L + mx);
+    /* Слоты живых при уходе члена не двигаются (by: site — слот это сайты): уходит b из трёх
+     * равных — у a и c остаются ВСЕ их прежние слоты, и добирают они только слоты b; вернулся b —
+     * карта снова та же, что при всех живых. */
+    {
+        unsigned char all[GROUP_BAL_SLOTS], nob[GROUP_BAL_SLOTS], back[GROUP_BAL_SLOTS];
+        const unsigned char alive_b0[3] = { 1, 0, 1 }, alive3b[3] = { 1, 1, 1 };
+        g.members_n = 3;
+        memset(g.weight, 0, 7);
+        group_balance_slots(&g, NULL, all);
+        group_balance_slots(&g, alive_b0, nob);
+        group_balance_slots(&g, alive3b, back);
+        int moved = 0, got_b = 0, ca = 0, cc = 0;
+        for (int s = 0; s < GROUP_BAL_SLOTS; s++) {
+            if (all[s] != 1 && nob[s] != all[s]) moved++;
+            if (all[s] == 1 && (nob[s] == 0 || nob[s] == 2)) got_b++;
+            ca += nob[s] == 0;
+            cc += nob[s] == 2;
+        }
+        check("слоты: b ушёл — слоты a и c на месте", 0, moved);
+        check("  слоты b розданы живым поровну — 60/60", 6060, ca * 100L + cc);
+        check("  все 40 слотов b — живым", 40, got_b);
+        check("  b вернулся — карта как при всех живых", 0, memcmp(all, back, sizeof(all)));
+        /* Веса 1:2:3, уходит a — c и b сохраняют свои слоты, доли живых — 40/80. */
+        g.weight[0] = 1; g.weight[1] = 2; g.weight[2] = 3;
+        const unsigned char alive_a0[3] = { 0, 1, 1 };
+        group_balance_slots(&g, NULL, all);
+        group_balance_slots(&g, alive_a0, nob);
+        int cb = 0, kept = 0;
+        moved = 0;
+        for (int s = 0; s < GROUP_BAL_SLOTS; s++) {
+            cb += nob[s] == 1;
+            kept += all[s] != 0 && nob[s] == all[s];
+            if (all[s] != 0 && nob[s] != all[s]) moved++;
+        }
+        check("слоты: веса 1:2:3, a ушёл — b 48 из 120, слоты b и c на месте", 4800, cb * 100L + moved);
+        check("  у живых по-прежнему все 100 их слотов", 100, kept);
+        memset(g.weight, 0, 7);
+    }
+    g.members_n = 7;
     const unsigned char none7[7] = { 0 };
     group_balance_slots(&g, none7, own);
     check("слоты: живых нет — карта пуста", 0xff, own[0] == 0xff && own[GROUP_BAL_SLOTS - 1] == 0xff ? 0xff : 0);

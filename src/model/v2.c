@@ -577,7 +577,7 @@ static const struct { const char *key; unsigned bit; const char *owner; } KIND_K
 #define KIND_KEYS_N (sizeof(KIND_KEYS) / sizeof(KIND_KEYS[0]))
 
 static const char *const GROUP_KEYS[] = { "pick", "members", "default", "tolerance", "interval",
-                                          "url", "idle_timeout", "weights", NULL };
+                                          "url", "idle_timeout", "weights", "by", NULL };
 
 static int p_obfs(struct v2 *x, const struct ynode *n, const char *name, struct out_obfs *ob) {
     static const char *const K[] = { "mode", "server", "listen", NULL };
@@ -663,7 +663,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
     k.v2 = 1;
     /* Ключи группы, у которых свой pick: tolerance, interval, url, idle_timeout — latency; weights —
      * balance. Какой pick, известно только после всех ключей (pick может стоять последним). */
-    const struct ynode *lat_key = NULL, *w_key = NULL;
+    const struct ynode *lat_key = NULL, *w_key = NULL, *by_key = NULL;
     for (size_t i = 0; i < ynode_len(val); i++) {
         const struct ynode *kk = ynode_key_at(val, i), *v = ynode_val_at(val, i);
         const char *ks = kk->str, *sv;
@@ -785,6 +785,15 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
                 if (long_of(x, v, w, 0, GROUP_IDLE_MAX_S, &lv)) return -1;
                 o.grp.idle_timeout_s = (int)lv;
                 lat_key = kk;
+            } else if (!strcmp(ks, "by")) {
+                /* Чем balance раздаёт новые соединения: случайно или хешем адресов (balance.c). */
+                if (str_of(x, v, w, &sv)) return -1;
+                int b = BY_CONNECTION;
+                while (b <= BY_SITE_CLIENT && strcmp(group_by_name(b), sv)) b++;
+                if (b > BY_SITE_CLIENT)
+                    return fail(x, v, "%s: «%s» — нужен connection, site или site_client", w, sv);
+                o.grp.by = b;
+                by_key = kk;
             } else {
                 /* weights — число на каждого члена, по порядку members; сколько членов, станет
                  * известно во втором проходе — там и сверяется длина. */
@@ -876,6 +885,9 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
                         lat_key->str);
         if (w_key && o.grp.pick != PICK_BALANCE)
             return fail(x, w_key, "%s: weights — доли соединений, они есть только у pick: balance", where);
+        if (by_key && o.grp.pick != PICK_BALANCE)
+            return fail(x, by_key, "%s: by — как раздавать соединения, он есть только у pick: balance",
+                        where);
     } else {
         /* Разбор и проверка ключей — у вида (один разбор на оба формата, kind.h). */
         if (kd->parse && kd->parse(&o, &k, x->e) != 0) return wrap(x, key);

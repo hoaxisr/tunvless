@@ -7,7 +7,7 @@
  *   chain bal_305 {
  *     ct mark and МАСКА == 0x00100000 goto mark_301     ← соединение уже на члене: туда же
  *     ct mark and МАСКА == 0x00200000 goto mark_302
- *     numgen random mod 120 vmap @balmap_305           ← новое соединение: слот → член
+ *     numgen random mod 120 vmap @balmap_305           ← новое соединение: слот → член (by: site — jhash)
  *     goto mark_305                                     ← живых нет: метка самой группы
  *   }
  *   chain mark_301 { meta mark set mark and ~МАСКА or 0x00100000 ...; ct mark set mark }
@@ -24,6 +24,18 @@
  * (вернувшийся член забрал бы себе чужие слоты вместе с их установленными соединениями). Случайный
  * номер равномерен при любом составе трафика (у jhash по адресу клиента один клиент со всеми его
  * соединениями ложился бы на один член), и ему не нужны порты — у ICMP и GRE их нет.
+ *
+ * by: site и site_client — ДРУГОЙ ВОПРОС: не «соединение на одном члене», а «сайт на одном члене»
+ * (у Clash — consistent-hashing и sticky-sessions). Его хеш и решает: вместо numgen —
+ *
+ *     meta nfproto ipv4 jhash ip daddr mod 120 seed 0x<таблица> vmap @balmap_<таблица>
+ *     meta nfproto ipv6 jhash ip6 daddr mod 120 seed 0x<таблица> vmap @balmap_<таблица>
+ *
+ * (site_client — `ip saddr . ip daddr`). Карта, метка соединения и сторож — те же: установленное
+ * соединение держит метка, новое соединение сайта — его слот. Сайт — адрес назначения в момент
+ * разметки, то есть до dnat fake-IP: при fake-IP это имя (у имени свой поддельный адрес), без
+ * него — адрес. Чтобы уход члена не тасовал сайты остальных, слоты живых при уходе не двигаются:
+ * group_balance_slots раздаёт живым только слоты ушедших (src/kinds/group.c).
  *
  * ПОЧЕМУ КАРТА СЛОТОВ, А НЕ `mod <живых>`. Уход члена меняет только элементы карты: сторож
  * переписывает их одной транзакцией по netlink (src/lib/nftvmap.c, src/daemon/fogroup.c), без
@@ -125,9 +137,29 @@ static void build_one(struct nft_table *t, const struct spec *sp, const struct o
         ir_comment(r6, "steer-balance-v6:%s", g->name);
     }
     restore_rules(t, c, sp, g, 0);
-    struct nft_rule *r = ir_rule(c);
-    ir_x(r, "numgen random mod %d vmap @%s", GROUP_BAL_SLOTS, map);
-    ir_comment(r, "steer-balance:%s", g->name);
+    struct nft_rule *r;
+    if (gc->by == BY_CONNECTION) {
+        r = ir_rule(c);
+        ir_x(r, "numgen random mod %d vmap @%s", GROUP_BAL_SLOTS, map);
+        ir_comment(r, "steer-balance:%s", g->name);
+    }
+    /* by: site, site_client — слот по хешу адресов, по правилу на семейство (адрес IPv4 и IPv6 —
+     * разные поля заголовка). Семя — номер таблицы группы: постоянное (тот же сайт попадает в тот
+     * же слот и после apply, и после перезагрузки — без семени ядро берёт случайное на каждое
+     * правило), и у каждой группы своё — иначе вложенная balance с тем же хешем получала бы
+     * только «свои» слоты внешней и отдавала бы их одному члену. */
+    for (int fam = 4; gc->by != BY_CONNECTION && fam <= 6; fam += 2) {
+        if (fam == 6 && !out_has_cap(g, KC_IPV6)) break;
+        const char *ip = fam == 4 ? "ip" : "ip6";
+        r = ir_rule(c);
+        ir_family(r, fam);
+        if (gc->by == BY_SITE_CLIENT)
+            ir_x(r, "jhash %s saddr . %s daddr mod %d seed 0x%x vmap @%s", ip, ip, GROUP_BAL_SLOTS,
+                 (unsigned)g->table, map);
+        else
+            ir_x(r, "jhash %s daddr mod %d seed 0x%x vmap @%s", ip, GROUP_BAL_SLOTS, (unsigned)g->table, map);
+        ir_comment(r, "steer-balance:%s", g->name);
+    }
     r = ir_rule(c);
     ir_x(r, "goto %s", fall);
     mark_chain(t, g);

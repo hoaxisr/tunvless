@@ -293,6 +293,11 @@ struct tgws_cfg {
  * которых рождает перевод v1 (по выходу на устройство). Индекс, а не указатель: struct spec
  * копируется значением (стенды, сверка), и указатель в копии смотрел бы в оригинал. */
 enum group_pick { PICK_ORDER = 0, PICK_LATENCY, PICK_MANUAL, PICK_BALANCE };
+/* balance: чем ядро выбирает слот нового соединения (ключ `by`, docs/spec-v2.md). CONNECTION —
+ * случайно, каждое соединение само по себе; SITE — хеш адреса назначения: один сайт — один член
+ * (consistent-hashing у Clash); SITE_CLIENT — хеш пары «адрес клиента, адрес назначения»: сайт у
+ * одного устройства — на одном члене (sticky-sessions). Порядок — как в спеке (group_by_name). */
+enum group_by { BY_CONNECTION = 0, BY_SITE, BY_SITE_CLIENT };
 
 struct group_cfg {
     enum group_pick pick;
@@ -314,6 +319,8 @@ struct group_cfg {
     int idle_timeout_s;
     /* balance: вес члена (1..100; 0 — не задан, то есть 1) — доля новых соединений. */
     unsigned char *weight;
+    /* balance: чем раздаются новые соединения (enum group_by); 0 — случайно. */
+    int by;
     /* СОСТОЯНИЕ, а не настройка (как device и failed у выхода): что сторож выбрал в последнем
      * проходе. Заполняет outputs_adopt_active_st из памяти сторожа, разбор оставляет -1/нулями.
      * У группы с именованными членами cur и alive — решение подхвата по приговорам членов

@@ -277,6 +277,7 @@ static void output_flow(FILE *f, const struct output *o, const struct onames *on
                 fprintf(f, "%s%u", i ? ", " : "", g->weight[i] ? g->weight[i] : 1u);
             fputc(']', f);
         }
+        if (g->pick == PICK_BALANCE && g->by != BY_CONNECTION) fs(&w, "by", group_by_name(g->by));
     } else {
         struct out_keys kk;
         memset(&kk, 0, sizeof(kk));

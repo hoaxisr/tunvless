@@ -2,7 +2,8 @@
 # Группы выходов спеки v2 в демоне с настоящими nft и ip (docs/architecture.md, «4в»).
 #
 # Сеть стенда: наше пространство (демон `steerd daemon --watch --apply`), клиент за устройством
-# lanx (192.168.7.2) и ответчик за двумя парами veth — sw1 (член a) и sw2 (член b). На ответчике:
+# lanx (192.168.7.2 и 192.168.7.3) и ответчик за тремя парами veth — sw1 (член a), sw2 (член b) и
+# sw3 (член c, только у групп by: site и site_client, 3а). На ответчике:
 # 1.1.1.1 и 8.8.8.8 — цели проб сторожа, 10.2.0.1:8080 — HTTP-ответчик generate_204 (считает
 # запросы по пути и отвечает, с какого адреса пришёл запрос: 10.9.1.1 — через a, 10.9.2.1 —
 # через b) и эхо TCP на 10.2.0.1:9000 для долгого соединения. Задержка члена — tc netem на
@@ -31,6 +32,11 @@
 #  3. balance: новые соединения клиента расходятся по обоим членам; упавший член выпадает из карты
 #     (карта в ядре — только цепочка живого, событие balance), новые идут на живого; установленное
 #     соединение не перескакивает ни при уходе, ни при возврате другого члена.
+#  3а. balance by: site — один сайт на одном члене (24 адреса, у каждого все соединения на одном
+#     члене, а сайты — по всем трём членам); член a лёг — сайты b и c остались на своих членах, сайты a
+#     разошлись по живым; a вернулся — каждый сайт снова там, где был. by: site_client — у каждого
+#     из двух адресов клиента сайт на одном члене, но у разных клиентов один и тот же сайт может
+#     быть на разных членах.
 #  4. idle_timeout: без трафика через группу ни одного запроса проверки; трафик пошёл — замер есть.
 #
 # Нужны root, unshare, nsenter, nft, ip, tc и python3; без них — пропуск.
@@ -66,9 +72,9 @@ sysctl -qw net.ipv4.ip_forward=1
 
 tmp="$(mktemp -d)"
 mkdir -p "$tmp/st" "$tmp/bin"
-D="" SUB="" RPID="" CPID="" HP="" EP="" LP=""
+D="" SUB="" RPID="" CPID="" HP="" EP="" SP="" LP=""
 cleanup() {
-    kill $SUB $HP $EP $LP $RPID $CPID 2>/dev/null
+    kill $SUB $HP $EP $SP $LP $RPID $CPID 2>/dev/null
     [ -n "$D" ] && kill "$D" 2>/dev/null
     # Провал — журнал демона в вывод стенда; GROUPS_KEEP=1 оставляет каталог стенда.
     [ "$fail" != 0 ] && [ -f "$tmp/d.err" ] && { echo "--- журнал демона (хвост)"; tail -n 40 "$tmp/d.err"; }
@@ -85,7 +91,9 @@ R() { nsenter -t "$RPID" -n "$@"; }
 C() { nsenter -t "$CPID" -n "$@"; }
 R ip link set lo up
 R ip addr add 1.1.1.1/32 dev lo; R ip addr add 8.8.8.8/32 dev lo; R ip addr add 10.2.0.1/32 dev lo
-for k in 1 2; do
+# «Сайты» групп by (3а): 10.4.0.1-24 — by: site, 10.5.0.1-24 — by: site_client.
+for i in $(seq 1 24); do R ip addr add 10.4.0.$i/32 dev lo; R ip addr add 10.5.0.$i/32 dev lo; done
+for k in 1 2 3; do
     ip link add sw$k type veth peer name sw${k}p
     ip link set sw${k}p netns "$RPID"
     R ip link set sw${k}p up; R ip addr add 10.9.$k.2/24 dev sw${k}p
@@ -110,6 +118,7 @@ ip link add lanx type veth peer name lanxp
 ip link set lanxp netns "$CPID"
 ip link set lanx up; ip addr add 192.168.7.1/24 dev lanx
 C ip link set lo up; C ip link set lanxp up; C ip addr add 192.168.7.2/24 dev lanxp
+C ip addr add 192.168.7.3/24 dev lanxp
 C ip route add default via 192.168.7.1
 # Как у роутера — маршрут по умолчанию в WAN (здесь пустое устройство). Ответ на замер через члена
 # приходит с его устройства без метки, и проверка обратного пути (rp_filter=2, loose) ищет маршрут к
@@ -121,7 +130,7 @@ nft -f - <<'EOF'
 table ip groupsmatch_nat {
     chain post {
         type nat hook postrouting priority srcnat; policy accept;
-        oifname { "sw1", "sw2" } masquerade
+        oifname { "sw1", "sw2", "sw3" } masquerade
     }
 }
 EOF
@@ -177,6 +186,20 @@ while True:
     c, a = s.accept()
     threading.Thread(target=serve, args=(c, a), daemon=True).start()
 PY
+# «Кто я» на любом адресе ответчика, порт 8090: ответ — адрес собеседника, то есть член (3а).
+cat > "$tmp/site.py" <<'PY'
+import socket, threading
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('0.0.0.0', 8090)); s.listen(64)
+def serve(c, a):
+    try:
+        c.sendall(a[0].encode())
+    finally:
+        c.close()
+while True:
+    c, a = s.accept()
+    threading.Thread(target=serve, args=(c, a), daemon=True).start()
+PY
 # Долгое соединение клиента: пишет строку по сигналу (файл-триггер), ответ — в журнал.
 cat > "$tmp/long.py" <<'PY'
 import socket, sys, time, os
@@ -195,6 +218,7 @@ PY
 # nsenter напрямую, а не функцией R: у функции в фоне $! — подоболочка, и kill её не снял бы сервер.
 nsenter -t "$RPID" -n python3 "$tmp/http.py" "$tmp/http.log" "$V6" >"$tmp/http.err" 2>&1 & HP=$!
 nsenter -t "$RPID" -n python3 "$tmp/echo.py" >"$tmp/echo.err" 2>&1 & EP=$!
+nsenter -t "$RPID" -n python3 "$tmp/site.py" >"$tmp/site.err" 2>&1 & SP=$!
 sleep 0.5
 
 cat > "$tmp/j.py" <<'PY'
@@ -212,6 +236,8 @@ j() { python3 "$tmp/j.py" "$1"; }
 
 printf '10.2.0.0/24\n' > "$tmp/bal.lst"
 printf '10.3.0.0/24\n' > "$tmp/idl.lst"
+printf '10.4.0.0/24\n' > "$tmp/sit.lst"
+printf '10.5.0.0/24\n' > "$tmp/sic.lst"
 V6G=""
 [ "$V6" = 1 ] && V6G='  v6g: { kind: group, pick: latency, members: [b, a], url: "http://probe.test:8080/v6_204", tolerance: 60, idle_timeout: 0 }'
 cat > "$tmp/spec.yaml" <<EOF
@@ -220,18 +246,25 @@ lan: { devices: [lanx] }
 lists:
   lb: { prefixes_file: $tmp/bal.lst }
   li: { prefixes_file: $tmp/idl.lst }
+  ls: { prefixes_file: $tmp/sit.lst }
+  lc: { prefixes_file: $tmp/sic.lst }
 outputs:
   a:   { kind: interface, device: sw1 }
   b:   { kind: interface, device: sw2 }
+  c:   { kind: interface, device: sw3 }
   man: { kind: group, pick: manual, members: [a, b], default: a }
   lat: { kind: group, pick: latency, members: [b, a], url: "http://10.2.0.1:8080/generate_204", tolerance: 60, idle_timeout: 0 }
   idl: { kind: group, pick: latency, members: [b, a], url: "http://10.2.0.1:8080/idle_204", idle_timeout: 3600 }
   iv:  { kind: group, pick: latency, members: [b, a], url: "http://10.2.0.1:8080/iv_204", tolerance: 60, interval: 10, idle_timeout: 0 }
 $V6G
   bal: { kind: group, pick: balance, members: [a, b] }
+  sit: { kind: group, pick: balance, by: site, members: [a, b, c] }
+  sic: { kind: group, pick: balance, by: site_client, members: [a, b, c] }
 rules:
   - { name: bal, to: [lb], out: bal }
   - { name: idl, to: [li], out: idl }
+  - { name: sit, to: [ls], out: sit }
+  - { name: sic, to: [lc], out: sic }
 EOF
 S="--spec $tmp/spec.yaml --state-dir $tmp/st"
 STEER_SOCKET="$tmp/steer.sock"
@@ -501,8 +534,10 @@ map_targets() { nft list map inet steer "balmap_$(reg bal 3)" | grep -o 'goto ma
 ip link set "$other" down
 wait_for '[ "$(map_targets)" = "goto mark_$(reg "$km" 3) " ]' 30
 check "упал член $om — карта только с живым" "goto mark_$(reg "$km" 3) " "$(map_targets)"
+# Событие — после прохода по всем группам balance (у sit и sic — свои): ждём строку группы bal.
+wait_for 'grep -q "\"ev\":\"balance\",\"out\":\"bal\"" "$tmp/sub.out"' 5
 check "  подписчику — balance с живыми" "{\"v\":1,\"ev\":\"balance\",\"out\":\"bal\",\"alive\":[\"$km\"]}" \
-    "$(grep '"ev":"balance"' "$tmp/sub.out" | tail -n 1)"
+    "$(grep '"ev":"balance","out":"bal"' "$tmp/sub.out" | tail -n 1)"
 touch "$tmp/go.1"
 wait_for '[ "$(awk "\$1 == 1" "$tmp/long.log")" ]' 5
 check "  установленное соединение на своём члене" "$first" "$(awk '$1 == 1 { print $2 }' "$tmp/long.log")"
@@ -516,6 +551,51 @@ touch "$tmp/go.2"
 wait_for '[ "$(awk "\$1 == 2" "$tmp/long.log")" ]' 5
 check "  установленное соединение не перескочило на вернувшийся" "$first" "$(awk '$1 == 2 { print $2 }' "$tmp/long.log")"
 kill $LP 2>/dev/null
+
+# ---- 3а. balance by: site, site_client ----
+# site АДРЕС [ИСТОЧНИК] — через какого члена ушло новое соединение к адресу (10.9.K.1 — член K).
+site() { C python3 -c 'import socket, sys
+s = socket.create_connection((sys.argv[1], 8090), timeout=3, source_address=(sys.argv[2], 0))
+print(s.recv(64).decode())' "$1" "${2:-192.168.7.2}" 2>/dev/null; }
+# sites ПРЕФИКС [ИСТОЧНИК] — «адрес:член» по 24 сайтам, по три соединения на сайт; сайт, чьи
+# соединения разошлись по разным членам, — «адрес:разошлись».
+sites() {
+    for i in $(seq 1 24); do
+        m1="$(site "$1.$i" "${2:-}")"; m2="$(site "$1.$i" "${2:-}")"; m3="$(site "$1.$i" "${2:-}")"
+        if [ -n "$m1" ] && [ "$m1" = "$m2" ] && [ "$m1" = "$m3" ]; then echo "$i:$m1"; else echo "$i:разошлись"; fi
+    done | tr '\n' ' '
+}
+s0="$(sites 10.4.0)"
+check "by: site — все соединения сайта на одном члене" "" "$(echo "$s0" | tr ' ' '\n' | grep -v ':10\.9\.[123]\.1$' | grep .)"
+check "  сайты — по всем трём членам" "3" "$(echo "$s0" | tr ' ' '\n' | cut -d: -f2 | grep . | sort -u | wc -l)"
+check "  в цепочке группы — jhash адреса назначения, numgen нет" "1 0" \
+    "$(nft list chain inet steer "bal_$(reg sit 3)" | grep -c 'jhash ip daddr mod 120 seed') $(nft list chain inet steer "bal_$(reg sit 3)" | grep -c numgen)"
+sit_targets() { nft list map inet steer "balmap_$(reg sit 3)" | grep -o 'goto mark_[0-9]*' | sort -u | tr '\n' ' '; }
+ip link set sw1 down
+wait_for '[ "$(sit_targets | wc -w)" = 4 ]' 30
+check "a лёг — в карте by: site только b и c" "$(printf 'goto mark_%s\ngoto mark_%s\n' "$(reg b 3)" "$(reg c 3)" | sort | tr '\n' ' ')" "$(sit_targets)"
+s1="$(sites 10.4.0)"
+# Сайты b и c — на прежних членах; сайты a — на живых.
+moved="" lost=""
+for e in $s0; do
+    i="${e%%:*}" m="${e#*:}"
+    now="$(echo "$s1" | tr ' ' '\n' | awk -F: -v i="$i" '$1 == i { print $2 }')"
+    if [ "$m" = 10.9.1.1 ]; then case "$now" in 10.9.2.1|10.9.3.1) ;; *) lost="$lost $i:$now" ;; esac
+    elif [ "$now" != "$m" ]; then moved="$moved $i:$m>$now"; fi
+done
+check "  сайты b и c остались на своих членах" "" "$moved"
+check "  сайты a — на живых членах" "" "$lost"
+ip link set sw1 up
+wait_for '[ "$(sit_targets | wc -w)" = 6 ]' 30
+check "a вернулся — каждый сайт снова на прежнем члене" "$s0" "$(sites 10.4.0)"
+
+c2="$(sites 10.5.0 192.168.7.2)"
+c3="$(sites 10.5.0 192.168.7.3)"
+check "by: site_client — у клиента .2 сайт на одном члене" "" "$(echo "$c2" | tr ' ' '\n' | grep 'разошлись')"
+check "  у клиента .3 — тоже" "" "$(echo "$c3" | tr ' ' '\n' | grep 'разошлись')"
+check "  у разных клиентов один сайт бывает на разных членах" "yes" "$([ "$c2" != "$c3" ] && echo yes || echo no)"
+check "  в цепочке группы — jhash пары адресов" "1" \
+    "$(nft list chain inet steer "bal_$(reg sic 3)" | grep -c 'jhash ip saddr . ip daddr mod 120 seed')"
 
 stop_daemon
 echo "groupsmatch: $pass passed, $fail failed"
