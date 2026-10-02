@@ -23,7 +23,8 @@
 #include "stack.h"
 #include "scrypto.h"
 
-#define SS_CHUNK 0x3FFF
+#define SS_CHUNK 0x3FFF          /* предел куска AEAD (SIP004); отправляем такими же и в 2022 */
+#define SS2022_CHUNK 0xFFFF      /* предел куска SIP022: сервер 2022 вправе прислать столько */
 
 enum { RS_SALT = 0, RS_FIXED, RS_LEN, RS_PAY };
 
@@ -42,7 +43,10 @@ struct ss_sess {
     uint32_t dst; uint16_t dport;
 
     size_t acc_n, want;          /* накопитель и сколько байт ждём на стадии */
-    unsigned char acc[SS_CHUNK + 32 + 16];
+    /* Под наибольший кусок, какой может прислать сервер (SIP022 — 0xFFFF и тег). Страницы
+     * таблицы сессий стек отображает лениво: хвост буфера занимает память, только когда кусок
+     * больше 0x3FFF на самом деле пришёл. */
+    unsigned char acc[SS2022_CHUNK + 16];
 };
 
 static const char *ss_peer(const void *ctx) { return ((const struct px_node *)ctx)->vn.host; }
@@ -385,7 +389,7 @@ static int ss_tcp_down(const struct px_node *n, struct ss_sess *s, const unsigne
             s->want = varlen + 16;
         } else if (s->rx == RS_LEN) {
             size_t want = ((size_t)s->acc[0] << 8) | s->acc[1];
-            if (!want || want > SS_CHUNK) return -1;
+            if (!want || want > (s->is2022 ? SS2022_CHUNK : SS_CHUNK)) return -1;
             s->rx = RS_PAY;
             s->want = want + 16;
         } else {                              /* RS_PAY */

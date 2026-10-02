@@ -92,6 +92,19 @@ void px_vmess_authid(const unsigned char cmdkey[16], uint64_t ts, const unsigned
     (void)ts; (void)rand4; memcpy(out, cmdkey, 16);
 }
 uint32_t px_fnv1a(const unsigned char *p, size_t n) { (void)p; (void)n; return 0; }
+/* shadowsocks: вывод ключей и UDP — заглушки (AEAD-заглушка выше не шифрует: открытый текст на месте). */
+void px_ss_evp_key(const char *pass, unsigned char *key, size_t key_n) { (void)pass; memset(key, 1, key_n); }
+int px_ss_subkey(const unsigned char *key, size_t key_n, const unsigned char *salt, unsigned char *subkey) {
+    (void)key; (void)salt; memset(subkey, 2, key_n); return 0;
+}
+void px_ss2022_subkey(const unsigned char *psk, size_t key_n, const unsigned char *salt, unsigned char *subkey) {
+    (void)psk; (void)salt; memset(subkey, 3, key_n);
+}
+int px_ss2022_eih(const unsigned char *ipsk, size_t key_n, const unsigned char *upsk,
+                  const unsigned char *salt, unsigned char out[16]) {
+    (void)ipsk; (void)key_n; (void)upsk; (void)salt; memset(out, 4, 16); return 0;
+}
+int tr_dial_udp(const char *host, uint16_t port) { (void)host; (void)port; return -1; }
 
 static unsigned char g_em[8192];
 static size_t g_em_n, g_em_calls;
@@ -227,7 +240,46 @@ static void test_vmess_key_fail(void) {
     free(sess);
 }
 
+/* ---- shadowsocks 2022 ----------------------------------------------------------------------- */
+
+static void test_ss2022_big_chunk(void) {
+    /* SIP022: кусок нагрузки — до 0xFFFF байт (у AEAD до 2022 — 0x3FFF). Ответ сервера с куском в
+     * 20480 байт обязан дойти, а не рвать поток. */
+    const struct dialer_ops *ops = &proxy_ss_dialer;
+    struct px_node n; memset(&n, 0, sizeof n);
+    n.proto = PX_SS; n.ss_method = SS_2022_AES128; n.ss_key_n = 16;
+    void *sess = calloc(1, ops->sess_size);
+    ops->clear(sess);
+    struct flow_key k; memset(&k, 0, sizeof k);
+    ops->flow_open(&n, sess, &k, 0);
+    ops->connect(&n, sess, 2);
+    feed_reset(NULL, 0);
+    check("ss 2022: запрос ушёл", SEND_OK, ops->send(&n, sess, &k, 0, (const unsigned char *)"GET /", 5));
+    unsigned char reqsalt[16];
+    memcpy(reqsalt, g_tx, 16);
+
+    enum { BIG = 20480 };
+    static unsigned char rx[16 + (11 + 16 + 16) + (100 + 16) + (2 + 16) + (BIG + 16)];
+    size_t o = 0;
+    memset(rx + o, 7, 16); o += 16;                                  /* соль ответа */
+    rx[o++] = 1; memset(rx + o, 0, 8); o += 8;                        /* type, timestamp */
+    memcpy(rx + o, reqsalt, 16); o += 16;                             /* соль запроса */
+    rx[o++] = 0; rx[o++] = 100; memset(rx + o, 0, 16); o += 16;       /* длина первого куска + тег */
+    memset(rx + o, 'a', 100); o += 100; memset(rx + o, 0, 16); o += 16;
+    rx[o++] = BIG >> 8; rx[o++] = BIG & 0xff; memset(rx + o, 0, 16); o += 16;
+    memset(rx + o, 'b', BIG); o += BIG; memset(rx + o, 0, 16); o += 16;
+    g_em_n = 0; g_em_calls = 0;
+    int dr = 0;
+    for (size_t off = 0; off < o && !dr; off += 4096)
+        dr = ops->deliver(&n, sess, 0, rx + off, o - off < 4096 ? o - off : 4096, emit, NULL);
+    check("ss 2022: кусок 20480 байт — поток цел", 0, dr);
+    check("ss 2022: оба куска отданы", 2, (long)g_em_calls);
+    ops->close(sess);
+    free(sess);
+}
+
 int main(void) {
+    test_ss2022_big_chunk();
     test_vmess_key_fail();
     test_http_early_bytes();
     test_trojan_udp();
