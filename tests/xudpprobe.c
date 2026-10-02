@@ -22,13 +22,17 @@
 #include "vldial.h"
 #include "dialer.h"
 #include "stack.h"
+#include "pool.h"
 
 time_t stack_now_s(void) { return time(NULL); }
 int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, void *arg) {
     (void)o; (void)d; (void)ready; (void)arg;
     return 1;
 }
-void vl_watch_seen(int rc) { (void)rc; }
+int pool_run(struct output *o, const struct pool_cfg *pc, stack_ready_fn ready, void *arg) {
+    (void)o; (void)pc; (void)ready; (void)arg;
+    return 1;
+}
 
 static int g_got;
 static int emit(void *arg, const unsigned char *p, size_t n) {

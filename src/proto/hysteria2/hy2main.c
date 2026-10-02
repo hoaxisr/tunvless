@@ -1,7 +1,7 @@
 /* Модуль hysteria2: подкоманды `steer hysteria2`, `hysteria2-nodes`, `hysteria2-probe`, слежка за
  * узлом и файл состояния для status/diag.
  *
- * ПОВТОРЯЕТ УСТРОЙСТВО vless (src/proto/vless/vlmain.c, vlwatch.c) и нарочно не выносит общего:
+ * ПОВТОРЯЕТ УСТРОЙСТВО vless (src/proto/vless/vlmain.c; слежка vless теперь — пул узлов src/tunnel/pool.c) и нарочно не выносит общего:
  * общее — «прочитать спеку, выбрать узел, поднять стек, следить», а различается всё внутри — что
  * такое узел, чем он проверяется, что значит «поднят». Вынос заставил бы протоколы знать друг
  * друга; пока их два, копия в сотню строк дешевле. Разница по существу одна: соединение с узлом у
@@ -264,6 +264,8 @@ static void *state_thread(void *arg) {
 /* ---- слежка за узлом -------------------------------------------------------------------------- */
 
 #define NW_PERIOD_S    60
+/* Период проверки — ключ `interval` выхода (умолчание NW_PERIOD_S). */
+static int g_nw_period_s = NW_PERIOD_S;
 #define NW_CONFIRM_S   3
 #define NW_RETRY_S     15
 #define NW_RETRY_MAX_S 300
@@ -318,7 +320,7 @@ static void nw_wait(uint64_t due, int up) {
 }
 
 /* Причина в событии down — не длиннее записи линии событий (EVLINE_WRITE_MAX 480 байт, кириллица в
- * ней по шесть знаков на байт), обрезка по границе знака UTF-8. Довод — nw_down в vlwatch.c. */
+ * ней по шесть знаков на байт), обрезка по границе знака UTF-8. Довод — pl_down_event в src/tunnel/pool.c. */
 #define NW_WHY_ESC 440
 static void nw_down(const char *why) {
     char w[160];
@@ -343,7 +345,7 @@ static void *nw_thread(void *arg) {
     const struct hy2_node *cur = &g_nw.nodes[g_nw.cur];
     int up = 1, fails = 0;
     uint64_t retry = NW_RETRY_S;
-    uint64_t due = nw_now_ms() + (g_nw.checked ? NW_PERIOD_S * 1000ull : 0);
+    uint64_t due = nw_now_ms() + (g_nw.checked ? (uint64_t)g_nw_period_s * 1000ull : 0);
     char why[256];
     int hs;
     for (;;) {
@@ -356,7 +358,7 @@ static void *nw_thread(void *arg) {
                 pthread_mutex_lock(&g_nw.mu);
                 g_nw.streak = 0;
                 pthread_mutex_unlock(&g_nw.mu);
-                due = nw_now_ms() + NW_PERIOD_S * 1000ull;
+                due = nw_now_ms() + (uint64_t)g_nw_period_s * 1000ull;
                 continue;
             }
             if (++fails < 2) { due = nw_now_ms() + NW_CONFIRM_S * 1000ull; continue; }
@@ -376,7 +378,7 @@ static void *nw_thread(void *arg) {
             pthread_mutex_unlock(&g_nw.mu);
             nw_up(1);
             fprintf(stderr, LOG_I2 "узел %s снова отвечает\n", cur->name);
-            due = nw_now_ms() + NW_PERIOD_S * 1000ull;
+            due = nw_now_ms() + (uint64_t)g_nw_period_s * 1000ull;
             continue;
         }
         for (size_t k = 0; k < g_nw.sel_n; k++) {
@@ -533,5 +535,8 @@ int cmd_hysteria2(const char *spec_path, const char *out_name) {
 
     struct err e = {0};
     if (registry_assign(sp, &e) < 0) err_die(&e);
+    /* Ключи пула, которые у hysteria2 есть: период проверки узла и срок простоя QUIC. */
+    if (o->hy2.pool.interval_s) g_nw_period_s = o->hy2.pool.interval_s;
+    hy2c_set_idle(o->hy2.pool.silence_s);
     return hy2_tunnel_run(o, &nodes[chosen], h2_ready, &ra);
 }

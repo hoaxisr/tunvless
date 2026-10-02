@@ -127,7 +127,6 @@ static int ht_connect(const void *ctx, void *sess, int timeout_s) {
     struct http_sess *s = sess;
     int rc = px_stream_open(n, &s->t, timeout_s);
     if (rc == 0) rc = http_connect(n, s, timeout_s);
-    px_watch_seen(rc);
     if (rc) { transport_close(&s->t); return rc; }
     s->established = 1;
     return 0;

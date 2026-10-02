@@ -65,6 +65,11 @@ struct helper_state {
      * помнит сам мост, и новый экземпляр начинает с чистого листа. */
     struct helper_health health[HELPER_HEALTH_MAX];
     size_t health_n;
+    /* Клиент туннеля по подписке: номера активных живых узлов пула через запятую (событие active,
+     * evline.h; src/tunnel/pool.c), «» — живых нет; active_known — событие было. Сбрасывается с
+     * новым процессом. */
+    char active[160];
+    int active_known;
 };
 
 struct helper {

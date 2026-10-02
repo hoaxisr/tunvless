@@ -38,6 +38,11 @@
 #include <poll.h>
 #include <time.h>
 #include <sys/socket.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
 
 /* ---- стек установщиков --------------------------------------------------------- */
 
@@ -98,6 +103,7 @@ int run_quiet(const char *const argv[]) {
 #include "../src/tunnel/stack.c"
 #include "vldial.h"
 #include "client.h"
+#include "../src/tunnel/pool.c"
 
 /* ---- подменённое соединение с узлом -------------------------------------------- */
 
@@ -435,7 +441,13 @@ static void run_bad(void *arg) {
     /* Имя длиннее 15 символов: tun_open откажет и сам, так что устройство не появится ни до
      * правки, ни после — различается только названа ли причина. */
     snprintf(o.device, sizeof(o.device), "tunnelmatch-no-such-dev");
-    g_run_rc = vless_tunnel_run(&o, arg, NULL, NULL);
+    /* Подъём — на пуле узлов (src/tunnel/pool.h): первый активный узел — негодный. */
+    struct pool_cfg pc;
+    memset(&pc, 0, sizeof(pc));
+    pc.nodes = arg;
+    pc.stride = sizeof(struct vless_node);
+    pc.first = 0;
+    g_run_rc = vless_tunnel_run(&o, &pc, NULL, NULL);
 }
 
 /* I-097: UUID узла не разбирается. Прежде соединение закрывалось молча — ни строки, ни
@@ -558,6 +570,584 @@ static void t_spare_slot(void) {
     *sp = save;
 }
 
+
+/* ==== ПУЛ УЗЛОВ ВЫХОДА И СБРОС СОЕДИНЕНИЙ (src/tunnel/pool.c) ================================
+ *
+ * ЧТО ПРОВЕРЯЕТСЯ. Две половины одной задачи (узел умер, а соединения через него висят):
+ *
+ *   стек (src/tunnel/stack.c) — связь с узлом ОБОРВАНА (RST узла, срок ядра) — клиенту RST, а не
+ *   FIN, и слежке за узлом сказано lost; узел закрыл связь штатно (FIN) — клиенту FIN, как прежде;
+ *   отправка узлу не удалась — RST, а не молчаливое закрытие; данные на соединение, которого нет в
+ *   таблице (клиент выхода перезапустился), — RST; порог молчания встаёт на сокет связи
+ *   (TCP_USER_TIMEOUT, keepalive); узел соединения больше не активен — RST, а соединения живого
+ *   узла не тронуты;
+ *
+ *   пул (src/tunnel/pool.c) — раздача by: site держит сайт на одном узле и не двигает сайты живых
+ *   узлов, когда один лёг; connection делит поровну; мёртвый узел заменяется следующим свободным
+ *   кандидатом (занятые пропускаются), пустой слот находит узел сам; запасная связь годится только
+ *   своему слоту (site) или переезжает с соединением на свой узел (connection); серия отказов и
+ *   обрыв зовут проверку раньше срока; файл состояния называет активные узлы.
+ *
+ * КАК. Стенд включает pool.c целиком, как и stack.c (всё нужное в них статическое; отдельным стендом
+ * с #include это было бы ещё одно нарушение храповика tests/buildmatch.sh), а протокол под пулом —
+ * поддельный дайлер: его связь — настоящий TCP через петлю к слушателю стенда, поэтому RST и FIN
+ * узла — настоящие, и состояние сокета (TCP_INFO) стек спрашивает у ядра, а не у подделки.
+ * Устройство — та же сокетная пара. Проверка узла — флаг alive у подделки.
+ * Само молчание узла (ядро обрывает связь по порогу) здесь не воспроизвести — петля пакетов не
+ * теряет; его гоняет tests/run-silence.sh в сетевом пространстве. */
+
+/* ---- поддельный протокол: узел и связь ------------------------------------------------------ */
+
+struct fnode { char name[16]; char host[16]; int alive; };
+static struct fnode g_fn[5];
+
+struct fsess { int fd; const struct fnode *node; int flow_opens; };
+
+static int g_lfd = -1;
+static uint16_t g_lport;
+static pthread_mutex_t g_srv_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_srv[256];
+static const struct fnode *g_srv_node[256];
+static int g_srv_n;
+
+static const char *f_peer(const void *ctx) { return ((const struct fnode *)ctx)->host; }
+static void f_describe(const void *ctx, char *out, size_t n) {
+    snprintf(out, n, "%s", ((const struct fnode *)ctx)->name);
+}
+static const char *f_strerror(int rc) { (void)rc; return "подмена"; }
+static int f_connect(const void *ctx, void *sess, int t) {
+    (void)t;
+    const struct fnode *n = ctx;
+    struct fsess *s = sess;
+    if (!n->alive) return TR_ECONNECT;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons(g_lport) };
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (fd < 0 || connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) return TR_ECONNECT;
+    int a = accept(g_lfd, NULL, NULL);
+    pthread_mutex_lock(&g_srv_mu);
+    g_srv_node[g_srv_n] = n;
+    g_srv[g_srv_n++] = a;
+    pthread_mutex_unlock(&g_srv_mu);
+    s->fd = fd;
+    return 0;
+}
+static void f_take(void *dst, void *src) {
+    struct fsess *d = dst, *s = src;
+    d->fd = s->fd;
+    s->fd = -1;
+}
+static void f_close(void *sess) {
+    struct fsess *s = sess;
+    if (s->fd >= 0) close(s->fd);
+    s->fd = -1;
+}
+static void f_clear(void *sess) {
+    struct fsess *s = sess;
+    s->fd = -1;
+    s->node = NULL;
+    s->flow_opens = 0;
+}
+static int f_fd(const void *sess) { return ((const struct fsess *)sess)->fd; }
+static int f_has_data(const void *sess) { (void)sess; return 0; }
+static int f_flow_open(const void *ctx, void *sess, const struct flow_key *k, int udp) {
+    (void)k; (void)udp;
+    struct fsess *s = sess;
+    s->node = ctx;
+    s->flow_opens++;
+    return 0;
+}
+static int f_send(const void *ctx, void *sess, const struct flow_key *k, int udp,
+                  const unsigned char *d, size_t n) {
+    (void)ctx; (void)k; (void)udp;
+    struct fsess *s = sess;
+    return send(s->fd, d, n, MSG_NOSIGNAL) == (ssize_t)n ? SEND_OK : SEND_FATAL;
+}
+static size_t f_dgram_frame(const unsigned char *p, size_t n, unsigned char *out, size_t cap) {
+    if (n + 2 > cap) return 0;
+    out[0] = (unsigned char)(n >> 8);
+    out[1] = (unsigned char)n;
+    memcpy(out + 2, p, n);
+    return n + 2;
+}
+static int f_read(void *sess, unsigned char *buf, size_t cap, const unsigned char **data, size_t *got) {
+    struct fsess *s = sess;
+    *got = 0;
+    ssize_t r = recv(s->fd, buf, cap, MSG_DONTWAIT);
+    if (r > 0) { *data = buf; *got = (size_t)r; return 0; }
+    return -1;
+}
+static int f_deliver(const void *ctx, void *sess, int udp, const unsigned char *d, size_t n,
+                     dialer_emit_fn emit, void *arg) {
+    (void)ctx; (void)sess; (void)udp;
+    return emit(arg, d, n);
+}
+
+static const struct dialer_ops f_ops = {
+    .name = "подмена", .caps = DC_PRECONNECT, .sess_size = sizeof(struct fsess),
+    .peer = f_peer, .describe = f_describe, .strerror = f_strerror, .connect = f_connect,
+    .take = f_take, .close = f_close, .clear = f_clear, .fd = f_fd, .has_data = f_has_data,
+    .flow_open = f_flow_open, .send = f_send, .dgram_frame = f_dgram_frame, .read = f_read,
+    .deliver = f_deliver,
+};
+
+static int f_probe(const void *node, int t, char *why, size_t n) {
+    (void)t;
+    if (((const struct fnode *)node)->alive) return 0;
+    snprintf(why, n, "узел стенда молчит");
+    return -1;
+}
+static const char *f_name(const void *node) { return ((const struct fnode *)node)->name; }
+static const struct pool_proto f_proto = { .ops = &f_ops, .probe = f_probe, .name = f_name, .tag = "pm" };
+
+static int g_sel[5] = { 0, 1, 2, 3, 4 };
+
+/* Пул заново: active слотов, кандидаты 0..ncand-1, первый — узел 0. */
+static void pool_new(int active, int by, int ncand, const char *out) {
+    while (g_conns && g_live_n) conn_drop(&g_conns[g_live[0]]);
+    free(g_pl.slot);
+    memset(&g_pl.cf, 0, sizeof g_pl.cf);
+    g_pl.sig[0] = '\0';
+    g_pl.said_up = 0;
+    g_pl.why[0] = '\0';
+    struct pool_cfg pc = {
+        .proto = &f_proto, .nodes = g_fn, .stride = sizeof(struct fnode), .sel = g_sel,
+        .sel_n = (size_t)ncand, .first = 0, .checked = 1, .active = active, .by = by,
+        .interval_s = 60, .silence_s = 20, .out = out,
+    };
+    const struct dialer *d = pool_setup(&pc);
+    g_spare_want = 0;
+    stack_setup(d);
+}
+
+
+static void pm_send(uint16_t sport, uint32_t dst, uint32_t seq, uint32_t ack, unsigned char flags,
+                     const unsigned char *d, size_t n) {
+    unsigned char p[2048];
+    size_t l = tcp_build(p, sizeof(p), CLI_IP, dst, sport, 443, seq, ack, flags, d, n, 65535, 0, -1);
+    handle_packet(&g_tun, p, l);
+}
+
+/* Пакеты, написанные стеком в устройство: сколько, флаги всех вместе, номер последнего. */
+static int pm_drain(unsigned *flags, uint32_t *seq) {
+    unsigned char p[70000];
+    int cnt = 0;
+    if (flags) *flags = 0;
+    for (;;) {
+        ssize_t r = recv(g_dev_peer, p, sizeof(p), MSG_DONTWAIT);
+        if (r <= 0) break;
+        struct flow_key k;
+        size_t off;
+        if (ip_parse(p, (size_t)r, &k, &off) == 0) {
+            if (flags) *flags |= k.tcp_flags;
+            if (seq) *seq = k.seq;
+            cnt++;
+        }
+    }
+    return cnt;
+}
+
+static struct flow_key pm_key(uint16_t sport, uint32_t dst) {
+    struct flow_key k;
+    memset(&k, 0, sizeof(k));
+    k.src = CLI_IP; k.dst = dst; k.sport = sport; k.dport = 443; k.proto = 6;
+    return k;
+}
+
+/* Соединение до «поток готов»: SYN, установщик, готовность (conn_ready), ACK клиента. */
+static struct conn *pm_open(uint16_t sport, uint32_t dst) {
+    struct flow_key k = pm_key(sport, dst);
+    pm_send(sport, dst, 1000, 0, TCP_SYN, NULL, 0);
+    struct conn *c = conn_find(&k);
+    if (!c || !c->pending) return NULL;
+    for (int i = 0; i < 3000 && !__atomic_load_n(&c->done, __ATOMIC_ACQUIRE); i++) {
+        struct timespec ts = { 0, 1000000 };
+        nanosleep(&ts, NULL);
+    }
+    if (!__atomic_load_n(&c->done, __ATOMIC_ACQUIRE) || conn_ready(c, &g_tun)) return NULL;
+    pm_send(sport, dst, 1001, 2, TCP_ACK, NULL, 0);
+    pm_drain(NULL, NULL);
+    return conn_find(&k);
+}
+
+static int pm_srv_of(const struct conn *c) {
+    /* Серверный конец связи соединения — по номеру порта: локальный порт клиента = удалённый у
+     * сервера. */
+    struct sockaddr_in a;
+    socklen_t al = sizeof a;
+    if (getsockname(c->fd, (struct sockaddr *)&a, &al) != 0) return -1;
+    pthread_mutex_lock(&g_srv_mu);
+    int found = -1;
+    for (int i = 0; i < g_srv_n; i++) {
+        struct sockaddr_in b;
+        socklen_t bl = sizeof b;
+        if (g_srv[i] >= 0 && getpeername(g_srv[i], (struct sockaddr *)&b, &bl) == 0 &&
+            b.sin_port == a.sin_port) found = g_srv[i];
+    }
+    pthread_mutex_unlock(&g_srv_mu);
+    return found;
+}
+
+static void pm_srv_rst(int fd) {
+    struct linger lg = { 1, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    close(fd);
+    struct timespec ts = { 0, 50000000 };
+    nanosleep(&ts, NULL);
+}
+
+static void pm_sweep(void) {
+    g_now_ns = now_ns();
+    g_now_s = (time_t)(g_now_ns / 1000000000ull);
+    static unsigned seen;
+    nodes_sweep(&seen, g_now_ns);
+    for (int li = 0; li < g_live_n; ) {
+        struct conn *c = &g_conns[g_live[li]];
+        if (c->pending || !conn_deadlines(c, &g_tun, g_now_ns)) li++;
+    }
+}
+
+/* ---- стек ---------------------------------------------------------------------------------- */
+
+static void t_pool_stack(void) {
+    pool_new(1, BY_CONNECTION, 2, NULL);
+    unsigned fl;
+    uint32_t sq;
+
+    /* Данные на соединение, которого нет. */
+    const unsigned char d[] = "GET / HTTP/1.1\r\n";
+    pm_send(50001, 0x0a0a0a0au, 5000, 777, TCP_ACK | TCP_PSH, d, sizeof d - 1);
+    int n = pm_drain(&fl, &sq);
+    check(n == 1 && (fl & TCP_RST) && sq == 777,
+          "данные без соединения (клиент выхода перезапущен) — RST с номером его подтверждения");
+    pm_send(50001, 0x0a0a0a0au, 5000, 778, TCP_ACK, NULL, 0);
+    n = pm_drain(&fl, &sq);
+    check(n == 1 && (fl & TCP_RST) && sq == 778,
+          "подтверждение без соединения (challenge ACK на наш RST) — RST с его номером");
+    pm_send(50001, 0x0a0a0a0au, 5000, 779, TCP_RST, NULL, 0);
+    check(pm_drain(NULL, NULL) == 0, "RST без соединения — без ответа");
+
+    /* Порог молчания на сокете связи. */
+    struct conn *c = pm_open(50002, 0x0a0a0a0bu);
+    check(c != NULL, "стенд: соединение через пул открылось");
+    if (!c) return;
+    unsigned uto = 0;
+    int ka = 0, idle = 0;
+    socklen_t l = sizeof uto;
+    getsockopt(c->fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &uto, &l);
+    l = sizeof ka;
+    getsockopt(c->fd, SOL_SOCKET, SO_KEEPALIVE, &ka, &l);
+    l = sizeof idle;
+    getsockopt(c->fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, &l);
+    check(uto == 20000 && ka == 1 && idle == 20,
+          "порог молчания 20 с — на сокете связи TCP_USER_TIMEOUT 20000 мс, keepalive через 20 с");
+
+    /* Узел сбросил связь посреди ответа. */
+    g_pl.slot[0].checked_at = 0;
+    g_pl.slot[0].kick = 0;
+    int s = pm_srv_of(c);
+    if (send(s, "abc", 3, 0) != 3) check(0, "стенд: сервер не отправил");
+    struct timespec ts = { 0, 30000000 };
+    nanosleep(&ts, NULL);
+    drain_conn(c, &g_tun);
+    pm_drain(NULL, NULL);
+    pm_send(50002, 0x0a0a0a0bu, 1001, c->our_seq, TCP_ACK, NULL, 0);
+    pm_srv_rst(s);
+    drain_conn(c, &g_tun);
+    check(c->srv_closed && c->aborted, "RST узла — связь оборвана (aborted), а не закрыта");
+    check(g_pl.slot[0].kick == 1 && g_pl.slot[0].lost == 1, "обрыв связи — слежке: проверить узел сейчас (lost)");
+    pm_sweep();
+    n = pm_drain(&fl, NULL);
+    struct flow_key k = pm_key(50002, 0x0a0a0a0bu);
+    check(n == 1 && (fl & TCP_RST) && !(fl & TCP_FIN) && !conn_find(&k),
+          "оборванная связь — клиенту RST, а не FIN (обрезанный ответ не выглядит целым)");
+
+    /* Обрыв, когда клиент ещё не подтвердил отданное: какой номер он ждёт, неизвестно — RST обоими. */
+    c = pm_open(50005, 0x0a0a0a0bu);
+    if (!c) { check(0, "стенд: соединение для двух RST не открылось"); return; }
+    s = pm_srv_of(c);
+    if (send(s, "abcdef", 6, 0) != 6) check(0, "стенд: сервер не отправил");
+    nanosleep(&ts, NULL);
+    drain_conn(c, &g_tun);
+    pm_drain(NULL, NULL);
+    uint32_t ca = c->client_ack, os = c->our_seq;
+    pm_srv_rst(s);
+    drain_conn(c, &g_tun);
+    pm_sweep();
+    {
+        unsigned char p[2048];
+        uint32_t seqs[4];
+        int m = 0;
+        ssize_t r;
+        while (m < 4 && (r = recv(g_dev_peer, p, sizeof p, MSG_DONTWAIT)) > 0) {
+            struct flow_key kk;
+            size_t off;
+            if (ip_parse(p, (size_t)r, &kk, &off) == 0 && (kk.tcp_flags & TCP_RST)) seqs[m++] = kk.seq;
+        }
+        check(os == ca + 6 && m == 2 && seqs[0] == ca && seqs[1] == os,
+              "обрыв при неподтверждённом — RST и с подтверждённым номером, и с отправленным (RFC 5961)");
+    }
+
+    /* Узел закрыл связь штатно. */
+    c = pm_open(50003, 0x0a0a0a0bu);
+    if (!c) { check(0, "стенд: второе соединение не открылось"); return; }
+    s = pm_srv_of(c);
+    shutdown(s, SHUT_WR);
+    nanosleep(&ts, NULL);
+    drain_conn(c, &g_tun);
+    check(c->srv_closed && !c->aborted, "FIN узла — закрытие, не обрыв");
+    pm_sweep();
+    n = pm_drain(&fl, NULL);
+    check(n == 1 && (fl & TCP_FIN) && !(fl & TCP_RST), "закрытая узлом связь — клиенту FIN, как прежде");
+    close(s);
+
+    /* Отправка узлу не удалась. */
+    c = pm_open(50004, 0x0a0a0a0bu);
+    if (!c) { check(0, "стенд: третье соединение не открылось"); return; }
+    pm_srv_rst(pm_srv_of(c));
+    pm_send(50004, 0x0a0a0a0bu, 1001, 2, TCP_ACK | TCP_PSH, d, sizeof d - 1);
+    n = pm_drain(&fl, NULL);
+    k = pm_key(50004, 0x0a0a0a0bu);
+    check((fl & TCP_RST) && !conn_find(&k), "отправка узлу не удалась — клиенту RST, а не молчание");
+}
+
+/* Узел соединения перестал быть активным: его соединения — RST, соединения живого слота — живы. */
+static void t_pool_stale(void) {
+    for (int i = 0; i < 5; i++) g_fn[i].alive = 1;
+    pool_new(2, BY_CONNECTION, 4, NULL);
+    pl_check(1);                                         /* пустой слот нашёл узел */
+    check(g_pl.slot[1].node == 1 && g_pl.slot[1].up, "пустой слот при подъёме — первый свободный кандидат (1)");
+    struct conn *a = NULL, *b = NULL;
+    for (uint16_t p = 51000; p < 51100 && (!a || !b); p++) {
+        struct conn *c = pm_open(p, 0x0b0b0b0bu);
+        if (!c) continue;
+        const struct pl_sess *ps = SESS(c);
+        if (ps->slot == 0 && !a) a = c;
+        else if (ps->slot == 1 && !b) b = c;
+        else conn_reset(c, &g_tun);
+    }
+    pm_drain(NULL, NULL);
+    check(a && b, "раздача connection — соединения есть на обоих узлах");
+    if (!a || !b) return;
+    struct flow_key ka = a->key, kb = b->key;
+    unsigned ep0 = __atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE);
+    g_fn[0].alive = 0;
+    pl_check(0);
+    check(g_pl.slot[0].up && g_pl.slot[0].node == 0, "одна неудачная проверка — узел ещё жив (повтор через 3 с)");
+    pl_check(0);
+    check(g_pl.slot[0].up && g_pl.slot[0].node == 2,
+          "две неудачи подряд — замена следующим свободным кандидатом (1 занят, взят 2)");
+    check(__atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE) != ep0, "смена узла — стеку: набор узлов изменился");
+    pm_sweep();
+    unsigned fl;
+    pm_drain(&fl, NULL);
+    check(!conn_find(&ka) && (fl & TCP_RST), "соединение мёртвого узла — RST клиенту, без перезапуска процесса");
+    check(conn_find(&kb) != NULL, "соединение живого узла — не тронуто");
+    struct conn *cb = conn_find(&kb);
+    if (cb) conn_reset(cb, &g_tun);
+    pm_drain(NULL, NULL);
+}
+
+/* ---- пул ------------------------------------------------------------------------------------ */
+
+static void t_pool_pick(void) {
+    for (int i = 0; i < 5; i++) g_fn[i].alive = 1;
+    pool_new(3, BY_SITE, 5, NULL);
+    pl_check(1);
+    pl_check(2);
+    check(g_pl.slot[1].node == 1 && g_pl.slot[2].node == 2, "три слота — узлы 0, 1, 2 по порядку кандидатов");
+    int at[200], per[3] = { 0, 0, 0 }, same = 1;
+    struct flow_key k = pm_key(1, 0);
+    for (int i = 0; i < 200; i++) {
+        k.dst = htonl(0x5db80000u + (uint32_t)i * 7919u);
+        k.sport = (uint16_t)(1000 + i);
+        at[i] = pl_pick(&k);
+        k.sport = (uint16_t)(2000 + i);
+        if (pl_pick(&k) != at[i]) same = 0;
+        per[at[i]]++;
+    }
+    check(same, "by: site — сайт на одном узле при любом порте и соединении");
+    check(per[0] > 30 && per[1] > 30 && per[2] > 30, "by: site — сайты разошлись по всем трём узлам");
+    g_pl.slot[1].up = 0;
+    int kept = 1, moved = 1;
+    for (int i = 0; i < 200; i++) {
+        k.dst = htonl(0x5db80000u + (uint32_t)i * 7919u);
+        int now = pl_pick(&k);
+        if (at[i] != 1 && now != at[i]) kept = 0;
+        if (at[i] == 1 && now == 1) moved = 0;
+    }
+    check(kept, "узел лёг — сайты живых узлов остаются на своих местах");
+    check(moved, "узел лёг — его сайты ушли на живые");
+    g_pl.slot[1].up = 1;
+
+    pool_new(3, BY_SITE_CLIENT, 5, NULL);
+    pl_check(1);
+    pl_check(2);
+    k.dst = htonl(0x5db80001u);
+    int seen[3] = { 0, 0, 0 };
+    for (uint32_t c = 0; c < 60; c++) {
+        k.src = htonl(0x0a000002u + c);
+        seen[pl_pick(&k)] = 1;
+    }
+    check(seen[0] + seen[1] + seen[2] >= 2, "by: site_client — один сайт у разных клиентов на разных узлах");
+
+    pool_new(3, BY_CONNECTION, 5, NULL);
+    pl_check(1);
+    pl_check(2);
+    int cnt[3] = { 0, 0, 0 };
+    for (int i = 0; i < 3000; i++) cnt[pl_pick(&k)]++;
+    check(cnt[0] > 800 && cnt[1] > 800 && cnt[2] > 800, "by: connection — новые соединения поровну");
+}
+
+static void t_pool_refill(void) {
+    for (int i = 0; i < 5; i++) g_fn[i].alive = 1;
+    g_fn[1].alive = 0;
+    pool_new(3, BY_CONNECTION, 5, NULL);
+    pl_check(1);
+    pl_check(2);
+    check(g_pl.slot[1].node == 2 && g_pl.slot[2].node == 3,
+          "пустые слоты — по порядку кандидатов, молчащий кандидат пропущен");
+    for (int i = 0; i < 5; i++) g_fn[i].alive = 0;
+    pl_check(0);
+    pl_check(0);
+    check(!g_pl.slot[0].up && g_pl.slot[0].node == 0 && g_pl.slot[0].retry == PL_RETRY_S * 2,
+          "замены нет — слот ждёт круга, пауза растёт вдвое");
+    check(g_pl.said_up == 1, "живые слоты остались — выход по-прежнему up");
+    for (int s = 1; s < 3; s++) { pl_check(s); pl_check(s); }
+    check(g_pl.said_up == 0, "живых слотов нет — демону down");
+    g_fn[3].alive = 1;
+    pl_check(0);
+    check(!g_pl.slot[0].up, "круг: узел, который ждёт свой мёртвый слот, другому слоту не отдаётся");
+    pl_check(2);
+    check(g_pl.slot[2].up && g_pl.slot[2].node == 3 && g_pl.said_up == 1,
+          "круг: свой прежний узел ответил — слот жив на нём же, демону снова up");
+    g_fn[4].alive = 1;
+    pl_check(0);
+    check(g_pl.slot[0].up && g_pl.slot[0].node == 4, "круг: ответил свободный кандидат — слот на нём");
+    int ids = 0;
+    for (int i = 0; i < 3; i++)
+        for (int j = i + 1; j < 3; j++)
+            if (g_pl.slot[i].up && g_pl.slot[j].up && g_pl.slot[i].node == g_pl.slot[j].node) ids = 1;
+    check(!ids, "два живых слота на одном узле не бывают");
+}
+
+static void t_pool_spares(void) {
+    for (int i = 0; i < 5; i++) g_fn[i].alive = 1;
+    pool_new(2, BY_SITE, 3, NULL);
+    pl_check(1);
+    static unsigned char dst[PL_HDR + sizeof(struct fsess)], src[PL_HDR + sizeof(struct fsess)];
+    struct pl_sess *d = (struct pl_sess *)dst, *s = (struct pl_sess *)src;
+    pl_clear(dst);
+    pl_clear(src);
+    struct flow_key k = pm_key(1, htonl(0x5db80001u));
+    pl_flow_open(&g_pl, dst, &k, 0);
+    pthread_mutex_lock(&g_pl.mu);
+    pl_bind(s, 1 - d->slot);
+    pthread_mutex_unlock(&g_pl.mu);
+    check(pl_match(&g_pl, dst, src) == 0, "by: site — запасная к чужому узлу соединению сайта не годится");
+    pthread_mutex_lock(&g_pl.mu);
+    pl_bind(s, d->slot);
+    pthread_mutex_unlock(&g_pl.mu);
+    check(pl_match(&g_pl, dst, src) == 1, "by: site — запасная своего узла годится");
+    g_pl.slot[d->slot].gen++;
+    check(pl_match(&g_pl, dst, src) == -1, "запасная к узлу, который больше не активен, — выбросить");
+
+    pool_new(2, BY_CONNECTION, 3, NULL);
+    pl_check(1);
+    pl_clear(dst);
+    pl_clear(src);
+    pl_flow_open(&g_pl, dst, &k, 0);
+    pthread_mutex_lock(&g_pl.mu);
+    pl_bind(s, 1 - d->slot);
+    pthread_mutex_unlock(&g_pl.mu);
+    const void *want = s->node;
+    check(pl_match(&g_pl, dst, src) == 1, "by: connection — годится запасная любого живого узла");
+    ((struct fsess *)INNER(src))->fd = -1;
+    pl_take(dst, src);
+    const struct fsess *fd = INNER(dst);
+    check(d->node == want && fd->node == want && fd->flow_opens == 2,
+          "запасная другого узла — соединение переезжает на него, поток заведён заново под узел");
+
+    /* Серия отказов установления — проверка раньше срока. */
+    g_pl.slot[0].kick = 0;
+    pl_clear(dst);
+    pthread_mutex_lock(&g_pl.mu);
+    pl_bind(d, 0);
+    pthread_mutex_unlock(&g_pl.mu);
+    pl_seen(d, -1);
+    pl_seen(d, -1);
+    check(!g_pl.slot[0].kick, "два отказа установления — проверки раньше срока ещё нет");
+    pl_seen(d, -1);
+    check(g_pl.slot[0].kick == 1, "три отказа подряд — проверить узел сейчас");
+    g_pl.slot[0].kick = 0;
+    g_pl.slot[0].checked_at = pl_now_ms();
+    pl_lost(&g_pl, d);
+    check(!g_pl.slot[0].kick, "обрыв сразу после проверки — второй проверки не зовёт (пачка обрывов)");
+    /* После обрыва по порогу молчания узел мёртв с первой неудачной проверки. */
+    for (int i = 0; i < 5; i++) g_fn[i].alive = 1;
+    pool_new(2, BY_CONNECTION, 3, NULL);
+    pl_check(1);
+    g_pl.slot[0].checked_at = 0;
+    pthread_mutex_lock(&g_pl.mu);
+    pl_bind(d, 0);
+    pthread_mutex_unlock(&g_pl.mu);
+    pl_lost(&g_pl, d);
+    g_fn[0].alive = 0;
+    pl_check(0);
+    check(g_pl.slot[0].up && g_pl.slot[0].node == 2,
+          "обрыв по порогу молчания и одна неудачная проверка — узел заменён без повтора через 3 с");
+    g_fn[0].alive = 1;
+}
+
+static void t_pool_state(void) {
+    char dir[] = "/tmp/poolmatch.XXXXXX";
+    if (!mkdtemp(dir)) { check(0, "стенд: каталог состояния"); return; }
+    steer_set_state_dir(dir);
+    for (int i = 0; i < 5; i++) g_fn[i].alive = 1;
+    pool_new(3, BY_SITE, 5, "vl");
+    pl_publish();
+    pl_check(1);
+    pl_check(2);
+    char path[200], buf[1024] = "";
+    snprintf(path, sizeof path, "%s/pm-vl", dir);
+    FILE *f = fopen(path, "r");
+    size_t r = f ? fread(buf, 1, sizeof buf - 1, f) : 0;
+    if (f) fclose(f);
+    buf[r] = '\0';
+    char want[300];
+    snprintf(want, sizeof want, "\"want\":3,\"slots\":3,\"by\":\"site\",\"active\":[{\"index\":0,\"name\":\"n0\"},"
+             "{\"index\":1,\"name\":\"n1\"},{\"index\":2,\"name\":\"n2\"}]}");
+    check(strstr(buf, want) != NULL && strstr(buf, "\"pid\":"), "файл состояния — активные узлы с номерами и именами");
+    unlink(path);
+    rmdir(dir);
+}
+
+/* Пул узлов и сброс соединений — после проверок разбора: пул заводит свой дайлер (pool_new), и
+ * таблица соединений с этого места живёт с ним. */
+static int pool_part(void) {
+    signal(SIGPIPE, SIG_IGN);
+    for (int i = 0; i < 5; i++) {
+        snprintf(g_fn[i].name, sizeof g_fn[i].name, "n%d", i);
+        snprintf(g_fn[i].host, sizeof g_fn[i].host, "h%d", i);
+        g_fn[i].alive = 1;
+    }
+    g_lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = { .sin_family = AF_INET };
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t sl = sizeof sa;
+    if (g_lfd < 0 || bind(g_lfd, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(g_lfd, 64) != 0 ||
+        getsockname(g_lfd, (struct sockaddr *)&sa, &sl) != 0) return 2;
+    g_lport = ntohs(sa.sin_port);
+    dev_drain(NULL);
+    t_pool_stack();
+    t_pool_stale();
+    t_pool_pick();
+    t_pool_refill();
+    t_pool_spares();
+    t_pool_state();
+    return 0;
+}
+
 int main(void) {
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0 || pipe(g_sess_pipe) != 0) return 2;
@@ -586,6 +1176,7 @@ int main(void) {
     t_send_refused();
     t_dns_evict();
     t_spare_slot();
+    if (pool_part() != 0) check(0, "стенд пула: слушатель на петле не завёлся");
 
     printf(g_fail ? "\ntunnelmatch: ПРОВАЛ\n" : "\nвсе проверки прошли\n");
     return g_fail;

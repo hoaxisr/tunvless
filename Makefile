@@ -569,10 +569,13 @@ $(BUILD)/tungromatch: tests/tungromatch.c src/tunnel/tun.c src/tunnel/tun.h
 # (stack.c) включается целиком, дайлер VLESS (vldial.c) настоящий и компонуется отдельно, а
 # соединение с узлом (vless_connect и transport_*) подменено, поэтому криптобиблиотека не нужна —
 # её типов в заголовках нет (src/lib/scrypto.h), как у ext-syntax. Подробности — в шапке стенда.
+# Второй половиной стенд включает пул узлов выхода (src/tunnel/pool.c) с поддельным протоколом под
+# ним: обрыв связи с узлом — RST клиенту, порог молчания на сокете, замена мёртвого узла без
+# перезапуска, раздача by. Молчание узла в сети — tests/run-silence.sh (root).
 TUNNELMATCH_SRC = src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/vless_proto.c src/proto/vless/vision.c \
-                  src/proto/vless/vldial.c src/proto/vless/vlwatch.c \
+                  src/proto/vless/vldial.c \
                   src/lib/jsonw.c src/lib/evline.c $(MODEL_KINDS) $(KINDS_EXT_SRC)
-$(BUILD)/tunnelmatch: tests/tunnelmatch.c src/tunnel/stack.c src/tunnel/dialer.h $(TUNNELMATCH_SRC)
+$(BUILD)/tunnelmatch: tests/tunnelmatch.c src/tunnel/stack.c src/tunnel/pool.c src/tunnel/pool.h src/tunnel/dialer.h $(TUNNELMATCH_SRC)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/tunnelmatch.c \
 		$(TUNNELMATCH_SRC) -lpthread -ldl

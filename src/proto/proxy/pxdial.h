@@ -34,11 +34,12 @@ const char *px_strerror(int rc);
  * время рукопожатия. */
 int px_probe(const struct px_node *n, int timeout_s, char *why, size_t why_n, int *hs_ms);
 
-/* Поднять туннель выхода к узлу (stack_run с дайлером протокола). ready — как у stack_run. */
-int px_tunnel_run(struct output *o, const struct px_node *node,
+/* Поднять туннель выхода на пуле узлов pc (src/tunnel/pool.h; узлы — struct px_node, дайлер
+ * протокола — pc->proto->ops): стек с дайлером под пулом (pool_run). ready — как у stack_run.
+ * Исход открытия потока слежке за узлами докладывает пул — дайлерам протоколов об этом думать не
+ * нужно. */
+struct pool_cfg;
+int px_tunnel_run(struct output *o, const struct pool_cfg *pc,
                   void (*ready)(void *arg, const char *dev), void *arg);
-
-/* Слежка за узлом (pxmain.c): исход открытия потока зовёт проверку раньше срока. */
-void px_watch_seen(int rc);
 
 #endif

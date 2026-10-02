@@ -145,7 +145,7 @@ static int sk_connect(const void *ctx, void *sess, int timeout_s) {
     const struct px_node *n = ctx;
     struct socks_sess *s = sess;
     int fd = tr_dial(n->vn.host, n->vn.port, timeout_s);
-    if (fd < 0) { px_watch_seen(fd); return fd; }
+    if (fd < 0) return fd;
     int rc;
     if (n->socks_ver == 5) {
         rc = socks5_hello(fd, n);
@@ -174,11 +174,10 @@ static int sk_connect(const void *ctx, void *sess, int timeout_s) {
     } else {
         rc = s->udp ? PX_EPROTO : socks4_request(fd, s->dst, s->dport, n->user);
     }
-    if (rc != 0) { close(fd); px_watch_seen(rc); return rc; }
+    if (rc != 0) { close(fd); return rc; }
     /* Сокет остаётся блокирующим со сроком SO_SNDTIMEO (tr_dial), как связь транспорта у
      * остальных дайлеров: отправка (sk_send) пишет кусок целиком. Чтение — MSG_DONTWAIT. */
     s->cfd = fd;
-    px_watch_seen(0);
     return 0;
 }
 

@@ -22,7 +22,6 @@ static const unsigned char *g_rx;     /* ответ сервера: отдаёт
 static size_t g_rx_n, g_rx_off, g_rx_chunk = 4096;
 
 time_t stack_now_s(void) { return time(NULL); }
-void px_watch_seen(int rc) { (void)rc; }
 const char *px_strerror(int rc) { (void)rc; return "?"; }
 int px_stream_open(const struct px_node *n, struct transport *t, int timeout_s) {
     (void)n; (void)timeout_s; t->link.fd = 99; return 0;

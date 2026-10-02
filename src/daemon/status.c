@@ -202,7 +202,7 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
     fprintf(out, "{\"schema\":1,\"at\":%ld,"
                  "\"features\":[\"lan_devices\",\"nodes\",\"pool\",\"active_device\","
                  "\"status_cache\",\"xslink\",\"xsteer_state\",\"spec_schema2\",\"awg\","
-                 "\"via\",\"failed\",\"groups\",\"balance_by\",\"exclude\"]",
+                 "\"via\",\"failed\",\"groups\",\"balance_by\",\"exclude\",\"active_nodes\"]",
             (long)time(NULL));
     /* Локальные устройства — следом: интерфейс показывает, с чего забирается трафик, и
      * без этого поля ему пришлось бы читать спеку вторым источником, то есть однажды
@@ -310,7 +310,7 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
                                  ",\"total\":%d}", pr.node, pr.total);
             }
             /* Устройство есть, а узел за ним клиент потерял (слежка за узлом под демоном,
-             * src/proto/vless/vlwatch.c). Обычно выход тогда и в отказе (up:false, failed:true — сторож
+             * src/tunnel/pool.c). Обычно выход тогда и в отказе (up:false, failed:true — сторож
              * принял down клиента), но поле своё, а не probe: probe значит «устройства нет, подъём
              * идёт или не удался», а устройство на месте. Причина — словами клиента, время —
              * когда сказал. Поля нет — узел отвечает или сказать нечего (без демона слежки нет). */

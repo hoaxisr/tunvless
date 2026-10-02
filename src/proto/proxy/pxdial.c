@@ -11,6 +11,7 @@
 #include "pxdial.h"
 #include "sublink.h"
 #include "stack.h"
+#include "pool.h"
 #include "spec.h"
 
 const struct dialer_ops *px_dialer_for(enum px_proto p) {
@@ -113,16 +114,13 @@ out:
 
 /* ---- подъём -------------------------------------------------------------------------------- */
 
-int px_tunnel_run(struct output *o, const struct px_node *node,
+int px_tunnel_run(struct output *o, const struct pool_cfg *pc,
                   void (*ready)(void *arg, const char *dev), void *arg) {
-    const struct dialer_ops *ops = px_dialer_for(node->proto);
-    if (!ops) {
+    const struct px_node *node = (const struct px_node *)pc->nodes + pc->first;
+    if (!pc->proto->ops) {
         fprintf(stderr, "steer[warn]: proxy: протокол узла %s не поддержан — туннель %s не поднят\n",
                 node->name, o->device);
         return 1;
     }
-    static struct dialer d;
-    d.ops = ops;
-    d.ctx = node;
-    return stack_run(o, &d, ready, arg);
+    return pool_run(o, pc, ready, arg);
 }

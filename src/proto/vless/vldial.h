@@ -52,12 +52,14 @@ extern const struct dialer_ops vless_dialer;
 /* Трассировка разбора (STEER_TUN_TRACE) — та же, что у стека, и в тот же поток журнала. */
 void vl_set_trace(int on);
 
-/* Поднять туннель выхода к узлу node: проверка узла, которую нельзя отложить до первого
- * соединения, и стек с дайлером VLESS (stack_run). ready — как у stack_run (stack.h,
- * stack_ready_fn): устройство поднято, и модуль говорит об этом демону; NULL — никому. Возвращает
- * код выхода процесса, всегда ненулевой — успешного выхода у цикла нет. */
+/* Поднять туннель выхода на пуле узлов pc (src/tunnel/pool.h; узлы — struct vless_node, первый
+ * активный — pc->first): проверка узла, которую нельзя отложить до первого соединения, и стек с
+ * дайлером VLESS под пулом (pool_run). ready — как у stack_run (stack.h, stack_ready_fn): устройство
+ * поднято; up демону говорит пул, модуль — только своё; NULL — ничего. Возвращает код выхода
+ * процесса, всегда ненулевой — успешного выхода у цикла нет. */
 struct output;
-int vless_tunnel_run(struct output *o, const struct vless_node *node,
+struct pool_cfg;
+int vless_tunnel_run(struct output *o, const struct pool_cfg *pc,
                      void (*ready)(void *arg, const char *dev), void *arg);
 
 #endif

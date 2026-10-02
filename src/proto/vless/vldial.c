@@ -25,7 +25,7 @@
 #include "vision.h"
 #include "client.h"
 #include "vldial.h"
-#include "vlwatch.h"
+#include "pool.h"
 #include "stack.h"
 
 #define LOG_W  "steer[warn] tunnel: "
@@ -55,13 +55,11 @@ static void vl_describe(const void *ctx, char *out, size_t n) {
 
 /* ---- связь ----------------------------------------------------------------------------- */
 
+/* Исход установления слежке за узлом докладывает пул узлов (src/tunnel/pool.c): он знает, к какому
+ * из активных узлов шло соединение. */
 static int vl_connect(const void *ctx, void *sess, int timeout_s) {
     struct vl_sess *s = sess;
-    int rc = vless_connect(ctx, &s->t, timeout_s);
-    /* Исход — слежке за узлом (под демоном, vlwatch.c): серия отказов зовёт её проверку раньше
-     * срока. Здесь, а не в стеке: мера «жив ли узел» — протокола. */
-    vl_watch_seen(rc);
-    return rc;
+    return vless_connect(ctx, &s->t, timeout_s);
 }
 
 /* Связь из запасной сессии — в сессию соединения. Копируется только struct transport: UUID и
@@ -631,11 +629,12 @@ static int vl_deliver(const void *ctx, void *sess, int udp, const unsigned char 
 
 /* ---- подъём ---------------------------------------------------------------------------- */
 
-int vless_tunnel_run(struct output *o, const struct vless_node *node,
+int vless_tunnel_run(struct output *o, const struct pool_cfg *pc,
                      void (*ready)(void *arg, const char *dev), void *arg) {
     /* Идентификатор узла — ДО устройства и потоков, пока узел ещё можно назвать. Дальше он
      * разбирается заново на каждое соединение (vl_flow_open), и отказ там означал бы туннель,
      * который поднят, но закрывает всё подряд (I-097). */
+    const struct vless_node *node = (const struct vless_node *)pc->nodes + pc->first;
     unsigned char id[16];
     if (vless_uuid_parse(node->uuid, id) != 0) {
         fprintf(stderr, "steer[warn]: у узла %s не разбирается UUID — туннель %s не поднят; "
@@ -643,11 +642,9 @@ int vless_tunnel_run(struct output *o, const struct vless_node *node,
         return 1;
     }
     g_trace = getenv("STEER_TUN_TRACE") != NULL;
-    /* Статический: стек держит указатель на дайлер до конца процесса (g_dl в stack.c). */
-    static struct dialer d;
-    d.ops = &vless_dialer;
-    d.ctx = node;
-    return stack_run(o, &d, ready, arg);
+    /* Узлы соединений выбирает пул (src/tunnel/pool.c): активных может быть несколько, у каждого
+     * соединения свой, и замена умершего — без перезапуска процесса. */
+    return pool_run(o, pc, ready, arg);
 }
 
 const struct dialer_ops vless_dialer = {

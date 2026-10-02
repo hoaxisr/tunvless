@@ -47,7 +47,6 @@ static void pw_hex(const char *pass, char out[57]) {
 static int tj_connect(const void *ctx, void *sess, int timeout_s) {
     struct trojan_sess *s = sess;
     int rc = px_stream_open(ctx, &s->t, timeout_s);
-    px_watch_seen(rc);
     return rc;
 }
 static void tj_take(void *dst, void *src) {

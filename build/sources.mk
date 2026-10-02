@@ -209,13 +209,13 @@ XS_COMMON_SRC := src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/x
 #                  годность): половина разбора sub.c, которую с ним делит модуль steer-proxy
 #                  (trojan://, vmess://), — в libsteer, как и сам транспорт.
 SUBLINK_SRC := src/proto/vless/sublink.c
-STACK_SRC := src/tunnel/stack.c src/tunnel/rtx.c
+STACK_SRC := src/tunnel/stack.c src/tunnel/rtx.c src/tunnel/pool.c
 TRANSPORT_SRC := src/proto/transport/transport.c src/proto/transport/trdial.c \
                  src/proto/transport/trsec.c src/proto/tls/ech.c src/proto/transport/trgrpc.c \
                  src/proto/transport/trxhttp.c src/proto/transport/trupgrade.c \
                  src/proto/transport/trws.c src/proto/transport/trpath.c src/proto/tls/roots.c \
                  src/proto/transport/trvenc.c
-VLESS_MOD_SRC := src/proto/vless/vlmain.c src/proto/vless/vldial.c src/proto/vless/vlwatch.c \
+VLESS_MOD_SRC := src/proto/vless/vlmain.c src/proto/vless/vldial.c \
                  src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/vless/vision.c
 EXT_ROUTER_SRC := src/proto/vless/sub.c $(SUBLINK_SRC) $(VLESS_MOD_SRC) $(STACK_SRC) $(TRANSPORT_SRC) \
                   src/proto/xsteer/xsclient.c src/proto/vless/subfetch.c src/proto/tgws/tgws.c src/proto/tls/tlsprobe.c \

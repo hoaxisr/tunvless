@@ -370,6 +370,14 @@ static void ev_line(struct supd *s, struct helper *h, const char *line) {
         if (evline_int(&e, "total", &t)) st->total = t;
     } else if (!strcmp(e.ev, "health")) {
         ev_health(s, h, &e);
+    } else if (!strcmp(e.ev, "active")) {
+        /* Активные узлы пула: только цифры и запятые — строка ложится в JSON массивом как есть
+         * (helper ниже), поэтому чужое в ней отвергается целиком. */
+        const char *nodes = evline_str(&e, "nodes");
+        if (!nodes || strspn(nodes, "0123456789,") != strlen(nodes) ||
+            strlen(nodes) >= sizeof(st->active)) return;
+        snprintf(st->active, sizeof(st->active), "%s", nodes);
+        st->active_known = 1;
     }
 }
 
@@ -1075,6 +1083,8 @@ static int start_one(struct helper *h, void *arg) {
         h->st.bound[0] = '\0';
         h->st.node = h->st.total = h->st.nonode = 0;
         h->st.health_n = 0;
+        h->st.active[0] = '\0';
+        h->st.active_known = 0;
         h->st.started = (long)time(NULL);
         helper_started(h, pid);
     }
@@ -1108,8 +1118,8 @@ static void child_cb(struct loop *l, pid_t pid, int status, void *arg) {
         int was_up = h->st.up;
         h->st.running = 0;
         h->st.up = 0;
-        /* down клиента, следившего за узлом, говорил об узле этого процесса (он и выходит, найдя
-         * другой узел, — proto/vless/vlwatch.c, «слежка за узлом»). Новый процесс выберет узел заново, и
+        /* down клиента, следившего за узлом, говорил об узлах этого процесса (пул узлов,
+         * tunnel/pool.c, «слежка»). Новый процесс выберет узел заново, и
          * «ни один узел не ответил» (probe_of) до его подъёма было бы неправдой. */
         if (h->st.watch) h->st.said_down = 0;
         h->st.watch = 0;
@@ -1444,6 +1454,8 @@ int supd_helper_json(const struct supd *s, const char *name, FILE *out) {
         if (cmd_picks_nodes(h->cmd) && (st->node || st->nonode))
             fprintf(out, ",\"node\":%ld,\"total\":%ld", st->nonode ? st->nonode : st->node,
                     st->total);
+        /* Активные узлы пула (номера среди пригодных, как у vless-nodes) — когда клиент сказал. */
+        if (st->active_known) fprintf(out, ",\"active\":[%s]", st->active);
         if (!strcmp(h->cmd, "tgws") || st->health_n) {
             fputs(",\"paths_down\":", out);
             health_json(out, st, now);

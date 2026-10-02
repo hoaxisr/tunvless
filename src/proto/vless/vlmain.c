@@ -2,8 +2,9 @@
  *
  * Точка входа протокола. Жила в конце цикла туннеля (tunnel.c), пока цикл был сварен с VLESS;
  * при выделении стека (шаг 2 выпуска 1.10) переехала сюда без изменений в выводе и кодах
- * выхода. Отсюда модуль читает спеку и подписку, выбирает узел, заводит слежку за ним
- * (vlwatch.c) и отдаёт устройство стеку вместе с дайлером (vless_tunnel_run в vldial.c).
+ * выхода. Отсюда модуль читает спеку и подписку, выбирает первый узел и отдаёт устройство стеку с
+ * дайлером под пулом узлов (vless_tunnel_run в vldial.c, src/tunnel/pool.c): пул держит `active`
+ * узлов сразу, следит за каждым и заменяет умерший без перезапуска процесса.
  *
  * В пакете роутера (1.10, шаг 4) эти команды — команды бинарника модуля steer-vless: демон
  * запускает его ребёнком (механизм prog, daemon/helpers.c), а в steerd от них остаётся заглушка
@@ -19,7 +20,7 @@
 #include "vless.h"
 #include "client.h"
 #include "vldial.h"
-#include "vlwatch.h"
+#include "pool.h"
 #include "spec.h"
 #include "evline.h"
 #include "jsonw.h"
@@ -37,13 +38,6 @@
 /* Узлы подписки — массив в куче по числу узлов в файле (vless_load_sub): раньше их было «не больше
  * 128», статикой на 157 КБ, а хвост подписки терялся. */
 static struct vless_node *g_nodes;
-/* Что нужно слежке за узлом, когда стек поднимет устройство (vl_ready). */
-struct vl_ready_arg {
-    const struct vless_node *nodes;
-    const int *sel;
-    size_t sel_n;
-    int cur, checked;
-};
 /* Спека — значение, а не глобалы (правило 6, docs/architecture.md, раздел 2): экземпляр
  * заводит каждая точка входа (cmd_vless, cmd_vless_nodes, cmd_vless_probe) и передаёт его
  * параметром в load_nodes и underlay_setup. Выделяется по требованию, а не static в каждой из
@@ -346,7 +340,8 @@ static void vl_probe_report(const char *out_name, enum probe_state st, int node,
     if (!evline_enabled()) probe_report(out_name, st, node, total);
 }
 
-/* Устройство поднято (ready у stack_run, stack.h): сказать up и завести слежку за узлом.
+/* Устройство поднято (ready у stack_run, stack.h). up демону и слежку за узлами завёл пул узлов
+ * (src/tunnel/pool.c) перед этим вызовом; здесь — только строка о маршруте без демона.
  *
  * МАРШРУТ ВЫХОДА ЗДЕСЬ НЕ СТАВИТСЯ (1.10, шаг 3). До того клиент сам звал bind_device — код
  * демона в процессе помощника: таблица, ip rule, conntrack, набор failopen. С шага 4 модуль —
@@ -364,11 +359,18 @@ static void vl_probe_report(const char *out_name, enum probe_state st, int node,
  * --supervise --apply`). Об этом — одна строка в журнал, чтобы «туннель поднят, а трафика по
  * каналам нет» не пришлось разгадывать. */
 static void vl_ready(void *arg, const char *dev) {
-    const struct vl_ready_arg *ra = arg;
-    vl_watch_start(ra->nodes, ra->sel, ra->sel_n, ra->cur, ra->checked, dev);
+    (void)arg;
     if (!evline_enabled())
         fprintf(stderr, LOG_I2 "%s поднят; маршрут выхода к нему ставит демон — без демона "
                         "таблица выхода не тронута\n", dev);
+}
+
+/* Узел глазами пула: проверка — та же vless_probe, что при подъёме и у `vless-probe`. */
+static int vl_pool_probe(const void *node, int timeout_s, char *why, size_t why_n) {
+    return vless_probe(node, timeout_s, why, why_n);
+}
+static const char *vl_pool_name(const void *node) {
+    return ((const struct vless_node *)node)->name;
 }
 
 int cmd_vless(const char *spec_path, const char *out_name) {
@@ -501,17 +503,30 @@ int cmd_vless(const char *spec_path, const char *out_name) {
      * устройство. Запись снимается здесь, а не в vless_tunnel_run: снять её обязан тот, кто её
      * поставил, иначе на каждом пути выхода из подъёма про неё придётся помнить.
      *
-     * Под демоном об узле за устройством дальше говорит слежка (vl_watch_start, vlwatch.c):
-     * up с watch, down, когда узел перестал отвечать, и снова up. Заводится она не здесь, а когда
-     * стек поднял устройство (vl_ready ниже): up несёт имя устройства, и по нему демон привязывает
-     * маршрут выхода. Без демона — прежний up, которого никто не читает. */
+     * Об узлах за устройством дальше говорит слежка пула (src/tunnel/pool.c): up с watch, down,
+     * когда живых узлов не осталось, и снова up. Заводится она не здесь, а когда стек поднял
+     * устройство: up несёт имя устройства, и по нему демон привязывает маршрут выхода. Без демона
+     * событий никто не читает, а слежка всё равно идёт — замена узла и сброс соединений нужны и там. */
     probe_clear(out_name);
-    static struct vl_ready_arg ra;
-    ra.nodes = nodes;
-    ra.sel = sel;
-    ra.sel_n = sel_n;
-    ra.cur = chosen;
-    ra.checked = !out_node_named(o);
+    /* Пул узлов (src/tunnel/pool.c): первый активный — выбранный здесь, остальные `active - 1`
+     * пул найдёт среди кандидатов сам, уже с поднятым устройством, — подъём не ждёт их проверок. */
+    static const struct pool_proto proto = {
+        .ops = &vless_dialer, .probe = vl_pool_probe, .name = vl_pool_name, .tag = "vless",
+    };
+    static struct pool_cfg pc;
+    const struct tun_pool *tp = &o->vless.pool;
+    pc.proto = &proto;
+    pc.nodes = nodes;
+    pc.stride = sizeof(*nodes);
+    pc.sel = sel;
+    pc.sel_n = sel_n;
+    pc.first = chosen;
+    pc.checked = !out_node_named(o);
+    pc.active = tp->active ? tp->active : 1;
+    pc.by = tp->by;
+    pc.interval_s = tp->interval_s ? tp->interval_s : POOL_INTERVAL_S;
+    pc.silence_s = tp->silence_s < 0 ? 0 : tp->silence_s ? tp->silence_s : POOL_SILENCE_S;
+    pc.out = out_name;
 
     /* Реестр — чтобы узнать таблицу выхода: из неё берётся адрес устройства. Вызов
      * идемпотентен и с apply не спорит: тот же файл, те же номера. Правило 5,
@@ -519,5 +534,5 @@ int cmd_vless(const char *spec_path, const char *out_name) {
      * изнутри registry_assign. */
     struct err e = {0};
     if (registry_assign(sp, &e) < 0) err_die(&e);
-    return vless_tunnel_run(o, &nodes[chosen], vl_ready, &ra);
+    return vless_tunnel_run(o, &pc, vl_ready, NULL);
 }

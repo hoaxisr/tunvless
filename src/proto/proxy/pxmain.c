@@ -1,6 +1,6 @@
-/* Модуль steer-proxy: подкоманды `steer proxy`, `proxy-nodes`, `proxy-probe`, слежка за узлом и
- * файл состояния для status/diag. Повторяет устройство hy2main.c/vlmain.c (общее — «прочитать
- * спеку, выбрать узел, поднять стек, следить»), различается узлом и мерой. */
+/* Модуль steer-proxy: подкоманды `steer proxy`, `proxy-nodes`, `proxy-probe`. Повторяет устройство
+ * vlmain.c (общее — «прочитать спеку, выбрать узел, поднять стек на пуле узлов»), различается узлом
+ * и мерой. Слежка за узлами и файл состояния для status/diag — у пула (src/tunnel/pool.c). */
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <stdio.h>
@@ -16,6 +16,7 @@
 #include "evline.h"
 #include "jsonw.h"
 #include "probe.h"
+#include "pool.h"
 
 #define LOG_W2 "steer[warn]: "
 #define LOG_I2 "steer[info]: "
@@ -211,174 +212,10 @@ int cmd_proxy_probe(const char *spec_path, const char *out_name, int node, int t
     return found >= 0 ? 0 : 1;
 }
 
-/* ---- файл состояния ------------------------------------------------------------------------- */
-
-static char g_state_out[64];
-static const struct px_node *g_cur;
-
-static void state_write(void) {
-    char path[300], tmp[320];
-    snprintf(path, sizeof(path), "%s/proxy-%.32s", steer_state_dir(), g_state_out);
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    FILE *f = fopen(tmp, "w");
-    if (!f) return;
-    fprintf(f, "{\"pid\":%ld,\"node\":", (long)getpid());
-    jsonw_str(f, g_cur->name);
-    fprintf(f, ",\"protocol\":");
-    jsonw_str(f, px_proto_name(g_cur->proto));
-    fprintf(f, ",\"up\":true}\n");
-    fclose(f);
-    if (rename(tmp, path) != 0) unlink(tmp);
-}
-
-static void *state_thread(void *arg) {
-    (void)arg;
-    for (;;) { state_write(); struct timespec ts = { 3, 0 }; nanosleep(&ts, NULL); }
-    return NULL;
-}
-
-/* ---- слежка за узлом ------------------------------------------------------------------------ */
-
-#define NW_PERIOD_S 60
-#define NW_CONFIRM_S 3
-#define NW_RETRY_S 15
-#define NW_RETRY_MAX_S 300
-#define NW_STREAK 3
-#define NW_TIMEOUT_S 8
-
-static struct {
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
-    int on, streak, kick;
-    const struct px_node *nodes;
-    const int *sel;
-    size_t sel_n;
-    int cur, checked;
-    char dev[16];
-} g_nw = { .mu = PTHREAD_MUTEX_INITIALIZER };
-
-static void nw_up(int watch) {
-    if (g_nw.dev[0] && watch)
-        evline_emit("up", "watch", EVLINE_INT, 1L, "dev", EVLINE_STR, g_nw.dev, (const char *)NULL);
-    else if (g_nw.dev[0]) evline_emit("up", "dev", EVLINE_STR, g_nw.dev, (const char *)NULL);
-    else if (watch) evline_emit("up", "watch", EVLINE_INT, 1L, (const char *)NULL);
-    else evline_emit("up", (const char *)NULL);
-}
-
-void px_watch_seen(int rc) {
-    if (!__atomic_load_n(&g_nw.on, __ATOMIC_ACQUIRE)) return;
-    pthread_mutex_lock(&g_nw.mu);
-    if (rc == 0) g_nw.streak = 0;
-    else if (++g_nw.streak >= NW_STREAK) { g_nw.kick = 1; pthread_cond_signal(&g_nw.cv); }
-    pthread_mutex_unlock(&g_nw.mu);
-}
-
-static uint64_t nw_now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
-}
-
-static void nw_wait(uint64_t due, int up) {
-    struct timespec ts = { .tv_sec = (time_t)(due / 1000), .tv_nsec = (long)(due % 1000) * 1000000L };
-    while (!(up && g_nw.kick) && nw_now_ms() < due)
-        pthread_cond_timedwait(&g_nw.cv, &g_nw.mu, &ts);
-    g_nw.kick = 0;
-}
-
-#define NW_WHY_ESC 440
-static void nw_down(const char *why) {
-    char w[160];
-    size_t n = 0, esc = 0;
-    for (const unsigned char *s = (const unsigned char *)why; *s && n + 1 < sizeof(w); ) {
-        size_t len = *s >= 0xF0 ? 4 : *s >= 0xE0 ? 3 : *s >= 0xC0 ? 2 : 1;
-        size_t cost = 0, k;
-        for (k = 0; k < len && s[k]; k++)
-            cost += s[k] >= 0x80 || s[k] < 0x20 ? 6 : (s[k] == '"' || s[k] == '\\') ? 2 : 1;
-        if (k < len || n + len + 1 > sizeof(w) || esc + cost > NW_WHY_ESC) break;
-        memcpy(w + n, s, len);
-        n += len; esc += cost; s += len;
-    }
-    w[n] = '\0';
-    evline_emit("down", "why", EVLINE_STR, w[0] ? w : "узел не отвечает", (const char *)NULL);
-}
-
-static void *nw_thread(void *arg) {
-    (void)arg;
-    const struct px_node *cur = &g_nw.nodes[g_nw.cur];
-    int up = 1, fails = 0;
-    uint64_t retry = NW_RETRY_S;
-    uint64_t due = nw_now_ms() + (g_nw.checked ? NW_PERIOD_S * 1000ull : 0);
-    char why[256];
-    int hs;
-    for (;;) {
-        pthread_mutex_lock(&g_nw.mu);
-        nw_wait(due, up);
-        pthread_mutex_unlock(&g_nw.mu);
-        if (up) {
-            if (px_probe(cur, NW_TIMEOUT_S, why, sizeof(why), &hs) == 0) {
-                fails = 0;
-                pthread_mutex_lock(&g_nw.mu); g_nw.streak = 0; pthread_mutex_unlock(&g_nw.mu);
-                due = nw_now_ms() + NW_PERIOD_S * 1000ull;
-                continue;
-            }
-            if (++fails < 2) { due = nw_now_ms() + NW_CONFIRM_S * 1000ull; continue; }
-            up = 0; fails = 0; retry = NW_RETRY_S;
-            nw_down(why);
-            fprintf(stderr, LOG_W2 "узел %s не отвечает: %s — проверяю узлы\n", cur->name, why);
-            due = nw_now_ms() + retry * 1000ull;
-            continue;
-        }
-        if (px_probe(cur, NW_TIMEOUT_S, why, sizeof(why), &hs) == 0) {
-            up = 1;
-            pthread_mutex_lock(&g_nw.mu); g_nw.streak = 0; g_nw.kick = 0; pthread_mutex_unlock(&g_nw.mu);
-            nw_up(1);
-            fprintf(stderr, LOG_I2 "узел %s снова отвечает\n", cur->name);
-            due = nw_now_ms() + NW_PERIOD_S * 1000ull;
-            continue;
-        }
-        for (size_t k = 0; k < g_nw.sel_n; k++) {
-            const struct px_node *n = &g_nw.nodes[g_nw.sel[k]];
-            if (g_nw.sel[k] == g_nw.cur || px_probe(n, NW_TIMEOUT_S, why, sizeof(why), &hs) != 0) continue;
-            fprintf(stderr, LOG_W2 "узел %s не отвечает, а %s отвечает — выхожу, чтобы выбрать узел заново\n",
-                    cur->name, n->name);
-            exit(0);
-        }
-        retry = retry * 2 > NW_RETRY_MAX_S ? NW_RETRY_MAX_S : retry * 2;
-        due = nw_now_ms() + retry * 1000ull;
-    }
-    return NULL;
-}
-
-static void watch_start(const struct px_node *nodes, const int *sel, size_t sel_n, int cur,
-                        int checked, const char *dev) {
-    snprintf(g_nw.dev, sizeof(g_nw.dev), "%s", dev ? dev : "");
-    if (!evline_enabled()) { nw_up(0); return; }
-    pthread_condattr_t ca;
-    pthread_condattr_init(&ca);
-    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
-    pthread_cond_init(&g_nw.cv, &ca);
-    pthread_condattr_destroy(&ca);
-    g_nw.nodes = nodes; g_nw.sel = sel; g_nw.sel_n = sel_n; g_nw.cur = cur; g_nw.checked = checked;
-    pthread_attr_t a;
-    pthread_attr_init(&a);
-    pthread_attr_setstacksize(&a, 512 * 1024);
-    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-    pthread_t t;
-    pthread_mutex_lock(&g_nw.mu);
-    int err = pthread_create(&t, &a, nw_thread, NULL);
-    pthread_attr_destroy(&a);
-    if (err) {
-        pthread_mutex_unlock(&g_nw.mu);
-        fprintf(stderr, LOG_W2 "поток слежки за узлом не создался (%s) — потерю узла клиент не заметит\n",
-                strerror(err));
-        nw_up(0);
-        return;
-    }
-    __atomic_store_n(&g_nw.on, 1, __ATOMIC_RELEASE);
-    nw_up(1);
-    pthread_mutex_unlock(&g_nw.mu);
-}
+/* Файл состояния (proxy-<выход>, status и diag) и слежку за узлами ведёт пул узлов выхода
+ * (src/tunnel/pool.c): N активных узлов сразу, проверка каждого, замена мёртвого без перезапуска
+ * процесса. Прежде здесь жили своя слежка за одним узлом (копия vlwatch.c) и поток, переписывавший
+ * файл состояния раз в три секунды. */
 
 /* ---- подъём -------------------------------------------------------------------------------- */
 
@@ -386,22 +223,19 @@ static void px_probe_report(const char *out_name, enum probe_state st, int node,
     if (!evline_enabled()) probe_report(out_name, st, node, total);
 }
 
-struct ready_arg {
-    const struct px_node *nodes;
-    const int *sel;
-    size_t sel_n;
-    int cur, checked;
-};
-
+/* Устройство поднято: up демону и слежку завёл пул; здесь — только строка о маршруте без демона. */
 static void px_ready(void *arg, const char *dev) {
-    const struct ready_arg *ra = arg;
-    static pthread_t st;
-    pthread_create(&st, NULL, state_thread, NULL);
-    pthread_detach(st);
-    watch_start(ra->nodes, ra->sel, ra->sel_n, ra->cur, ra->checked, dev);
+    (void)arg;
     if (!evline_enabled())
         fprintf(stderr, LOG_I2 "%s поднят; маршрут выхода к нему ставит демон — без демона таблица выхода не тронута\n", dev);
 }
+
+/* Узел глазами пула: проверка — та же px_probe, что при подъёме и у `proxy-probe`. */
+static int px_pool_probe(const void *node, int timeout_s, char *why, size_t why_n) {
+    int hs;
+    return px_probe(node, timeout_s, why, why_n, &hs);
+}
+static const char *px_pool_name(const void *node) { return ((const struct px_node *)node)->name; }
 
 int cmd_proxy(const char *spec_path, const char *out_name) {
     evline_open();
@@ -465,11 +299,31 @@ int cmd_proxy(const char *spec_path, const char *out_name) {
         return 1;
     }
     probe_clear(out_name);
-    static struct ready_arg ra;
-    ra.nodes = nodes; ra.sel = sel; ra.sel_n = sel_n; ra.cur = chosen; ra.checked = !out_proxy_node_named(o);
-    g_cur = &nodes[chosen];
-    snprintf(g_state_out, sizeof(g_state_out), "%s", out_name);
+    /* Пул узлов (src/tunnel/pool.c), как у vless: первый активный — выбранный здесь, остальные
+     * `active - 1` пул найдёт среди кандидатов сам. */
+    static struct pool_proto proto;
+    static char extra[48];
+    snprintf(extra, sizeof extra, "\"protocol\":\"%s\"", px_proto_name(nodes[chosen].proto));
+    proto.ops = px_dialer_for(nodes[chosen].proto);
+    proto.probe = px_pool_probe;
+    proto.name = px_pool_name;
+    proto.tag = "proxy";
+    proto.extra = extra;
+    static struct pool_cfg pc;
+    const struct tun_pool *tp = &o->proxy.pool;
+    pc.proto = &proto;
+    pc.nodes = nodes;
+    pc.stride = sizeof(*nodes);
+    pc.sel = sel;
+    pc.sel_n = sel_n;
+    pc.first = chosen;
+    pc.checked = !out_proxy_node_named(o);
+    pc.active = tp->active ? tp->active : 1;
+    pc.by = tp->by;
+    pc.interval_s = tp->interval_s ? tp->interval_s : POOL_INTERVAL_S;
+    pc.silence_s = tp->silence_s < 0 ? 0 : tp->silence_s ? tp->silence_s : POOL_SILENCE_S;
+    pc.out = out_name;
     struct err e = {0};
     if (registry_assign(sp, &e) < 0) err_die(&e);
-    return px_tunnel_run(o, &nodes[chosen], px_ready, &ra);
+    return px_tunnel_run(o, &pc, px_ready, NULL);
 }

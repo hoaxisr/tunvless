@@ -181,6 +181,14 @@ void hy2c_set_mark(uint32_t mark, int required) {
     E.mark_req = required;
 }
 
+/* Срок простоя QUIC (ключ `silence` выхода): узел, от которого ничего нет дольше срока, — соединение
+ * закрыто, потоки клиентов кончаются, следующий поток поднимает соединение заново. PING QUIC шлёт
+ * чаще срока втрое, но не реже прежних 10 с. Умолчание — прежнее: 30 с и 10 с. */
+static unsigned g_idle_ms = 30000;
+void hy2c_set_idle(int silence_s) {
+    if (silence_s > 0) g_idle_ms = (unsigned)silence_s * 1000u;
+}
+
 static void set_err(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void set_err(const char *fmt, ...) {
     va_list ap;
@@ -274,8 +282,8 @@ static void make_cfg(const struct hy2_node *n, const char *ip, struct qc_cfg *c,
     c->brutal_bps = n->up_bps;
     c->bbr = n->up_bps == 0;
     c->datagram_max = 1500;
-    c->keepalive_ms = 10000;
-    c->idle_ms = 30000;
+    c->idle_ms = g_idle_ms;
+    c->keepalive_ms = g_idle_ms / 3 < 10000 ? g_idle_ms / 3 : 10000;
     c->flow_manual = 1;
     c->max_data = 16u << 20;
     c->max_stream_data = 8u << 20;

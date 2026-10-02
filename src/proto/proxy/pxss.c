@@ -120,7 +120,6 @@ static int ss_connect(const void *ctx, void *sess, int timeout_s) {
     const struct px_node *n = ctx;
     struct ss_sess *s = sess;
     int rc = s->udp ? ss_udp_open(s, n) : px_stream_open(n, &s->t, timeout_s);
-    px_watch_seen(rc);
     return rc;
 }
 

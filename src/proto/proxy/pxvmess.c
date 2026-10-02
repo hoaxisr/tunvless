@@ -84,7 +84,6 @@ static int vm_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
 static int vm_connect(const void *ctx, void *sess, int timeout_s) {
     struct vmess_sess *s = sess;
     int rc = px_stream_open(ctx, &s->t, timeout_s);
-    px_watch_seen(rc);
     return rc;
 }
 static void vm_take(void *dst, void *src) {
