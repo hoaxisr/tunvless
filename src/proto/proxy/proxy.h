@@ -74,7 +74,8 @@ struct px_node {
 };
 
 #define PX_SKIP_REASONS 8
-struct px_skip { char reason[64]; char example[144]; size_t count; };
+/* reason — того же размера, что skip_reason узла (96): иначе причина у подписки обрезается. */
+struct px_skip { char reason[96]; char example[144]; size_t count; };
 struct px_sub_stats {
     size_t skipped;                      /* узлов наших протоколов, непригодных к работе */
     size_t foreign;                      /* ссылок и outbound'ов других протоколов */

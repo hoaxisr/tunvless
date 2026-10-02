@@ -140,6 +140,9 @@ static void test_insecure(void) {
     size_t got = px_parse_sub(sub, out, 8, 0, &st);
     check("без insecure: узел с allowInsecure пропущен, s3 — номер 1", 21,
           (long)(got * 10 + (got == 2 && !strcmp(out[1].name, "s3"))));
+    /* Причина у подписки — целиком (поле причины было 64 байта при 96 у узла: «…у в» и обрубок буквы). */
+    check_str("  причина в skipped_reasons — целиком", "allowInsecure: включите insecure у выхода явно",
+              st.reasons[0].reason);
     vless_set_insecure(1);
     got = px_parse_sub(sub, out, 8, 0, &st);
     check("с insecure: все три, t2 — номер 1, s3 — номер 2", 3, (long)got);

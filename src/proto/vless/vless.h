@@ -97,7 +97,9 @@ int vless_parse_url(const char *url, struct vless_node *n);
 #define VLESS_SKIP_REASONS 8
 
 struct vless_skip {
-    char reason[64];       /* та же строка, что легла бы в vless_node.skip_reason */
+    /* та же строка, что легла бы в vless_node.skip_reason, и того же размера: при 64 байтах против 96
+     * у узла причина в skipped_reasons обрезалась («…включите insecure у выхода явн»). */
+    char reason[96];
     char example[144];     /* имя ПЕРВОГО узла с этой причиной, иначе host:port.
                             * Длиннее name[128] намеренно: во второй форме сюда влезает
                             * host целиком плюс ":65535", а обрезанный хост в объяснении

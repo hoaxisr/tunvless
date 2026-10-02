@@ -273,6 +273,19 @@ int main(void) {
         check_n("незнакомая схема: сумма сходится", 1,
                 (long)(n + st.skipped + st.foreign));
     }
+    /* Причина пропуска в skipped_reasons — целиком, как в узле: поле причины у подписки было 64 байта
+     * при 96 у узла, и «allowInsecure: включите insecure у выхода явно» (65 байт) уезжала в интерфейс
+     * как «…у выхода явн». */
+    {
+        struct vless_node nodes[4];
+        struct vless_sub_stats st;
+        vless_set_insecure(0);
+        size_t n = vless_parse_sub("vless://11111111-2222-3333-4444-555555555555@b.test:443"
+                                   "?security=tls&sni=b.test&allowInsecure=1#B\n", nodes, 4, &st);
+        check_n("allowInsecure без insecure: узел пропущен", 0, (long)n);
+        check("  причина в skipped_reasons — целиком",
+              "allowInsecure: включите insecure у выхода явно", st.reasons[0].reason);
+    }
     {
         /* И ТА ЖЕ СКЛЕЙКА, НО ДЛИННЕЕ БУФЕРА СТРОКИ — вторая половина обращения steer#2.
          *
