@@ -310,6 +310,11 @@ static void output_flow(FILE *f, const struct output *o, const struct onames *on
         if (kk.insecure) { fk(&w, "insecure"); fputs("true", f); }
         if (kk.excl.cc_n) fseq_s(&w, "exclude", kk.excl.cc[0], 3, kk.excl.cc_n);
         if (kk.excl.names_n) fseq(&w, "exclude_name", kk.excl.names, kk.excl.names_n);
+        /* Пул узлов туннеля — только отличное от умолчания (struct tun_pool). */
+        if (kk.pool.active > 1) { fk(&w, "active"); fprintf(f, "%d", kk.pool.active); }
+        if (kk.pool.by != BY_CONNECTION) fs(&w, "by", group_by_name(kk.pool.by));
+        if (kk.pool.interval_s) { fk(&w, "interval"); fprintf(f, "%d", kk.pool.interval_s); }
+        if (kk.pool.silence_s) { fk(&w, "silence"); fprintf(f, "%d", kk.pool.silence_s < 0 ? 0 : kk.pool.silence_s); }
         if (kk.conf[0]) fpath(&w, "conf", kk.conf);
         if (kk.stream) { fk(&w, "stream"); fputs("true", f); }
         if (kk.stream_port) { fk(&w, "stream_port"); fprintf(f, "%d", kk.stream_port); }

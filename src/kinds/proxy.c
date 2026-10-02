@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "spec.h"
+#include "tunpool.h"
 
 /* enum px_proto (proxy.h) — числами, чтобы ядро не зависело от заголовка модуля. */
 enum { PXK_TROJAN = 1, PXK_SS, PXK_SOCKS, PXK_HTTP, PXK_VMESS };
@@ -42,6 +43,8 @@ static int proxy_parse(struct output *o, const struct out_keys *k, struct err *e
     o->proxy.nodes_n = k->nodes_n;
     o->proxy.insecure = k->insecure;
     o->proxy.excl = k->excl;
+    o->proxy.pool = k->pool;
+    if (tun_pool_check(o, k, e) != 0) return -1;
     if (!o->proxy.sub_file[0]) {
         char msg[160];
         snprintf(msg, sizeof(msg), "outputs.%s: kind %s нужен %s с подпиской", o->name,
@@ -77,53 +80,41 @@ static void proxy_keys_of(const struct output *o, struct out_keys *k) {
     k->nodes_n = o->proxy.nodes_n;
     k->insecure = o->proxy.insecure;
     k->excl = o->proxy.excl;
+    k->pool = o->proxy.pool;
     char dev[32];
     snprintf(dev, sizeof(dev), "%.15s", o->name);
     k->device_derived = !strcmp(dev, o->device);
 }
 
-/* Файл состояния модуля (proxy-<выход>): верен, пока жив процесс из поля pid (как у hysteria2). */
-static int state_read(const char *out_name, char *buf, size_t n) {
-    char path[256];
-    snprintf(path, sizeof(path), "%s/proxy-%.32s", steer_state_dir(), out_name);
-    FILE *f = fopen(path, "r");
-    if (!f) return -1;
-    size_t r = fread(buf, 1, n - 1, f);
-    fclose(f);
-    buf[r] = '\0';
-    char *nl = strchr(buf, '\n');
-    if (nl) *nl = '\0';
-    if (buf[0] != '{') return -1;
-    const char *p = strstr(buf, "\"pid\":");
-    if (!p) return -1;
-    long pid = 0;
-    if (sscanf(p + 6, "%ld", &pid) != 1 || pid <= 0 || kill((pid_t)pid, 0) != 0) return -1;
-    return 0;
-}
-
+/* Файл состояния модуля (proxy-<выход>) пишет пул узлов (src/tunnel/pool.c); читает tun_state_read
+ * (tunpool.h): верен, пока жив процесс из поля pid. */
 static void proxy_status(FILE *out, const struct spec *sp, const struct output *o) {
     (void)sp;
     fprintf(out, ",\"nodes\":[");
     for (size_t d = 0; d < o->proxy.nodes_n; d++)
         fprintf(out, "%s%d", d ? "," : "", o->proxy.nodes[d]);
     fprintf(out, "]");
-    char buf[512];
-    if (state_read(o->name, buf, sizeof(buf)) == 0) fprintf(out, ",\"proxy\":%s", buf);
+    char *st = tun_state_load("proxy", o->name);
+    if (st) fprintf(out, ",\"proxy\":%s", st);
+    free(st);
 }
 
 static void proxy_diag(kind_diag_fn *put, const struct spec *sp, const struct output *o) {
     (void)sp;
-    char buf[512], what[200];
-    if (state_read(o->name, buf, sizeof(buf)) != 0) {
+    char what[200];
+    char *buf = tun_state_load("proxy", o->name);
+    if (!buf) {
         snprintf(what, sizeof(what), "выход %.40s: клиент %s не запущен", o->name, kind_of(o)->name);
         put("proxy", "fail", what, "перезапустите ядро steer: /etc/init.d/steer restart");
         return;
     }
     int up = strstr(buf, "\"up\":true") != NULL;
+    free(buf);
     snprintf(what, sizeof(what), "выход %.40s: соединение с узлом %s %s", o->name, kind_of(o)->name,
              up ? "поднято" : "не поднято");
     put("proxy", up ? "ok" : "fail", what,
         up ? "" : "узел не принял соединение: `steer proxy-probe` называет причину");
+    if (up) tun_pool_diag(put, "proxy", o, &o->proxy.pool);
 }
 
 static int proxy_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
@@ -142,6 +133,9 @@ static int proxy_helper(const struct spec *sp, const struct output *o, struct ki
     for (size_t i = 0; i < o->proxy.nodes_n; i++)
         kind_sig_mix(&h->sig, &o->proxy.nodes[i], sizeof(o->proxy.nodes[i]));
     kind_sig_excl(&h->sig, &o->proxy.excl);
+    /* Пул узлов (active, by, interval, silence) клиент читает при старте, как и выбор узлов. */
+    if (o->proxy.pool.active || o->proxy.pool.by || o->proxy.pool.interval_s || o->proxy.pool.silence_s)
+        kind_sig_mix(&h->sig, &o->proxy.pool, sizeof(o->proxy.pool));
     return 0;
 }
 

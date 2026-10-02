@@ -156,6 +156,16 @@ struct iface_cfg {
     struct out_obfs obfs;
 };
 
+/* ПУЛ УЗЛОВ туннеля по подписке (ключи `active`, `by`, `interval`, `silence` спеки v2; src/tunnel/
+ * pool.c). Ноль — ключа нет, действует умолчание: один активный узел, раздача connection, проверка
+ * раз в 60 с, порог молчания 20 с. silence_s -1 — порог выключен явно (`silence: 0`). */
+struct tun_pool {
+    int active;                 /* сколько узлов кандидатов работают сразу */
+    int by;                     /* enum group_by: те же значения, что у by группы balance */
+    int interval_s;             /* период проверки каждого активного узла */
+    int silence_s;              /* порог молчания узла на живом соединении */
+};
+
 struct vless_cfg {
     /* Откуда брать узлы. Подписка, а не один узел, потому что
      * failover между узлами — то же самое, что между устройствами, и списком он и
@@ -202,6 +212,7 @@ struct vless_cfg {
      * (страна по флагу в имени, кусок имени; src/model/nodesel.h). Только отбор: номера `nodes`
      * от него не сдвигаются, вместе с `nodes` и `transport` — пересечение. */
     struct node_exclude excl;
+    struct tun_pool pool;       /* active, by, interval, silence */
 };
 
 /* hysteria2 (kind: tunnel, protocol: hysteria2). Узлы берутся из подписки так же, как у vless, —
@@ -213,6 +224,9 @@ struct hy2_cfg {
     int *nodes;                 /* арена спеки, nodes_n записей (NULL при 0), как у vless_cfg */
     size_t nodes_n;
     struct node_exclude excl;   /* exclude, exclude_name — как у vless_cfg */
+    /* Из ключей пула — только interval (период проверки узла) и silence (срок простоя QUIC):
+     * соединение с узлом у hysteria2 одно на все потоки, и active/by разбор отвергает. */
+    struct tun_pool pool;
 };
 
 /* Протоколы прокси (kind: tunnel, protocol: trojan|shadowsocks|socks|http|vmess) — модуль
@@ -226,6 +240,7 @@ struct proxy_cfg {
     size_t nodes_n;
     int insecure;               /* не проверять сертификат узлов security=tls (trojan/vmess/http) */
     struct node_exclude excl;   /* exclude, exclude_name — как у vless_cfg */
+    struct tun_pool pool;       /* active, by, interval, silence — как у vless */
 };
 
 /* Исключение узлов — в подпись помощника (kind_helper.sig): клиент отбирает кандидатов при старте,
@@ -378,6 +393,8 @@ struct out_keys {
     unsigned transports;        /* `transport:` спеки v2 (vless_cfg.transports) */
     int insecure;               /* `insecure:` спеки v2 (vless_cfg.insecure) */
     struct node_exclude excl;   /* `exclude:`, `exclude_name:` спеки v2 (vless_cfg.excl) */
+    struct tun_pool pool;       /* `active`, `by`, `interval`, `silence` спеки v2 (struct tun_pool) */
+    int by_set;                 /* `by` записан (у него ноль — значение connection) */
     /* `devices` спеки v1 — кандидаты в порядке предпочтения. В модели поля нет: пул устройств —
      * это группа (kind: group), её собирает перевод v1 (model/v1.c), а вид выхода только
      * решает, принимает ли он такой список вообще (KK_DEVICES — у interface). */

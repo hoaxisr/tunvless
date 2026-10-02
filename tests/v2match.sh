@@ -262,6 +262,46 @@ if [ -x "$XK" ]; then
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec ex4.yaml --state-dir "$tmp/state" 2>&1)"
     if echo "$out" | grep -qF "ключ exclude есть только у kind: tunnel"; then ok; else
         bad "exclude у interface — отказ «только у kind: tunnel»" "$out"; fi
+    # Пул узлов туннеля (src/tunnel/pool.c): active, by, interval, silence — у vless и протоколов
+    # прокси; convert печатает отличное от умолчания и остаётся неподвижной точкой; у hysteria2 — только
+    # interval и silence; отказы — с местом.
+    printf 'version: 2\noutputs:\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl, active: 3, by: site, interval: 30, silence: 0 }\n' > "$tmp/pl1.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl1.yaml --state-dir "$tmp/state" 2>&1)"
+    if [ $? = 0 ]; then ok; else bad "active/by/interval/silence у vless — приняты" "$(echo "$out" | head -n 3)"; fi
+    (cd "$tmp" && "$XKA" spec convert --spec pl1.yaml > c1.yaml 2>&1 && "$XKA" spec convert --spec c1.yaml > c2.yaml 2>&1)
+    if grep -q 'active: 3, by: site, interval: 30, silence: 0' "$tmp/c1.yaml" && cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml"; then ok; else
+        bad "convert печатает ключи пула (неподвижная точка)" "$(grep -n nl "$tmp/c1.yaml")"; fi
+    printf 'version: 2\noutputs:\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl, active: 1, by: connection, silence: 20 }\n' > "$tmp/pl2.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl2.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -qF "by — раздача соединений между активными узлами, она есть только при active больше 1"; then ok; else
+        bad "by при active: 1 — отказ" "$out"; fi
+    plref() {   # имя, ключи, строка отказа, место
+        printf 'version: 2\noutputs:\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl, %s }\n' "$2" > "$tmp/pl3.yaml"
+        out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl3.yaml --state-dir "$tmp/state" 2>&1)"
+        rc=$?
+        if [ "$rc" = 2 ] && echo "$out" | grep -qF -- "$3" && { [ -z "$4" ] || echo "$out" | grep -qF "pl3.yaml:$4:"; }; then ok; else
+            bad "$1" "код $rc: $out"; fi
+    }
+    plref "active: 0 — отказ с местом" "active: 0" "active" 3:70
+    plref "by: random — отказ с местом" "active: 2, by: random" "«random» — нужен connection, site или site_client" 3:77
+    plref "interval: 2 — отказ" "interval: 2" "interval" 3:72
+    plref "silence: 3 — отказ с причиной" "silence: 3" "меньше 5 с" 3:71
+    plref "silence: 40000 — отказ" "silence: 40000" "silence" 3:71
+    plref "active больше узлов в nodes — отказ" "nodes: [0, 1], active: 3" "active 3, а узлов в nodes 2" ""
+    printf 'version: 2\noutputs:\n  tj: { kind: tunnel, protocol: trojan, subscription: sub/tj, active: 2, by: site_client }\n' > "$tmp/pl4.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl4.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -qF "требует пакет steer-proxy" || [ "$(echo "$out" | grep -c 'active\|by')" = 0 ]; then ok; else
+        bad "active/by у trojan — разбирает вид прокси (или отказ «нужен пакет»)" "$out"; fi
+    printf 'version: 2\noutputs:\n  hy: { kind: tunnel, protocol: hysteria2, subscription: sub/hy, interval: 30, silence: 15 }\n' > "$tmp/pl5.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl5.yaml --state-dir "$tmp/state" 2>&1)"
+    if [ $? = 0 ]; then ok; else bad "interval/silence у hysteria2 — приняты" "$(echo "$out" | head -n 3)"; fi
+    printf 'version: 2\noutputs:\n  hy: { kind: tunnel, protocol: hysteria2, subscription: sub/hy, active: 2 }\n' > "$tmp/pl6.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl6.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -qF "у kind hysteria2 нет active больше 1"; then ok; else bad "active у hysteria2 — отказ" "$out"; fi
+    printf 'version: 2\noutputs:\n  wg: { kind: interface, device: wg0, active: 2 }\n' > "$tmp/pl7.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl7.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -qF "ключ active есть только у kind: tunnel"; then ok; else
+        bad "active у interface — отказ «только у kind: tunnel»" "$out"; fi
 else
     bad "не собран $XK (make build/steer-xk)"
 fi

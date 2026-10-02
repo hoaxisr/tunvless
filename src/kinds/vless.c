@@ -12,9 +12,11 @@
  * человек видит рабочую конфигурацию, в которой трафик пропадает. */
 #include <stdio.h>
 #include <string.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include "spec.h"
+#include "tunpool.h"
 
 const struct vless_cfg *out_vless(const struct output *o) {
     return kind_of(o) == &kind_vless ? &o->vless : NULL;
@@ -29,6 +31,8 @@ static int vless_parse(struct output *o, const struct out_keys *k, struct err *e
     o->vless.transports = k->transports;
     o->vless.insecure = k->insecure;
     o->vless.excl = k->excl;            /* массивы — в арене спеки, как nodes */
+    o->vless.pool = k->pool;
+    if (tun_pool_check(o, k, e) != 0) return -1;
     if (!o->vless.sub_file[0]) {
         char msg[160];
         snprintf(msg, sizeof(msg), "outputs.%s: kind vless нужен %s с подпиской", o->name,
@@ -57,6 +61,7 @@ static void vless_keys_of(const struct output *o, struct out_keys *k) {
     k->transports = o->vless.transports;
     k->insecure = o->vless.insecure;
     k->excl = o->vless.excl;
+    k->pool = o->vless.pool;
     char dev[32];
     snprintf(dev, sizeof(dev), "%.15s", o->name);
     k->device_derived = !strcmp(dev, o->device);
@@ -79,6 +84,10 @@ static void vless_status(FILE *out, const struct spec *sp, const struct output *
     /* Проверка сертификата выключена явно — видно в status, пока ключ включён. Печатается только
      * тогда: вывод выходов без ключа остаётся прежним. */
     if (o->vless.insecure) fprintf(out, ",\"insecure\":true");
+    /* Активные узлы пула (src/tunnel/pool.c) — пока клиент жив: номера, имена, сколько просили. */
+    char *st = tun_state_load("vless", o->name);
+    if (st) fprintf(out, ",\"vless\":%s", st);
+    free(st);
 }
 
 /* `insecure` выхода: проверка сертификата узлов TLS выключена по решению человека. warn, а не fail:
@@ -86,6 +95,7 @@ static void vless_status(FILE *out, const struct spec *sp, const struct output *
  * ключ включён. */
 static void vless_diag(kind_diag_fn *put, const struct spec *sp, const struct output *o) {
     (void)sp;
+    tun_pool_diag(put, "vless", o, &o->vless.pool);
     if (!o->vless.insecure) return;
     char what[160];
     snprintf(what, sizeof(what), "выход %.40s: сертификат узла не проверяется", o->name);
@@ -123,6 +133,9 @@ static int vless_helper(const struct spec *sp, const struct output *o, struct ki
     if (o->vless.insecure) kind_sig_mix(&h->sig, "insecure", 8);
     /* И исключение узлов: клиент отбирает кандидатов при старте. */
     kind_sig_excl(&h->sig, &o->vless.excl);
+    /* И пул узлов: active, by, interval, silence клиент тоже читает при старте. */
+    if (o->vless.pool.active || o->vless.pool.by || o->vless.pool.interval_s || o->vless.pool.silence_s)
+        kind_sig_mix(&h->sig, &o->vless.pool, sizeof(o->vless.pool));
     return 0;
 }
 

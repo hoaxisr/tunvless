@@ -30,6 +30,16 @@ static int hy2_parse(struct output *o, const struct out_keys *k, struct err *e) 
     o->hy2.nodes = k->nodes;
     o->hy2.nodes_n = k->nodes_n;
     o->hy2.excl = k->excl;
+    o->hy2.pool = k->pool;
+    /* Несколько узлов сразу — нет: соединение с узлом у hysteria2 одно QUIC на все потоки
+     * (hy2conn.c), и узел соединения выбрать нечем. interval и silence — есть. */
+    if (k->pool.active > 1 || k->by_set) {
+        char msg[320];
+        snprintf(msg, sizeof(msg), "outputs.%s: у kind hysteria2 нет %s — соединение с узлом одно на "
+                 "все потоки (QUIC), несколько узлов сразу есть у vless и протоколов прокси", o->name,
+                 k->by_set ? "by" : "active больше 1");
+        return err_set(e, "%s", msg);
+    }
     if (!o->hy2.sub_file[0]) {
         char msg[160];
         snprintf(msg, sizeof(msg), "outputs.%s: kind hysteria2 нужен %s с подпиской", o->name,
@@ -59,6 +69,7 @@ static void hy2_keys_of(const struct output *o, struct out_keys *k) {
     k->nodes = o->hy2.nodes;
     k->nodes_n = o->hy2.nodes_n;
     k->excl = o->hy2.excl;
+    k->pool = o->hy2.pool;
     char dev[32];
     snprintf(dev, sizeof(dev), "%.15s", o->name);
     k->device_derived = !strcmp(dev, o->device);
@@ -128,6 +139,9 @@ static int hy2_helper(const struct spec *sp, const struct output *o, struct kind
     for (size_t i = 0; i < o->hy2.nodes_n; i++)
         kind_sig_mix(&h->sig, &o->hy2.nodes[i], sizeof(o->hy2.nodes[i]));
     kind_sig_excl(&h->sig, &o->hy2.excl);
+    /* interval и silence клиент читает при старте. */
+    if (o->hy2.pool.interval_s || o->hy2.pool.silence_s)
+        kind_sig_mix(&h->sig, &o->hy2.pool, sizeof(o->hy2.pool));
     return 0;
 }
 

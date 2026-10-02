@@ -571,6 +571,10 @@ static const struct { const char *key; unsigned bit; const char *owner; } KIND_K
     { "insecure",     KK_SUB,    "kind: tunnel" },
     { "exclude",      KK_SUB,    "kind: tunnel" },
     { "exclude_name", KK_SUB,    "kind: tunnel" },
+    { "active",       KK_SUB,    "kind: tunnel" },
+    { "by",           KK_SUB,    "kind: tunnel" },
+    { "interval",     KK_SUB,    "kind: tunnel" },
+    { "silence",      KK_SUB,    "kind: tunnel" },
     { "stream",       KK_STREAM, "kind: xsteer" },
     { "stream_port",  KK_STREAM, "kind: xsteer" },
     { "strategy",     KK_OPTS,   "kind: zapret" },
@@ -595,6 +599,39 @@ static int p_obfs(struct v2 *x, const struct ynode *n, const char *name, struct 
         if (strlen(v[i]) > 79) return fail(x, it, "%s: длиннее 79 байт", w);
     }
     if (obfs_set(name, v[0], v[1], v[2], ob, x->e) != 0) return wrap(x, n);
+    return 0;
+}
+
+/* Пул узлов туннеля (struct tun_pool в spec.h, src/tunnel/pool.c): active, by, interval, silence.
+ * Значения — здесь; что из них годится протоколу и как они сочетаются с nodes — у вида (parse). */
+static int p_tun_pool(struct v2 *x, const struct ynode *v, const char *w, const char *ks,
+                      struct out_keys *k) {
+    long lv;
+    const char *sv;
+    if (!strcmp(ks, "active")) {
+        /* Предел сверху — номера узлов (0..65535 у nodes): больше узлов в выборе не бывает. */
+        if (long_of(x, v, w, 1, 65536, &lv)) return -1;
+        k->pool.active = (int)lv;
+    } else if (!strcmp(ks, "by")) {
+        if (str_of(x, v, w, &sv)) return -1;
+        int b = BY_CONNECTION;
+        while (b <= BY_SITE_CLIENT && strcmp(group_by_name(b), sv)) b++;
+        if (b > BY_SITE_CLIENT) return fail(x, v, "%s: «%s» — нужен connection, site или site_client", w, sv);
+        k->pool.by = b;
+        k->by_set = 1;
+    } else if (!strcmp(ks, "interval")) {
+        if (long_of(x, v, w, GROUP_INT_MIN_S, GROUP_INT_MAX_S, &lv)) return -1;
+        k->pool.interval_s = (int)lv;
+    } else {
+        /* silence: 0 — порога нет (сроки ядра). Снизу 5 с: короче нескольких кругов повторной
+         * передачи на медленной линии порог обрывал бы живые соединения. Сверху — предел ядра для
+         * TCP_KEEPIDLE (32767 с). */
+        if (long_of(x, v, w, 0, 32767, &lv)) return -1;
+        if (lv > 0 && lv < 5)
+            return fail(x, v, "%s: %ld с — меньше 5 с: столько длится повторная передача на медленной "
+                        "линии, и живые соединения обрывались бы; 0 — порога нет", w, lv);
+        k->pool.silence_s = lv ? (int)lv : -1;
+    }
     return 0;
 }
 
@@ -740,6 +777,12 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             if (str_of(x, v, w, &sv)) return -1;
             if (!name_ok(sv)) return fail(x, v, "%s: «%s» — имя устройства негодного состава", w, sv);
             if (copy_to(x, v, w, sv, o.device, sizeof(o.device))) return -1;
+            continue;
+        }
+        /* Ключи пула туннеля — до ключей группы: interval и by есть и там, с другим смыслом. */
+        if (tunnel && (!strcmp(ks, "active") || !strcmp(ks, "by") || !strcmp(ks, "interval") ||
+                       !strcmp(ks, "silence"))) {
+            if (p_tun_pool(x, v, w, ks, &k)) return -1;
             continue;
         }
         size_t gk = 0;
