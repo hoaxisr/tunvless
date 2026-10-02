@@ -37,7 +37,11 @@ esac
 # ПЕРЕД сборкой и коммитит его после (см. .github/workflows/release.yml), поэтому дерево во
 # время релизной сборки грязное всегда, и флаг помечал бы «-dirty» каждый релиз — то есть
 # перестал бы что-либо значить.
-REV="$(git describe --tags --always 2>/dev/null || true)"
+#
+# Не на теге — номер из VERSION и коммит («2.0.0-g32b3a4b»), а не describe от последнего тега:
+# тот давал «v1.5.9-239-g…» у сборки 2.0.0, ещё не помеченной тегом, и читался как 1.5.9.
+REV="$(git describe --tags --exact-match 2>/dev/null ||
+      { _h="$(git rev-parse --short HEAD 2>/dev/null)" && echo "$VERSION-g$_h"; } || true)"
 [ -n "$REV" ] || REV="неизвестна"
 OUT=out
 # Свой образ, а не образ сборщика splify: в том нет исходников криптобиблиотеки, и расширенная
@@ -330,14 +334,16 @@ for spec in $ISAS; do
     printf '  %-26s ' "$arch (libs)"
     libs="build/libs/$arch"
     rm -rf "$libs"
+    # Объектные файлы снимаются и владелец выхода возвращается ВНУТРИ контейнера: docker пишет от
+    # root, и на машине без root (GitHub Actions) `rm -rf obj` снаружи падал «Permission denied».
     if docker run --rm -v "$PWD:/src" -w /src --entrypoint sh \
             -e CC="zig cc -target $target -mcpu=$mcpu" -e AR="zig ar" -e ZIG=1 \
-            -e INTERP="$(interp_of "$target" "$mcpu")" "$IMAGE" \
-            /src/build/build-libs.sh "/src/$libs" "$VERSION" "$REV" \
+            -e INTERP="$(interp_of "$target" "$mcpu")" "$IMAGE" -c \
+            '/src/build/build-libs.sh "$1" "$2" "$3"; rc=$?; rm -rf "$1/obj"; chown -R "$4" "$1"; exit $rc' _ \
+            "/src/$libs" "$VERSION" "$REV" "$(id -u):$(id -g)" \
             >"build/$arch-libs.log" 2>"build/$arch-libs.err"; then
         echo "libsteer $(stat -c %s "$libs"/libsteer.so.*) + wolfssl $(stat -c %s "$libs"/libsteer-wolfssl.so.*)" \
              "+ steerd $(stat -c %s "$libs/steerd") bytes"
-        rm -rf "$libs/obj"
     else
         rm -rf "$libs"
         echo "FAILED — $(grep -m1 error "build/$arch-libs.err" || head -1 "build/$arch-libs.err")"

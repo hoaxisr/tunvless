@@ -25,7 +25,9 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     docker build -t "$IMAGE" build/ >/dev/null
 fi
 VERSION="$(cat VERSION)"
-REV="$(git describe --tags --always 2>/dev/null || echo неизвестна)"
+# Не на теге — номер из VERSION и коммит, как у build.sh.
+REV="$(git describe --tags --exact-match 2>/dev/null ||
+      { _h="$(git rev-parse --short HEAD 2>/dev/null)" && echo "$VERSION-g$_h"; } || echo неизвестна)"
 inside() {  # путь на машине -> путь в контейнере
     _a="$(cd "$(dirname "$1")" && pwd -P)/$(basename "$1")"
     case "$_a" in "$MOUNT"/*) echo "/w/${_a#"$MOUNT"/}" ;; *) echo "ext-build: $1 вне $MOUNT" >&2; exit 2 ;; esac
@@ -33,8 +35,10 @@ inside() {  # путь на машине -> путь в контейнере
 mkdir -p "$OUTD"
 apps=""
 for a in "$@"; do apps="$apps ${a%%:*}:$(inside "${a#*:}")"; done
+# Объектные файлы и владелец выхода — внутри контейнера: docker пишет от root, а снаружи (GitHub
+# Actions — не root) их не удалить.
 docker run --rm -v "$MOUNT:/w" -w "$(inside "$STEER")" --entrypoint sh \
     -e CC="zig cc -target $target -mcpu=$mcpu" -e AR="zig ar" -e ZIG=1 \
-    -e INTERP="$(interp_of "$target" "$mcpu")" -e STEER_EXT_APPS="${apps# }" -e STEER_EXT_ONLY=1 "$IMAGE" \
-    build/build-libs.sh "$(inside "$OUTD")" "$VERSION" "$REV"
-rm -rf "$OUTD/obj"
+    -e INTERP="$(interp_of "$target" "$mcpu")" -e STEER_EXT_APPS="${apps# }" -e STEER_EXT_ONLY=1 "$IMAGE" -c \
+    'build/build-libs.sh "$1" "$2" "$3"; rc=$?; rm -rf "$1/obj"; chown -R "$4" "$1"; exit $rc' _ \
+    "$(inside "$OUTD")" "$VERSION" "$REV" "$(id -u):$(id -g)"
