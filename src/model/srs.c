@@ -80,8 +80,29 @@
  *     «и», исключение с двумя условиями сразу («не (udp и порт 443)»), исключение не того вида
  *     (подсети из клаузы имён);
  *   - правило без назначения и без приложения — весь трафик по протоколу или портам;
- *   - adguard_domain — сам элемент (образцы с якорями AdGuard, а не имена); остальное правило
- *     остаётся, потому что внутри группы назначения элементы — «или».
+ *   - adguard_domain, где в образце есть символ, которого не бывает в имени (всё, кроме букв,
+ *     цифр, «.», «-», «_» и «*»), — сам элемент; остальное правило остаётся, потому что внутри
+ *     группы назначения элементы — «или». Обычный adguard_domain читается (см. ниже).
+ *
+ * ADGUARD_DOMAIN. Так sing-box (`rule-set convert --type adguard`) хранит правила фильтров
+ * AdGuard: то же succinct-дерево, что у domain, но ключ — образец с якорями. Ключ лежит
+ * обращённым ruleLine из NewAdGuardMatcher (sing/common/domain/adguard_matcher.go): спереди
+ * 0x0A, если было «||», 0x0D, если якоря начала не было, ничего — если было «|»; сзади 0x08,
+ * если не было «^». Каждому виду есть точное соответствие в синтаксисе списка резолвера
+ * (сопоставляет fnmatch без флагов, и «*» там, как anyLabel у sing-box, берёт и точки):
+ *
+ *     ||x^  — имя и поддомены            x            (176 тысяч из 177 в фильтре AdGuard DNS)
+ *     |x^   — только само имя            =x
+ *     x^    — x в конце, с любым началом *x
+ *     со «*» внутри — тот же якорь шаблоном: «||a*b^» → a*b и *.a*b
+ *     без «^» — тот же якорь с «*» в конце: «|x» → x*  (метку 0x08 hasWithDepth в sing-box
+ *               обходит, как anyLabel, — дальше что угодно, не только целые метки)
+ *
+ * Соответствие сверено с `sing-box rule-set match` на всех видах (tests/srs/adguard.*). Одно
+ * расхождение намеренное: правило с заглавными буквами sing-box сравнивает с учётом регистра и
+ * не совпадает ни с чем, а резолвер сравнивает без регистра — как правило и задумано в AdGuard.
+ * Поэтому adguard_domain не снимается и в исключении: фильтры AdGuard — это «и не (@@-правила)»
+ * поверх блок-списка, и без исключения набор не выражался вовсе (splify2-lists#1).
  *
  * Про снятое печатается одна строка steer[warn] на файл (srs_skipped), и файл принимается.
  * Отказом (−1) остаётся только испорченный файл: половина разобранного набора — не набор.
@@ -126,6 +147,7 @@ enum {
 /* Служебные метки матчера доменов (sing/common/domain/matcher.go). */
 #define LBL_PREFIX  0x0D   /* '\r' — «дальше что угодно»: суффикс с ведущей точкой */
 #define LBL_ROOT    0x0A   /* '\n' — «домен и его поддомены» (с версии 2)          */
+#define LBL_ADG_OPEN 0x08  /* '\b' — adguard_domain без «^»: дальше целые метки     */
 
 #define MAX_KEY     512    /* ключ дерева: домен плюс метка; с запасом на UTF-8 */
 #define MAX_DEPTH   512    /* глубина обхода не больше длины ключа              */
@@ -158,7 +180,7 @@ static const struct { unsigned bit; const char *what; } DR_TEXT[] = {
     { DR_AND2,    "«и» с двумя назначениями или источниками" },
     { DR_EXCL,    "исключение, которое не выражается" },
     { DR_NODEST,  "правило без назначения" },
-    { DR_ADGUARD, "adguard_domain" },
+    { DR_ADGUARD, "правила AdGuard с символами, которых не бывает в имени" },
 };
 
 /* ---- файл и распаковка ---------------------------------------------------------------- */
@@ -609,12 +631,34 @@ static int skip_default_iface_addr(struct rd *r) {
     return 0;
 }
 
-static int skip_adguard(struct rd *r) {
+/* Байт метки adguard_domain, который выражается в синтаксисе списка: буквы, цифры, «.», «-»,
+ * «_», «*», байты UTF-8 и служебные метки ключа. Остальное (`?`, `[`, `\`, `=`, пробел…) в
+ * имени не встречается, а в fnmatch или в начале строки списка значило бы другое. */
+static int adg_label_ok(unsigned char b) {
+    return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') ||
+           b == '.' || b == '-' || b == '_' || b == '*' || b >= 0x80 ||
+           b == LBL_ROOT || b == LBL_PREFIX || b == LBL_ADG_OPEN;
+}
+
+/* Метки дерева adguard_domain: пропуск с проверкой, все ли выражаются (*odd = 1, если нет). */
+static int scan_adg_labels(struct rd *r, uint64_t n, int *odd) {
+    while (n) {
+        size_t chunk = n > RD_BUF ? RD_BUF : (size_t)n;
+        const unsigned char *q = rd_take(r, chunk);
+        if (!q) return -1;
+        for (size_t i = 0; odd && !*odd && i < chunk; i++)
+            if (!adg_label_ok(q[i])) *odd = 1;
+        n -= chunk;
+    }
+    return 0;
+}
+
+static int scan_adguard(struct rd *r, size_t *nkeys, int *odd) {
     (void)rd_u8(r);
-    if (scan_u64_array(r, NULL) != 0 || scan_u64_array(r, NULL) != 0) return -1;
+    if (scan_u64_array(r, nkeys) != 0 || scan_u64_array(r, NULL) != 0) return -1;
     uint64_t nl = rd_uvarint(r);
     if (r->err || nl > 100000000u) { r->err = 1; return -1; }
-    return rd_move(r, NULL, nl);
+    return scan_adg_labels(r, nl, odd);
 }
 
 static int skip_u16_list(struct rd *r) {
@@ -760,13 +804,18 @@ static int scan_default(struct rd *r, struct drule *d) {
             if (scan_strings(r, NULL) != 0) return -1;
             d->drop |= DR_NETTYPE;
             break;
-        case IT_ADGUARD_DOMAIN:
-            /* Тот же succinct-набор, но с другими метками (`*` и 0x08): правила AdGuard — не
-             * имена, а образцы с якорями. Снимается сам элемент: внутри группы назначения
-             * элементы — «или», и без него правило только уже. */
-            if (skip_adguard(r) != 0) return -1;
-            d->skip |= DR_ADGUARD;
+        case IT_ADGUARD_DOMAIN: {
+            /* Образцы с якорями AdGuard (см. шапку, «adguard_domain»). Если хоть одна метка не
+             * выражается, снимается весь элемент — в обоих проходах одинаково: внутри группы
+             * назначения элементы — «или», и без него правило только уже, а исключение с
+             * снятым элементом conj_neg не примет. */
+            size_t k = 0;
+            int odd = 0;
+            if (scan_adguard(r, &k, &odd) != 0) return -1;
+            if (odd) d->skip |= DR_ADGUARD;
+            else if (k) { d->has |= D_DOM; d->n_dom += k; }
             break;
+        }
         case IT_NET_EXPENSIVE: case IT_NET_CONSTRAINED:
             /* Полезной нагрузки нет: сам тег и есть значение. */
             d->drop |= DR_NETFLAG;
@@ -1516,6 +1565,39 @@ static uint64_t *read_u64_array(struct rd *r, size_t *out_n) {
     return a;
 }
 
+/* Разворот по РУНАМ, как его делает sing-box при записи (reverseDomain: руны в обратном
+ * порядке, байты каждой — в прямом). Ключ идёт вперёд, от руны к руне, и каждая руна
+ * ложится с конца буфера. Побайтовый разворот давал верное имя только на ASCII: у
+ * «пример.рф» байты каждой буквы выходили задом наперёд. Байт, который не начинает
+ * последовательность UTF-8 (sing-box таких не пишет), считается руной из одного байта.
+ * buf — не меньше body_n + 1 байт. */
+static void unreverse(const unsigned char *key, size_t body_n, char *buf) {
+    for (size_t i = 0; i < body_n; ) {
+        unsigned char b = key[i];
+        size_t w = b < 0x80 ? 1 : (b >> 5) == 6 ? 2 : (b >> 4) == 14 ? 3 : (b >> 3) == 30 ? 4 : 1;
+        if (i + w > body_n) w = 1;
+        for (size_t k = 1; k < w; k++)
+            if ((key[i + k] & 0xC0) != 0x80) { w = 1; break; }
+        memcpy(buf + body_n - i - w, key + i, w);
+        i += w;
+    }
+    buf[body_n] = '\0';
+}
+
+static int emit_dom(struct walk *w, uint32_t target, enum srs_dom dom, const char *str, size_t n) {
+    struct srs_elem el;
+    memset(&el, 0, sizeof(el));
+    el.kind = SRS_EL_DOMAIN;
+    el.excl = (target & OCC_EXCL) != 0;
+    el.clause = target & ~OCC_EXCL;
+    el.dom = dom;
+    el.str = str;
+    el.len = n;
+    int rc = w->cb(w->ctx, &el);
+    if (rc) w->stop = rc;
+    return rc;
+}
+
 /* Ключ дерева → элемент. Ключ лежит обращённым и с терминатором в конце; терминатор он же
  * вид. Разворот обратно — по рунам (см. шапку, «две ловушки»). */
 static int emit_key(struct walk *w, uint32_t target, const unsigned char *key, size_t n) {
@@ -1528,32 +1610,39 @@ static int emit_key(struct walk *w, uint32_t target, const unsigned char *key, s
     else if (term == LBL_PREFIX) dom = SRS_DOM_WILDCARD;
     else { dom = SRS_DOM_EXACT; body_n = n; }
     if (body_n == 0 || body_n > MAX_KEY) return 0;
-    /* Разворот по РУНАМ, как его делает sing-box при записи (reverseDomain: руны в обратном
-     * порядке, байты каждой — в прямом). Ключ идёт вперёд, от руны к руне, и каждая руна
-     * ложится с конца буфера. Побайтовый разворот давал верное имя только на ASCII: у
-     * «пример.рф» байты каждой буквы выходили задом наперёд. Байт, который не начинает
-     * последовательность UTF-8 (sing-box таких не пишет), считается руной из одного байта. */
-    for (size_t i = 0; i < body_n; ) {
-        unsigned char b = key[i];
-        size_t w = b < 0x80 ? 1 : (b >> 5) == 6 ? 2 : (b >> 4) == 14 ? 3 : (b >> 3) == 30 ? 4 : 1;
-        if (i + w > body_n) w = 1;
-        for (size_t k = 1; k < w; k++)
-            if ((key[i + k] & 0xC0) != 0x80) { w = 1; break; }
-        memcpy(buf + body_n - i - w, key + i, w);
-        i += w;
-    }
-    buf[body_n] = '\0';
-    struct srs_elem el;
-    memset(&el, 0, sizeof(el));
-    el.kind = SRS_EL_DOMAIN;
-    el.excl = (target & OCC_EXCL) != 0;
-    el.clause = target & ~OCC_EXCL;
-    el.dom = dom;
-    el.str = buf;
-    el.len = body_n;
-    int rc = w->cb(w->ctx, &el);
-    if (rc) w->stop = rc;
-    return rc;
+    unreverse(key, body_n, buf);
+    return emit_dom(w, target, dom, buf, body_n);
+}
+
+/* Ключ adguard_domain → один или два элемента (соответствие — в шапке,
+ * «adguard_domain»). Ключ обращён: спереди 0x08, если в правиле не было «^», сзади якорь
+ * начала — 0x0A («||»), 0x0D (без якоря) или ничего («|»). Служебная метка внутри образца —
+ * не наш ключ, он пропускается, как пустой. */
+static int emit_adguard(struct walk *w, uint32_t target, const unsigned char *key, size_t n) {
+    int open = n > 0 && key[0] == LBL_ADG_OPEN;
+    if (open) { key++; n--; }
+    unsigned anchor = n > 0 && (key[n - 1] == LBL_ROOT || key[n - 1] == LBL_PREFIX) ? key[n - 1] : 0;
+    size_t body_n = anchor ? n - 1 : n;
+    if (body_n == 0 || body_n > MAX_KEY) return 0;
+    for (size_t i = 0; i < body_n; i++)
+        if (key[i] == LBL_ROOT || key[i] == LBL_PREFIX || key[i] == LBL_ADG_OPEN) return 0;
+    char b[MAX_KEY + 1];
+    unreverse(key, body_n, b);
+    int star = memchr(b, '*', body_n) != NULL;
+    const char *t = open ? "*" : "";             /* без «^»: дальше что угодно */
+    char g[MAX_KEY + 8];
+#define ADG_GLOB(...) (snprintf(g, sizeof(g), __VA_ARGS__), \
+                       emit_dom(w, target, SRS_DOM_GLOB, g, strlen(g)))
+    int rc;
+    if (anchor == LBL_ROOT)                      /* «||»: само имя и поддомены */
+        rc = !star && !open ? emit_dom(w, target, SRS_DOM_SUFFIX, b, body_n)
+                            : (ADG_GLOB("%s%s", b, t) || ADG_GLOB("*.%s%s", b, t));
+    else if (anchor == LBL_PREFIX)               /* без якоря: любое начало */
+        rc = ADG_GLOB("*%s%s", b, t);
+    else                                         /* «|»: с начала имени */
+        rc = !star && !open ? emit_dom(w, target, SRS_DOM_EXACT, b, body_n) : ADG_GLOB("%s%s", b, t);
+#undef ADG_GLOB
+    return rc ? -1 : 0;
 }
 
 /* Обход дерева с явным стеком: глубину задаёт СОДЕРЖИМОЕ ФАЙЛА, и рекурсия ею бы управляла.
@@ -1571,7 +1660,9 @@ struct swalk {
     unsigned char label;
 };
 
-static int succinct_walk(struct walk *w, uint32_t target, const struct succinct *s) {
+typedef int (*key_emit)(struct walk *w, uint32_t target, const unsigned char *key, size_t n);
+
+static int succinct_walk(struct walk *w, uint32_t target, const struct succinct *s, key_emit emit) {
     size_t nbits = s->nbitmap * 64;
     struct swalk *stack = malloc(MAX_DEPTH * sizeof(*stack));
     unsigned char key[MAX_KEY];
@@ -1583,7 +1674,7 @@ static int succinct_walk(struct walk *w, uint32_t target, const struct succinct 
     while (sp > 0 && !rc) {
         struct swalk e = stack[--sp];
         if (e.plen > 0) key[e.plen - 1] = e.label;
-        if (bit_at(s->leaves, s->nleaves, e.node) && emit_key(w, target, key, e.plen)) break;
+        if (bit_at(s->leaves, s->nleaves, e.node) && emit(w, target, key, e.plen)) break;
         size_t zeros = (size_t)e.bm - (size_t)e.node;
         for (size_t i = e.bm; i < nbits && bit_at(s->bitmap, s->nbitmap, i) == 0; i++, zeros++) {
             if (zeros >= s->nlabels) { rc = -1; break; }        /* карта врёт про метки */
@@ -1603,9 +1694,13 @@ static int succinct_walk(struct walk *w, uint32_t target, const struct succinct 
     return rc;
 }
 
-static int walk_domain_matcher(struct walk *w, uint32_t target) {
+/* Дерево domain или adguard_domain — в память на время обхода, ключи — потребителю по одному.
+ * adguard_domain, где есть невыразимая метка, не отдаёт ничего: первый проход снял его так же
+ * (scan_adguard). */
+static int walk_tree(struct walk *w, uint32_t target, int adg) {
     struct rd *r = w->r;
-    if (!(w->want & SRS_EL_DOMAIN) || !sel_on(w, target)) return scan_domain_matcher(r, NULL);
+    if (!(w->want & SRS_EL_DOMAIN) || !sel_on(w, target))
+        return adg ? scan_adguard(r, NULL, NULL) : scan_domain_matcher(r, NULL);
     (void)rd_u8(r);
     struct succinct s;
     memset(&s, 0, sizeof(s));
@@ -1615,8 +1710,13 @@ static int walk_domain_matcher(struct walk *w, uint32_t target) {
     int rc = -1;
     if (!r->err && nlab <= 100000000u && s.leaves && s.bitmap) {
         s.labels = malloc(nlab ? (size_t)nlab : 1);
+        int odd = 0;
         if (s.labels && rd_move(r, s.labels, nlab) == 0) {
             s.nlabels = (size_t)nlab;
+            for (size_t i = 0; adg && !odd && i < s.nlabels; i++) odd = !adg_label_ok(s.labels[i]);
+        }
+        if (odd) rc = 0;
+        else if (s.labels && s.nlabels == (size_t)nlab && !r->err) {
             size_t total = 0;
             for (size_t i = 0; i < s.nbitmap; i++) total += (size_t)__builtin_popcountll(s.bitmap[i]);
             s.samp = malloc((total / SAMPLE + 1) * sizeof(uint32_t));
@@ -1630,7 +1730,7 @@ static int walk_domain_matcher(struct walk *w, uint32_t target) {
                         word &= word - 1;
                     }
                 }
-                rc = succinct_walk(w, target, &s);
+                rc = succinct_walk(w, target, &s, adg ? emit_adguard : emit_key);
             }
         }
     }
@@ -1721,7 +1821,7 @@ static int walk_default(struct walk *w, uint32_t occ) {
         if (t == IT_FINAL) { (void)rd_u8(r); return r->err ? -1 : 0; }
         int rc = 0;
         switch (t) {
-        case IT_DOMAIN:          rc = walk_domain_matcher(w, m.dom); break;
+        case IT_DOMAIN:          rc = walk_tree(w, m.dom, 0); break;
         case IT_DOMAIN_KEYWORD:  rc = walk_strings(w, m.dom, SRS_DOM_KEYWORD); break;
         case IT_DOMAIN_REGEX:    rc = walk_strings(w, m.dom, SRS_DOM_REGEX); break;
         case IT_IP_CIDR:         rc = walk_ipset(w, m.cidr); break;
@@ -1734,7 +1834,7 @@ static int walk_default(struct walk *w, uint32_t occ) {
         case IT_PORT: case IT_SOURCE_PORT: case IT_QUERY_TYPE:
             rc = skip_u16_list(r);
             break;
-        case IT_ADGUARD_DOMAIN:      rc = skip_adguard(r); break;
+        case IT_ADGUARD_DOMAIN:      rc = walk_tree(w, m.dom, 1); break;
         case IT_NET_EXPENSIVE: case IT_NET_CONSTRAINED: break;
         case IT_IFACE_ADDR:          rc = skip_iface_addr(r); break;
         case IT_DEFAULT_IFACE_ADDR:  rc = skip_default_iface_addr(r); break;

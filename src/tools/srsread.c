@@ -38,6 +38,7 @@ static int print_elem(void *ctx, const struct srs_elem *el) {
         case SRS_DOM_EXACT:    fprintf(o->dom, "=%s\n", el->str); break;  /* только само имя */
         case SRS_DOM_KEYWORD:  fprintf(o->dom, "*%s*\n", el->str); break;
         case SRS_DOM_REGEX:    fprintf(o->dom, "re:%s\n", el->str); break;
+        case SRS_DOM_GLOB:     fprintf(o->dom, "%s\n", el->str); break;      /* шаблон AdGuard */
         }
         return 0;
     }

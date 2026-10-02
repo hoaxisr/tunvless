@@ -120,6 +120,7 @@ static int dom_rule(const struct srs_elem *el, char *buf, size_t n) {
     case SRS_DOM_WILDCARD: return snprintf(buf, n, "*%s", el->str);
     case SRS_DOM_KEYWORD:  return snprintf(buf, n, "*%s*", el->str);
     case SRS_DOM_REGEX:    return snprintf(buf, n, "re:%s", el->str);
+    case SRS_DOM_GLOB:     return snprintf(buf, n, "%s", el->str);
     }
     return -1;
 }

@@ -24,8 +24,11 @@
  *   SUFFIX    domain_suffix       — имя и его поддомены          «x.com»    RULE_NAMESPACE
  *   WILDCARD  domain_suffix «.x»  — буквальный суффикс строки    «*.x.com»  RULE_WILDCARD
  *   KEYWORD   domain_keyword      — подстрока                    «*слово*»  RULE_WILDCARD
- *   REGEX     domain_regex        — регулярное выражение         «re:…»     RULE_REGEX */
-enum srs_dom { SRS_DOM_EXACT, SRS_DOM_SUFFIX, SRS_DOM_WILDCARD, SRS_DOM_KEYWORD, SRS_DOM_REGEX };
+ *   REGEX     domain_regex        — регулярное выражение         «re:…»     RULE_REGEX
+ *   GLOB      adguard_domain      — шаблон fnmatch как есть      «a*b.*»    RULE_WILDCARD
+ * У GLOB в строке всегда есть «*»: правила AdGuard без «*» и с «^» идут как EXACT и SUFFIX. */
+enum srs_dom { SRS_DOM_EXACT, SRS_DOM_SUFFIX, SRS_DOM_WILDCARD, SRS_DOM_KEYWORD, SRS_DOM_REGEX,
+               SRS_DOM_GLOB };
 
 enum srs_ek { SRS_EL_DOMAIN = 1, SRS_EL_CIDR = 2 };
 

@@ -1014,6 +1014,61 @@ int main(void) {
         }
     }
 
+    /* ---- adguard_domain: фильтр AdGuard, собранный sing-box ---------------------------------
+     *
+     * tests/srs/adguard.srs собран `sing-box rule-set convert --type adguard` из adguard.txt —
+     * все виды правил («||x^», «|x^», без якоря, со «*», без «^», hosts, регулярное выражение,
+     * исключения «@@» и $important), то есть ровно та форма, в которой публикуются фильтры
+     * AdGuard (splify2-lists#1): «важные» или «(блок-список и не исключения)». Вердикт резолвера
+     * по каждому имени сверяется с вердиктом самого sing-box (adguard.oracle). */
+    {
+        char sp[] = "/tmp/dnsmatch-adg-spec.XXXXXX";
+        int sf = mkstemp(sp);
+        if (sf >= 0) {
+            FILE *ws = fdopen(sf, "w");
+            fprintf(ws, "{\"schema\":1,"
+                        "\"outputs\":{\"vl\":{\"kind\":\"interface\",\"device\":\"lo\"}},"
+                        "\"channels\":["
+                        "{\"name\":\"a\",\"match\":{\"srs_file\":\"tests/srs/adguard.srs\"},"
+                        "\"out\":\"vl\"}]}\n");
+            fclose(ws);
+            static struct spec cfg;
+            struct err e = {0};
+            if (load_spec(sp, &cfg, &e) < 0) err_die(&e);
+            dch_build(&cfg);
+            check("adguard: канал резолвера есть", 1, g_dch_n > 0);
+            struct ruleset m;
+            struct dpart *parts = NULL;
+            size_t pn = 0;
+            int comp = 0, n_ok = 0, n_all = 0;
+            FILE *o = fopen("tests/srs/adguard.oracle", "r");
+            if (g_dch_n && o && dch_rules_load(&g_dch[0], &m, &parts, &pn, &comp) == 0) {
+                g_dch[0].rules = m;
+                g_dch[0].parts = parts;
+                g_dch[0].parts_n = pn;
+                g_dch[0].composite = comp;
+                char line[256], name[200];
+                int want;
+                while (fgets(line, sizeof(line), o)) {
+                    if (line[0] == '#' || sscanf(line, "%199s %d", name, &want) != 2) continue;
+                    n_all++;
+                    int got = dch_matches(&g_dch[0], name);
+                    if (got == want) n_ok++;
+                    else printf("  adguard: %s — sing-box %d, резолвер %d\n", name, want, got);
+                }
+                ruleset_free(&g_dch[0].rules);
+                dch_parts_free(g_dch[0].parts, g_dch[0].parts_n);
+                g_dch[0].parts = NULL;
+                g_dch[0].parts_n = 0;
+            }
+            if (o) fclose(o);
+            check("adguard: эталон прочитан", 1, n_all >= 40);
+            check("adguard: вердикты совпадают с sing-box", n_all, n_ok);
+            g_dch_n = 0;
+            unlink(sp);
+        }
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
 }

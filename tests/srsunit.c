@@ -71,6 +71,7 @@ static int collect(void *ctx, const struct srs_elem *el) {
         case SRS_DOM_EXACT:    snprintf(line, sizeof(line), "=%s\n", el->str); break;
         case SRS_DOM_KEYWORD:  snprintf(line, sizeof(line), "*%s*\n", el->str); break;
         case SRS_DOM_REGEX:    snprintf(line, sizeof(line), "re:%s\n", el->str); break;
+        case SRS_DOM_GLOB:     snprintf(line, sizeof(line), "%s\n", el->str); break;
         }
         bput(el->excl ? &c->xdom : &c->dom, line);
         if (el->excl) c->nx++; else c->ndom++;
@@ -282,6 +283,28 @@ static void t_logic(void) {
     check("снятые правила элементов не дают", 1, !strstr(S(&c.dom), "proc.example") &&
           !strstr(S(&c.dom), "inv.example") && !strstr(S(&c.pfx), "10.9.0.0"));
     check("keyword и regex на месте", 1, strstr(S(&c.dom), "*kw*\n") && strstr(S(&c.dom), "re:^re\\.example$\n"));
+    coll_free(&c);
+}
+
+/* adguard_domain (splify2-lists#1): набор фильтра AdGuard читается целиком — с исключениями
+ * «@@» и «важными» правилами; вердикты по именам — в dnsmatch против sing-box. */
+static void t_adguard(void) {
+    const struct srs_set *s;
+    struct err e = {0};
+    check("adguard: разобран", 0, srs_open(FIX "adguard.srs", &s, &e));
+    check("adguard: ничего не снято", 1, srs_skipped(s) == NULL);
+    check("adguard: клауза с исключениями-именами", 1, srs_any_flag(s, SRS_F_XDOM));
+    srs_release(s);
+    struct coll c;
+    walk(FIX "adguard.srs", SRS_EL_DOMAIN, NULL, &c);
+    check("«||x^» — имя и поддомены", 1, strstr(S(&c.dom), "\nads.example\n") != NULL);
+    check("«|x^» — только имя", 1, strstr(S(&c.dom), "=exact.example\n") != NULL);
+    check("без якоря — любое начало", 1, strstr(S(&c.dom), "*tail.example\n") != NULL);
+    check("«||a*b^» — шаблоном и с поддоменами", 1, strstr(S(&c.dom), "\nwild*.example\n") &&
+          strstr(S(&c.dom), "*.wild*.example\n"));
+    check("без «^» — хвост «*»", 1, strstr(S(&c.dom), "\nopen.example*\n") &&
+          strstr(S(&c.dom), "*.open.example*\n"));
+    check("исключение «@@|x^» — с пометкой excl", 1, strstr(S(&c.xdom), "=keep.open.example\n") != NULL);
     coll_free(&c);
 }
 
@@ -522,6 +545,7 @@ int main(void) {
     t_v1();
     t_logic();
     t_v6();
+    t_adguard();
     t_broken();
     t_l4();
     t_plan();
