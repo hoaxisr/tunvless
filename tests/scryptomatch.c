@@ -371,6 +371,14 @@ static void test_proxy_prims(void) {
     check_mem("XChaCha20-Poly1305: обратно", lad, xp, ln);
     xc[ln] ^= 1;
     check("XChaCha20-Poly1305: подменённый тег", SC_EAUTH, sc_xchacha_open(xk, xn, xa, 12, xc, ln + 16, xp));
+    /* Пустая датаграмма (один тег): open пишет n - 16 = 0 байт — ни байта в out ни при годном теге,
+     * ни при подменённом (wolfSSL на отказе обнуляет переданный ему размер выхода). */
+    unsigned char canary[2] = { 0xa5, 0xa5 };
+    check("XChaCha20-Poly1305: пустое — шифрование", 0, sc_xchacha_seal(xk, xn, xa, 12, NULL, 0, xc));
+    check("XChaCha20-Poly1305: пустое — расшифровка", 0, sc_xchacha_open(xk, xn, xa, 12, xc, 16, canary));
+    xc[0] ^= 1;
+    check("XChaCha20-Poly1305: пустое, подменённый тег", SC_EAUTH, sc_xchacha_open(xk, xn, xa, 12, xc, 16, canary));
+    check("XChaCha20-Poly1305: пустое — out не тронут", 0xa5a5, canary[0] << 8 | canary[1]);
 
     struct sc_shake sh;
     check("SHAKE128: заведение", 0, sc_shake128_init(&sh, "", 0));

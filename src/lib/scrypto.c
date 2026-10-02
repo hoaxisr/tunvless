@@ -415,8 +415,11 @@ int sc_xchacha_open(const unsigned char key[32], const unsigned char nonce[24],
                     unsigned char *out) {
     static const unsigned char empty[1];
     if (n < 16 || n > UINT32_MAX || aad_n > UINT32_MAX) return SC_EINVAL;
-    int rc = wc_XChaCha20Poly1305_Decrypt(out, n - 16 ? n - 16 : 1, in, n, aad_n ? aad : empty,
-                                          aad_n, nonce, 24, key, 32);
+    /* Пустая датаграмма: выход нулевой длины, но wolfSSL не берёт NULL и на отказе тега обнуляет
+     * весь переданный ему размер выхода — поэтому ему отдаётся свой байт, а не out вызывающего. */
+    unsigned char none[1];
+    int rc = wc_XChaCha20Poly1305_Decrypt(n > 16 ? out : none, n > 16 ? n - 16 : 1, in, n,
+                                          aad_n ? aad : empty, aad_n, nonce, 24, key, 32);
     if (rc == WC_NO_ERR_TRACE(MAC_CMP_FAILED_E)) return SC_EAUTH;
     return rc == 0 ? 0 : SC_ECRYPTO;
 }
