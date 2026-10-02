@@ -455,7 +455,11 @@ int px_parse_url(const char *url, struct px_node *n, enum px_proto want) {
     else return -1;
     if (rc < 0) return -1;
     if (want && n->proto != want) return -1;
-    if (rc > 0) snprintf(n->skip_reason, sizeof(n->skip_reason), "%s", n->skip_reason[0] ? n->skip_reason : n->vn.skip_reason);
+    /* Своей причины нет — берём причину общей половины. Копировать skip_reason в самого себя
+     * (snprintf с тем же буфером источником) нельзя: это неопределённое поведение, и glibc
+     * на -O2 оставлял пустую строку — все причины пропуска терялись. */
+    if (rc > 0 && !n->skip_reason[0])
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "%s", n->vn.skip_reason);
     return rc;
 }
 

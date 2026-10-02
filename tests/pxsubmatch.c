@@ -21,7 +21,9 @@ static void test_parse(void) {
     check_str("ss pass", "secret", n.pass);
     check_str("ss тип tcp", "tcp", n.vn.type);
     check("ss неизвестный метод — негоден", 1, px_parse_url("ss://rc4-md5:p@h.example:1", &n, 0));
+    check_str("ss неизвестный метод — причина названа", "метод rc4-md5 не поддержан", n.skip_reason);
     check("ss plugin= отвергается", 1, px_parse_url("ss://aes-128-gcm:p@h.example:1?plugin=obfs", &n, 0));
+    check_str("ss plugin= — причина названа", "plugin= не поддержан", n.skip_reason);
     check("ss base64 userinfo", 0, px_parse_url("ss://YWVzLTEyOC1nY206cGFzcw==@h.example:1234", &n, 0));
     check("ss base64 method", (long)SS_AES128_GCM, (long)n.ss_method);
     check("ss 2022 PSK не той длины — негоден", 1,
