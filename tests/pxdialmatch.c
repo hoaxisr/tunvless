@@ -142,7 +142,27 @@ static void test_http_long_auth(void) {
     check("http: Basic целиком (512 знаков)", 512, (long)bl);
 }
 
+static void test_http_early_bytes(void) {
+    /* Сервер цели говорит первым (SSH, SMTP): его байты приходят тем же чтением, что ответ 200.
+     * Они — начало потока цели и обязаны дойти до клиента. */
+    struct px_node n;
+    http_node(&n, "", "");
+    static const char resp[] = "HTTP/1.1 200 OK\r\n\r\nSSH-2.0-x\r\n";
+    void *sess = NULL;
+    check("http: ответ 200 с данными цели — CONNECT прошёл", 0, http_connect_with(&n, resp, sizeof resp - 1, &sess));
+    const struct dialer_ops *ops = &proxy_http_dialer;
+    static unsigned char buf[TUNNEL_BUF];
+    const unsigned char *data = NULL;
+    size_t got = 0;
+    g_em_n = 0;
+    int rr = ops->read(sess, buf, sizeof buf, &data, &got);
+    if (rr == 0 && got) ops->deliver(&n, sess, 0, data, got, emit, NULL);
+    check("http: байты цели после заголовков дошли", 1, g_em_n == 11 && !memcmp(g_em, "SSH-2.0-x\r\n", 11));
+    free(sess);
+}
+
 int main(void) {
+    test_http_early_bytes();
     test_trojan_udp();
     test_http_long_auth();
     return unit_done("pxdialmatch");

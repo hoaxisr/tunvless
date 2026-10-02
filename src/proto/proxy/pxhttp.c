@@ -13,10 +13,14 @@
 #include "pxdial.h"
 #include "stack.h"
 
+#define HT_RESP_MAX 1024
+
 struct http_sess {
     uint8_t established;
+    uint16_t pend_off, pend_n;   /* байты цели, пришедшие вместе с ответом 200 (pend) */
     uint32_t dst; uint16_t dport;
     struct transport t;
+    unsigned char pend[HT_RESP_MAX];
 };
 
 static const char *ht_peer(const void *ctx) { return ((const struct px_node *)ctx)->vn.host; }
@@ -28,6 +32,7 @@ static void ht_describe(const void *ctx, char *out, size_t n) {
 static void ht_clear(void *sess) {
     struct http_sess *s = sess;
     s->established = 0;
+    s->pend_off = s->pend_n = 0;
     s->t.link.fd = -1;
 }
 
@@ -83,7 +88,7 @@ static int http_connect(const struct px_node *n, struct http_sess *s, int timeou
     if (rl < 0 || (size_t)rl >= sizeof req) return TR_EIO;
     if (transport_write(&s->t, (const unsigned char *)req, (size_t)rl)) return TR_EIO;
 
-    char resp[1024];
+    char resp[HT_RESP_MAX];
     size_t rn = 0;
     int64_t deadline_ms;
     { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -108,6 +113,12 @@ static int http_connect(const struct px_node *n, struct http_sess *s, int timeou
     if (strncmp(resp, "HTTP/1.", 7) != 0) return PX_EPROTO;
     const char *sp = strchr(resp, ' ');
     if (!sp || sp[1] != '2' || sp[2] != '0' || sp[3] != '0') return PX_EADDR;
+    /* Что пришло за пустой строкой — уже поток цели (сервер, который говорит первым: SSH, SMTP);
+     * его отдаёт первое чтение (ht_read), а не выбрасывает рукопожатие. */
+    size_t hl = (size_t)(strstr(resp, "\r\n\r\n") - resp) + 4;
+    s->pend_off = 0;
+    s->pend_n = (uint16_t)(rn - hl);
+    memcpy(s->pend, resp + hl, rn - hl);
     return 0;
 }
 
@@ -125,7 +136,10 @@ static int ht_connect(const void *ctx, void *sess, int timeout_s) {
 static void ht_take(void *dst, void *src) { (void)dst; (void)src; }   /* пула нет */
 static void ht_close(void *sess) { transport_close(&((struct http_sess *)sess)->t); }
 static int ht_fd(const void *sess) { return transport_fd(&((const struct http_sess *)sess)->t); }
-static int ht_has_data(const void *sess) { return transport_has_data(&((const struct http_sess *)sess)->t); }
+static int ht_has_data(const void *sess) {
+    const struct http_sess *s = sess;
+    return s->pend_off < s->pend_n || transport_has_data(&s->t);
+}
 
 static int ht_send(const void *ctx, void *sess, const struct flow_key *k, int udp,
                    const unsigned char *data, size_t n) {
@@ -142,7 +156,16 @@ static size_t ht_dgram_frame(const unsigned char *p, size_t n, unsigned char *ou
 }
 
 static int ht_read(void *sess, unsigned char *buf, size_t cap, const unsigned char **data, size_t *got) {
-    return transport_read_zc(&((struct http_sess *)sess)->t, buf, cap, data, got);
+    struct http_sess *s = sess;
+    if (s->pend_off < s->pend_n) {
+        size_t k = (size_t)(s->pend_n - s->pend_off);
+        if (k > cap) k = cap;
+        memcpy(buf, s->pend + s->pend_off, k);
+        s->pend_off = (uint16_t)(s->pend_off + k);
+        *data = buf; *got = k;
+        return 0;
+    }
+    return transport_read_zc(&s->t, buf, cap, data, got);
 }
 
 static int ht_deliver(const void *ctx, void *sess, int udp, const unsigned char *rx, size_t got,
