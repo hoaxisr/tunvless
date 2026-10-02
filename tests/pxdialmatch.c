@@ -59,6 +59,40 @@ size_t px_socks_addr(unsigned char *out, uint32_t dst_net, uint16_t dport_host) 
     return 7;
 }
 
+/* vmess: слой scrypto и вывод ключей (pxwire.c) — заглушки; g_shake_fail — отказ SHAKE128. */
+static int g_shake_fail;
+size_t sc_aead_key_len(enum sc_aead_alg a) { return a == SC_AES128_GCM ? 16 : 32; }
+int sc_aead_setkey(struct sc_aead *k, enum sc_aead_alg a, const unsigned char *key) {
+    (void)key; k->alg = (int)a; return 0;
+}
+void sc_aead_free(struct sc_aead *k) { k->alg = 0; }
+int sc_aead_seal(struct sc_aead *k, const unsigned char nonce[12], const void *aad, size_t aad_n,
+                 unsigned char *buf, size_t n, unsigned char tag[16]) {
+    (void)k; (void)nonce; (void)aad; (void)aad_n; (void)buf; (void)n; memset(tag, 0, 16); return 0;
+}
+int sc_aead_open(struct sc_aead *k, const unsigned char nonce[12], const void *aad, size_t aad_n,
+                 unsigned char *buf, size_t n, const unsigned char tag[16]) {
+    (void)k; (void)nonce; (void)aad; (void)aad_n; (void)buf; (void)n; (void)tag; return 0;
+}
+int sc_shake128_init(struct sc_shake *s, const void *in, size_t n) {
+    (void)in; (void)n; s->ready = !g_shake_fail; return g_shake_fail ? SC_ECRYPTO : 0;
+}
+int sc_shake128_read(struct sc_shake *s, unsigned char *out, size_t n) {
+    if (!s->ready) return SC_EINVAL;
+    memset(out, 0, n); return 0;
+}
+void sc_shake128_free(struct sc_shake *s) { s->ready = 0; }
+void px_vmess_cmdkey(const unsigned char uuid[16], unsigned char cmdkey[16]) { memcpy(cmdkey, uuid, 16); }
+void px_vmess_kdf(const unsigned char key[16], const struct px_kdf_path *paths, size_t npaths,
+                  unsigned char *out, size_t out_n) {
+    (void)paths; (void)npaths; memset(out, key[0], out_n);
+}
+void px_vmess_authid(const unsigned char cmdkey[16], uint64_t ts, const unsigned char rand4[4],
+                     unsigned char out[16]) {
+    (void)ts; (void)rand4; memcpy(out, cmdkey, 16);
+}
+uint32_t px_fnv1a(const unsigned char *p, size_t n) { (void)p; (void)n; return 0; }
+
 static unsigned char g_em[8192];
 static size_t g_em_n, g_em_calls;
 static int emit(void *arg, const unsigned char *p, size_t n) {
@@ -161,7 +195,40 @@ static void test_http_early_bytes(void) {
     free(sess);
 }
 
+/* ---- vmess ---------------------------------------------------------------------------------- */
+
+static void test_vmess_key_fail(void) {
+    /* Маска длины (SHAKE128) не завелась: отправлять с неинициализированной маской нельзя —
+     * сервер получит мусорную длину. Отказ отправки — честный исход. */
+    const struct dialer_ops *ops = &proxy_vmess_dialer;
+    struct px_node n; memset(&n, 0, sizeof n);
+    n.proto = PX_VMESS; n.vmess_sec = VMESS_AES128_GCM;
+    void *sess = calloc(1, ops->sess_size);
+    ops->clear(sess);
+    struct flow_key k; memset(&k, 0, sizeof k);
+    ops->flow_open(&n, sess, &k, 0);
+    ops->connect(&n, sess, 2);
+    feed_reset(NULL, 0);
+    g_shake_fail = 1;
+    int sr = ops->send(&n, sess, &k, 0, (const unsigned char *)"GET /", 5);
+    g_shake_fail = 0;
+    check("vmess: SHAKE128 не завёлся — SEND_FATAL", SEND_FATAL, sr);
+    check("vmess: на провод ничего не ушло", 0, (long)g_tx_n);
+    ops->close(sess);
+    free(sess);
+    /* Контроль: без отказа запрос уходит. */
+    sess = calloc(1, ops->sess_size);
+    ops->clear(sess);
+    ops->flow_open(&n, sess, &k, 0);
+    ops->connect(&n, sess, 2);
+    feed_reset(NULL, 0);
+    check("vmess: обычный запрос — SEND_OK", SEND_OK, ops->send(&n, sess, &k, 0, (const unsigned char *)"GET /", 5));
+    ops->close(sess);
+    free(sess);
+}
+
 int main(void) {
+    test_vmess_key_fail();
     test_http_early_bytes();
     test_trojan_udp();
     test_http_long_auth();

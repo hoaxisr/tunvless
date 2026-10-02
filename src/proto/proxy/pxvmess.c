@@ -154,34 +154,42 @@ static size_t vm_build_request(const struct px_node *n, struct vmess_sess *s,
     size_t o = 0;
     memcpy(out + o, authid, 16); o += 16;
     /* зашифрованная длина заголовка */
+    /* Каждый отказ слоя (ключ не развернулся, SHAKE не завёлся) — отказ запроса (0 → SEND_FATAL):
+     * дальше на провод ушли бы байты под неинициализированным ключом или маской длины. */
     struct sc_aead a;
     unsigned char lenpt[2] = { (unsigned char)(sizeof(H) >> 8), (unsigned char)sizeof(H) };
-    sc_aead_setkey(&a, SC_AES128_GCM, lenkey);
-    sc_aead_seal(&a, lennonce, authid, 16, lenpt, 2, out + o + 2);
-    memcpy(out + o, lenpt, 2); o += 2 + 16;
+    if (sc_aead_setkey(&a, SC_AES128_GCM, lenkey) != 0) return 0;
+    int sr = sc_aead_seal(&a, lennonce, authid, 16, lenpt, 2, out + o + 2);
     sc_aead_free(&a);
+    if (sr != 0) return 0;
+    memcpy(out + o, lenpt, 2); o += 2 + 16;
     memcpy(out + o, connnonce, 8); o += 8;
     /* зашифрованный заголовок */
-    sc_aead_setkey(&a, SC_AES128_GCM, hdrkey);
+    if (sc_aead_setkey(&a, SC_AES128_GCM, hdrkey) != 0) return 0;
     memcpy(out + o, H, sizeof H);
-    sc_aead_seal(&a, hdrnonce, authid, 16, out + o, sizeof H, out + o + sizeof H);
+    sr = sc_aead_seal(&a, hdrnonce, authid, 16, out + o, sizeof H, out + o + sizeof H);
     sc_aead_free(&a);
+    if (sr != 0) return 0;
     o += sizeof(H) + 16;
 
     /* Ключи тела (send) и ответа (recv). */
     unsigned char bk[32]; size_t bkn;
     vm_bodykey(s->sec, bodykey, bk, &bkn);
-    sc_aead_setkey(&s->benc, vm_alg(s->sec), bk); s->has_benc = 1;
+    if (sc_aead_setkey(&s->benc, vm_alg(s->sec), bk) != 0) return 0;
+    s->has_benc = 1;
     memcpy(s->biv, bodyiv, 16);
-    sc_shake128_init(&s->smask, bodyiv, 16); s->has_smask = 1;
+    if (sc_shake128_init(&s->smask, bodyiv, 16) != 0) return 0;
+    s->has_smask = 1;
 
     unsigned char rbk[16], rbiv[16], rbk32[32], full[32]; size_t rbkn;
     sc_hash(SC_SHA256, bodykey, 16, full); memcpy(rbk, full, 16);   /* respBodyKey = SHA256(bodyKey)[:16] */
     sc_hash(SC_SHA256, bodyiv, 16, full); memcpy(rbiv, full, 16);   /* respBodyIV  = SHA256(bodyIV)[:16] */
     vm_bodykey(s->sec, rbk, rbk32, &rbkn);
-    sc_aead_setkey(&s->bdec, vm_alg(s->sec), rbk32); s->has_bdec = 1;
+    if (sc_aead_setkey(&s->bdec, vm_alg(s->sec), rbk32) != 0) return 0;
+    s->has_bdec = 1;
     memcpy(s->riv, rbiv, 16);
-    sc_shake128_init(&s->rmask, rbiv, 16); s->has_rmask = 1;
+    if (sc_shake128_init(&s->rmask, rbiv, 16) != 0) return 0;
+    s->has_rmask = 1;
 
     struct px_kdf_path rp[1];
     rp[0].p = (const unsigned char *)"AEAD Resp Header Len Key"; rp[0].n = 24;
