@@ -29,7 +29,7 @@ CORE_DIRS := src/lib src/model src/platform src/compile src/daemon src/kinds src
 # PLATFORM_SRC); остальные — по одному на профиль, у base своего файла нет. Отдельно от ядра и
 # от расширенной части, потому что файл профиля не входит ни в одну сборку, кроме своей.
 PROFILE_DIRS := src/profile
-EXT_DIRS  := src/tunnel src/proto/tls src/proto/transport src/proto/vless src/proto/xsteer src/proto/tgws src/proto/quic src/proto/hysteria2 src/proto/proxy src/box src/modules
+EXT_DIRS  := src/tunnel src/proto/tls src/proto/transport src/proto/vless src/proto/xsteer src/proto/tgws src/proto/quic src/proto/hysteria2 src/proto/proxy src/modules
 # Клиент сокета `steer` (src/client) — отдельный бинарник, не профиль движка: CLIENT_SRC ниже.
 CLIENT_DIRS := src/client
 # Сторонний код (src/third_party) — не слой движка: файлы в нём не правятся (см. UPSTREAM в
@@ -42,7 +42,7 @@ INC_DIRS  := $(CORE_DIRS) $(PROFILE_DIRS) $(EXT_DIRS) $(CLIENT_DIRS) $(THIRD_DIR
 # в профиль android не входят, телефон не собирает ни QUIC-клиента, ни модули steer-hysteria2 и
 # steer-proxy). tests/buildmatch.sh сверяет
 # Android.bp с INC_DIRS за вычетом этого списка.
-PHONE_SKIP_DIRS := src/proto/hysteria2 src/proto/proxy src/box
+PHONE_SKIP_DIRS := src/proto/hysteria2 src/proto/proxy
 # Определения, которых ждёт сторонний код: yaml_private.h подключает config.h (номер версии
 # libyaml) только при HAVE_CONFIG_H. Ключ идёт во ВСЕ пути сборки движка — Makefile, build.sh,
 # build/build-ext*.sh (там он читается отсюда), в Android.bp — флагом библиотеки libsteer_yaml;
@@ -324,12 +324,9 @@ PROFILE_mod_obfs   := $(OBFS_MODULE_SRC)
 PROFILE_mod_tgws   := $(TGWS_MODULE_SRC)
 PROFILE_mod_hysteria2 := $(HY2_MODULE_SRC)
 PROFILE_mod_proxy  := $(PROXY_MODULE_SRC)
-# steer-box-connector: бинарник sing-box для podkop и forkop поверх steer (перевод конфига sing-box в
-# спеку, DNS, Clash API, mixed, наборы правил). Свой main (src/box/main.c) и свой разбор командной
-# строки sing-box — modcmd ему не нужен, но link_app кладёт modcmd.o всем, и --as-needed его
-# выбрасывает. Только роутер: на телефоне нет ни podkop, ни forkop.
-BOX_MODULE_SRC := src/box/bconn.c src/box/boxcli.c src/box/boxrun.c src/box/clash.c src/box/dns.c src/box/dnsmsg.c src/box/dnsup.c src/box/evloop.c src/box/fetch.c src/box/gen.c src/box/json.c src/box/main.c src/box/mixed.c src/box/net.c src/box/ruleset_cli.c src/box/rulesets.c src/box/sbconf.c src/box/steerctl.c src/box/translate.c
-PROFILE_mod_box    := $(BOX_MODULE_SRC)
+# steer-box-connector (sing-box для podkop и forkop) живёт в своём репозитории
+# (github.com/splify2/steer-box-connector) и собирается build/ext-build.sh; нужные ему символы
+# libsteer — в build/exports-ext.lst.
 
 # Два бинарника на пакет (docs/architecture.md, раздел 4а, «Бинарники»): профиль — это движок
 # steerd (демон, компилятор, apply, помощники, инструменты; ссылка steer-tools на него же), а

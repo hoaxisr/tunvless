@@ -55,7 +55,7 @@ m_base="$( { profile_src base; echo; profile_var KINDS_EXT_SRC; echo; profile_va
 # Профили разделяемой раскладки (шаг 4 выпуска 1.10: libsteer, steerd, четыре модуля) — тоже
 # профили: точки входа модулей (src/modules/main_*.c) существуют только в них.
 m_ext="$( { profile_src extended; echo; profile_src server; echo; profile_src tgws; echo
-            for p in libsteer steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy mod_box; do profile_src "$p"; echo; done; } |
+            for p in libsteer steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy; do profile_src "$p"; echo; done; } |
           words | grep -E "^($(profile_var EXT_DIRS | tr ' ' '|'))/" | names)"
 check "sources.mk: профиль base (с видами расширенной части) — это все каталоги ядра"  "$disk_base" "$m_base"
 check "sources.mk: профили покрывают всю расширенную часть" "$disk_ext" "$m_ext"
@@ -330,10 +330,10 @@ check "барьер релиза ловит все отказы build.sh" "" "$m
 
 # Ожидаемое число пакетов барьер считает из build.sh. Сверяем, что счёт вообще работает:
 # ноль архитектур означал бы барьер, требующий ноль пакетов, то есть отключённый.
-arch_n=$(sed -n '/^ISAS="/,/^"$/p' build.sh | grep -c '^[a-z0-9_.-]*:')
-check "архитектуры в build.sh считаются" "1" "$([ "$arch_n" -ge 1 ] && echo 1 || echo 0)"
+arch_n=$(sed -n '/^ISAS="/,/^"$/p' build/arches.sh | grep -c '^[a-z0-9_.-]*:')
+check "архитектуры в build/arches.sh считаются" "1" "$([ "$arch_n" -ge 1 ] && echo 1 || echo 0)"
 check "барьер релиза считает архитектуры тем же образцом" "1" \
-    "$(grep -c "sed -n '/\^ISAS=\"/,/\^\"\$/p' build.sh | grep -c '\^\[a-z0-9_.-\]\*:'" "$wf")"
+    "$(grep -c "sed -n '/\^ISAS=\"/,/\^\"\$/p' build/arches.sh | grep -c '\^\[a-z0-9_.-\]\*:'" "$wf")"
 
 # ---- два формата пакета и архив для VPS --------------------------------------
 # OpenWrt 24.10 перешёл на apk, но 23.05 и 22.03 живут на роутерах и будут жить: на 4/32

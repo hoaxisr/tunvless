@@ -1,0 +1,12 @@
+# Экспорт libsteer для модулей ВНЕ этого дерева: их исходников здесь нет, и build/libs-exports.sh не
+# может вычислить их нужды сам. По строке на символ; # — пояснение. Потребители:
+#   steer-box-connector (github.com/splify2/steer-box-connector) — sing-box для podkop и forkop:
+#   HTTP/2 для DoH (Quad9 отвечает только по h2) и X25519 для sing-box generate reality-keypair.
+# Убрать символ отсюда — сломать сборку того модуля; добавить — только по его просьбе.
+h2_end_stream
+h2_next
+h2_read
+h2_start_ex
+h2_strerror
+h2_write
+sc_x25519_base

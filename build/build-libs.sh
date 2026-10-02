@@ -193,6 +193,9 @@ link_app() {  # ИМЯ КЛАСС-ФЛАГИ СПИСОК-ПРОФИЛЯ
 # shellcheck disable=SC2086
 MODCMD="$(profile_var MODCMD_SRC)"
 $CC -Os $APPF -c "$MODCMD" -o "$OBJ/modcmd.o"
+# STEER_EXT_ONLY=1 (build/ext-build.sh) — только библиотеки и внешние модули: steerd и модули steer
+# внешнему модулю не нужны, их пакеты собирает build.sh steer.
+if [ -z "${STEER_EXT_ONLY:-}" ]; then
 link_app steerd "-Os $APPF" PROFILE_steerd
 link_app steer-vless "-O2 $APPF" PROFILE_mod_vless
 link_app steer-xsteer "-O2 $APPF" PROFILE_mod_xsteer
@@ -200,7 +203,24 @@ link_app steer-obfs "-O2 $APPF" PROFILE_mod_obfs
 link_app steer-tgws "-O2 $APPF" PROFILE_mod_tgws
 link_app steer-hysteria2 "-O2 $APPF" PROFILE_mod_hysteria2
 link_app steer-proxy "-O2 $APPF" PROFILE_mod_proxy
-link_app sing-box "-O2 $APPF" PROFILE_mod_box
+fi
+
+# Внешние модули (STEER_EXT_APPS="имя:каталог …"): бинарники из исходников ВНЕ этого дерева —
+# steer-box-connector (sing-box). Собираются теми же флагами и с той же libsteer, что модули
+# steer, а нужные им символы библиотека экспортирует по build/exports-ext.lst. Зовёт их сборка
+# build/ext-build.sh.
+_eldi=""
+[ -z "$INTERP" ] || _eldi="-Wl,--dynamic-linker=$INTERP"
+for _ea in ${STEER_EXT_APPS:-}; do
+    _en="${_ea%%:*}"; _ed="${_ea#*:}"
+    _eod="$OBJ/ext-$_en"
+    mkdir -p "$_eod"
+    # shellcheck disable=SC2046,SC2086
+    compile "-O2 $APPF -I$_ed" "$_eod" $(ls "$_ed"/*.c)
+    # shellcheck disable=SC2086
+    $CC -o "$OUT/$_en" "$_eod"/*.o "$OBJ/modcmd.o" "$SO" $_eldi $RPL \
+        -Wl,--gc-sections -Wl,--as-needed -s $LIBS
+done
 
 # Клиент сокета `steer` — по-прежнему статический, один на все раскладки (build.sh собирает его сам).
-echo "libs: готово в $OUT (libsteer.so.$VERSION, libsteer-wolfssl.so.$WVER, steerd, steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2, steer-proxy, sing-box)"
+echo "libs: готово в $OUT (libsteer.so.$VERSION, libsteer-wolfssl.so.$WVER, steerd, steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2, steer-proxy${STEER_EXT_APPS:+, внешние: $STEER_EXT_APPS})"

@@ -75,17 +75,7 @@ THIRD_DEFS="$(profile_var THIRD_DEFS)" || exit 2
 # на оба пакета (в нём нет ни видов, ни протоколов), собирается один раз на архитектуру.
 CLIENT_SRC="$(profile_var CLIENT_SRC)" || exit 2
 
-ISAS="
-mipsel_24kc:mipsel-linux-musl:mips32r2+soft_float
-mips_24kc:mips-linux-musl:mips32r2+soft_float
-aarch64_cortex-a53:aarch64-linux-musl:cortex_a53
-aarch64_generic:aarch64-linux-musl:baseline
-arm_cortex-a7_neon-vfpv4:arm-linux-musleabihf:cortex_a7
-arm_cortex-a9:arm-linux-musleabi:cortex_a9
-arm_cortex-a9_neon:arm-linux-musleabihf:cortex_a9+neon
-arm_cortex-a9_vfpv3-d16:arm-linux-musleabihf:cortex_a9+vfp3d16
-x86_64:x86_64-linux-musl:baseline
-"
+. ./build/arches.sh
 
 # ТРИ РАЗНОВИДНОСТИ CORTEX-A9, А НЕ ОДНА, и выбирать из них нельзя: OpenWrt публикует именно
 # три, и пакет под чужую роутер не поставит — apk и opkg сверяют архитектуру по имени.
@@ -118,17 +108,7 @@ mkdir -p "$OUT" build/pkg
 # hard-float ARM получили бы имя без суффикса), поэтому задаём явно по тройке цели; тот же
 # суффикс определяет, какая из трёх сборок Cortex-A9 у нас (musleabi против musleabihf, см. выше).
 # RPATH не нужен: библиотеки лежат в /usr/lib, где musl ищет сам.
-interp_of() {  # ТРОЙКА MCPU
-    case "$1" in
-        mipsel-linux-musl*)     echo /lib/ld-musl-mipsel-sf.so.1 ;;
-        mips-linux-musl*)       echo /lib/ld-musl-mips-sf.so.1 ;;
-        aarch64-linux-musl*)    echo /lib/ld-musl-aarch64.so.1 ;;
-        arm-linux-musleabihf*)  echo /lib/ld-musl-armhf.so.1 ;;
-        arm-linux-musleabi*)    echo /lib/ld-musl-arm.so.1 ;;
-        x86_64-linux-musl*)     echo /lib/ld-musl-x86_64.so.1 ;;
-        *) echo "interp_of: неизвестная цель $1 ($2)" >&2; echo /lib/ld-musl-unknown.so.1 ;;
-    esac
-}
+# interp_of — в build/arches.sh (его берут и внешние модули).
 
 # ---- две упаковки одного пакета: apk и opkg ----------------------------------
 #
@@ -562,32 +542,7 @@ EOF
         pack "steer-$m" "$mroot" "$mdeps" "$md" mod
     done
 
-    # steer-box-connector: sing-box для podkop и forkop на движке steer (src/box). Отдельный пакет,
-    # а не модуль движка: он ставится ВМЕСТО пакетов sing-box (их бинарник /usr/bin/sing-box и
-    # служба /etc/init.d/sing-box — то, что зовут podkop и forkop), поэтому конфликтует с ними и
-    # заменяет их файлы. Зависит от steer-core той же версии: коннектор — модуль, линкуется с
-    # libsteer.so и ведёт свой экземпляр steerd. Страница LuCI (Services → Steer Connector) — в
-    # том же пакете: без коннектора ей нечего показывать.
-    broot="build/pkg/$arch-box"
-    rm -rf "$broot"
-    mkdir -p "$broot/usr/bin" "$broot/etc/init.d" "$broot/etc/config" "$broot/usr/libexec/rpcd" \
-        "$broot/usr/share/nftables.d/chain-pre/forward" "$broot/www"
-    cp "$libs/sing-box" "$broot/usr/bin/sing-box"
-    cp files/box/etc/init.d/sing-box "$broot/etc/init.d/sing-box"
-    cp files/box/etc/config/sing-box "$broot/etc/config/sing-box"
-    cp files/box/etc/config/steer-box "$broot/etc/config/steer-box"
-    cp files/box/usr/libexec/rpcd/steer-box "$broot/usr/libexec/rpcd/steer-box"
-    cp files/box/usr/share/nftables.d/chain-pre/forward/50-steer-box.nft \
-        "$broot/usr/share/nftables.d/chain-pre/forward/50-steer-box.nft"
-    cp -a luci-box/htdocs/. "$broot/www/"
-    cp -a luci-box/root/. "$broot/"
-    find "$broot" -type d -exec chmod 0755 {} +
-    find "$broot" -type f -exec chmod 0644 {} +
-    chmod 0755 "$broot/usr/bin/sing-box" "$broot/etc/init.d/sing-box" "$broot/usr/libexec/rpcd/steer-box"
-    bdeps="steer-core $(pkg_deps "$broot/usr/bin/sing-box" mod)"
-    pack steer-box-connector "$broot" "$bdeps" \
-        "steer-box-connector: sing-box для podkop и forkop на движке steer (вместо пакета sing-box)" box \
-        "sing-box sing-box-tiny sing-box-extended" "sing-box"
+    # steer-box-connector — свой репозиторий (github.com/splify2/steer-box-connector).
 
     # Мета-пакет steer-extended (устарел, оставлен на переход): ядро и модули vless, xsteer, obfs,
     # tgws; hysteria2 не входит. Пустой пакет менеджеры не любят, поэтому в нём один маленький
