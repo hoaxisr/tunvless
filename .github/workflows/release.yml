@@ -361,5 +361,6 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           python3 scripts/publish.py --product steer --version "$VERSION" --channel "$channel" \
+            --name "steer $VERSION" \
             --source-tag "v$VERSION" --changelog "$RUNNER_TEMP/release-notes.md" --assets "$assets" \
             --mirror "https://github.com/splify2/steer/releases/download/v$VERSION"
