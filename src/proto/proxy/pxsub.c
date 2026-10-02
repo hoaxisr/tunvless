@@ -410,6 +410,11 @@ static int vmess_parse(const char *url, struct px_node *n) {
     vj_get(json, "net", net, sizeof(net));
     if (!strcmp(net, "h2")) snprintf(n->vn.type, sizeof(n->vn.type), "xhttp");   /* h2 ≈ xhttp stream */
     else snprintf(n->vn.type, sizeof(n->vn.type), "%s", net);
+    /* type у v2rayN — вид маскировки tcp: «http» — HTTP-заголовок, которого клиент не шлёт
+     * (как headerType=http у vless; sl_link_usable_pre называет причину). */
+    char htype[16] = "";
+    vj_get(json, "type", htype, sizeof(htype));
+    if (!strcmp(htype, "http")) n->vn.tcp_http = 1;
     vj_get(json, "path", n->vn.path, sizeof(n->vn.path));
     vj_get(json, "host", n->vn.http_host, sizeof(n->vn.http_host));
     if (!strcmp(net, "grpc")) sl_set_field(n->vn.service, sizeof(n->vn.service), n->vn.path, strlen(n->vn.path));

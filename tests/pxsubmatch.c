@@ -50,6 +50,11 @@ static void test_parse(void) {
     check("vmess sec auto", (long)VMESS_AUTO, (long)n.vmess_sec);
     check_str("vmess tls", "tls", n.vn.security);
 
+    /* tcp с HTTP-маскировкой (type=http у v2rayN) — заголовка мы не шлём: узел непригоден с
+     * причиной, а не идёт голым tcp на сервер, который ждёт HTTP-запрос. */
+    check("vmess tcp type=http — негоден", 1, px_parse_url("vmess://eyJ2IjoiMiIsInBzIjoibiIsImFkZCI6ImguZXhhbXBsZSIsInBvcnQiOiI0NDMiLCJpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsImFpZCI6IjAiLCJzY3kiOiJhdXRvIiwibmV0IjoidGNwIiwidHlwZSI6Imh0dHAiLCJob3N0IjoieC5leGFtcGxlIiwicGF0aCI6Ii8iLCJ0bHMiOiIifQ==", &n, 0));
+    check_str("vmess tcp type=http — причина", "tcp headerType=http не поддержан", n.skip_reason);
+
     check("want фильтр: ss при want=vmess — не наша", -1, px_parse_url("ss://aes-128-gcm:p@h.example:1", &n, PX_VMESS));
     check("не наша схема", -1, px_parse_url("wireguard://x@h:1", &n, 0));
     check("адрес «отвечать некому»", 1, px_parse_url("ss://aes-128-gcm:p@127.0.0.1:1", &n, 0));
