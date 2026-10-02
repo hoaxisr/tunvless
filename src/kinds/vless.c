@@ -28,6 +28,7 @@ static int vless_parse(struct output *o, const struct out_keys *k, struct err *e
     o->vless.nodes_n = k->nodes_n;
     o->vless.transports = k->transports;
     o->vless.insecure = k->insecure;
+    o->vless.excl = k->excl;            /* массивы — в арене спеки, как nodes */
     if (!o->vless.sub_file[0]) {
         char msg[160];
         snprintf(msg, sizeof(msg), "outputs.%s: kind vless нужен %s с подпиской", o->name,
@@ -55,6 +56,7 @@ static void vless_keys_of(const struct output *o, struct out_keys *k) {
     k->nodes_n = o->vless.nodes_n;
     k->transports = o->vless.transports;
     k->insecure = o->vless.insecure;
+    k->excl = o->vless.excl;
     char dev[32];
     snprintf(dev, sizeof(dev), "%.15s", o->name);
     k->device_derived = !strcmp(dev, o->device);
@@ -119,6 +121,8 @@ static int vless_helper(const struct spec *sp, const struct output *o, struct ki
         kind_sig_mix(&h->sig, &o->vless.transports, sizeof(o->vless.transports));
     /* И insecure: клиент читает его при старте, смена без перезапуска не вступила бы в силу. */
     if (o->vless.insecure) kind_sig_mix(&h->sig, "insecure", 8);
+    /* И исключение узлов: клиент отбирает кандидатов при старте. */
+    kind_sig_excl(&h->sig, &o->vless.excl);
     return 0;
 }
 

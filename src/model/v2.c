@@ -569,6 +569,8 @@ static const struct { const char *key; unsigned bit; const char *owner; } KIND_K
     { "nodes",        KK_NODES,  "kind: tunnel" },
     { "transport",    KK_SUB,    "kind: tunnel" },
     { "insecure",     KK_SUB,    "kind: tunnel" },
+    { "exclude",      KK_SUB,    "kind: tunnel" },
+    { "exclude_name", KK_SUB,    "kind: tunnel" },
     { "stream",       KK_STREAM, "kind: xsteer" },
     { "stream_port",  KK_STREAM, "kind: xsteer" },
     { "strategy",     KK_OPTS,   "kind: zapret" },
@@ -849,6 +851,43 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             }
         } else if (!strcmp(ks, "insecure")) {
             if (bool_of(x, v, w, &k.insecure)) return -1;
+        } else if (!strcmp(ks, "exclude")) {
+            /* Страны, узлы которых не брать (флаг в имени узла, src/model/nodesel.h): одно значение
+             * или список. Код — ровно две заглавные латинские буквы, как в флаге: «ru» или «RUS»
+             * не совпали бы ни с одним узлом молча. Пустой список — ничего не исключать. */
+            if (items_ok(x, v, w)) return -1;
+            if (n_items(v)) {
+                k.excl.cc = (char (*)[3])spec_alloc(s, n_items(v) * 3);
+                if (!k.excl.cc) return fail(x, v, "%s: недостаточно памяти для спеки", w);
+            }
+            for (size_t i2 = 0; i2 < n_items(v); i2++) {
+                const struct ynode *it = item(v, i2);
+                const char *c = it->str;
+                if (strlen(c) != 2 || c[0] < 'A' || c[0] > 'Z' || c[1] < 'A' || c[1] > 'Z')
+                    return fail(x, it, "%s: «%s» — код страны: две заглавные латинские буквы "
+                                "(ISO 3166-1), например RU", w, c);
+                for (size_t b = 0; b < k.excl.cc_n; b++)
+                    if (!strcmp(k.excl.cc[b], c)) return fail(x, it, "%s: %s указан дважды", w, c);
+                memcpy(k.excl.cc[k.excl.cc_n++], c, 3);
+            }
+        } else if (!strcmp(ks, "exclude_name")) {
+            /* Куски имени узла, без учёта регистра (латиница и кириллица): узел, в имени которого
+             * есть любой из них, в кандидаты не идёт. Пустой кусок нашёлся бы в каждом имени —
+             * его отвергает items_ok. */
+            if (items_ok(x, v, w)) return -1;
+            if (n_items(v)) {
+                k.excl.names = (const char **)spec_alloc(s, n_items(v) * sizeof(char *));
+                if (!k.excl.names) return fail(x, v, "%s: недостаточно памяти для спеки", w);
+            }
+            for (size_t i2 = 0; i2 < n_items(v); i2++) {
+                const struct ynode *it = item(v, i2);
+                for (size_t b = 0; b < k.excl.names_n; b++)
+                    if (!strcmp(k.excl.names[b], it->str))
+                        return fail(x, it, "%s: «%s» указано дважды", w, it->str);
+                const char *c = spec_strdup(s, it->str);
+                if (!c) return fail(x, it, "%s: недостаточно памяти для спеки", w);
+                k.excl.names[k.excl.names_n++] = c;
+            }
         } else if (!strcmp(ks, "stream")) {
             if (bool_of(x, v, w, &k.stream)) return -1;
         } else if (!strcmp(ks, "stream_port")) {

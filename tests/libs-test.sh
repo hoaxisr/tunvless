@@ -221,6 +221,65 @@ check "hysteria2-nodes /файл --insecure: принят и ничего не �
     "$f_plain" "$f_ins"
 check "  узел с insecure=1 в перечне и помечен" "1" "$(printf '%s' "$f_ins" | grep -c '"name":"H".*"insecure":true')"
 
+# ---- exclude и exclude_name: отбор кандидатов без сдвига номеров -----------------------------------
+# Страна узла — флаг-эмодзи в имени (пара regional indicator), как у интерфейса splify2. Узлы на
+# 192.0.2.x (TEST-NET-1): проба честно не дождётся ответа за секунду, но по списку results видно, каких
+# кандидатов она брала.
+RU="$(printf '\360\237\207\267\360\237\207\272')"; NL="$(printf '\360\237\207\263\360\237\207\261')"
+DE="$(printf '\360\237\207\251\360\237\207\252')"
+mkdir -p "$L/excl"
+EX="$(cd "$L/excl" && pwd)"
+cat > "$EX/vl.txt" <<SUB
+vless://$U@192.0.2.1:443?security=tls&sni=a.test#$RU Москва
+vless://$U@192.0.2.2:443?security=tls&sni=b.test#$NL Мобильный
+vless://$U@192.0.2.3:443?security=tls&sni=c.test#$DE Франкфурт
+SUB
+# У hysteria2 пробел — разделитель ссылок подписки (hy2sub.c), поэтому пробел в имени — %20.
+printf 'hysteria2://p@192.0.2.4:443/?sni=h.test#%s%%20hy\nhysteria2://p@192.0.2.5:443/?sni=h.test#%s%%20hy\n' "$RU" "$DE" > "$EX/hy.txt"
+printf 'trojan://p@192.0.2.6:443?security=tls&sni=t.test#%s t\ntrojan://p@192.0.2.7:443?security=tls&sni=t.test#%s t\n' "$RU" "$DE" > "$EX/px.txt"
+cat > "$EX/spec.yaml" <<SPEC
+version: 2
+outputs:
+  vl:  { kind: tunnel, protocol: vless, subscription: vl.txt, exclude: RU, exclude_name: мобил }
+  all: { kind: tunnel, protocol: vless, subscription: vl.txt, exclude: [RU, NL, DE] }
+  pin: { kind: tunnel, protocol: vless, subscription: vl.txt, nodes: [0, 2], exclude: RU }
+  hy:  { kind: tunnel, protocol: hysteria2, subscription: hy.txt, exclude: RU }
+  tj:  { kind: tunnel, protocol: trojan, subscription: px.txt, exclude: RU }
+SPEC
+SE="--spec $EX/spec.yaml --state-dir $EX/st"
+f="$("$L/steer-vless" vless-nodes "$EX/vl.txt" 2>/dev/null)"
+o="$("$L/steer-vless" vless-nodes vl $SE 2>/dev/null)"
+check "vless-nodes /файл: у узла cc по флагу, без excluded" "RU NL DE |0" \
+    "$(printf '%s' "$f" | grep -o '"cc":"[A-Z]*"' | sed 's/"cc":"\(..\)"/\1/' | tr '\n' ' ')|$(printf '%s' "$f" | grep -c excluded)"
+check "vless-nodes выход с exclude: номера те же, что по файлу" "$(printf '%s' "$f" | names)" "$(printf '%s' "$o" | names)"
+check "  исключённые — RU по стране и «Мобильный» по куску имени" \
+    '{"index":0,"name":"'"$RU"' Москва","host":"192.0.2.1","port":443,"type":"tcp","security":"tls","vision":false,"cc":"RU","excluded":true}|"cc":"NL","excluded":true}|"cc":"DE"}' \
+    "$(printf '%s' "$o" | node_of "$RU Москва")|$(printf '%s' "$o" | node_of "$NL Мобильный" | grep -o '"cc".*')|$(printf '%s' "$o" | node_of "$DE Франкфурт" | grep -o '"cc".*')"
+p="$("$L/steer-vless" vless-probe vl --timeout 1 $SE 2>/dev/null)"
+check "vless-probe выход с exclude: перебор только по неисключённым (номер 2)" "2" \
+    "$(printf '%s' "$p" | grep -o '"index":[0-9]*' | sed 's/.*://' | tr '\n' ' ' | sed 's/ $//')"
+p="$("$L/steer-vless" vless-probe pin --timeout 1 $SE 2>/dev/null)"
+check "  вместе с nodes — пересечение: из [0, 2] остаётся 2" "2" \
+    "$(printf '%s' "$p" | grep -o '"index":[0-9]*' | sed 's/.*://' | tr '\n' ' ' | sed 's/ $//')"
+p="$("$L/steer-vless" vless-probe all --timeout 1 $SE 2>/dev/null)"; rc=$?
+check "  все исключены — отказ со своей причиной, а не перебор исключённых" "1 1" \
+    "$rc $(printf '%s' "$p" | grep -c 'все выбранные узлы исключены')"
+p="$("$L/steer-vless" vless-probe vl --node 0 --timeout 1 $SE 2>/dev/null)"
+check "  узел, названный --node, проверяется и исключённым" "0" \
+    "$(printf '%s' "$p" | grep -o '"index":[0-9]*' | sed 's/.*://')"
+o="$("$L/steer-hysteria2" hysteria2-nodes hy $SE 2>/dev/null)"
+check "hysteria2-nodes выход с exclude: RU помечен, DE нет" '"cc":"RU","excluded":true}|"cc":"DE"}' \
+    "$(printf '%s' "$o" | node_of "$RU hy" | grep -o '"cc".*')|$(printf '%s' "$o" | node_of "$DE hy" | grep -o '"cc".*')"
+p="$("$L/steer-hysteria2" hysteria2-probe hy --timeout 1 $SE 2>/dev/null)"
+check "hysteria2-probe выход с exclude: перебор только по DE (номер 1)" "1" \
+    "$(printf '%s' "$p" | grep -o '"index":[0-9]*' | sed 's/.*://' | tr '\n' ' ' | sed 's/ $//')"
+o="$("$L/steer-proxy" proxy-nodes tj $SE 2>/dev/null)"
+check "proxy-nodes выход с exclude: RU помечен, DE нет" '"cc":"RU","excluded":true}|"cc":"DE"}' \
+    "$(printf '%s' "$o" | node_of "$RU t" | grep -o '"cc".*')|$(printf '%s' "$o" | node_of "$DE t" | grep -o '"cc".*')"
+p="$("$L/steer-proxy" proxy-probe tj --timeout 1 $SE 2>/dev/null)"
+check "proxy-probe выход с exclude: перебор только по DE (номер 1)" "1" \
+    "$(printf '%s' "$p" | grep -o '"index":[0-9]*' | sed 's/.*://' | tr '\n' ' ' | sed 's/ $//')"
+
 # С модулем: steerd передаёт командную строку модулю, ответ тот же байт в байт.
 cp "$L/steer-vless" "$empty/steer-vless"
 a="$(STEER_MODULE_DIR="$empty" "$L/steerd" vless-nodes nosuch --spec /nonexistent 2>&1; echo "rc=$?")"

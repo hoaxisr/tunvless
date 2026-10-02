@@ -41,6 +41,7 @@ static int proxy_parse(struct output *o, const struct out_keys *k, struct err *e
     o->proxy.nodes = k->nodes;
     o->proxy.nodes_n = k->nodes_n;
     o->proxy.insecure = k->insecure;
+    o->proxy.excl = k->excl;
     if (!o->proxy.sub_file[0]) {
         char msg[160];
         snprintf(msg, sizeof(msg), "outputs.%s: kind %s нужен %s с подпиской", o->name,
@@ -75,6 +76,7 @@ static void proxy_keys_of(const struct output *o, struct out_keys *k) {
     k->nodes = o->proxy.nodes;
     k->nodes_n = o->proxy.nodes_n;
     k->insecure = o->proxy.insecure;
+    k->excl = o->proxy.excl;
     char dev[32];
     snprintf(dev, sizeof(dev), "%.15s", o->name);
     k->device_derived = !strcmp(dev, o->device);
@@ -139,6 +141,7 @@ static int proxy_helper(const struct spec *sp, const struct output *o, struct ki
     }
     for (size_t i = 0; i < o->proxy.nodes_n; i++)
         kind_sig_mix(&h->sig, &o->proxy.nodes[i], sizeof(o->proxy.nodes[i]));
+    kind_sig_excl(&h->sig, &o->proxy.excl);
     return 0;
 }
 

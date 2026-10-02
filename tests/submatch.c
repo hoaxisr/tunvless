@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include "../src/proto/vless/sub.c"
+#include "nodesel.h"
 /* Вывод UUID живёт в vless_proto.c, а проверка пригодности — в sub.c, и стенду нужны
  * оба: ссылка из панели обязана и пройти проверку пригодности, и дать те самые 16 байт,
  * которые уедут в заголовок запроса. Исходник включается тем же приёмом, что и sub.c —
@@ -87,6 +88,33 @@ static void on_alarm(int sig) {
 }
 
 int main(void) {
+    /* ---- исключение узлов (src/model/nodesel.h): страна по флагу, кусок имени ------------- */
+    {
+        char cc[3] = "";
+        /* Флаг — первая пара regional indicator где угодно в имени, как ccFromName в splify2. */
+        check_n("флаг в начале: найден", 1, node_cc("\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1 Амстердам", cc));
+        check("  это NL", "NL", cc);
+        check_n("флаг в середине: найден", 1, node_cc("Узел #3 \xF0\x9F\x87\xA9\xF0\x9F\x87\xAA", cc));
+        check("  это DE", "DE", cc);
+        check_n("одиночный индикатор не флаг", 0, node_cc("x \xF0\x9F\x87\xB3 y", cc));
+        check_n("без флага — нет страны", 0, node_cc("Netherlands", cc));
+        node_cc("\xF0\x9F\x87\xA6\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1", cc);
+        check("три индикатора подряд — первая пара (как регулярное выражение интерфейса)", "AN", cc);
+        check_n("обрубок индикатора на конце не читается за строкой", 0, node_cc("a\xF0\x9F\x87", cc));
+        check_n("кусок имени без регистра: латиница", 1, node_name_has("NL Mobile LTE", "lte"));
+        check_n("кусок имени без регистра: кириллица", 1, node_name_has("Мобильный #6", "МОБИЛЬНЫЙ"));
+        check_n("  Ё и ё", 1, node_name_has("Тёплый стан", "ТЁПЛ"));
+        check_n("кусок, которого нет", 0, node_name_has("Мобильный #6", "лте"));
+        char ru[2][3] = { "RU", "US" };
+        const char *names[1] = { "мобил" };
+        struct node_exclude x = { ru, 2, names, 1 };
+        check_n("исключён по стране", 1, node_excluded(&x, "\xF0\x9F\x87\xB7\xF0\x9F\x87\xBA Москва"));
+        check_n("исключён по куску имени", 1, node_excluded(&x, "\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1 Мобильный"));
+        check_n("не исключён", 0, node_excluded(&x, "\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1 Амстердам"));
+        check_n("узел без флага по стране не исключается", 0, node_excluded(&x, "RU Moscow"));
+        check_n("пустое исключение — ничего", 0, node_excluded(NULL, "x"));
+    }
+
     /* ---- base64: то, чем подписки реально приходят ------------------------- */
     {
         char out[64];

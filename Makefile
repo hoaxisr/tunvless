@@ -482,6 +482,7 @@ $(BUILD)/visionmatch: tests/visionmatch.c src/proto/vless/vision.c src/proto/vle
 # trpath.c — отдельным объектом: путь ws и httpupgrade подписка отбраковывает тем же правилом, по
 # которому транспорт собирает запрос (src/proto/transport/trpath.h), а сам файл — чистые строки.
 $(BUILD)/submatch: tests/submatch.c src/proto/vless/sub.c src/proto/vless/sublink.c src/proto/vless/sublink.h \
+                  src/model/nodesel.h \
                   src/proto/vless/vless.h src/proto/transport/vencp.h \
                   src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h \
                   src/proto/transport/trpath.c src/proto/transport/trpath.h

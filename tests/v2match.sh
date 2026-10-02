@@ -232,6 +232,36 @@ if [ -x "$XK" ]; then
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec in3.yaml --state-dir "$tmp/state" 2>&1)"
     if echo "$out" | grep -qF "ключ insecure есть только у kind: tunnel"; then ok; else
         bad "insecure у interface — отказ «только у kind: tunnel»" "$out"; fi
+    # exclude и exclude_name: у туннеля любого протокола — исключение узлов по стране (флаг в имени) и
+    # по куску имени. convert печатает их обратно и остаётся неподвижной точкой; отказы — с местом.
+    for p in "protocol: vless" "protocol: hysteria2" "protocol: trojan"; do
+        printf 'version: 2\noutputs:\n  t: { kind: tunnel, %s, subscription: sub/t, exclude: [RU, NO], exclude_name: ["Мобильный", lte] }\n' "$p" > "$tmp/ex1.yaml"
+        out="$(cd "$tmp" && "$XKA" apply --dry-run --spec ex1.yaml --state-dir "$tmp/state" 2>&1)"
+        if [ $? = 0 ]; then ok; else bad "exclude, exclude_name у $p — приняты" "$(echo "$out" | head -n 3)"; fi
+        (cd "$tmp" && "$XKA" spec convert --spec ex1.yaml > c1.yaml 2>&1 && "$XKA" spec convert --spec c1.yaml > c2.yaml 2>&1)
+        if grep -q 'exclude: \[RU, "NO"\], exclude_name: \["Мобильный", lte\]' "$tmp/c1.yaml" && cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml"; then ok; else
+            bad "convert печатает exclude и exclude_name у $p (неподвижная точка)" "$(grep -n exclude "$tmp/c1.yaml")"; fi
+    done
+    printf 'version: 2\noutputs:\n  t: { kind: tunnel, protocol: vless, subscription: sub/t, exclude: DE }\n' > "$tmp/ex2.yaml"
+    (cd "$tmp" && "$XKA" spec convert --spec ex2.yaml > c1.yaml 2>&1)
+    if grep -q 'exclude: \[DE\]' "$tmp/c1.yaml"; then ok; else
+        bad "exclude: DE — одно значение как список из одного" "$(grep -n exclude "$tmp/c1.yaml")"; fi
+    exref() {   # имя, ключ: значение, строка отказа, место
+        printf 'version: 2\noutputs:\n  t: { kind: tunnel, protocol: vless, subscription: sub/t, %s }\n' "$2" > "$tmp/ex3.yaml"
+        out="$(cd "$tmp" && "$XKA" apply --dry-run --spec ex3.yaml --state-dir "$tmp/state" 2>&1)"
+        rc=$?
+        if [ "$rc" = 2 ] && echo "$out" | grep -qF -- "$3" && echo "$out" | grep -qF "ex3.yaml:$4:"; then ok; else
+            bad "$1" "код $rc: $out"; fi
+    }
+    exref "exclude: ru — отказ с местом" "exclude: ru" "«ru» — код страны: две заглавные латинские буквы" 3:69
+    exref "exclude: RUS — отказ" "exclude: [RUS]" "«RUS» — код страны: две заглавные латинские буквы" 3:70
+    exref "exclude: [RU, RU] — отказ" "exclude: [RU, RU]" "RU указан дважды" 3:74
+    exref "exclude_name: [a, a] — отказ" "exclude_name: [a, a]" "«a» указано дважды" 3:78
+    exref "exclude_name: \"\" — отказ" 'exclude_name: [""]' "непустая строка" 3:75
+    printf 'version: 2\noutputs:\n  wg: { kind: interface, device: wg0, exclude: [RU] }\n' > "$tmp/ex4.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec ex4.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -qF "ключ exclude есть только у kind: tunnel"; then ok; else
+        bad "exclude у interface — отказ «только у kind: tunnel»" "$out"; fi
 else
     bad "не собран $XK (make build/steer-xk)"
 fi

@@ -24,6 +24,7 @@
 /* Таблица вида (src/kinds/kind.h): поле kind у struct output — указатель на неё, а предикаты out_*
  * ниже — вопросы к её битам. Заголовок объявляет struct output и struct spec только по имени. */
 #include "kind.h"
+#include "nodesel.h"                /* struct node_exclude: ключи exclude и exclude_name */
 
 /* ПРЕДЕЛОВ ПО ЧИСЛУ ПРАВИЛ, СПИСКОВ, КЛИЕНТОВ, АДРЕСОВ, ФАЙЛОВ, ПОРТОВ, ЧЛЕНОВ ГРУППЫ И УЗЛОВ В
  * СПЕКЕ НЕТ. Раньше каждое из этих чисел было константой (64 правила, 16 выходов, 32 адреса у
@@ -197,6 +198,10 @@ struct vless_cfg {
      * продавца. Диагностика (`steer diag`) и status предупреждают, пока ключ включён; подпись
      * Reality он не затрагивает. */
     int insecure;
+    /* Ключи `exclude:` и `exclude_name:` спеки v2 — какие узлы подписки не брать в кандидаты
+     * (страна по флагу в имени, кусок имени; src/model/nodesel.h). Только отбор: номера `nodes`
+     * от него не сдвигаются, вместе с `nodes` и `transport` — пересечение. */
+    struct node_exclude excl;
 };
 
 /* hysteria2 (kind: tunnel, protocol: hysteria2). Узлы берутся из подписки так же, как у vless, —
@@ -207,6 +212,7 @@ struct hy2_cfg {
     char sub_file[256];
     int *nodes;                 /* арена спеки, nodes_n записей (NULL при 0), как у vless_cfg */
     size_t nodes_n;
+    struct node_exclude excl;   /* exclude, exclude_name — как у vless_cfg */
 };
 
 /* Протоколы прокси (kind: tunnel, protocol: trojan|shadowsocks|socks|http|vmess) — модуль
@@ -219,7 +225,17 @@ struct proxy_cfg {
     int *nodes;
     size_t nodes_n;
     int insecure;               /* не проверять сертификат узлов security=tls (trojan/vmess/http) */
+    struct node_exclude excl;   /* exclude, exclude_name — как у vless_cfg */
 };
+
+/* Исключение узлов — в подпись помощника (kind_helper.sig): клиент отбирает кандидатов при старте,
+ * и смена exclude без перезапуска не вступила бы в силу. Пусто — подпись прежняя. */
+static inline void kind_sig_excl(unsigned long long *h, const struct node_exclude *x) {
+    if (x->cc_n) kind_sig_mix(h, "exclude", 8);
+    for (size_t i = 0; i < x->cc_n; i++) kind_sig_mix(h, x->cc[i], 2);
+    if (x->names_n) kind_sig_mix(h, "exclude_name", 13);
+    for (size_t i = 0; i < x->names_n; i++) kind_sig_mix(h, x->names[i], strlen(x->names[i]) + 1);
+}
 
 /* Транспорты узла туннеля — имена как в ссылке узла (type=) и биты для vless_cfg.transports. */
 enum { TT_TCP = 1u << 0, TT_GRPC = 1u << 1, TT_XHTTP = 1u << 2, TT_WS = 1u << 3,
@@ -361,6 +377,7 @@ struct out_keys {
     int node_one, node_many;
     unsigned transports;        /* `transport:` спеки v2 (vless_cfg.transports) */
     int insecure;               /* `insecure:` спеки v2 (vless_cfg.insecure) */
+    struct node_exclude excl;   /* `exclude:`, `exclude_name:` спеки v2 (vless_cfg.excl) */
     /* `devices` спеки v1 — кандидаты в порядке предпочтения. В модели поля нет: пул устройств —
      * это группа (kind: group), её собирает перевод v1 (model/v1.c), а вид выхода только
      * решает, принимает ли он такой список вообще (KK_DEVICES — у interface). */

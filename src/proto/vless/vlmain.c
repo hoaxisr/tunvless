@@ -112,7 +112,8 @@ static void underlay_setup(struct spec *sp, const struct output *o) {
     transport_set_sock_mark(out_underlay_mark(sp, o ? o : &none), o && o->over[0]);
 }
 
-static void node_json(const struct vless_node *n, int index) {
+/* x — исключение выхода (exclude, exclude_name); NULL — перечень по файлу, без выхода. */
+static void node_json(const struct vless_node *n, int index, const struct node_exclude *x) {
     printf("{\"index\":%d,", index);
     printf("\"name\":"); jsonw_str(stdout, n->name);
     printf(",\"host\":"); jsonw_str(stdout, n->host);
@@ -141,7 +142,25 @@ static void node_json(const struct vless_node *n, int index) {
      * есть лишь при insecure выхода или `--insecure` по файлу, и сертификат его не проверяется. */
     if (n->fp[0] && strcmp(n->security, "none") != 0) { printf(",\"fp\":"); jsonw_str(stdout, n->fp); }
     if (n->allow_insecure && !strcmp(n->security, "tls")) printf(",\"insecure\":true");
+    /* cc — страна по флагу в имени (src/model/nodesel.h): по ней интерфейс строит список стран
+     * для exclude. excluded — узел выхода, который его exclude/exclude_name не берут в кандидаты;
+     * номер у него при этом прежний. Оба — только где есть. */
+    char cc[3];
+    if (node_cc(n->name, cc)) { printf(",\"cc\":"); jsonw_str(stdout, cc); }
+    if (node_excluded(x, n->name)) printf(",\"excluded\":true");
     printf("}");
+}
+
+/* Ключи `exclude:` и `exclude_name:` (vless_cfg.excl): из кандидатов уходят исключённые узлы, порядок
+ * остальных прежний. Только отбор — номера не сдвигаются (src/model/nodesel.h). Одна функция на
+ * подъём и на `vless-probe`, как transport_filter. Возвращает, сколько осталось. */
+static size_t exclude_filter(const struct output *o, const struct vless_node *nodes, int *sel,
+                             size_t sel_n) {
+    if (!o) return sel_n;
+    size_t k = 0;
+    for (size_t i = 0; i < sel_n; i++)
+        if (!node_excluded(&o->vless.excl, nodes[sel[i]].name)) sel[k++] = sel[i];
+    return k;
 }
 
 /* Ключ `transport:` спеки v2 (vless_cfg.transports в spec.h): из кандидатов остаются узлы с
@@ -217,7 +236,7 @@ int cmd_vless_nodes(const char *spec_path, const char *out_name, int insecure) {
            cnt, st.skipped, st.foreign);
     for (size_t i = 0; i < cnt; i++) {
         if (i) putchar(',');
-        node_json(&g_nodes[i], (int)i);
+        node_json(&g_nodes[i], (int)i, o ? &o->vless.excl : NULL);
     }
     printf("]");
     skipped_json(&st);
@@ -283,6 +302,12 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
         if (!sel_n) {
             printf("{\"ok\":false,\"error\":\"среди выбранных узлов нет узлов с транспортом "
                    "из transport\"}\n");
+            return 1;
+        }
+        sel_n = exclude_filter(o, g_nodes, sel, sel_n);
+        if (!sel_n) {
+            printf("{\"ok\":false,\"error\":\"все выбранные узлы исключены exclude или "
+                   "exclude_name\"}\n");
             return 1;
         }
     }
@@ -415,6 +440,18 @@ int cmd_vless(const char *spec_path, const char *out_name) {
                     (const char *)NULL);
         fprintf(stderr, LOG_W2 "среди %zu выбранных узлов нет ни одного с транспортом из "
                         "transport — проверьте transport и подписку\n", before);
+        return 1;
+    }
+    /* exclude, exclude_name — тот же довод: все кандидаты исключены — отказ со своей причиной, а
+     * не перебор исключённых. */
+    before = sel_n;
+    sel_n = exclude_filter(o, nodes, sel, sel_n);
+    if (!sel_n) {
+        vl_probe_report(out_name, PROBE_FAILED, 0, 0);
+        evline_emit("down", "why", EVLINE_STR, "все узлы-кандидаты исключены exclude",
+                    (const char *)NULL);
+        fprintf(stderr, LOG_W2 "все %zu узлов-кандидатов исключены exclude или exclude_name — "
+                        "проверьте исключение и подписку\n", before);
         return 1;
     }
 

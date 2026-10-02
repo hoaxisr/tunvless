@@ -674,6 +674,7 @@ v6-двойник (раздел «IPv6 правил» ниже), резолве�
   | `failed` | Выход, который сторож признал неработающим (on_fail применён), отдаётся с `up: false` и `failed: true`, а не по состоянию устройства (см. `up` / `failed` ниже). |
   | `groups` | Группы спеки v2 (`kind: group`): `pick` order/latency/manual/balance, вложенные группы, команда `select`; у выхода-группы в `status` — объект `group` (ниже). |
   | `balance_by` | Ключ `by` у группы `pick: balance` (docs/spec-v2.md): `connection`, `site`, `site_client` — раздача новых соединений случайно или хешем адресов. |
+  | `exclude` | Ключи `exclude` (страны по флагу в имени узла) и `exclude_name` (куски имени) у выхода `kind: tunnel` спеки v2 ([spec-v2.md](spec-v2.md)); у узла в `*-nodes` — поля `cc` и `excluded` (§6). |
   | `spec_schema2` | Спека `schema: 2` — сужение канала по протоколу и портам (§1). |
   | `via` | Ключ `via` у выхода (§1) и поле `via` в `status` (ниже). |
   | `status_cache` | `status --fast` отдаёт запомненный ответ с `"cached": true` (§6, «Память состояния»). |
@@ -1120,6 +1121,8 @@ stderr вызывающего, и управляющий слой уже зна�
 | vmess | `cipher` | всегда: шифр тела `auto`, `aes-128-gcm` или `chacha20-poly1305` |
 | trojan, vmess, http | `fp` | как у vless; только у tls и reality |
 | trojan, http | `insecure` | как у vless |
+| все | `cc` | страна по флагу-эмодзи в имени узла (первая пара символов regional indicator), две заглавные буквы; нет флага — поля нет |
+| все | `excluded` | `true` — перечень по выходу, и его `exclude`/`exclude_name` этот узел не берут в кандидаты; номер узла при этом прежний ([spec-v2.md](spec-v2.md)) |
 
 TLS у прокси называет общее поле `security`: `tls` или `reality` у trojan, `tls` у `https://` и у vmess
 с `tls`, `none` у `http://`, shadowsocks и socks. Признака `allowInsecure` у ссылки vmess ядро не

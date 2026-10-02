@@ -308,6 +308,8 @@ static void output_flow(FILE *f, const struct output *o, const struct onames *on
             if (c > 1) fputc(']', f);
         }
         if (kk.insecure) { fk(&w, "insecure"); fputs("true", f); }
+        if (kk.excl.cc_n) fseq_s(&w, "exclude", kk.excl.cc[0], 3, kk.excl.cc_n);
+        if (kk.excl.names_n) fseq(&w, "exclude_name", kk.excl.names, kk.excl.names_n);
         if (kk.conf[0]) fpath(&w, "conf", kk.conf);
         if (kk.stream) { fk(&w, "stream"); fputs("true", f); }
         if (kk.stream_port) { fk(&w, "stream_port"); fprintf(f, "%d", kk.stream_port); }

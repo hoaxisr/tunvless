@@ -71,7 +71,8 @@ static void underlay_setup(struct spec *sp, const struct output *o) {
     transport_set_sock_mark(out_underlay_mark(sp, o ? o : &none), o && o->over[0]);
 }
 
-static void node_json(const struct px_node *n, int index) {
+/* x — исключение выхода; NULL — перечень по файлу. cc и excluded — как у vless (vlmain.c). */
+static void node_json(const struct px_node *n, int index, const struct node_exclude *x) {
     printf("{\"index\":%d,\"name\":", index);
     jsonw_str(stdout, n->name);
     printf(",\"host\":");
@@ -93,7 +94,20 @@ static void node_json(const struct px_node *n, int index) {
         printf(",\"fp\":"); jsonw_str(stdout, n->vn.fp);
     }
     if (n->vn.allow_insecure && !strcmp(n->vn.security, "tls")) printf(",\"insecure\":true");
+    char cc[3];
+    if (node_cc(n->name, cc)) { printf(",\"cc\":"); jsonw_str(stdout, cc); }
+    if (node_excluded(x, n->name)) printf(",\"excluded\":true");
     printf("}");
+}
+
+/* exclude, exclude_name (proxy_cfg.excl): исключённые уходят из кандидатов, номера не сдвигаются.
+ * Одна функция на подъём и на `proxy-probe`. */
+static size_t exclude_filter(const struct output *o, const struct px_node *nodes, int *sel, size_t n) {
+    if (!o) return n;
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++)
+        if (!node_excluded(&o->proxy.excl, nodes[sel[i]].name)) sel[k++] = sel[i];
+    return k;
 }
 
 static void skipped_json(const struct px_sub_stats *st) {
@@ -131,7 +145,7 @@ int cmd_proxy_nodes(const char *spec_path, const char *out_name, int insecure) {
     printf(",\"node\":%d,\"chosen\":[", chosen_n == 1 ? o->proxy.nodes[0] : -1);
     for (size_t i = 0; i < chosen_n; i++) printf("%s%d", i ? "," : "", o->proxy.nodes[i]);
     printf("],\"usable\":%zu,\"skipped\":%zu,\"foreign\":%zu,\"nodes\":[", cnt, st.skipped, st.foreign);
-    for (size_t i = 0; i < cnt; i++) { if (i) putchar(','); node_json(&g_nodes[i], (int)i); }
+    for (size_t i = 0; i < cnt; i++) { if (i) putchar(','); node_json(&g_nodes[i], (int)i, o ? &o->proxy.excl : NULL); }
     printf("]");
     skipped_json(&st);
     printf("}\n");
@@ -166,6 +180,11 @@ int cmd_proxy_probe(const char *spec_path, const char *out_name, int node, int t
     else {
         sel_n = out_proxy_node_list(o, cnt, sel, cap);
         if (!sel_n) { printf("{\"ok\":false,\"error\":\"выбранных узлов нет в подписке, пригодных всего %zu\"}\n", cnt); return 1; }
+        sel_n = exclude_filter(o, g_nodes, sel, sel_n);
+        if (!sel_n) {
+            printf("{\"ok\":false,\"error\":\"все выбранные узлы исключены exclude или exclude_name\"}\n");
+            return 1;
+        }
     }
     int found = -1;
     printf("{\"output\":");
@@ -412,6 +431,15 @@ int cmd_proxy(const char *spec_path, const char *out_name) {
         evline_emit("nonode", "node", EVLINE_INT, (long)(o->proxy.nodes_n ? o->proxy.nodes[0] : -1),
                     "total", EVLINE_INT, (long)cnt, (const char *)NULL);
         fprintf(stderr, LOG_W2 "выбранных узлов нет в подписке (пригодных всего %zu) — проверьте nodes\n", cnt);
+        return 1;
+    }
+    size_t before = sel_n;
+    sel_n = exclude_filter(o, nodes, sel, sel_n);
+    if (!sel_n) {
+        px_probe_report(out_name, PROBE_FAILED, 0, 0);
+        evline_emit("down", "why", EVLINE_STR, "все узлы-кандидаты исключены exclude", (const char *)NULL);
+        fprintf(stderr, LOG_W2 "все %zu узлов-кандидатов исключены exclude или exclude_name — проверьте "
+                        "исключение и подписку\n", before);
         return 1;
     }
     int chosen = -1;
