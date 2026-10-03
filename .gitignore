@@ -123,3 +123,15 @@ build/obfs-*/
 build/uprobe-*
 build/xsconnmatch
 build/xslinkmatch
+# Стенды make test и ext-test, которых в списке не было (дерево после прогона оставалось грязным).
+build/b3match
+build/dupconnmatch
+build/dupmatch
+build/echmatch
+build/pxdialmatch
+build/pxmatch
+build/pxprobe
+build/pxsubmatch
+build/subpq
+build/vencprobe
+build/xudpprobe
