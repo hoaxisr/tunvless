@@ -369,9 +369,12 @@ check "build.sh упаковывает модули по кругу vless xsteer
 check "pack зовёт apk mkpkg и mk_ipk из одного дерева" "1 1" \
     "$(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c 'apk mkpkg') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c 'mk_ipk ')"
 # Мета-пакет steer-extended ставит ядро и четыре модуля (имя ждёт splify2, пакет устарел), а
-# модули зависят от ядра.
+# модули зависят от ядра. Системные зависимости 1.5.x он повторяет, иначе opkg при переходе с
+# steer-extended 1.5.x снимает ip-full, conntrack, kmod-nft-queue и kmod-tun как осиротевшие.
 check "steer-extended зависит от ядра и четырёх модулей" "1" \
-    "$(grep -c 'pack steer-extended "\$xroot" "steer-core steer-vless steer-xsteer steer-obfs steer-tgws"' build.sh)"
+    "$(grep -c 'pack steer-extended "\$xroot" "steer-core steer-vless steer-xsteer steer-obfs steer-tgws ' build.sh)"
+check "steer-extended повторяет системные зависимости ядра и модуля с TUN" "1" \
+    "$(grep 'pack steer-extended' build.sh | grep -c 'pkg_deps "" core) $(pkg_deps "" tun)')"
 check "steer-extended помечен устаревшим в описании" "1" \
     "$(grep -A1 'pack steer-extended' build.sh | grep -c 'steer-extended (устарел')"
 # steer-hysteria2 — отдельный пакет: мета-пакет его не ставит (решение владельца), и вид без модуля
