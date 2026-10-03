@@ -148,7 +148,7 @@ spec() {
     ch='{"name":"p","match":{"prefixes_files":["'"$2"'"]},"out":"vpn"}'
     if [ -n "${3:-}" ]; then
         dl=""; for f in $(echo "$3" | tr ',' ' '); do dl="$dl${dl:+,}\"$f\""; done
-        ch="$ch"',{"name":"d","match":{"domains_files":['"$dl"'],"mode":"fakeip"},"out":"vpn"}'
+        ch="$ch"',{"name":"'"${4:-d}"'","match":{"domains_files":['"$dl"'],"mode":"fakeip"},"out":"vpn"}'
     fi
     printf '{"schema":1,"from_default":["127.0.0.0/8"],"outputs":{"direct":{"kind":"direct"},'\
 '"vpn":{"kind":"interface","device":"lo"}},"channels":[%s]}\n' "$ch" > "$tmp/$1"
@@ -496,7 +496,7 @@ if [ "${CTLMATCH_INNER:-}" = 1 ] && [ -n "$real_nft" ] && ip link set lo up 2>/d
    "$real_nft" add table inet ctlmatch_probe 2>/dev/null; then
     "$real_nft" delete table inet ctlmatch_probe
     serve 1
-    spec D.json "$tmp/p1.lst" "$tmp/d1.lst"
+    spec D.json "$tmp/p1.lst" "$tmp/d1.lst" "Мои сайты"
     r="$(ctl apply < "$tmp/D.json")"
     check "apply при включённом движке: применена" "0 true true" \
         "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j saved) $(printf '%s' "$r" | j applied)"
@@ -571,6 +571,8 @@ ipv6 udp 41001 vpn - cnt" "$(printf '%s\n' "$out" | grep -v '^total')"
     DNSD=$!
     wait_for '[ -s "$tmp/state/dnsd.sig" ]' 5
     # dns-log: запросы по UDP и по TCP, регистр имени не важен; имя мимо каналов — channel null.
+    # Канал назван кириллицей: имя правила печатается UTF-8, а не байтами \u00XX (журнал имён
+    # splify2 показывал его как «ÐÐ¾Ð¸ ÑÐ°Ð¹ÑÑ»).
     wait_for '[ -S "$tmp/state/dnsd.sock" ]' 5
     cat > "$tmp/q.py" <<'PY'
 import socket, struct, sys, time
@@ -595,7 +597,7 @@ PY
     check "dns-log: код 0, резолвер работает" "0 true" \
         "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j stdout | j running)"
     check "  имена с каналом, выходом и счётчиком (UDP и TCP вместе)" \
-"example.com d vpn 3
+"example.com Мои сайты vpn 3
 nomatch.test null null 1
 only-tcp.test null null 1" \
         "$(printf '%s' "$r" | j stdout | python3 -c 'import json,sys; [print(n["name"], n["channel"] or "null", n["out"] or "null", n["count"]) for n in sorted(json.load(sys.stdin)["names"], key=lambda n: n["name"])]')"
@@ -612,7 +614,7 @@ only-tcp.test null null 1" \
     sleep 0.5
     check "  резолвер жив и перечитал списки" "yes 2" \
         "$(kill -0 $DNSD 2>/dev/null && echo yes || echo no) $(grep -c 'channel .*rule(s)' "$tmp/dnsd.err")"
-    spec D3.json "$tmp/p1.lst" "$tmp/d1.lst,$tmp/d2.lst"
+    spec D3.json "$tmp/p1.lst" "$tmp/d1.lst,$tmp/d2.lst" "Мои сайты"
     r="$(ctl apply < "$tmp/D3.json")"
     check "apply со сменой состава доменных каналов: резолверу перезапуск" "0 restart" \
         "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j reload.dnsd)"
