@@ -1326,7 +1326,12 @@ static void srv_spec_changed(struct ctl_srv *s, const char *by, int enabled,
     struct supd_changes ch;
     memset(&ch, 0, sizeof(ch));
     struct cbuf cj = {0};
+    /* Правила прежней спеки — до замены в памяти: у правила, которому сменили выход, соединения
+     * прежнего выхода снимаются (conns.c, reroute_evict). Только когда в ядро ушёл новый набор
+     * правил: без него маршрут соединений не менялся. */
+    struct rr_snap *rr = d && d->ruleset && s->d.have ? reroute_snap(s->d.sp) : NULL;
     if (steerd_load(&s->d) == 0) {
+        if (rr) reroute_evict(rr, s->d.sp, s->d.gr);
         supd_spec_changed(s->d.sup, &ch, d && d->ruleset);
         changed_json(&cj, d, &ch);
         struct cbuf f = {0};
@@ -1346,6 +1351,7 @@ static void srv_spec_changed(struct ctl_srv *s, const char *by, int enabled,
     }
     if (changed && cj.p) cb_put(changed, cj.p, cj.n);
     free(cj.p);
+    reroute_snap_free(rr);
     supd_changes_free(&ch);
     /* После watchd_spec_changed: включённый сейчас сторож проходит сразу, а не через успокоение. */
     srv_set_enabled(s, enabled);

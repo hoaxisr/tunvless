@@ -214,6 +214,8 @@ struct ctnl_evict_ctx {
     uint32_t val, mask;
     uint32_t *seq;
     int evicted;
+    ctnl_keep_fn keep;          /* NULL — снимать всё с меткой */
+    void *kctx;
 };
 
 /* Запись дампа при снятии: совпала по метке — снять отдельно, по исходному кортежу и CTA_ID. */
@@ -223,12 +225,26 @@ static int ctnl_evict_rec(const uint8_t *a, const uint8_t *end, uint8_t family, 
     if (!mv || (mv & x->mask) != x->val) return 0;
     const struct nlattr *tuple = ct_attr(a, end, CTA_TUPLE_ORIG);
     if (!tuple) return 0;
+    if (x->keep) {
+        /* Назначение исходного направления — то, по которому правило выбирало выход (у fake-IP —
+         * поддельный адрес: подмена переписывает только кортеж ответа). Записи без адреса не
+         * судим и не трогаем. */
+        size_t alen = family == AF_INET6 ? 16 : 4;
+        const struct nlattr *da = ct_attr_in(ct_attr_in(tuple, CTA_TUPLE_IP),
+                                             family == AF_INET6 ? CTA_IP_V6_DST : CTA_IP_V4_DST);
+        if (!da || da->nla_len < NLA_HDRLEN + alen) return 0;
+        if (x->keep(family, (const uint8_t *)da + NLA_HDRLEN, x->kctx)) return 0;
+    }
     x->evicted += ctnl_delete(x->xfd, family, ++*x->seq, tuple, ct_attr(a, end, CTA_ID),
                               ct_attr(a, end, CTA_ZONE));
     return 0;
 }
 
 int ctnl_evict_mark(uint32_t val, uint32_t mask) {
+    return ctnl_evict_mark_keep(val, mask, NULL, NULL);
+}
+
+int ctnl_evict_mark_keep(uint32_t val, uint32_t mask, ctnl_keep_fn keep, void *kctx) {
     /* Нулевое значение совпало бы с каждой записью без метки — то есть со всем чужим. Метка
      * выхода нулём не бывает; защита от ошибки вызывающего, а не от ядра. */
     if (!val || (val & ~mask)) return 0;
@@ -238,7 +254,7 @@ int ctnl_evict_mark(uint32_t val, uint32_t mask) {
     if (dfd >= 0 && xfd >= 0 && buf) {
         static const uint8_t fam[] = { AF_INET, AF_INET6 };
         uint32_t seq = (uint32_t)time(NULL);
-        struct ctnl_evict_ctx x = { xfd, val, mask, &seq, 0 };
+        struct ctnl_evict_ctx x = { xfd, val, mask, &seq, 0, keep, kctx };
         total = 0;
         for (size_t i = 0; i < sizeof(fam); i++) {
             /* 1 (фильтр отвергнут: меток у ядра нет) — снимать в этом семействе нечего, и

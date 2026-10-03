@@ -77,6 +77,13 @@ int explain_emit(const struct spec *sp, const struct groups *gr, const char *wha
  * ctnetlink, что у ctnl.c; журнал имён работающего резолвера отдаёт сам резолвер, dlog.c. Оба
  * печатают в поток: подкоманда — в stdout, демон — в память (src/daemon/ctl.c). */
 int ctnl_conns_print(FILE *out);
+/* Смена выхода правил (apply, reload): снимок правил прежней спеки — до замены её в памяти, и
+ * снятие соединений, которые прежний выход изменившегося правила держал бы дальше (conns.c). */
+struct rr_snap;
+struct groups;
+struct rr_snap *reroute_snap(const struct spec *sp);
+void reroute_evict(const struct rr_snap *old, const struct spec *sp, const struct groups *gr);
+void reroute_snap_free(struct rr_snap *s);
 int dlog_print(FILE *out);
 
 int cmd_apply(const char *spec, int dry);

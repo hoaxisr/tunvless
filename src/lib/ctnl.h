@@ -24,4 +24,10 @@ int ctnl_dump(int dfd, uint8_t family, int filter, uint32_t val, uint32_t mask,
 
 uint32_t ct_mark_of(const uint8_t *a, const uint8_t *end);
 
+/* Снять записи с (метка & mask) == val, кроме тех, чьё назначение исходного направления keep
+ * оставляет (1 — оставить; dst — 4 или 16 байт в порядке сети по семейству). Возврат — как у
+ * ctnl_evict_mark (spec.h): сколько снято или -1. */
+typedef int (*ctnl_keep_fn)(uint8_t family, const uint8_t *dst, void *ctx);
+int ctnl_evict_mark_keep(uint32_t val, uint32_t mask, ctnl_keep_fn keep, void *kctx);
+
 #endif

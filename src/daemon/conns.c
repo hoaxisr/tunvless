@@ -1,6 +1,11 @@
 #include "ctnl.h"
 #include "jsonw.h"
 #include "spec.h"
+#include "groups.h"
+#include "nftdump.h"
+#include "daemon.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
@@ -243,4 +248,303 @@ int ctnl_conns_print(FILE *out) {
             mem ? mem : "", x.shown, x.total, x.total > x.shown ? "true" : "false");
     free(mem);
     return 0;
+}
+
+/* ---- смена выхода правила: соединения прежнего выхода снимаются (apply, reload) ------------
+ *
+ * ЗАЧЕМ. Метка выхода пишется в метку соединения (`ct mark set mark`), и по ней решают не только
+ * маршрут, но и липкость: цепочка balance ведёт соединение, у которого метка — один из её
+ * членов, к тому же члену (src/compile/balance.c). Правило перевели с выхода A на группу
+ * balance, в которой A — член, — и установленные соединения правила остаются на A до своего
+ * конца, а новые идут по раздаче: один сеанс сайта с двух-трёх внешних адресов (живой роутер,
+ * 2026-10-03: 29 соединений Discord и Google на прежнем выходе через 25 минут после apply,
+ * YouTube — «подозрительный трафик из вашей сети»). Без липкости не лучше: пакет установленного
+ * соединения получает новую метку и уходит в другое устройство с подменой адреса, выбранной ещё
+ * для прежнего, — сервер такого соединения не знает. Снятая запись conntrack заводится заново по
+ * новым правилам: следующий пакет идёт новым путём, сервер отвечает сбросом, приложение
+ * соединяется заново уже через новый выход.
+ *
+ * ЧТО СНИМАЕТСЯ. Правило узнаётся по имени (без имени — по номеру). Изменилось — выход у правила
+ * другой, правило снято или выключено. Метки прежнего выхода такого правила — его метка и, у
+ * группы balance, метки членов (они и пишутся в соединение). Метка, которую не держит ни одно
+ * неизменившееся правило, снимается целиком. Метку держит и неизменившееся правило — тогда
+ * снимаются только записи, чьё назначение не лежит ни в одном наборе групп, ведущих в выход с
+ * этой меткой (наборы новых правил из ядра, после nft -f: у fake-IP — поддельные адреса
+ * резолвера); у такой группы нет набора («весь трафик») или наборы не прочитать — снимается
+ * целиком. Привязка выхода сторожем (failover.c, bind_device) — отдельный случай: там правило то
+ * же, меняется устройство. */
+
+#define LOG_I "steer[info] ctl: "
+
+struct rr_rule {
+    char key[40];
+    char out[32];
+    unsigned *marks;
+    size_t marks_n;
+};
+
+struct rr_snap {
+    struct rr_rule *r;
+    size_t n;
+};
+
+static int rr_mark_add(unsigned **v, size_t *n, unsigned m) {
+    if (!m) return 0;
+    for (size_t i = 0; i < *n; i++) if ((*v)[i] == m) return 0;
+    unsigned *nv = realloc(*v, (*n + 1) * sizeof(**v));
+    if (!nv) return -1;
+    nv[(*n)++] = m;
+    *v = nv;
+    return 0;
+}
+
+/* Метки, которые соединение через выход o может нести: свою и, у balance, — членов (вглубь). */
+static int rr_marks_of(const struct spec *sp, const struct output *o, unsigned **v, size_t *n,
+                       int depth) {
+    if (!o || depth > 16) return 0;
+    if (out_needs_mark(o) && rr_mark_add(v, n, o->mark & STEER_MARK_MASK) < 0) return -1;
+    if (out_group(o) && o->grp.pick == PICK_BALANCE)
+        for (size_t i = 0; i < o->grp.members_n; i++)
+            if (rr_marks_of(sp, spec_out(sp, o->grp.members[i]), v, n, depth + 1) < 0) return -1;
+    return 0;
+}
+
+static void rr_key(const struct spec *sp, size_t i, char *dst, size_t n) {
+    if (sp->rule[i].name[0]) snprintf(dst, n, "n:%s", sp->rule[i].name);
+    else snprintf(dst, n, "#%zu", i);
+}
+
+void reroute_snap_free(struct rr_snap *s) {
+    if (!s) return;
+    for (size_t i = 0; i < s->n; i++) free(s->r[i].marks);
+    free(s->r);
+    free(s);
+}
+
+struct rr_snap *reroute_snap(const struct spec *sp) {
+    if (!sp) return NULL;
+    struct rr_snap *s = calloc(1, sizeof(*s));
+    if (!s) return NULL;
+    s->r = calloc(sp->rule_n ? sp->rule_n : 1, sizeof(*s->r));
+    if (!s->r) { free(s); return NULL; }
+    for (size_t i = 0; i < sp->rule_n; i++) {
+        const struct spec_rule *ru = &sp->rule[i];
+        if (ru->disabled || ru->out < 0) continue;
+        const struct output *o = spec_out(sp, (size_t)ru->out);
+        if (!o) continue;
+        struct rr_rule *r = &s->r[s->n];
+        rr_key(sp, i, r->key, sizeof(r->key));
+        snprintf(r->out, sizeof(r->out), "%s", o->name);
+        if (rr_marks_of(sp, o, &r->marks, &r->marks_n, 0) < 0) { reroute_snap_free(s); return NULL; }
+        s->n++;
+    }
+    return s;
+}
+
+/* Интервалы назначений из наборов ядра, отсортированные по началу; конец включительно. */
+struct rr_iv { uint8_t lo[16], hi[16]; };
+struct rr_ivs {
+    struct rr_iv *v4, *v6;
+    size_t n4, n6, c4, c6;
+    int bad;
+};
+
+/* Элементы одного набора, как отдаёт ядро: начала и концы (флаг INTERVAL_END, конец — первый
+ * адрес ПОСЛЕ диапазона) порознь; пары собираются после дампа. */
+struct rr_raw { uint8_t k[16]; int end; };
+struct rr_rawset { struct rr_raw *e; size_t n, cap; size_t alen; int bad; };
+
+static void rr_raw_elem(void *arg, const struct nfd_elem *e) {
+    struct rr_rawset *r = arg;
+    if (e->klen != r->alen || e->key_end) { r->bad = 1; return; }  /* не адрес одного поля */
+    if (r->n == r->cap) {
+        size_t nc = r->cap ? r->cap * 2 : 64;
+        struct rr_raw *ne = realloc(r->e, nc * sizeof(*ne));
+        if (!ne) { r->bad = 1; return; }
+        r->e = ne;
+        r->cap = nc;
+    }
+    memset(r->e[r->n].k, 0, 16);
+    memcpy(r->e[r->n].k, e->key, r->alen);
+    r->e[r->n].end = (e->flags & 1u) != 0;     /* NFT_SET_ELEM_INTERVAL_END */
+    r->n++;
+}
+
+static void rr_raw_reset(void *arg) {
+    struct rr_rawset *r = arg;
+    r->n = 0;
+    r->bad = 0;
+}
+
+static int rr_raw_cmp(const void *a, const void *b) {
+    const struct rr_raw *x = a, *y = b;
+    int c = memcmp(x->k, y->k, 16);
+    if (c) return c;
+    return y->end - x->end;                    /* конец прежнего диапазона — раньше начала */
+}
+
+static int rr_iv_cmp(const void *a, const void *b) {
+    return memcmp(((const struct rr_iv *)a)->lo, ((const struct rr_iv *)b)->lo, 16);
+}
+
+static void rr_dec(uint8_t *k, size_t alen) {
+    for (size_t i = alen; i-- > 0;) if (k[i]-- != 0) break;
+}
+
+static int rr_iv_push(struct rr_ivs *iv, int v6, const uint8_t *lo, const uint8_t *hi) {
+    struct rr_iv **v = v6 ? &iv->v6 : &iv->v4;
+    size_t *n = v6 ? &iv->n6 : &iv->n4, *c = v6 ? &iv->c6 : &iv->c4;
+    if (*n == *c) {
+        size_t nc = *c ? *c * 2 : 64;
+        struct rr_iv *nv = realloc(*v, nc * sizeof(*nv));
+        if (!nv) return -1;
+        *v = nv;
+        *c = nc;
+    }
+    memcpy((*v)[*n].lo, lo, 16);
+    memcpy((*v)[*n].hi, hi, 16);
+    (*n)++;
+    return 0;
+}
+
+/* Набор name (семейство по alen) — в интервалы. 0 — прочитан или его нет; -1 — не прочитать. */
+static int rr_load_set(struct rr_ivs *iv, const char *name, size_t alen) {
+    struct rr_rawset r = { NULL, 0, 0, alen, 0 };
+    int stable = 0, rc = 0;
+    for (int tries = 0; !stable; tries++) {
+        if (tries == 3) { rc = -1; break; }
+        rr_raw_reset(&r);
+        int e = nfd_set_elems(NFD_INET, nft_table(), name, rr_raw_elem, rr_raw_reset, &r, &stable);
+        if (e == ENOENT) { free(r.e); return 0; }
+        if (e != 0) { rc = -1; break; }
+    }
+    if (rc == 0 && r.bad) rc = -1;
+    if (rc == 0) {
+        qsort(r.e, r.n, sizeof(*r.e), rr_raw_cmp);
+        int has_end = 0;
+        for (size_t i = 0; i < r.n; i++) has_end |= r.e[i].end;
+        uint8_t max[16];
+        memset(max, 0, 16);
+        memset(max, 0xff, alen);
+        for (size_t i = 0; i < r.n && rc == 0; i++) {
+            if (r.e[i].end) continue;
+            if (!has_end) { rc = rr_iv_push(iv, alen == 16, r.e[i].k, r.e[i].k); continue; }
+            /* Начало интервального набора: конец — следующий элемент с флагом конца; нет его —
+             * диапазон до последнего адреса. */
+            uint8_t hi[16];
+            if (i + 1 < r.n && r.e[i + 1].end) {
+                memcpy(hi, r.e[i + 1].k, 16);
+                rr_dec(hi, alen);
+            } else {
+                memcpy(hi, max, 16);
+            }
+            rc = rr_iv_push(iv, alen == 16, r.e[i].k, hi);
+        }
+    }
+    free(r.e);
+    return rc;
+}
+
+static int rr_keep(uint8_t family, const uint8_t *dst, void *ctx) {
+    const struct rr_ivs *iv = ctx;
+    int v6 = family == AF_INET6;
+    size_t alen = v6 ? 16 : 4, n = v6 ? iv->n6 : iv->n4;
+    const struct rr_iv *v = v6 ? iv->v6 : iv->v4;
+    uint8_t k[16];
+    memset(k, 0, 16);
+    memcpy(k, dst, alen);
+    /* Последний интервал с началом не больше адреса — и адрес не дальше его конца. Интервалы
+     * разных наборов могут перекрываться, поэтому — назад, пока начало не больше адреса. */
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (memcmp(v[mid].lo, k, 16) <= 0) lo = mid + 1; else hi = mid;
+    }
+    for (size_t i = lo; i-- > 0;)
+        if (memcmp(v[i].hi, k, 16) >= 0) return 1;
+    return 0;
+}
+
+/* Снятие для одной метки, которую держат и неизменившиеся правила: оставить записи с
+ * назначением в наборах групп, ведущих в выход с этой меткой. 0 — снято по наборам; -1 — по
+ * наборам нельзя (группа без набора, набор не прочитан): вызывающий снимает целиком. */
+static int rr_evict_filtered(const struct spec *sp, const struct groups *gr, unsigned mark,
+                             int *evicted) {
+    struct rr_ivs iv;
+    memset(&iv, 0, sizeof(iv));
+    int rc = 0, any = 0;
+    for (size_t i = 0; i < gr->n && rc == 0; i++) {
+        const struct group *g = &gr->g[i];
+        const struct output *o = out_by_name(sp, g->out);
+        unsigned *m = NULL;
+        size_t mn = 0;
+        if (rr_marks_of(sp, o, &m, &mn, 0) < 0) rc = -1;
+        int hit = 0;
+        for (size_t k = 0; k < mn; k++) hit |= m[k] == mark;
+        free(m);
+        if (rc || !hit) continue;
+        any = 1;
+        if (!group_has_set(g)) { rc = -1; break; }
+        char s6[80];
+        group_set6_name(g, s6, sizeof(s6));
+        if (rr_load_set(&iv, g->name, 4) < 0 || rr_load_set(&iv, s6, 16) < 0) rc = -1;
+    }
+    if (rc == 0 && !any) rc = -1;
+    if (rc == 0) {
+        qsort(iv.v4, iv.n4, sizeof(*iv.v4), rr_iv_cmp);
+        qsort(iv.v6, iv.n6, sizeof(*iv.v6), rr_iv_cmp);
+        *evicted = ctnl_evict_mark_keep(mark, STEER_MARK_MASK, rr_keep, &iv);
+        if (*evicted < 0) rc = -1;
+    }
+    free(iv.v4);
+    free(iv.v6);
+    return rc;
+}
+
+void reroute_evict(const struct rr_snap *old, const struct spec *sp, const struct groups *gr) {
+    if (!old || !sp || !gr) return;
+    struct rr_snap *now = reroute_snap(sp);
+    if (!now) return;
+    unsigned *cand = NULL, *pin = NULL;
+    size_t cand_n = 0, pin_n = 0;
+    char names[512] = "";
+    size_t nl = 0;
+    int oom = 0;
+    for (size_t i = 0; i < old->n && !oom; i++) {
+        const struct rr_rule *r = &old->r[i];
+        const struct rr_rule *nr = NULL;
+        for (size_t k = 0; k < now->n; k++)
+            if (!strcmp(now->r[k].key, r->key)) { nr = &now->r[k]; break; }
+        if (nr && !strcmp(nr->out, r->out)) {
+            /* Правило то же — его выход держит свои метки (в новой спеке). */
+            for (size_t k = 0; k < nr->marks_n && !oom; k++)
+                oom = rr_mark_add(&pin, &pin_n, nr->marks[k]) < 0;
+            continue;
+        }
+        for (size_t k = 0; k < r->marks_n && !oom; k++)
+            oom = rr_mark_add(&cand, &cand_n, r->marks[k]) < 0;
+        if (nl < sizeof(names) - 1)
+            nl += (size_t)snprintf(names + nl, sizeof(names) - nl, "%s%s → %s", nl ? ", " : "",
+                                   r->key[0] == 'n' ? r->key + 2 : r->key, nr ? nr->out : "—");
+        if (nl >= sizeof(names)) nl = sizeof(names) - 1;
+    }
+    for (size_t i = 0; i < cand_n && !oom; i++) {
+        unsigned m = cand[i];
+        int pinned = 0, n = -1;
+        for (size_t k = 0; k < pin_n; k++) pinned |= pin[k] == m;
+        const char *how = "целиком";
+        if (pinned && rr_evict_filtered(sp, gr, m, &n) == 0) how = "по наборам";
+        else n = ctnl_evict_mark(m, STEER_MARK_MASK);
+        if (n < 0) {
+            conntrack_evict(m);               /* запасной путь — внешний conntrack */
+            fprintf(stderr, LOG_I "смена выхода правил (%s): соединения метки 0x%08x сняты "
+                            "внешним conntrack\n", names, m);
+        } else if (n > 0) {
+            fprintf(stderr, LOG_I "смена выхода правил (%s): снято соединений метки 0x%08x — %d "
+                            "(%s)\n", names, m, n, how);
+        }
+    }
+    free(cand);
+    free(pin);
+    reroute_snap_free(now);
 }
