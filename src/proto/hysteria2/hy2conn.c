@@ -281,7 +281,10 @@ static void make_cfg(const struct hy2_node *n, const char *ip, struct qc_cfg *c,
     memset(c, 0, sizeof *c);
     c->host = ip;
     c->port = n->port;
-    c->sni = n->sni[0] ? n->sni : NULL;
+    /* Без sni имя сертификата сверяется с хостом узла — и с адресом тоже: у адреса SNI не уходит, а
+     * проверка идёт по SAN IP (qcssl_new), как у эталона (Go кладёт хост в ServerName). Прежде при
+     * адресе без sni имени не сверял никто, и годился сертификат любого имени от признанного корня. */
+    c->sni = n->sni[0] ? n->sni : n->host[0] ? n->host : NULL;
     c->alpn = "h3";
     c->insecure = n->insecure;
     if (n->has_pin) c->pin_sha256 = n->pin;

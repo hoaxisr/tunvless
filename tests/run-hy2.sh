@@ -107,7 +107,7 @@ start_server() {
     stop_server
     {
         echo "listen: $SIP:4433"
-        echo "tls: { cert: $WORK/cert.pem, key: $WORK/key.pem }"
+        echo "tls: { cert: $WORK/cert.pem, key: $WORK/key.pem${TLS_EXTRA:-} }"
         echo "auth: { type: password, password: hunter2 }"
         [ -n "${1:-}" ] && printf '%s\n' "$1"
     } > "$WORK/server.yaml"
@@ -272,6 +272,39 @@ case "$out" in *"QUIC не открылся"*) fail=$((fail + 1)); echo "  FAIL 
 write_sub "hysteria2://hunter2@$SIP:4433/?sni=$SIP&alpn=h3&pinSHA256=$PIN#ippin"
 out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
 contains "sni=адрес и pinSHA256: узел принят" "$out" '"ok":true'
+# Хост — адрес, sni нет: имя сверяется с адресом (SAN IP), как у эталона (Go кладёт хост в ServerName,
+# адрес в нём — проверка по SAN IP). Прежде без sni у адреса имени не проверял никто, и годился
+# сертификат любого имени, подписанный признанным корнем. Корни — свой файл поверх системного в своём
+# пространстве монтирования: иначе проверку имени не отличить от отказа цепочки.
+modca() {  # ФАЙЛ_КОРНЕЙ АРГУМЕНТЫ...
+    _ca="$1"; shift
+    ip netns exec "$NSC" unshare -m sh -c 'mount --bind "$0" /etc/ssl/certs/ca-certificates.crt && shift && exec "$@"' \
+        "$_ca" x env LD_LIBRARY_PATH="$LIBS" "$MOD" "$@"
+}
+if [ -f /etc/ssl/certs/ca-certificates.crt ] && command -v unshare >/dev/null 2>&1; then
+    cp "$WORK/cert.pem" "$WORK/cert-ip.pem"; cp "$WORK/key.pem" "$WORK/key-ip.pem"
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 \
+        -keyout "$WORK/key.pem" -out "$WORK/cert.pem" -subj "/CN=hy2.test" \
+        -addext "subjectAltName=DNS:hy2.test" >/dev/null 2>&1
+    # sniGuard сервера apernet по умолчанию закрывает соединение без SNI к сертификату на одно имя, — и
+    # отказ пришёл бы от сервера, а не от проверки клиента.
+    TLS_EXTRA=", sniGuard: disable"
+    start_server "" || exit 1
+    write_sub "hysteria2://hunter2@$SIP:4433/#ipnosni"
+    out="$(modca "$WORK/cert.pem" hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+    contains "адрес без sni, в сертификате только имя: отказ" "$out" '"ok":false'
+    write_sub "hysteria2://hunter2@$SIP:4433/?sni=hy2.test#dnsni"
+    out="$(modca "$WORK/cert.pem" hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+    contains "  тот же сервер с sni=hy2.test: принят (корни из своего файла)" "$out" '"ok":true'
+    cp "$WORK/cert-ip.pem" "$WORK/cert.pem"; cp "$WORK/key-ip.pem" "$WORK/key.pem"
+    start_server "" || exit 1
+    TLS_EXTRA=""
+    write_sub "hysteria2://hunter2@$SIP:4433/#ipsan"
+    out="$(modca "$WORK/cert.pem" hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+    contains "адрес без sni, адрес в SAN IP: принят" "$out" '"ok":true'
+else
+    echo "  пропуск: нет /etc/ssl/certs/ca-certificates.crt или unshare — проверка имени по адресу"
+fi
 
 # ---- 5. режим перегрузки ------------------------------------------------------------------------
 echo "5. режим перегрузки"
