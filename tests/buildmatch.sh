@@ -1067,6 +1067,16 @@ check "разбор спеки: urltest_reader_only отдаёт libsteer (мо�
 check "разбор спеки: единственная слабая ссылка model/kinds на символ urltls — в grpurl.c" "1" \
     "$(grep -rl 'steer_urltls_present' src/model src/kinds src/compile src/cli | wc -l | tr -d ' ')"
 
+# ---- экспорт для модулей вне дерева ----------------------------------------------------------------
+# Символы build/exports-ext.lst (нужды steer-box-connector и других внешних модулей) обязаны стоять в
+# libsteer.map: gen кладёт их туда сам, но правка карты руками или gen без списка молча убрали бы
+# символ, которым ядро само не пользуется, — и внешний модуль перестал бы компоноваться.
+ext_missing=""
+for sym in $(grep -v '^#' build/exports-ext.lst | grep -v '^$'); do
+    grep -qx "    $sym;" build/libsteer.map || ext_missing="$ext_missing $sym"
+done
+check "exports-ext.lst: каждый символ экспортируется libsteer.map" "" "$ext_missing"
+
 # ---- список изменений выпуска ---------------------------------------------------------------
 # release.yml берёт текст «что нового» из раздела «## <VERSION>» файла CHANGELOG.md, и стабильный
 # выпуск без него не выходит. Поднятая VERSION без раздела ловится здесь, а не на кнопке выпуска.
