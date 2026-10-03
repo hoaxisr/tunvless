@@ -540,7 +540,12 @@ check "  у провайдера ни одного пакета (отправл�
 # привязана, а apply-commit ещё идёт: назад стражем быстрее 300 мс, без второго «привязываю
 # заново», у провайдера ни одного пакета.
 sleep 6
-printf '#!/bin/sh\nsleep 0.6\nexec %s "$@"\n' "$real_nft" > "$tmp/bin/nft"
+# Загрузка набора правил (`nft -f`) у детей ждёт файла nft.go, а не срока: на нагруженной машине
+# 0,6 с сна могли кончиться раньше, чем стенд дождётся привязки и снимет правила, и «сверка ещё
+# идёт» было неправдой (68/69 через раз). Остальные вызовы nft — медленные, как прежде.
+rm -f "$tmp/nft.go"
+printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = -f ] && { i=0; while [ ! -e %s ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i + 1)); done; }; done\nsleep 0.6\nexec %s "$@"\n' \
+    "$tmp/nft.go" "$real_nft" > "$tmp/bin/nft"
 chmod +x "$tmp/bin/nft"
 TW="$("$real_ip" rule show | grep "fwmark 0x$MW/" | head -n 1 | sed -n 's/.*lookup \([^ ]*\).*/\1/p')"
 W0="$(cnt "$IW" real)" W6="$(cnt "$IW" real6)"
@@ -565,6 +570,7 @@ t0="$(now_ms)"
 wait_for '[ "$(ours)" = 1 ] && [ "$(ours6)" = 1 ]' 10
 msr=$(( $(now_ms) - t0 ))
 echo "     (правила назад через $msr мс после снятия посреди сверки)"
+touch "$tmp/nft.go"
 check "A9: правила сняты, пока apply-commit сверки ещё идёт" "yes" "$busy"
 check "  правила обоих семейств назад быстрее 300 мс — стражем, а не сверкой" "yes yes" \
     "$([ "$(ours)" = 1 ] && [ "$(ours6)" = 1 ] && [ $msr -lt 300 ] && echo yes || echo "no:$msr ms") $([ "$(grep -c 'сняты снаружи — возвращены: wg' "$tmp/d7.err")" -gt "$nr0" ] && echo yes || echo no)"
