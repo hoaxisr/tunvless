@@ -756,7 +756,13 @@ static void help_all(FILE *out) {
         if (!cmd_here(&CMDS[i])) {
             /* Команда названа даже там, где её нет. «Неизвестная команда» на steer vless
              * заставила бы искать опечатку вместо того, чтобы поставить нужный пакет. */
-            if (CMDS[i].ext && !CMDS[i].srv) { fputs(" [steer-extended]", out); missing = 1; }
+            /* Пакет — модуль, в котором команда живёт (steer-vless, steer-hysteria2…), а не
+             * прежний steer-extended: с 2.0 ядро и модули — отдельные пакеты. */
+            if (CMDS[i].ext && !CMDS[i].srv) {
+                const char *m = steer_cmd_module(CMDS[i].name);
+                fprintf(out, " [%s]", m ? m : "steer-extended");
+                missing = 1;
+            }
             /* Хаб — не «другой пакет для роутера», а другой артефакт: архив для VPS. Маркер
              * поэтому свой, иначе человека послали бы ставить steer-extended туда, где он не
              * поможет. */
@@ -774,8 +780,8 @@ static void help_all(FILE *out) {
           "Подробности по команде: steer help apply   (то же самое: steer apply --help)\n",
           plat()->name, plat_names());
     if (missing)
-        fputs("\nЭто базовая сборка: команды, помеченные [steer-extended], откажутся работать.\n"
-              "VLESS/Reality есть в пакете steer-extended — он ставится вместо этого и умеет всё то же.\n"
+        fputs("\nКоманды с пометкой [steer-…] живут в модулях ядра: заработают, когда рядом встанет\n"
+              "пакет этого модуля той же версии, что steer-core.\n"
               "Помеченное [steer-hub] живёт в архиве для VPS: на роутере хабу делать нечего.\n", out);
 }
 
@@ -795,8 +801,11 @@ static void help_cmd(FILE *out, const struct cli_cmd *c) {
     if (cmd_here(c)) return;
     if (c->srv)
         fputs("\nВ этой сборке команды нет: хаб ставится на VPS из архива steer-hub.\n", out);
-    else if (c->ext)
-        fputs("\nВ этой сборке команды нет: нужен пакет steer-extended.\n", out);
+    else if (c->ext) {
+        const char *m = steer_cmd_module(c->name);
+        fprintf(out, "\nКоманда живёт в модуле: нужен пакет %s той же версии, что steer-core.\n",
+                m ? m : "steer-extended");
+    }
 }
 
 void cli_help(FILE *out, const struct cli_cmd *cmd) {
