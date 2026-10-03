@@ -1196,7 +1196,7 @@ static int p_dns_up(struct v2 *x, const struct ynode *val, const char *where, co
              * (zapret, tgws, группа) метке некуда вести. */
             if (strcmp(out_kind_name(&s->out[oi]), "direct") != 0)
                 return fail(x, on, "%s: выход «%s» (kind=%s) без своего устройства — запрос "
-                            "к DNS нельзя направить через него; нужен interface, awg, vless или "
+                            "к DNS нельзя направить через него; нужен interface, awg, tunnel или "
                             "xsteer, либо direct", w, sv, out_kind_name(&s->out[oi]));
             oi = -1;
         }
