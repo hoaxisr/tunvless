@@ -1920,7 +1920,7 @@ check "ipv6 nat: masquerade IPv6 своей цепочкой — на оба в�
 check "ipv6 nat: цепочка — nat на srcnat" "1" \
     "$(chain_of "$h6n" postrouting_nat6 | grep -c 'type nat hook postrouting priority srcnat; policy accept;')"
 check "ipv6 nat: набора v6donor и отказов по источнику нет" "0" "$(printf '%s\n' "$h6n" | grep -c 'v6donor')"
-h6nl="$(STEER_NFT_COMPAT=legacy "$BIN" apply --dry-run --spec "$tmp/h6n.yaml" $H6 2>/dev/null)"
+h6nl="$(STEER_NFT_COMPAT=legacy STEER_NFT_IP6NAT=1 "$BIN" apply --dry-run --spec "$tmp/h6n.yaml" $H6 2>/dev/null)"
 check "ipv6 nat, старое ядро: masquerade — в ip6 postrouting_nat" "2" \
     "$(printf '%s\n' "$h6nl" | sed -n '/^table ip6 /,/^}/p' | grep -c 'oifname "wg[12]" counter masquerade comment "steer-nat6:')"
 h6spec "$tmp/h6o.yaml" ', ipv6: off' ''

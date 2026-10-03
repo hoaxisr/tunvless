@@ -64,7 +64,13 @@ static int nft_nat_probe(const char *fam) {
  * Номер версии здесь не ответ — ответ даёт только ядро. */
 static int nft_legacy_extras(void) {
     int r = 0;
-    if (nft_nat_probe("ip6") == 1) r |= NFTC_IP6NAT;
+    /* STEER_NFT_IP6NAT (0 или 1) переопределяет пробу для стендов, как STEER_NFT_CONCAT ниже:
+     * `nft -c` без root (сборка в GitHub Actions) отвечает «не умеет», и раскладка для старого
+     * ядра на стенде теряла таблицу ip6 — на роутере проба идёт от root и отвечает верно. */
+    const char *o6 = getenv("STEER_NFT_IP6NAT");
+    if (o6 && (!strcmp(o6, "0") || !strcmp(o6, "1"))) {
+        if (*o6 == '1') r |= NFTC_IP6NAT;
+    } else if (nft_nat_probe("ip6") == 1) r |= NFTC_IP6NAT;
     char text[256];
     snprintf(text, sizeof(text),
              "table inet %s_nprobe {\n"
