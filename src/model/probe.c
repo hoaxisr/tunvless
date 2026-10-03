@@ -32,7 +32,8 @@ void probe_report(const char *out_name, enum probe_state st, int node, int total
     FILE *f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "%s %d %d %ld %ld\n",
-            st == PROBE_RUNNING ? "probing" : st == PROBE_NO_SUCH_NODE ? "nonode" : "failed",
+            st == PROBE_RUNNING ? "probing" : st == PROBE_NO_SUCH_NODE ? "nonode"
+            : st == PROBE_ALL_EXCLUDED ? "excluded" : "failed",
             node, total, (long)getpid(), (long)time(NULL));
     fclose(f);
 }
@@ -145,6 +146,7 @@ static int probe_env(const char *out_name, struct probe_status *st) {
             st->state = !strcmp(word, "probing") ? PROBE_RUNNING
                       : !strcmp(word, "failed")  ? PROBE_FAILED
                       : !strcmp(word, "nonode")  ? PROBE_NO_SUCH_NODE
+                      : !strcmp(word, "excluded") ? PROBE_ALL_EXCLUDED
                       : !strcmp(word, "lost")    ? PROBE_LOST : PROBE_NONE;
             if (st->state == PROBE_NONE) st->node = st->total = 0;
             if (st->state == PROBE_LOST) {
@@ -186,7 +188,7 @@ struct probe_status probe_read(const char *out_name) {
         out.total = total;
         return out;
     }
-    if (!strcmp(word, "failed") || !strcmp(word, "nonode")) {
+    if (!strcmp(word, "failed") || !strcmp(word, "nonode") || !strcmp(word, "excluded")) {
         /* А это переживает смерть процесса намеренно: клиент выходит с кодом 1 именно потому,
          * что ни один узел не ответил, и приговор нужен ПОСЛЕ него. Живёт, пока свеж.
          *
@@ -198,6 +200,9 @@ struct probe_status probe_read(const char *out_name) {
         if (!strcmp(word, "nonode")) {
             out.state = PROBE_NO_SUCH_NODE;
             out.node = node;
+        } else if (!strcmp(word, "excluded")) {
+            out.state = PROBE_ALL_EXCLUDED;
+            out.node = 0;
         } else {
             out.state = PROBE_FAILED;
             out.node = 0;

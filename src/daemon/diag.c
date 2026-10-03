@@ -995,6 +995,15 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
                 diag("output", "fail", what, why);
                 continue;
             }
+            if (pr.state == PROBE_ALL_EXCLUDED) {
+                snprintf(what, sizeof(what),
+                         "выход %.40s: все узлы-кандидаты (%d) исключены", sp->out[i].name, pr.total);
+                snprintf(why, sizeof(why),
+                         "exclude и exclude_name не оставили ни одного узла — уберите часть "
+                         "исключений или возьмите другой узел");
+                diag("output", "fail", what, why);
+                continue;
+            }
             if (pr.state == PROBE_FAILED) {
                 if (pr.total > 0)
                     snprintf(what, sizeof(what),

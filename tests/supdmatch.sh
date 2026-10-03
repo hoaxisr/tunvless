@@ -666,6 +666,7 @@ upline='{"ev":"up"}' downline='{"ev":"down","why":"стенд: отказ"}'
 case "\$1 \$2" in
 nfqws*) while :; do sleep 0.1; done ;;
 "vless vl") printf '{"ev":"node","n":2,"total":5}\n' >&9; while :; do sleep 0.1; done ;;
+"vless vx") printf '{"ev":"excluded","total":3}\n{"ev":"down","why":"все узлы-кандидаты исключены exclude"}\n' >&9; while :; do sleep 0.1; done ;;
 vless*) upline="{\"ev\":\"up\",\"watch\":1,\"dev\":\"\$2\"}" downline='{"ev":"down","why":"стенд: узел молчит"}' ;;
 xsteer*) upline="{\"ev\":\"up\",\"dev\":\"\$2\"}" ;;
 esac
@@ -696,6 +697,7 @@ H
  "zq":{"kind":"zapret","opts_file":"$W/zq.opts"},
  "zr":{"kind":"zapret","opts_file":"$W/zr.opts"},
  "vl":{"kind":"vless","sub_file":"$W/sub.txt","on_fail":"direct"},
+ "vx":{"kind":"vless","sub_file":"$W/sub.txt","on_fail":"direct"},
  "va":{"kind":"vless","sub_file":"$W/sub.txt","on_fail":"direct"},
  "vb":{"kind":"vless","sub_file":"$W/sub.txt","on_fail":"direct"},
  "vv":{"kind":"interface","devices":["va","vb"],"on_fail":"drop"}$wo},
@@ -735,6 +737,13 @@ EOF
     check "  steerd status мимо клиента — тот же ход перебора, от демона" \
         '{"state":"probing","node":2,"total":5}' \
         "$(STEER_SOCKET="$W/s.sock" "$XK" status --spec "$W/spec.json" --state-dir "$W/st" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["outputs"]["vl"].get("probe"), separators=(",", ":")))' 2>&1)"
+    # Все кандидаты исключены exclude (событие excluded клиента): своё состояние, а не failed —
+    # «в подписке нет пригодных узлов» было бы неправдой, узлы есть, их не велено брать.
+    check "  status: все кандидаты исключены — состояние excluded, не failed" \
+        '{"state":"excluded","total":3}' "$(wst '["outputs"]["vx"]["probe"]')"
+    check "  и в steerd status мимо клиента" \
+        '{"state":"excluded","total":3}' \
+        "$(STEER_SOCKET="$W/s.sock" "$XK" status --spec "$W/spec.json" --state-dir "$W/st" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["outputs"]["vx"].get("probe"), separators=(",", ":")))' 2>&1)"
     check "  helper xa — живое состояние клиента xsteer из памяти демона (xsteer-peers)" \
         "xsteer True True" \
         "$(wctl helper xa | python3 -c 'import json,sys; d=json.loads(json.load(sys.stdin)["stdout"]); print(d["helper"], d["running"], d["up"])' 2>&1)"

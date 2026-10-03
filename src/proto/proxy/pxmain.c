@@ -270,7 +270,8 @@ int cmd_proxy(const char *spec_path, const char *out_name) {
     size_t before = sel_n;
     sel_n = exclude_filter(o, nodes, sel, sel_n);
     if (!sel_n) {
-        px_probe_report(out_name, PROBE_FAILED, 0, 0);
+        px_probe_report(out_name, PROBE_ALL_EXCLUDED, 0, (int)before);
+        evline_emit("excluded", "total", EVLINE_INT, (long)before, (const char *)NULL);
         evline_emit("down", "why", EVLINE_STR, "все узлы-кандидаты исключены exclude", (const char *)NULL);
         fprintf(stderr, LOG_W2 "все %zu узлов-кандидатов исключены exclude или exclude_name — проверьте "
                         "исключение и подписку\n", before);

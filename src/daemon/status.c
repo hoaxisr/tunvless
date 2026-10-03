@@ -306,6 +306,10 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
                 /* Номер вне подписки — СВОЁ состояние, а не разновидность failed: интерфейс
                  * обязан уметь сказать «поправьте номер», а не «поменяйте подписку». Оба
                  * числа рядом, потому что порознь они ничего не значат. */
+                /* Все кандидаты исключены `exclude`/`exclude_name` — своё состояние: чинится в
+                 * «Не брать», а не подпиской. total — кандидатов до исключения. */
+                else if (pr.state == PROBE_ALL_EXCLUDED)
+                    fprintf(out, ",\"probe\":{\"state\":\"excluded\",\"total\":%d}", pr.total);
                 else if (pr.state == PROBE_NO_SUCH_NODE)
                     fprintf(out, ",\"probe\":{\"state\":\"no_such_node\",\"node\":%d"
                                  ",\"total\":%d}", pr.node, pr.total);

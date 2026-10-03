@@ -1262,6 +1262,15 @@ int main(void) {
         check("пустая подписка: failed с нулём", PROBE_FAILED, pr.state);
         check("пустая подписка: пригодных ноль", 0, pr.total);
 
+        /* Все кандидаты исключены exclude: своё состояние, не failed с нулём («в подписке нет
+         * пригодных узлов» — неправда, узлы есть, их не велел брать человек). total — кандидатов
+         * до исключения. */
+        probe_report("vl", PROBE_ALL_EXCLUDED, 0, 5);
+        pr = probe_read("vl");
+        check("все исключены: состояние своё", PROBE_ALL_EXCLUDED, pr.state);
+        check("все исключены: не failed", 0, pr.state == PROBE_FAILED);
+        check("все исключены: кандидатов до исключения 5", 5, pr.total);
+
         /* Перебор идёт — верно, только пока жив написавший. Своё же pid жив, значит верно. */
         probe_report("vl", PROBE_RUNNING, 3, 26);
         pr = probe_read("vl");

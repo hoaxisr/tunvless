@@ -449,7 +449,8 @@ int cmd_vless(const char *spec_path, const char *out_name) {
     before = sel_n;
     sel_n = exclude_filter(o, nodes, sel, sel_n);
     if (!sel_n) {
-        vl_probe_report(out_name, PROBE_FAILED, 0, 0);
+        vl_probe_report(out_name, PROBE_ALL_EXCLUDED, 0, (int)before);
+        evline_emit("excluded", "total", EVLINE_INT, (long)before, (const char *)NULL);
         evline_emit("down", "why", EVLINE_STR, "все узлы-кандидаты исключены exclude",
                     (const char *)NULL);
         fprintf(stderr, LOG_W2 "все %zu узлов-кандидатов исключены exclude или exclude_name — "

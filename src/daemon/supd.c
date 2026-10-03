@@ -368,6 +368,9 @@ static void ev_line(struct supd *s, struct helper *h, const char *line) {
     } else if (!strcmp(e.ev, "nonode")) {
         if (evline_int(&e, "node", &v)) st->nonode = v;
         if (evline_int(&e, "total", &t)) st->total = t;
+    } else if (!strcmp(e.ev, "excluded")) {
+        st->excluded = 1;
+        if (evline_int(&e, "total", &t)) st->total = t;
     } else if (!strcmp(e.ev, "health")) {
         ev_health(s, h, &e);
     } else if (!strcmp(e.ev, "active")) {
@@ -1081,7 +1084,7 @@ static int start_one(struct helper *h, void *arg) {
         h->st.running = 1;
         h->st.up = h->st.known = h->st.said_down = h->st.watch = 0;
         h->st.bound[0] = '\0';
-        h->st.node = h->st.total = h->st.nonode = 0;
+        h->st.node = h->st.total = h->st.nonode = h->st.excluded = 0;
         h->st.health_n = 0;
         h->st.active[0] = '\0';
         h->st.active_known = 0;
@@ -1363,6 +1366,7 @@ static enum probe_state probe_of(const struct helper *h, int *node, int *total) 
     *node = 0;
     *total = (int)st->total;
     if (st->nonode) { *node = (int)st->nonode; return PROBE_NO_SUCH_NODE; }
+    if (st->excluded) return PROBE_ALL_EXCLUDED;
     if (st->running && !st->known && st->node > 0) { *node = (int)st->node; return PROBE_RUNNING; }
     /* down после up с watch — узел потерян живым клиентом, а не подъём кончился ничем: устройство
      * на месте, и «ни один узел не ответил» было бы про подъём, которого не было (probe.h). */
@@ -1477,7 +1481,8 @@ void supd_probe_env(const struct supd *s, char *buf, size_t n) {
         int node, total;
         enum probe_state ps = probe_of(h, &node, &total);
         const char *word = ps == PROBE_RUNNING ? "probing" : ps == PROBE_FAILED ? "failed"
-                         : ps == PROBE_NO_SUCH_NODE ? "nonode" : ps == PROBE_LOST ? "lost"
+                         : ps == PROBE_NO_SUCH_NODE ? "nonode" : ps == PROBE_ALL_EXCLUDED ? "excluded"
+                         : ps == PROBE_LOST ? "lost"
                          : "none";
         /* У lost ещё время и причина — diag ребёнком называет её так же, как status демона. */
         char tail[600] = "";
