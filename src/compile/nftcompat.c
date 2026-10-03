@@ -79,7 +79,11 @@ static int nft_legacy_extras(void) {
              "        meta mark 0x00000001 notrack\n"
              "    }\n"
              "}\n", nft_table());
-    if (nft_check_text(text) == 1) r |= NFTC_NOTRACK;
+    /* STEER_NFT_NOTRACK (0 или 1) — то же переопределение для стендов, что STEER_NFT_IP6NAT выше. */
+    const char *on = getenv("STEER_NFT_NOTRACK");
+    if (on && (!strcmp(on, "0") || !strcmp(on, "1"))) {
+        if (*on == '1') r |= NFTC_NOTRACK;
+    } else if (nft_check_text(text) == 1) r |= NFTC_NOTRACK;
     return r;
 }
 
