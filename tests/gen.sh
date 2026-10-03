@@ -168,7 +168,9 @@ table inet steer {
   }
 }
 NFT
-if [ "$(id -u)" = 0 ] && command -v nft >/dev/null 2>&1 && unshare -n true 2>/dev/null; then
+# Под снимком (tests/snapshot.sh, SNAP_STAGE) — всегда ветка «без root»: иначе этот вызов есть
+# только у root, и номера всех следующих снимков сдвигаются (выпуск в Actions идёт не от root).
+if [ -z "${SNAP_STAGE:-}" ] && [ "$(id -u)" = 0 ] && command -v nft >/dev/null 2>&1 && unshare -n true 2>/dev/null; then
 carried="$(unshare -n sh -c 'nft -f "$1" && shift && exec "$@"' sh "$tmp/carry.nft" \
     $BIN apply --dry-run --spec "$tmp/spec.json" $S 2>/dev/null)"
 
