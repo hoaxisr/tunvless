@@ -659,5 +659,15 @@ for arch in x86_64 aarch64_generic; do
     printf '%s bytes\n' "$(stat -c %s "$OUT/steer-hub-$uarch.tar.gz")"
 done
 
+# Владелец всего, что писал docker (от root): бинарники и архивы wolfSSL в build/, пакеты apk в
+# out/, каталоги, которые контейнер создал сам (build/libs, build/wolfssl-obj). Не от root (GitHub
+# Actions, сборка руками под своим пользователем) следующая сборка в том же дереве не могла бы их
+# снять или переписать снаружи контейнера, — отдаём пользователю хоста одним проходом в конце.
+if [ "$(id -u)" != 0 ]; then
+    docker run --rm -v "$PWD:/src" --entrypoint chown "$IMAGE" -R "$(id -u):$(id -g)" \
+        /src/build /src/"$OUT" >/dev/null 2>&1 ||
+        echo "    (не удалось вернуть владельца build/ и $OUT/ — часть файлов принадлежит root)"
+fi
+
 echo "packages:"
 ls -1 "$OUT" 2>/dev/null | sed 's/^/  /'
