@@ -1067,6 +1067,38 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
             diag("output", "fail", what, why);
             continue;
         }
+        /* Устройство есть, но выключено (operstate down). status отдаёт такому выходу
+         * `up: false`, а failed сторож ставит не сразу и не всякому выходу (одиночное устройство
+         * без группы он не пробует) — и до этой ветки diag шёл дальше к зоне и NAT, то есть на
+         * выключенном wg0 говорил «в зоне, NAT есть». Признак тот же, что у status: первые
+         * четыре буквы «down» (у туннелей обычное состояние — «unknown», это не отказ). */
+        {
+            char st[16] = "";
+            FILE *df = fopen(path, "r");
+            if (df) {
+                if (!fgets(st, sizeof(st), df)) st[0] = 0;
+                fclose(df);
+            }
+            if (strncmp(st, "down", 4) == 0) {
+                const struct output *po = out_for_device(sp, &sp->out[i], sp->out[i].device);
+                if (sp->out[i].failed)
+                    snprintf(what, sizeof(what), "выход %.40s: %.24s выключено, трафик канала %s",
+                             sp->out[i].name, sp->out[i].device,
+                             sp->out[i].on_fail == FAIL_DROP ? "остановлен" :
+                             sp->out[i].on_fail == FAIL_ZAPRET ? "идёт через обход" :
+                             "идёт напрямую");
+                else
+                    snprintf(what, sizeof(what), "выход %.40s: устройство %.24s выключено",
+                             sp->out[i].name, sp->out[i].device);
+                snprintf(why, sizeof(why), "%s",
+                         out_engine_managed(po)
+                             ? "туннель не поднят — смотрите журнал ядра steer"
+                             : "поднимите интерфейс (ifup) или проверьте его настройку; "
+                               "выход вернётся сам, когда устройство поднимется");
+                diag("output", "fail", what, why);
+                continue;
+            }
+        }
         struct fwcheck c = fw_check(sp->out[i].device);
         /* Нужен ли masquerade — свойство УСТРОЙСТВА, а не выхода, который его назвал: в пуле
          * kind=interface активным бывает устройство VLESS-туннеля или хаба xsteer, и вопрос

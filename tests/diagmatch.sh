@@ -26,6 +26,10 @@ if [ "${DIAGMATCH_INNER:-}" != 1 ]; then
     exit 0
 fi
 ip link set lo up
+# Свой sysfs: diag смотрит устройства по /sys/class/net, а sysfs показывает сеть того
+# пространства, в котором его смонтировали. Без перемонтирования стенд читал устройства ХОСТА —
+# на машине с настоящим wg0 «выход в wg0» был у стенда живым, на машине без него — пропавшим.
+mount -t sysfs sysfs /sys 2>/dev/null || echo "diagmatch: свой sysfs не смонтирован — устройства читаются с хоста"
 
 pass=0 fail=0
 tmp="$(mktemp -d)"
@@ -499,6 +503,25 @@ GRP
     ip link del gd1; ip link del gd2
 else
     echo "diagmatch: dummy-устройств нет — проверка группы из обёрток пропущена"
+fi
+
+# ---- устройство есть, но выключено (down) --------------------------------------------------
+#
+# status отдаёт такому выходу `up: false` без `failed` (сторож мог ещё не успеть или выход не в
+# группе), а diag видел только «есть ли /sys/class/net/<имя>» и шёл дальше к зоне и NAT: на
+# выключенном wg0 отчёт молчал о главном. Теперь — отказ «устройство выключено».
+if ip link add wg0 type dummy 2>/dev/null; then
+    outd="$($DIAG diag --spec "$tmp/iface.json" 2>/dev/null)"
+    check "устройство down: отказ" "fail" "$(printf '%s' "$outd" | verdict output)"
+    check "устройство down: так и названо" "1" \
+          "$(printf '%s' "$outd" | grep -c '"what":"выход vpn: устройство wg0 выключено')"
+    ip link set wg0 up
+    outu="$($DIAG diag --spec "$tmp/iface.json" 2>/dev/null)"
+    check "устройство поднято: про «выключено» молчим" "0" \
+          "$(printf '%s' "$outu" | grep -c 'выключено')"
+    ip link del wg0
+else
+    echo "diagmatch: dummy-устройств нет — проверка выключенного устройства пропущена"
 fi
 
 printf '\n%d проверок пройдено' "$pass"
