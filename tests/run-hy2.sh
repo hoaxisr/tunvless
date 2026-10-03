@@ -202,6 +202,25 @@ PY
 check "UDP: эхо 1 байт" "same" "$(udp_echo 1)"
 check "UDP: эхо 1200 байт" "same" "$(udp_echo 1200)"
 check "UDP: эхо 3000 байт (фрагментация в обе стороны)" "same" "$(udp_echo 3000)"
+# Залп в новый поток: первые датаграммы приходят, пока поток к узлу ещё открывается, и стек их
+# придерживает. Уйти серверу они обязаны по одной — склеенные, они приходили одной датаграммой
+# (у QUIC — два Initial или Initial с 0-RTT одним куском больше 2400 байт).
+burst="$(nsc python3 - "$TARGET" <<'PY'
+import socket, sys, os
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(5)
+for n in (1000, 2300, 3000):
+    s.sendto(os.urandom(n), (sys.argv[1], 7))
+got = []
+try:
+    while len(got) < 3:
+        r, _ = s.recvfrom(65535)
+        got.append(len(r))
+except Exception:
+    pass
+print(" ".join(map(str, sorted(got))))
+PY
+)"
+check "UDP: залп 1000+2300+3000 в новый поток — три датаграммы, а не склейка" "1000 2300 3000" "$burst"
 st="$(cat "$WORK/state/../state/hy2-hy" 2>/dev/null || true)"
 sleep 3.5
 st="$(cat "$WORK/state/hy2-hy" 2>/dev/null)"
