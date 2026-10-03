@@ -558,7 +558,13 @@ EOF
     mkdir -p "$xroot/usr/lib/steer"
     printf 'steer-extended %s: мета-пакет — steer-core, steer-vless, steer-xsteer, steer-obfs, steer-tgws\n' \
         "$VERSION" > "$xroot/usr/lib/steer/extended"
-    pack steer-extended "$xroot" "steer-core steer-vless steer-xsteer steer-obfs steer-tgws" \
+    # Системные зависимости 1.5.x (nftables ip-full conntrack kmod-nft-queue kmod-tun) мета-пакет
+    # повторяет нарочно. opkg (OpenWrt 24.10 и старше) при обновлении steer-extended 1.5.x до этого
+    # мета-пакета считает их осиротевшими раньше, чем доходит до зависимостей steer-core и модулей,
+    # и снимает: после `opkg install ./*-2.0.0-1_<арх>.ipk` на роутере не оставалось ip-full,
+    # conntrack, kmod-nft-queue и (без hysteria2) kmod-tun. apk решает транзакцию целиком и этого
+    # не делает, но зависимости общие для обоих форматов.
+    pack steer-extended "$xroot" "steer-core steer-vless steer-xsteer steer-obfs steer-tgws $(pkg_deps "" core) $(pkg_deps "" tun)" \
         "steer-extended (устарел, взамен — steer-core и нужные модули): ядро, VLESS/Reality, xsteer, обфускатор, мост Telegram" noop
 done
 
