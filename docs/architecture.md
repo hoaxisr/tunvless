@@ -65,7 +65,7 @@ xsteer — [docs/xsteer.md](xsteer.md).
 `conntrack`, `kmod-nft-queue`), `steer-vless`, `steer-xsteer`, `steer-obfs`, `steer-tgws`,
 `steer-hysteria2`, `steer-proxy` (по одному бинарнику `usr/sbin/steer-<имя>`; зависят от `steer-core (= версия)`,
 модули с собственным TUN — ещё от `kmod-tun`) и мета-пакет `steer-extended` (устаревший: ядро и
-первые четыре модуля; `steer-hysteria2` в него не входит). Библиотеки лежат внутри `steer-core`, а
+первые четыре модуля; `steer-hysteria2` и `steer-proxy` в него не входят). Библиотеки лежат внутри `steer-core`, а
 не в своих пакетах: `steerd` сам ходит по HTTPS (замер групп, `urltls.c`) и по DoH, DoT и DoQ (резолвер),
 поэтому криптография нужна ядру и без модулей. Модули файлов ядра не повторяют — у каждого файла
 один владелец.
