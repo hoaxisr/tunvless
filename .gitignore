@@ -115,3 +115,11 @@ build/nftvmap-tool
 build/urltestmatch
 build/nftvmapmatch
 build/groupsmatch
+# Сборка архивов для VPS (build.sh): каталоги раскладки хаба и обфускации, и стенды и пробы,
+# однажды уехавшие в репозиторий вместе с правками (бинарник хаба с прежними адресами в нём жил
+# с d278b90).
+build/hub-*/
+build/obfs-*/
+build/uprobe-*
+build/xsconnmatch
+build/xslinkmatch
