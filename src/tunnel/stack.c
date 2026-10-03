@@ -1373,6 +1373,19 @@ static int conn_node_lost(struct conn *c) {
  * местами, а TCP-поток этого не прощает. */
 static int early_flush(struct conn *c) {
     while (c->early_off < c->early_n) {
+        if (c->is_udp) {
+            /* Датаграммы — по одной, каждая своим вызовом (длина впереди — своя, см. udp_send_dgram):
+             * дайлер вправе слать датаграмму отдельным сообщением (hysteria2 — датаграммой QUIC), и
+             * склейка превратила бы их в одну. Хвост остаётся с границы датаграммы. */
+            uint32_t dl;
+            memcpy(&dl, c->early + c->early_off, sizeof(dl));
+            if (dl > c->early_n - c->early_off - sizeof(dl)) return -1;
+            int sr = upstream_send(c, c->early + c->early_off + sizeof(dl), dl);
+            if (sr == SEND_AGAIN) return 1;
+            if (sr != SEND_OK) return -1;
+            c->early_off += (uint32_t)sizeof(dl) + dl;
+            continue;
+        }
         size_t chunk = c->early_n - c->early_off;
         /* Запас под заголовок запроса и обёртку (у VLESS — кадр Vision): дайлер клеит их в
          * один буфер TUNNEL_BUF, и порция впритык не влезла бы вместе с ними. */
@@ -1392,8 +1405,8 @@ static int early_flush(struct conn *c) {
  *
  * Одна функция на TCP и UDP, потому что придерживается в обоих случаях РОВНО ТО, что уйдёт
  * серверу: у TCP это поток байт как есть, у UDP — уже обрамлённые дайлером датаграммы
- * (dgram_frame). Границы датаграмм при этом сохраняются сами, без второго счётчика: их несёт
- * само обрамление — у VLESS это длина в первых двух байтах каждой. */
+ * (dgram_frame), каждая со своей длиной впереди (udp_send_dgram): обрамление границ не несёт у
+ * всех — у hysteria2 датаграмма уходит как есть, и склеенные они приходили серверу одной. */
 static int early_hold(struct conn *c, const unsigned char *d, size_t n) {
     if (n > EARLY_CAP - c->early_n) return -1;
     if (!c->early) {
@@ -1429,8 +1442,12 @@ static int udp_send_dgram(struct conn *c, const unsigned char *p, size_t n) {
      * датаграмму придержать можно. Проверка стоит ЗДЕСЬ, в единственном месте, которое
      * знает про обрамление: разложенная по вызывающим, она была бы вторым правилом «кто
      * имеет право трогать сессию», и второе однажды разошлось бы с первым. */
-    if (c->pending)
+    if (c->pending) {
+        uint32_t dl = (uint32_t)fn;
+        if (sizeof(dl) + fn > EARLY_CAP - c->early_n) return SEND_AGAIN;
+        if (early_hold(c, (const unsigned char *)&dl, sizeof(dl)) != 0) return SEND_AGAIN;
         return early_hold(c, fr, fn) == 0 ? SEND_OK : SEND_AGAIN;
+    }
     return upstream_send(c, fr, fn);
 }
 

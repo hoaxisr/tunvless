@@ -496,6 +496,58 @@ static void t_send_refused(void) {
     dev_drain(NULL);
 }
 
+/* Датаграммы UDP, придержанные до готовности потока, уходят узлу по одной (каждая — своим вызовом
+ * send), а не одним куском. У hysteria2 обрамления длиной нет (dgram_frame отдаёт датаграмму как
+ * есть, границы несёт сама датаграмма QUIC), и склеенные три датаграммы клиента (1000, 2300 и
+ * 3000 байт) сервер получал одной в 6300 (Xray 26.7.28) или двумя (apernet) — первый залп QUIC
+ * (два Initial или Initial с 0-RTT) терялся. */
+static size_t g_es_len[8];
+static int g_es_n;
+static size_t es_frame(const unsigned char *p, size_t n, unsigned char *out, size_t cap) {
+    if (n > cap) return 0;
+    memcpy(out, p, n);
+    return n;
+}
+static int es_send(const void *ctx, void *sess, const struct flow_key *k, int udp,
+                   const unsigned char *d, size_t n) {
+    (void)ctx; (void)sess; (void)k; (void)udp; (void)d;
+    if (g_es_n < 8) g_es_len[g_es_n] = n;
+    g_es_n++;
+    return SEND_OK;
+}
+static void t_udp_early_bounds(void) {
+    static const struct dialer_ops es_ops = { .name = "границы", .dgram_frame = es_frame,
+                                              .send = es_send };
+    static const struct dialer es_dl = { &es_ops, NULL, 0 };
+    const struct dialer *save = g_dl;
+    g_dl = &es_dl;
+    struct conn *c = conn_new(&g_tun);
+    memset(c, 0, sizeof(*c));
+    c->used = 1;
+    c->fd = -1;
+    c->key = cli_key();
+    c->key.proto = 17;
+    c->key.sport = 30001;
+    c->is_udp = 1;
+    c->pending = 1;
+    conn_link(c);
+    static unsigned char d[3000];
+    memset(d, 0x5a, sizeof d);
+    g_es_n = 0;
+    int ok = udp_send_dgram(c, d, 1000) == SEND_OK && udp_send_dgram(c, d, 2300) == SEND_OK &&
+             udp_send_dgram(c, d, 3000) == SEND_OK;
+    check(ok && g_es_n == 0, "UDP до готовности потока: три датаграммы придержаны");
+    c->pending = 0;
+    int fr = early_flush(c);
+    check(fr == 0 && g_es_n == 3 && g_es_len[0] == 1000 && g_es_len[1] == 2300 && g_es_len[2] == 3000,
+          "UDP после готовности: придержанные ушли по одной — 1000, 2300, 3000");
+    if (fr != 0 || g_es_n != 3)
+        fprintf(stderr, "  вызовов send %d: %zu %zu %zu\n", g_es_n, g_es_len[0], g_es_len[1], g_es_len[2]);
+    g_dl = save;
+    conn_drop(c);
+    dev_drain(NULL);
+}
+
 /* Заполнить таблицу целиком свежими TCP, кроме одного потока UDP с заданными портом и
  * возрастом, и спросить conn_new о новом месте. Возвращает, отдали ли место этого потока. */
 static int full_table_gives_udp(uint16_t dport, int idle_s) {
@@ -1176,6 +1228,7 @@ int main(void) {
     t_send_refused();
     t_dns_evict();
     t_spare_slot();
+    t_udp_early_bounds();
     if (pool_part() != 0) check(0, "стенд пула: слушатель на петле не завёлся");
 
     printf(g_fail ? "\ntunnelmatch: ПРОВАЛ\n" : "\nвсе проверки прошли\n");
