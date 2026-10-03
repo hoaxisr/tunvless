@@ -149,6 +149,10 @@ struct dup {
     uint16_t next_id;
     int hproto;                 /* DoH: что выбрал сервер при последнем соединении — 0 не знаем, 1
                                  * http/1.1, 2 h2 (от этого зависит, сколько соединений заводить) */
+    /* Группа серверов (cfg.grp): личная копия номеров членов (cfg.gm указывает сюда) и пауза
+     * каждого члена — по cfg.gm_n (dupgrp.c). */
+    unsigned *gm_own;
+    struct dpause *gp;
 };
 
 struct dreq {
@@ -174,6 +178,14 @@ struct dreq {
     uint8_t q[DUP_QMAX];
     uint16_t qn;
 };
+
+/* ---- группы серверов (dupgrp.c) ------------------------------------------------------------- */
+int grp_ask(struct dup *g, const uint8_t *q, size_t n, dup_done_fn cb, void *ctx);
+void grp_tick(long now);
+long grp_deadline(void);                /* ближайший срок группы (мс монотонных часов) или -1 */
+int grp_busy(void);
+void grp_render(FILE *f, const struct dup *g);
+const char *dup_state(const struct dup *up);     /* состояние апстрима для dns-log (dup.c) */
 
 extern struct dup **g_dups;             /* текущие апстримы, по номеру настройки */
 extern size_t g_dups_n;

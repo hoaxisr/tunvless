@@ -158,6 +158,95 @@ int main(void) {
     check("  кэша нет", 0, (int)g_dcache_cfg.entries);
     free(txt);
 
+    /* ---- группы серверов и сервер для имён вне правил (dns.other) ---- */
+    f = fopen(sp, "w");
+    fprintf(f, "version: 2\nlan: { devices: [br-lan] }\nlists:\n  la: { domains_file: %s }\n  lb: { domains_file: %s }\n"
+               "outputs:\n  vpn: { kind: interface, device: wg0 }\n"
+               "dns:\n  upstream: both\n  other: oth\n  upstreams:\n"
+               "    both: { servers: [b, a], mode: race }\n"
+               "    a: { url: 'udp://192.0.2.1' }\n    b: { url: 'udp://192.0.2.2', out: vpn }\n"
+               "    c: { url: 'udp://192.0.2.3' }\n    unused: { url: 'udp://192.0.2.4', out: vpn }\n"
+               "    oth: { servers: [c, a] }\n"
+               "rules:\n  - { name: ra, to: [la], out: vpn }\n"
+               "  - { name: rb, to: [lb], out: vpn, dns: { servers: [c], mode: failover } }\n", lst, lst2);
+    fclose(f);
+    static struct spec cfgg;
+    check("спека с группами и dns.other читается", 0, load_spec(sp, &cfgg, &e) < 0);
+    check("  группа both: race, члены b и a по порядку", 1, cfgg.dns.up[0].grp == DNSG_RACE &&
+          cfgg.dns.up[0].mem_n == 2 && cfgg.dns.up[0].mem[0] == 2 && cfgg.dns.up[0].mem[1] == 1);
+    check("  группа без mode — failover", DNSG_FAILOVER, cfgg.dns.up[5].grp);
+    check("  dns.other — группа oth", 6, (int)cfgg.dns.other);
+    check("  своя группа правила rb", 1, cfgg.rule[1].dns && cfgg.dns.up[cfgg.rule[1].dns - 1].grp == DNSG_FAILOVER &&
+          cfgg.dns.up[cfgg.rule[1].dns - 1].inl);
+    check("  член группы через выход используется (страж выхода)", 1, spec_dns_up_used(&cfgg, 2));
+    check("  сервер вне групп и назначений не используется", 0, spec_dns_up_used(&cfgg, 4));
+    check("  член группы dns.other используется", 1, spec_dns_up_used(&cfgg, 3));
+    cfgg.out[0].mark = 0x00100000;
+    txt = NULL; m = open_memstream(&txt, &tn);
+    tabfmt_build(&cfgg, m); fclose(m);
+    check("таблица: седьмое число заголовка — dns.other", 1, !strncmp(txt, "2 6 0 10 3600 30 ", 17));
+    check("  строка группы race: члены номерами строк", 1, strstr(txt, "\nboth|group:race|-|0|1,2|-\n") != NULL);
+    {
+        const char *pb = strstr(txt, "\nb|udp://192.0.2.2|vpn|1048576|-|-\n"), *pg = strstr(txt, "\nboth|");
+        check("  члены — раньше группы, b с меткой выхода", 1, pb && pg && pb < pg);
+    }
+    check("  неиспользуемый сервер в таблицу не идёт", 1, strstr(txt, "unused|") == NULL);
+    check("  группа dns.other и своя группа правила", 1, strstr(txt, "\noth|group:failover|-|0|") != NULL &&
+          strstr(txt, "\nrb|group:failover|-|0|") != NULL);
+    for (size_t i = 0; i < g_dch_n; i++) free(g_dch[i].rules_path);
+    memset(g_dch, 0, g_dch_cap * sizeof(*g_dch));
+    g_dch_n = 0;
+    check("  разбор своей таблицы", 0, tabfmt_parse(txt, tn));
+    check("  апстримов шесть", 6, (int)g_dup_cfg_n);
+    {
+        int gi = -1, oi = -1;
+        for (size_t i = 0; i < g_dup_cfg_n; i++) {
+            if (!strcmp(g_dup_cfg[i].u.name, "both")) gi = (int)i;
+            if (!strcmp(g_dup_cfg[i].u.name, "oth")) oi = (int)i;
+        }
+        check("  группа both разобрана: race, два члена-сервера", 1, gi >= 0 && g_dup_cfg[gi].grp == DNSG_RACE &&
+              g_dup_cfg[gi].gm_n == 2 && !strcmp(g_dup_cfg[g_dup_cfg[gi].gm[0]].u.name, "b") &&
+              !strcmp(g_dup_cfg[g_dup_cfg[gi].gm[1]].u.name, "a"));
+        check("  g_dup_other — строка группы oth", oi + 1, (int)g_dup_other);
+    }
+    free(txt);
+    /* Испорченная строка группы: член — группа и номер вне таблицы — выпадают. */
+    {
+        const char *t = "0 3 0 10 3600 30 3\nx|udp://192.0.2.1|-|0|-|-\ng|group:race|-|0|1,3,9|-\nh|group:failover|-|0|2,1|-\n";
+        check("таблица с группой в группе разбирается", 0, tabfmt_parse(t, strlen(t)));
+        check("  у h остался только сервер x", 1, g_dup_cfg[2].gm_n == 1 && g_dup_cfg[2].gm[0] == 0);
+        check("  у g — только x", 1, g_dup_cfg[1].gm_n == 1 && g_dup_cfg[1].gm[0] == 0);
+        check("  dns.other — h", 3, (int)g_dup_other);
+        const char *t2 = "0 1 0 10 3600 30 2\nx|udp://192.0.2.1|-|0|-|-\n";
+        check("  dns.other вне таблицы — отказ разбора", -1, tabfmt_parse(t2, strlen(t2)));
+    }
+    /* Годный ответ и пауза после отказа. */
+    {
+        uint8_t aa[64];
+        size_t al = mk_answer(aa, "g.test", 60, 0, 1);
+        check("годный ответ: NOERROR", 1, dup_ans_good(aa, al));
+        al = mk_answer(aa, "g.test", 60, 3, 0);
+        check("  NXDOMAIN — годный", 1, dup_ans_good(aa, al));
+        al = mk_answer(aa, "g.test", 60, 2, 0);
+        check("  SERVFAIL — нет", 0, dup_ans_good(aa, al));
+        al = mk_answer(aa, "g.test", 60, 5, 0);
+        check("  REFUSED — нет", 0, dup_ans_good(aa, al));
+        check("  нет ответа — нет", 0, dup_ans_good(NULL, 0));
+        struct dpause pz = {0};
+        dpause_fail(&pz, 1000);
+        check("пауза: первая 5 с", 6000, (int)pz.until_ms);
+        check("  на паузе", 1, dpause_on(&pz, 5999));
+        check("  кончилась", 0, dpause_on(&pz, 6000));
+        dpause_fail(&pz, 7000);
+        check("  вторая — вдвое длиннее", 17000, (int)pz.until_ms);
+        for (int i = 0; i < 20; i++) dpause_fail(&pz, 20000);
+        check("  потолок 300 с", 320000, (int)pz.until_ms);
+        dpause_ok(&pz);
+        check("  годный ответ снимает паузу", 0, dpause_on(&pz, 20000));
+        dpause_fail(&pz, 30000);
+        check("  и снова первая 5 с", 35000, (int)pz.until_ms);
+    }
+
     /* Отказы спеки. */
     const char *bad[] = {
         "dns: { upstreams: { a: { url: 'tls://dns.test' } } }",                    /* нечем разрешить имя */
@@ -165,6 +254,14 @@ int main(void) {
         "dns: { upstream: nope }",                                                  /* нет такого */
         "dns: { upstreams: { a: { url: 'tls://1.1.1.1', out: nope } } }",          /* нет выхода */
         "dns: { cache_ttl: { min: 100, max: 10 } }",                                /* min > max */
+        "dns: { upstreams: { a: { url: 'udp://1.1.1.1' }, g: { servers: [a] }, h: { servers: [g, a] } } }", /* группа в группе */
+        "dns: { upstreams: { a: { url: 'udp://1.1.1.1' }, g: { servers: [a, nope] } } }", /* нет члена */
+        "dns: { upstreams: { a: { url: 'udp://1.1.1.1' }, g: { servers: [a, a] } } }",    /* член дважды */
+        "dns: { upstreams: { a: { url: 'udp://1.1.1.1' }, g: { servers: [] } } }",        /* пустая группа */
+        "dns: { upstreams: { a: { url: 'udp://1.1.1.1' }, g: { servers: [a], mode: fast } } }", /* режим */
+        "dns: { upstreams: { a: { url: 'udp://1.1.1.1' }, g: { servers: [a], url: 'udp://1.1.1.1' } } }", /* и то и то */
+        "dns: { upstreams: { g: { servers: [g] } } }",                              /* сама в себе */
+        "dns: { other: nope }",                                                     /* нет такого */
     };
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
         f = fopen(sp, "w");

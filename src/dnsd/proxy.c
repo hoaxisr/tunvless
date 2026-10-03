@@ -608,6 +608,34 @@ static chm_t match_for(const char *qname, uint16_t qtype) {
  * в run_proxy, порт задан там. */
 static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, socklen_t fromlen,
                      struct dnsd_local local, int have_local);
+static void forward_old(struct pending *p, uint8_t *buf, size_t n, size_t qend,
+                        const struct sockaddr_storage *fromp, socklen_t fromlen,
+                        const struct dnsd_local *localp, int have_local, int hit, chm_t sets,
+                        int quiet, int cacheable, unsigned cup);
+
+/* ИМЕНА СВОЕЙ СЕТИ — у DNS роутера, даже когда задан сервер для имён вне правил (`dns.other`):
+ * имя без точки (имя устройства из DHCP), домены локальной сети (lan, local, home.arpa, internal,
+ * localhost, localdomain, home) и обратные зоны (in-addr.arpa, ip6.arpa — PTR адресов своей сети
+ * знает только dnsmasq, а публичные он и сам спросит наверху). Внешний сервер на них ответил бы
+ * NXDOMAIN, и устройства локальной сети перестали бы находиться по имени. 1 — имя своей сети. */
+int name_local(const char *q) {
+    static const char *const SUF[] = { "lan", "local", "home.arpa", "internal", "localhost",
+                                       "localdomain", "home", "in-addr.arpa", "ip6.arpa", NULL };
+    size_t n = strlen(q);
+    while (n && q[n - 1] == '.') n--;
+    if (!n || !memchr(q, '.', n)) return 1;
+    for (size_t i = 0; SUF[i]; i++) {
+        size_t l = strlen(SUF[i]);
+        if (n >= l && !strncasecmp(q + n - l, SUF[i], l) && (n == l || q[n - l - 1] == '.')) return 1;
+    }
+    return 0;
+}
+
+/* Сервер имён вне правил (`dns.other`): пауза после отказа и сколько вопросов ушло прежним путём
+ * вместо него (dns-log, dlog.c). */
+struct dpause g_other_pause;
+unsigned long g_other_fallback;
+
 static int handle_client_query(void) {
     uint8_t buf[MAX_PKT];
     /* Dual-stack listener -> the client may be IPv6 (or v4-mapped). The reply is
@@ -794,13 +822,18 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
      * слот и возвращается на место в ответе. */
     p->cli_id = (uint16_t)((buf[0] << 8) | buf[1]);
     p->gen = pending_next_gen();
-    uint16_t tag = pending_tag(p);
+    p->oth = 0;
 
     /* ИМЯ ПОД ПРАВИЛОМ: КЭШ И СВОЙ АПСТРИМ КАНАЛА (dup.h, dcache.c). Обе ветки заканчиваются в
      * upstream_answer — том же месте, куда приходит ответ по сети, — поэтому fake-IP остаётся
      * строгим: подмена в ядре ставится там и раньше ответа клиенту, откуда бы ответ ни взялся. */
     unsigned cup = hit >= 0 ? (unsigned)g_dch[hit].up : 0;
-    int cacheable = hit >= 0 && dcache_on();
+    /* ИМЯ ВНЕ ПРАВИЛ И СЕРВЕР ДЛЯ НИХ (`dns.other`): вопрос уходит туда, а не прежним путём. Имена
+     * своей сети (name_local) остаются у DNS роутера: их знает только он. Сервер на паузе после
+     * отказа — прежний путь сразу; ответ из кэша годится и тогда. */
+    int oth = hit == -1 && g_dup_other && !name_local(qname);
+    if (oth) cup = g_dup_other;
+    int cacheable = (hit >= 0 || oth) && dcache_on();
     if (cacheable) {
         uint8_t cbuf[MAX_PKT];
         size_t cn = dcache_get(cup, buf, (size_t)n, cbuf, sizeof(cbuf), (long)mono_sec());
@@ -811,11 +844,19 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
             return 1;
         }
     }
+    if (oth && dpause_on(&g_other_pause, dup_now_ms())) {
+        cup = 0;
+        cacheable = 0;
+        g_other_fallback++;
+    }
     if (cup) {
         /* У канала свой сервер: вопрос уходит туда, и только туда. Не принят (нет метки выхода,
          * нет TLS, очередь полна, пауза после неудачи) — SERVFAIL клиенту, а не прежний путь:
-         * он вёл бы имя мимо выхода, который человек выбрал для DNS. */
+         * он вёл бы имя мимо выхода, который человек выбрал для DNS. Имя вне правил (oth) — наоборот:
+         * сервер для них не ответил — спросить прежним путём (sec_done, other_fallback), чтобы
+         * сайты не пропадали вместе с сервером. */
         pending_arm(p, &from, fromlen, &local, have_local, hit, sets, quiet);
+        p->oth = (uint8_t)oth;
         p->qfp = (qend > 12 && qend <= (size_t)n) ? question_fp(buf, qend) : 0;
         p->qsec_end = (uint16_t)((p->qfp) ? qend : 0);
         p->cput = (uint8_t)cacheable;
@@ -830,6 +871,24 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
             sec_done(sctx, NULL, 0, buf, (size_t)n);
         return 1;
     }
+    forward_old(p, buf, (size_t)n, qend, &from, fromlen, &local, have_local, hit, sets, quiet,
+                cacheable, cup);
+    return 1;
+}
+
+/* ПРЕЖНИЙ ПУТЬ НАВЕРХ: вопрос — резолверу на петле (dnsmasq) или, в режиме origdst, тому, к кому
+ * он шёл; по TCP, если пришёл по TCP. Слот p уже выдан (номер клиента и поколение в нём), здесь он
+ * заполняется и объявляется занятым после удачной отправки. Зовёт его dns_query и запасной путь
+ * имени вне правил, когда сервер dns.other не ответил (other_fallback). buf переписывается (номер
+ * транзакции наверх). */
+static void forward_old(struct pending *p, uint8_t *buf, size_t n, size_t qend,
+                        const struct sockaddr_storage *fromp, socklen_t fromlen,
+                        const struct dnsd_local *localp, int have_local, int hit, chm_t sets,
+                        int quiet, int cacheable, unsigned cup) {
+    if (g_up_fd < 0) return;
+    struct sockaddr_storage from = *fromp;
+    struct dnsd_local local = *localp;
+    uint16_t tag = pending_tag(p);
     int ufd = g_up_fd;
     union dnsd_sa up;
     uint32_t ctmark = 0;
@@ -865,7 +924,7 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
     int tcpu = -1;
     if (g_tcp_cur && !quiet) {
         tcpu = tcpu_open(p, buf, (size_t)n, &up, tag, qend, ctmark, have_mark);
-        if (tcpu < 0) return 1;                /* ответ SERVFAIL уже ушёл клиенту */
+        if (tcpu < 0) return;                  /* ответ SERVFAIL уже ушёл клиенту */
     } else if ((g_origdst ? sendto(ufd, buf, (size_t)n, 0, &up.sa, uplen)
                    : send(g_up_fd, buf, (size_t)n, 0)) < 0) {
         /* Чаще всего это ECONNREFUSED от петли: резолвер наверху не запущен или
@@ -877,7 +936,7 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
         if (warn_due(&said_send, now))
             fprintf(stderr, "steer dnsd: запрос не ушёл наверх (127.0.0.1:%d): %s\n",
                     g_up_port, strerror(errno));
-        return 1;
+        return;
     }
 
     /* Отпечаток вопроса — ПОСЛЕ удачной отправки и до того, как слот объявлен занятым:
@@ -903,7 +962,6 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
     p->local = local;
     p->have_local = have_local;
     p->expire = time(NULL) + PENDING_TTL_SEC;
-    return 1;
 }
 
 /* Ответ пришёл оттуда, куда ушёл вопрос: семейство, адрес и порт. Зона (sin6_scope_id) не
@@ -1727,10 +1785,32 @@ static void sec_done(void *ctx, const uint8_t *ans, size_t n, const uint8_t *q, 
     g_tcp_cur = tc;
     /* Ответ обязан отвечать на НАШ вопрос (как у ответа по UDP, handle_upstream_response). */
     int ok = ans && !(p->qfp && (n < p->qsec_end || question_fp(ans, p->qsec_end) != p->qfp));
-    if (ok) {
+    if (p->oth) {
+        /* Имя вне правил, сервер dns.other: годный ответ снимает паузу; нет ответа — пауза (следующие
+         * имена сразу идут прежним путём); SERVFAIL или REFUSED — без паузы (сервер жив, не смог с
+         * одним именем). В обоих случаях вопрос уходит прежним путём, а не SERVFAIL клиенту. */
+        if (ok && dup_ans_good(ans, n)) {
+            dpause_ok(&g_other_pause);
+        } else {
+            if (!ok) dpause_fail(&g_other_pause, dup_now_ms());
+            else g_other_pause.fail++;
+            g_other_fallback++;
+            uint8_t qb[MAX_PKT];
+            p->in_use = 0;
+            p->sec = 0;
+            p->oth = 0;
+            if (tc != &g_tcp_dead && qn >= 12 && qn <= sizeof(qb)) {
+                memcpy(qb, q, qn);
+                forward_old(p, qb, qn, p->qsec_end, &p->client, p->client_len, &p->local,
+                            p->have_local, p->hit, p->sets, p->quiet, 0, 0);
+            }
+            ok = -1;
+        }
+    }
+    if (ok > 0) {
         p->sec = 0;
         upstream_answer(p, (uint8_t *)(uintptr_t)ans, (ssize_t)n);
-    } else {
+    } else if (!ok) {
         p->in_use = 0;
         p->sec = 0;
         static time_t said;

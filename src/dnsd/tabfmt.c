@@ -23,8 +23,12 @@ void tabfmt_build(const struct spec *sp, FILE *out) {
     if (!ext)
         fprintf(out, "%zu\n", g_dch_n);
     else
-        fprintf(out, "%zu %zu %ld %ld %ld %ld\n", g_dch_n, g_dup_cfg_n, g_dcache_cfg.entries,
+        fprintf(out, "%zu %zu %ld %ld %ld %ld", g_dch_n, g_dup_cfg_n, g_dcache_cfg.entries,
                 g_dcache_cfg.ttl_min, g_dcache_cfg.ttl_max, g_dcache_cfg.ttl_neg);
+    /* Сервер имён вне правил (`dns.other`) — седьмым числом, только когда он задан: без него
+     * заголовок прежний до байта. */
+    if (ext && g_dup_other) fprintf(out, " %u", g_dup_other);
+    if (ext) fputc('\n', out);
     for (size_t i = 0; i < g_dch_n; i++) {
         const struct dchan *c = &g_dch[i];
         /* family — по факту (1.9, IPv6): «46», когда у доменной группы есть половина IPv6
@@ -40,6 +44,13 @@ void tabfmt_build(const struct spec *sp, FILE *out) {
     /* Апстрим: имя|адрес|выход|метка|адреса сервера|серверы bootstrap. «-» — пусто. */
     for (size_t i = 0; i < g_dup_cfg_n; i++) {
         const struct dup_cfg *u = &g_dup_cfg[i];
+        if (u->grp) {
+            /* Группа: «имя|group:race|-|0|члены|-» — члены номерами строк апстримов с единицы. */
+            fprintf(out, "%s|group:%s|-|0|", u->u.name, u->grp == DNSG_RACE ? "race" : "failover");
+            for (size_t k = 0; k < u->gm_n; k++) fprintf(out, "%s%u", k ? "," : "", u->gm[k] + 1);
+            fputs("|-\n", out);
+            continue;
+        }
         fprintf(out, "%s|%s|%s|%u|", u->u.name, u->u.url, u->via[0] ? u->via : "-", u->mark);
         join_list(out, u->u.ips, u->u.ips_n);
         fputc('|', out);
@@ -140,25 +151,33 @@ static int parse_chan_line(const char *buf, size_t from, size_t line_end, struct
     return field >= 5 ? 0 : -1;
 }
 
-/* Первая строка: «N» (до 1.11) или «N U кэш min max neg». */
-static int parse_header(const char *buf, size_t nl, long *want, long *upn, struct dcache_cfg *cc) {
+/* Первая строка: «N» (до 1.11) или «N U кэш min max neg [other]». */
+static int parse_header(const char *buf, size_t nl, long *want, long *upn, struct dcache_cfg *cc,
+                        long *other) {
     char h[96];
     field_copy(h, sizeof(h), buf, nl);
     char *end = NULL;
     long n = strtol(h, &end, 10);
     *upn = 0;
+    *other = 0;
     memset(cc, 0, sizeof(*cc));
     if (end == h || n < 0) return -1;       /* число каналов ничем, кроме памяти, не ограничено */
     *want = n;
     if (*end == '\0') return 0;
     if (*end != ' ') return -1;
-    long u, e, mn, mx, ng;
-    int used = 0;
-    if (sscanf(end + 1, "%ld %ld %ld %ld %ld%n", &u, &e, &mn, &mx, &ng, &used) != 5 ||
-        end[1 + used] != '\0')
+    long u, e, mn, mx, ng, ot = 0;
+    int used = 0, used2 = 0;
+    if (sscanf(end + 1, "%ld %ld %ld %ld %ld%n", &u, &e, &mn, &mx, &ng, &used) != 5) return -1;
+    if (end[1 + used] == ' ') {
+        if (sscanf(end + 1 + used, " %ld%n", &ot, &used2) != 1 || end[1 + used + used2] != '\0' ||
+            ot < 0 || ot > u)
+            return -1;
+    } else if (end[1 + used] != '\0') {
         return -1;
+    }
     if (u < 0 || e < 0 || e > 1000000 || mn < 0 || mx < 0 || ng < 0) return -1;
     *upn = u;
+    *other = ot;
     cc->entries = e; cc->ttl_min = mn; cc->ttl_max = mx; cc->ttl_neg = ng;
     return 0;
 }
@@ -209,6 +228,30 @@ static int parse_up_line(const char *buf, size_t from, size_t end, struct dup_cf
     memset(c, 0, sizeof(*c));
     field_copy(c->u.name, sizeof(c->u.name), buf + f[0][0], f[0][1]);
     field_copy(c->u.url, sizeof(c->u.url), buf + f[1][0], f[1][1]);
+    c->own = 1;
+    if (!strncmp(c->u.url, "group:", 6)) {
+        /* Группа: члены — номера строк апстримов с единицы через запятую; проверяются, когда
+         * разобраны все строки (tabfmt_parse). Режим, которого этот резолвер не знает, — группа
+         * без членов: каналы на неё получают отказ, а не чужой ответ. */
+        const char *m = buf + f[4][0];
+        size_t mlen = f[4][1], items = 1;
+        for (size_t i = 0; i < mlen; i++) items += m[i] == ',';
+        c->grp = !strcmp(c->u.url + 6, "race") ? DNSG_RACE
+               : !strcmp(c->u.url + 6, "failover") ? DNSG_FAILOVER : 0;
+        if (!c->grp) { c->u.url[0] = '\0'; return 0; }
+        c->gm = calloc(items, sizeof(*c->gm));
+        if (!c->gm) return -1;
+        for (size_t pos = 0; pos < mlen;) {
+            size_t e = pos;
+            while (e < mlen && m[e] != ',') e++;
+            char num[16];
+            field_copy(num, sizeof(num), m + pos, e - pos);
+            long v = strtol(num, NULL, 10);
+            if (v > 0) c->gm[c->gm_n++] = (unsigned)(v - 1);
+            pos = e + 1;
+        }
+        return 0;
+    }
     if (!(f[2][1] == 1 && buf[f[2][0]] == '-')) {
         field_copy(c->via, sizeof(c->via), buf + f[2][0], f[2][1]);
         c->need_mark = 1;
@@ -216,7 +259,7 @@ static int parse_up_line(const char *buf, size_t from, size_t end, struct dup_cf
     char num[16];
     field_copy(num, sizeof(num), buf + f[3][0], f[3][1]);
     c->mark = (unsigned)strtoul(num, NULL, 10);
-    c->own = 1;                     /* массивы адресов ниже — куча этой записи (dup_cfg_list_reset) */
+    /* own = 1 (выше): массивы адресов ниже — куча этой записи (dup_cfg_list_reset) */
     if (list_into(buf + f[4][0], f[4][1], &c->u.ips, &c->u.ips_n) != 0 ||
         list_into(buf + f[5][0], f[5][1], &c->u.boot, &c->u.boot_n) != 0) {
         free(c->u.ips);
@@ -240,9 +283,9 @@ static int parse_up_line(const char *buf, size_t from, size_t end, struct dup_cf
 int tabfmt_parse(const char *buf, size_t len) {
     size_t nl = find_nl(buf, len, 0);
     if (nl >= len) return -1; /* нет даже строки-счётчика */
-    long want, upn;
+    long want, upn, other;
     struct dcache_cfg cc;
-    if (parse_header(buf, nl, &want, &upn, &cc) != 0) return -1;
+    if (parse_header(buf, nl, &want, &upn, &cc, &other) != 0) return -1;
 
     tabfmt_release_current();
     dup_cfg_list_reset();
@@ -288,6 +331,15 @@ int tabfmt_parse(const char *buf, size_t len) {
     /* Канал, чей апстрим в таблице не назван, спрашивает прежним путём. */
     for (size_t i = 0; i < g_dch_n; i++)
         if (g_dch[i].up < 0 || (size_t)g_dch[i].up > g_dup_cfg_n) g_dch[i].up = 0;
+    /* Член группы — сервер этой же таблицы, не группа: иначе он из группы выпадает. */
+    for (size_t i = 0; i < g_dup_cfg_n; i++) {
+        struct dup_cfg *c = &g_dup_cfg[i];
+        size_t k = 0;
+        for (size_t j = 0; j < c->gm_n; j++)
+            if (c->gm[j] < g_dup_cfg_n && c->gm[j] != i && !g_dup_cfg[c->gm[j]].grp) c->gm[k++] = c->gm[j];
+        c->gm_n = k;
+    }
+    g_dup_other = (unsigned)other;
     return 0;
 }
 
@@ -310,9 +362,9 @@ int tabfmt_feed(struct tabfmt_feed *st, const char *data, size_t n) {
 
     size_t nl = find_nl(st->buf, st->len, 0);
     if (nl >= st->len) return 0; /* строка-счётчик ещё не дописана */
-    long want, upn;
+    long want, upn, other;
     struct dcache_cfg cc;
-    if (parse_header(st->buf, nl, &want, &upn, &cc) != 0) return -1;
+    if (parse_header(st->buf, nl, &want, &upn, &cc, &other) != 0) return -1;
     want += upn;                 /* строки каналов и строки апстримов идут подряд */
 
     size_t pos = nl + 1;

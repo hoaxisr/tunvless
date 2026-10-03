@@ -326,6 +326,69 @@ static int set_lookup(const char *set, const char *elem, const char *addr) {
     return NFT_LEGACY && set_scan(set, addr);
 }
 
+/* КАКИМ СЕРВЕРОМ DNS ОТВЕТИЛ РЕЗОЛВЕР НА ИМЯ — поле `dns` его записи в журнале имён (dns-log, dlog.c):
+ * резолвер сам решил, под какое правило имя попало и чей это сервер, и сам записал. Угадывать
+ * здесь по спеке значило бы повторить подбор имени по спискам вторым кодом. Имя сервера — ключ
+ * dns.upstreams (или имя правила у своего сервера правила): буквы, цифры, «_-.» — без экранирования. */
+static int dns_used(const char *name, char *dst, size_t n) {
+    char *mem = NULL;
+    size_t len = 0;
+    FILE *m = open_memstream(&mem, &len);
+    if (!m) return -1;
+    int rc = dlog_print(m);
+    fclose(m);
+    if (rc != 0 || !mem) { free(mem); return -1; }
+    char key[300];
+    snprintf(key, sizeof(key), "{\"name\":\"%s\",", name);
+    for (char *k = key; *k; k++) if (*k >= 'A' && *k <= 'Z') *k = (char)(*k + 32);
+    const char *e = strstr(mem, key);
+    const char *d = e ? strstr(e, ",\"dns\":") : NULL;
+    const char *end = e ? strchr(e + 1, '}') : NULL;
+    int res = -1;
+    if (d && end && d < end) {
+        d += 7;
+        if (!strncmp(d, "null", 4)) res = 0;
+        else if (*d == '"') {
+            const char *q = strchr(d + 1, '"');
+            if (q && (size_t)(q - d - 1) < n) {
+                memcpy(dst, d + 1, (size_t)(q - d - 1));
+                dst[q - d - 1] = '\0';
+                res = 1;
+            }
+        }
+    }
+    free(mem);
+    return res;
+}
+
+/* Строка «DNS: …» под ответом на имя: сервер, группа (режим и состав) или DNS роутера. */
+static void explain_dns_line(const struct spec *cfg, const char *name, FILE *out) {
+    char used[64];
+    int r = dns_used(name, used, sizeof(used));
+    if (r < 0) return;
+    if (r == 0) {
+        fprintf(out, "      DNS: DNS роутера (прежний путь)\n");
+        return;
+    }
+    const struct spec_dns_up *u = NULL;
+    for (size_t i = 0; i < cfg->dns.up_n && !u; i++)
+        if (!strcmp(cfg->dns.up[i].name, used)) u = &cfg->dns.up[i];
+    if (u && u->grp) {
+        fprintf(out, "      DNS: группа «%s» (%s):", used,
+                u->grp == DNSG_RACE ? "все сразу, первый годный ответ" : "по очереди");
+        for (size_t k = 0; k < u->mem_n; k++)
+            if (u->mem[k] < cfg->dns.up_n) fprintf(out, "%s %s", k ? "," : "", cfg->dns.up[u->mem[k]].name);
+        fputc('\n', out);
+    } else if (u) {
+        fprintf(out, "      DNS: сервер «%s» (%s)\n", used, u->url);
+    } else {
+        fprintf(out, "      DNS: «%s»\n", used);
+    }
+    if (cfg->dns.other && cfg->dns.other <= cfg->dns.up_n &&
+        !strcmp(cfg->dns.up[cfg->dns.other - 1].name, used))
+        fprintf(out, "      имя вне правил: не ответит — спросится DNS роутера\n");
+}
+
 int cmd_explain(const char *spec, const char *what) {
     static struct spec cfg;
     static struct groups gr;
@@ -365,12 +428,14 @@ int explain_emit(const struct spec *cfg, const struct groups *gr, const char *wh
         if (rc == -2) {
             fprintf(out, "%s -> резолвер ответил, но адреса не дал: имени нет либо оно не в "
                    "доменных списках, а вышестоящий сервер его не знает\n", what);
+            explain_dns_line(cfg, what, out);
             return 0;
         }
         int fake = fake_addr(resolved, NULL);
         fprintf(out, "%s -> %s (%s)\n", what, resolved,
                fake ? "fake-IP, выдан steer — значит имя в доменном списке"
                     : "настоящий адрес — имя ни в одном доменном списке не нашлось");
+        explain_dns_line(cfg, what, out);
         addr = resolved;
     }
     /* Адрес IPv6 (1.9) ищется в парных наборах «<группа>6»: туда компилятор кладёт строки IPv6

@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/epoll.h>
 #include <sys/random.h>
 #include <sys/socket.h>
@@ -530,7 +531,17 @@ struct pending {
     uint32_t sgen;
     uint8_t cput;
     unsigned cup;
+    /* Имя вне правил ушло на сервер `dns.other`: не ответит — вопрос уходит прежним путём
+     * (proxy.c, sec_done), а не SERVFAIL клиенту. */
+    uint8_t oth;
 };
+
+/* Сервер имён вне правил (`dns.other`, proxy.c): пауза после отказа и сколько вопросов ушло прежним
+ * путём вместо него — для dns-log (dlog.c). */
+extern struct dpause g_other_pause;
+extern unsigned long g_other_fallback;
+/* Имя своей сети: остаётся у DNS роутера и при `dns.other` (proxy.c). */
+int name_local(const char *q);
 
 extern struct pending g_pending[MAX_PENDING];
 extern uint8_t g_gen_next;

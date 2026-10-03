@@ -119,7 +119,7 @@ DNSD_TABLE_SRC := src/dnsd/table.c src/dnsd/tabfmt.c
 DNSD_SRC := src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c \
             src/dnsd/rules.c src/dnsd/wire.c src/dnsd/origdst.c src/dnsd/fakeip.c $(DNSD_TABLE_SRC) \
             src/dnsd/dlog.c src/dnsd/realip.c src/dnsd/adopt.c src/dnsd/proxy.c src/dnsd/main.c \
-            src/dnsd/fpseed.c src/dnsd/dcache.c src/dnsd/dup.c src/dnsd/dupdial.c \
+            src/dnsd/fpseed.c src/dnsd/dcache.c src/dnsd/dup.c src/dnsd/dupgrp.c src/dnsd/dupdial.c \
             src/dnsd/doq.c src/dnsd/doh2.c
 
 # Виды выхода (src/kinds, docs/architecture.md, раздел 2, правило 1): вид — это файл, и какие виды

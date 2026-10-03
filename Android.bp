@@ -94,6 +94,7 @@ cc_defaults {
         "src/dnsd/fpseed.c",
         "src/dnsd/dcache.c",
         "src/dnsd/dup.c",
+        "src/dnsd/dupgrp.c",
         "src/dnsd/dupdial.c",
         "src/dnsd/doq.c",
         "src/dnsd/doh2.c",

@@ -28,6 +28,7 @@
  * клиента или один список (компилятор пока берёт у правила одного клиента и один список). Молча
  * не игнорируется ничего. */
 #define _GNU_SOURCE
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1211,6 +1212,65 @@ static int p_dns_up(struct v2 *x, const struct ynode *val, const char *where, co
     return 0;
 }
 
+/* Апстрим по имени среди записанных в dns.upstreams (не своих серверов правил); -1 — нет. */
+static int up_named(const struct spec *s, const char *name) {
+    for (size_t k = 0; k < s->dns.up_n; k++)
+        if (!s->dns.up[k].inl && !strcmp(s->dns.up[k].name, name)) return (int)k;
+    return -1;
+}
+
+/* Группа серверов: `servers` — имена серверов из dns.upstreams по порядку (у failover — порядок
+ * опроса), `mode` — race (спросить всех сразу, взять первый годный ответ) или failover (по очереди;
+ * умолчание). Группа в группе — отказ: порядок и «сразу всех» у вложенной группы не определены, а
+ * плоский список выражает то же. Число серверов не ограничено. Имена уже известны все: группы
+ * разбираются после всех записей dns.upstreams. */
+static int p_dns_grp(struct v2 *x, const struct ynode *val, const char *where, const char *name,
+                     struct spec_dns_up *u) {
+    struct spec *s = x->s;
+    static const char *const G[] = { "servers", "mode", NULL };
+    char w[96], nm[32];
+    const char *sv;
+    snprintf(nm, sizeof(nm), "%s", name);      /* name бывает самим u->name: memset ниже его стёр бы */
+    memset(u, 0, sizeof(*u));
+    u->out = -1;
+    u->grp = DNSG_FAILOVER;
+    snprintf(u->name, sizeof(u->name), "%s", nm);
+    name = nm;
+    if (want_map(x, val, where)) return -1;
+    if (ynode_get(val, "url"))
+        return fail(x, val, "%s: url и servers вместе — это либо сервер (url), либо группа серверов "
+                    "(servers)", where);
+    if (keys_known(x, val, where, G)) return -1;
+    const struct ynode *mn = ynode_get(val, "mode"), *sn = ynode_get(val, "servers");
+    if (mn) {
+        snprintf(w, sizeof(w), "%s.mode", where);
+        if (str_of(x, mn, w, &sv)) return -1;
+        if (!strcmp(sv, "race")) u->grp = DNSG_RACE;
+        else if (strcmp(sv, "failover") != 0)
+            return fail(x, mn, "%s: «%s» — нужен race (все сразу) или failover (по очереди)", w, sv);
+    }
+    snprintf(w, sizeof(w), "%s.servers", where);
+    if (items_ok(x, sn, w)) return -1;
+    size_t k = n_items(sn);
+    if (!k) return fail(x, sn ? sn : val, "%s: пустой список — нужен хотя бы один сервер", w);
+    u->mem = (unsigned *)spec_alloc(s, k * sizeof(*u->mem));
+    if (!u->mem) return fail(x, sn, "%s: недостаточно памяти для спеки", w);
+    for (size_t i = 0; i < k; i++) {
+        const struct ynode *it = item(sn, i);
+        int m = up_named(s, it->str);
+        if (m < 0) return fail(x, it, "%s: сервера «%s» нет в dns.upstreams", w, it->str);
+        if (!strcmp(it->str, name) && !s->dns.up[m].inl && s->dns.up[m].grp)
+            return fail(x, it, "%s: группа не может входить сама в себя", w);
+        if (s->dns.up[m].grp)
+            return fail(x, it, "%s: «%s» — группа; группа в группе не поддерживается — перечислите "
+                        "её серверы", w, it->str);
+        for (size_t j = 0; j < u->mem_n; j++)
+            if (u->mem[j] == (unsigned)m) return fail(x, it, "%s: сервер «%s» указан дважды", w, it->str);
+        u->mem[u->mem_n++] = (unsigned)m;
+    }
+    return 0;
+}
+
 /* Имя сервера DoT, DoH и DoQ, не записанное адресом, нужно откуда-то разрешить: `ips` апстрима или
  * bootstrap (его или общий). Без них апстрим при первом же запросе не нашёл бы сервер. */
 static int up_has_way(const struct spec *s, const struct spec_dns_up *u) {
@@ -1222,7 +1282,7 @@ static int up_has_way(const struct spec *s, const struct spec_dns_up *u) {
 
 static int p_dns(struct v2 *x, const struct ynode *n) {
     struct spec *s = x->s;
-    static const char *const K[] = { "mode", "cache", "cache_ttl", "upstream", "upstreams",
+    static const char *const K[] = { "mode", "cache", "cache_ttl", "upstream", "upstreams", "other",
                                      "bootstrap", "traceroute_hops", NULL };
     if (want_map(x, n, "dns") || keys_known(x, n, "dns", K)) return -1;
     const struct ynode *v;
@@ -1265,19 +1325,43 @@ static int p_dns(struct v2 *x, const struct ynode *n) {
                     return fail(x, key, "dns.upstreams: имя «%s» повторяется", nm);
             snprintf(where, sizeof(where), "dns.upstreams.%s", nm);
             struct spec_dns_up *u = &s->dns.up[s->dns.up_n];
+            if (val && val->kind == YN_MAP && ynode_get(val, "servers")) {
+                /* Группа: члены — после всех записей (имя может стоять ниже по разделу). */
+                memset(u, 0, sizeof(*u));
+                u->out = -1;
+                u->grp = DNSG_FAILOVER;
+                snprintf(u->name, sizeof(u->name), "%s", nm);
+                s->dns.up_n++;
+                continue;
+            }
             if (p_dns_up(x, val, where, nm, u)) return -1;
             if (!up_has_way(s, u))
                 return fail(x, val, "%s: имя «%s» нечем разрешить — задайте ips (адреса сервера) или "
                             "bootstrap", where, u->host);
             s->dns.up_n++;
         }
+        for (size_t i = 0, k = 0; i < ynode_len(v); i++) {
+            const struct ynode *val = ynode_val_at(v, i);
+            char where[64];
+            while (k < s->dns.up_n && strcmp(s->dns.up[k].name, ynode_key_at(v, i)->str)) k++;
+            if (k == s->dns.up_n || !s->dns.up[k].grp) continue;
+            snprintf(where, sizeof(where), "dns.upstreams.%s", s->dns.up[k].name);
+            if (p_dns_grp(x, val, where, s->dns.up[k].name, &s->dns.up[k])) return -1;
+        }
     }
-    if ((v = ynode_get(n, "upstream"))) {
-        if (str_of(x, v, "dns.upstream", &sv)) return -1;
-        size_t u = 0;
-        while (u < s->dns.up_n && strcmp(s->dns.up[u].name, sv)) u++;
-        if (u == s->dns.up_n) return fail(x, v, "dns.upstream: апстрима «%s» нет в dns.upstreams", sv);
-        s->dns.general = (unsigned)(u + 1);
+    /* Общий сервер правил и сервер имён вне правил — имя сервера или группы из dns.upstreams. */
+    static const struct { const char *key; size_t off; } R[] = {
+        { "upstream", offsetof(struct spec_dns, general) },
+        { "other", offsetof(struct spec_dns, other) },
+    };
+    for (size_t r = 0; r < sizeof(R) / sizeof(R[0]); r++) {
+        char w[32];
+        snprintf(w, sizeof(w), "dns.%s", R[r].key);
+        if (!(v = ynode_get(n, R[r].key))) continue;
+        if (str_of(x, v, w, &sv)) return -1;
+        int u = up_named(s, sv);
+        if (u < 0) return fail(x, v, "%s: апстрима «%s» нет в dns.upstreams", w, sv);
+        *(unsigned *)((char *)&s->dns + R[r].off) = (unsigned)(u + 1);
     }
     return 0;
 }
@@ -1480,16 +1564,20 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
     if ((v = ynode_get(n, "dns"))) {
         snprintf(w, sizeof(w), "правило %s: dns", rn);
         if (v->kind == YN_MAP) {
-            /* Свой сервер прямо в правиле: тот же набор ключей, что у dns.upstreams. Имя ему
-             * даёт правило (для status и журнала). */
+            /* Свой сервер прямо в правиле: тот же набор ключей, что у dns.upstreams, — сервер или
+             * группа серверов. Имя ему даёт правило (для status и журнала). */
             if (spec_reserve_up(s, s->dns.up_n + 1))
                 return fail(x, v, "%s: недостаточно памяти для спеки (%zu апстримов)", w,
                             s->dns.up_n + 1);
             struct spec_dns_up *u = &s->dns.up[s->dns.up_n];
-            if (p_dns_up(x, v, w, rn, u)) return -1;
+            if (ynode_get(v, "servers")) {
+                if (p_dns_grp(x, v, w, rn, u)) return -1;
+            } else {
+                if (p_dns_up(x, v, w, rn, u)) return -1;
+                if (!up_has_way(s, u))
+                    return fail(x, v, "%s: имя «%s» нечем разрешить — задайте ips или bootstrap", w, u->host);
+            }
             u->inl = 1;
-            if (!up_has_way(s, u))
-                return fail(x, v, "%s: имя «%s» нечем разрешить — задайте ips или bootstrap", w, u->host);
             r->dns = (unsigned)(++s->dns.up_n);
         } else {
             if (str_of(x, v, w, &sv)) return -1;

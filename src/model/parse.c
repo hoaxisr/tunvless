@@ -665,6 +665,25 @@ int spec_is_mac(const char *s) {
     return groups == 6;
 }
 
+/* ---- пользуется ли резолвер апстримом (spec.h) --------------------------------------------- */
+
+/* Назначение (номер плюс один) ведёт к апстриму u: это он сам или группа, где он член. */
+static int dns_ref_hits(const struct spec *sp, unsigned ref, size_t u) {
+    if (!ref || ref > sp->dns.up_n) return 0;
+    if (ref == u + 1) return 1;
+    const struct spec_dns_up *g = &sp->dns.up[ref - 1];
+    for (size_t k = 0; g->grp && k < g->mem_n; k++)
+        if (g->mem[k] == u) return 1;
+    return 0;
+}
+
+int spec_dns_up_used(const struct spec *sp, size_t u) {
+    if (dns_ref_hits(sp, sp->dns.general, u) || dns_ref_hits(sp, sp->dns.other, u)) return 1;
+    for (size_t r = 0; r < sp->rule_n; r++)
+        if (!sp->rule[r].disabled && dns_ref_hits(sp, sp->rule[r].dns, u)) return 1;
+    return 0;
+}
+
 /* ---- адрес апстрима DNS (dns.upstreams, docs/spec-v2.md) ---------------------------------------
  *
  * Схема выбирает транспорт, и только она: `https://` — DoH (RFC 8484), `tls://` — DoT (RFC 7858),

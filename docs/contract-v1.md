@@ -676,7 +676,9 @@ v6-двойник (раздел «IPv6 правил» ниже), резолве�
   | `balance_by` | Ключ `by` у группы `pick: balance` (docs/spec-v2.md): `connection`, `site`, `site_client` — раздача новых соединений случайно или хешем адресов. |
   | `exclude` | Ключи `exclude` (страны по флагу в имени узла) и `exclude_name` (куски имени) у выхода `kind: tunnel` спеки v2 ([spec-v2.md](spec-v2.md)); у узла в `*-nodes` — поля `cc` и `excluded` (§6). |
   | `active_nodes` | Пул узлов туннеля — ключи `active`, `by`, `interval`, `silence` у выхода `kind: tunnel` спеки v2 ([spec-v2.md](spec-v2.md), «Пул узлов туннеля»); у выхода в `status` — объект `vless` (`proxy`) с полем `active` (ниже), в `helper` демона — поле `active`. |
-  | `spec_schema2` | Спека `schema: 2` — сужение канала по протоколу и портам (§1). |
+  | `dns_groups` | Группа серверов DNS в `dns.upstreams` спеки v2 — `{ servers, mode: race \| failover }` ([spec-v2.md](spec-v2.md), раздел `dns`); годится в `dns.upstream`, `dns.other` и `dns` правила; в `dns-log` — `proto: "group"` с членами. |
+| `dns_other` | Ключ `dns.other` спеки v2: сервер или группа для имён вне правил, с запасным путём на DNS роутера; в `dns-log` — объект `other` и поле `dns` у имени. |
+| `spec_schema2` | Спека `schema: 2` — сужение канала по протоколу и портам (§1). |
   | `via` | Ключ `via` у выхода (§1) и поле `via` в `status` (ниже). |
   | `status_cache` | `status --fast` отдаёт запомненный ответ с `"cached": true` (§6, «Память состояния»). |
   | `xslink` | Ссылка `xs://` принимается везде, где ждут настройку xsteer (docs/xsteer.md, «Ссылка xs://»). |

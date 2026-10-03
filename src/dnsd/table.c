@@ -22,6 +22,7 @@ struct dchan *dch_new(void) {
  * tabfmt.c (DNSD_TABLE_SRC), без транспортов резолвера. */
 struct dup_cfg *g_dup_cfg;
 size_t g_dup_cfg_n, g_dup_cfg_cap;
+unsigned g_dup_other;
 struct dcache_cfg g_dcache_cfg;
 
 /* ---- наборы каналов имени (chm_t, dnsd_int.h) ------------------------------------------------
@@ -517,9 +518,65 @@ static void dch_add_srs_channel(const struct spec *sp, size_t ci) {
     }
 }
 
-/* Апстримы, которыми пользуются каналы, — в g_dup_cfg (то, что пойдёт в таблицу), а номера в
- * каналах — из нумерации спеки в нумерацию таблицы. Апстрим, на который не ссылается ни один
- * канал, в таблицу не идёт: резолверу незачем держать соединение, которым никто не спросит.
+/* Апстрим спеки номер u (с единицы) — в таблицу, если его там ещё нет; номер в таблице (с единицы)
+ * или 0. Группа ведёт за собой членов: они встают в таблицу раньше неё, а группа хранит их номера
+ * в таблице. Вложенных групп спека не допускает (v2.c), поэтому глубина — один шаг. */
+static int up_take(const struct spec *sp, int *map, size_t u) {
+    if (!u || u > sp->dns.up_n) return 0;
+    if (map[u]) return map[u];
+    const struct spec_dns_up *s = &sp->dns.up[u - 1];
+    unsigned *gm = NULL;
+    size_t gm_n = 0;
+    if (s->grp) {
+        gm = s->mem_n ? malloc(s->mem_n * sizeof(*gm)) : NULL;
+        if (!gm) return 0;
+        for (size_t k = 0; k < s->mem_n; k++) {
+            if (s->mem[k] >= sp->dns.up_n || sp->dns.up[s->mem[k]].grp) continue;
+            int t = up_take(sp, map, s->mem[k] + 1);
+            if (t) gm[gm_n++] = (unsigned)(t - 1);
+        }
+        if (!gm_n) { free(gm); return 0; }
+    }
+    if (g_dup_cfg_n == g_dup_cfg_cap) {
+        size_t nc = g_dup_cfg_cap ? g_dup_cfg_cap * 2 : 8;
+        struct dup_cfg *np = realloc(g_dup_cfg, nc * sizeof(*np));
+        if (!np) { free(gm); return 0; }
+        g_dup_cfg = np;
+        g_dup_cfg_cap = nc;
+    }
+    struct dup_cfg *c = &g_dup_cfg[g_dup_cfg_n];
+    memset(c, 0, sizeof(*c));
+    c->u = *s;                      /* ips и boot — указатели в спеку: она живёт дольше печати */
+    c->u.mem = NULL;
+    c->u.mem_n = 0;
+    if (s->grp) {
+        c->grp = s->grp;
+        c->gm = gm;
+        c->gm_n = gm_n;
+        c->u.boot = NULL;
+        c->u.boot_n = 0;
+    } else {
+        if (!c->u.boot_n) {
+            c->u.boot = sp->dns.boot;
+            c->u.boot_n = sp->dns.boot_n;
+        }
+        if (s->out >= 0 && (size_t)s->out < sp->out_n) {
+            const struct output *o = &sp->out[s->out];
+            snprintf(c->via, sizeof(c->via), "%s", o->name);
+            c->need_mark = 1;
+            c->mark = o->mark ? (o->mark | STEER_TUNNEL_BIT) : 0;
+        } else {
+            c->mark = STEER_SELF_MARK;
+        }
+    }
+    map[u] = (int)++g_dup_cfg_n;
+    return map[u];
+}
+
+/* Апстримы, которыми пользуются каналы и имена вне правил (`dns.other`), — в g_dup_cfg (то, что
+ * пойдёт в таблицу), а номера в каналах — из нумерации спеки в нумерацию таблицы. Апстрим, на
+ * который не ссылается ни один канал, ни dns.other, ни используемая группа, в таблицу не идёт:
+ * резолверу незачем держать соединение, которым никто не спросит.
  *
  * ПУТЬ ЗАПРОСА. Метка сокета апстрима «через выход» — метка выхода-подложки (marks.h,
  * out_underlay_mark): ip rule ведёт её в таблицу устройства выхода, а postrouting_guard не
@@ -532,40 +589,15 @@ static void dch_add_srs_channel(const struct spec *sp, size_t ci) {
 static void dch_up_finalize(const struct spec *sp) {
     /* Номера апстримов спеки → номера таблицы: по числу апстримов, а не по константе. */
     int *map = calloc(sp->dns.up_n + 1, sizeof(int));
-    if (!map) return;
     dup_cfg_list_reset();
+    g_dup_other = 0;
+    if (!map) return;
     for (size_t i = 0; i < g_dch_n; i++) {
         int u = g_dch[i].up;
         if (!u) continue;
-        if ((size_t)u > sp->dns.up_n) { g_dch[i].up = 0; continue; }
-        if (!map[u]) {
-            const struct spec_dns_up *s = &sp->dns.up[u - 1];
-            if (g_dup_cfg_n == g_dup_cfg_cap) {
-                size_t nc = g_dup_cfg_cap ? g_dup_cfg_cap * 2 : 8;
-                struct dup_cfg *np = realloc(g_dup_cfg, nc * sizeof(*np));
-                if (!np) { g_dch[i].up = 0; continue; }
-                g_dup_cfg = np;
-                g_dup_cfg_cap = nc;
-            }
-            struct dup_cfg *c = &g_dup_cfg[g_dup_cfg_n];
-            memset(c, 0, sizeof(*c));
-            c->u = *s;                      /* ips и boot — указатели в спеку: она живёт дольше печати */
-            if (!c->u.boot_n) {
-                c->u.boot = sp->dns.boot;
-                c->u.boot_n = sp->dns.boot_n;
-            }
-            if (s->out >= 0 && (size_t)s->out < sp->out_n) {
-                const struct output *o = &sp->out[s->out];
-                snprintf(c->via, sizeof(c->via), "%s", o->name);
-                c->need_mark = 1;
-                c->mark = o->mark ? (o->mark | STEER_TUNNEL_BIT) : 0;
-            } else {
-                c->mark = STEER_SELF_MARK;
-            }
-            map[u] = (int)++g_dup_cfg_n;
-        }
-        g_dch[i].up = map[u];
+        g_dch[i].up = (u > 0 && (size_t)u <= sp->dns.up_n) ? up_take(sp, map, (size_t)u) : 0;
     }
+    g_dup_other = (unsigned)up_take(sp, map, sp->dns.other);
     free(map);
     g_dcache_cfg.entries = sp->dns.cache;
     g_dcache_cfg.ttl_min = sp->dns.ttl_min;
@@ -576,9 +608,12 @@ static void dch_up_finalize(const struct spec *sp) {
 /* Список апстримов таблицы — пустым; массивы адресов освобождаются у тех, кто ими владеет
  * (разобранных из текста, tabfmt_parse), у взятых взаймы из спеки — нет. */
 void dup_cfg_list_reset(void) {
-    for (size_t i = 0; i < g_dup_cfg_n; i++)
+    for (size_t i = 0; i < g_dup_cfg_n; i++) {
         if (g_dup_cfg[i].own) { free(g_dup_cfg[i].u.ips); free(g_dup_cfg[i].u.boot); }
+        free(g_dup_cfg[i].gm);                      /* номера членов группы — всегда свои */
+    }
     g_dup_cfg_n = 0;
+    g_dup_other = 0;
 }
 
 void dch_build(const struct spec *sp) {

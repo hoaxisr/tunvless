@@ -1332,12 +1332,11 @@ static void build_guard(struct nft_table *t, const struct spec *sp, const struct
     /* Метку выхода несёт и сокет апстрима DNS «через выход» (dns.upstreams.<имя>.out, src/dnsd/dup.h),
      * если на него ссылается правило или он общий: запрос к серверу обязан уйти в устройство этого
      * выхода, а снятое правило ip rule или лёгший выход не должны выпускать его в WAN. Неиспользуемый
-     * апстрим метки не получает и правила не заводит. */
+     * апстрим метки не получает и правила не заводит. Используемый — и член группы серверов, и
+     * сервер для имён вне правил (`dns.other`): spec_dns_up_used. */
     for (size_t u = 0; u < sp->dns.up_n; u++) {
         if (sp->dns.up[u].out < 0 || (size_t)sp->dns.up[u].out >= sp->out_n) continue;
-        int ref = sp->dns.general == u + 1;
-        for (size_t r = 0; r < sp->rule_n && !ref; r++) ref = sp->rule[r].dns == u + 1 && !sp->rule[r].disabled;
-        if (ref) guard_use(sp, &sp->out[sp->dns.up[u].out], used, 0);
+        if (spec_dns_up_used(sp, u)) guard_use(sp, &sp->out[sp->dns.up[u].out], used, 0);
     }
     struct nft_chain *c = NULL;
     for (size_t i = 0; i < sp->out_n; i++) {

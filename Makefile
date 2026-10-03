@@ -91,6 +91,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@BUILD=$(BUILD) sh tests/boxenv.sh
 	@sh tests/climatch.sh
 	@sh tests/dnsproxy.sh
+	@sh tests/dnsgroups.sh
 	@sh tests/dnsnft.sh
 	@sh tests/applynft.sh
 	@sh tests/applynft-legacy.sh

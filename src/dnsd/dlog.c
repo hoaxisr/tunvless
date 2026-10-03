@@ -128,6 +128,16 @@ static char *dlog_render(size_t *len) {
         } else {
             fputs("null,\"out\":null", f);
         }
+        /* Каким сервером или группой отвечает резолвер на это имя (по нынешней таблице): у канала —
+         * его апстрим, вне правил — `dns.other`; null — прежний путь (DNS роутера). */
+        unsigned du = 0;
+        if (e->hit >= 0 && (size_t)e->hit < g_dch_n) du = (unsigned)g_dch[e->hit].up;
+        else if (e->hit == -1 && g_dup_other && !name_local(e->name)) du = g_dup_other;
+        fputs(",\"dns\":", f);
+        /* Имя апстрима — ключ dns.upstreams (ASCII) или, у своего сервера правила, имя правила
+         * (бывает кириллицей) — пишется как имя канала, UTF-8 как есть. */
+        if (du && du <= g_dup_cfg_n) jsonw_str(f, g_dup_cfg[du - 1].u.name);
+        else fputs("null", f);
         fprintf(f, ",\"count\":%u,\"last\":%lld,\"ago\":%ld}", e->count,
                 (long long)(wall - ago), ago);
     }
@@ -138,6 +148,19 @@ static char *dlog_render(size_t *len) {
     fputs("],\"cache\":", f);
     if (dcache_on()) dcache_render(f);
     else fputs("null", f);
+    /* Сервер имён вне правил (`dns.other`): имя, пауза после отказа (секунд до конца; 0 — нет),
+     * годных ответов, отказов и вопросов, ушедших вместо него прежним путём. null — не задан. */
+    fputs(",\"other\":", f);
+    if (g_dup_other && g_dup_other <= g_dup_cfg_n) {
+        long now = dup_now_ms();
+        long left = dpause_on(&g_other_pause, now) ? (g_other_pause.until_ms - now + 999) / 1000 : 0;
+        fputs("{\"name\":", f);
+        jsonw_str(f, g_dup_cfg[g_dup_other - 1].u.name);
+        fprintf(f, ",\"pause\":%ld,\"ok\":%lu,\"failed\":%lu,\"fallback\":%lu}", left,
+                g_other_pause.ok, g_other_pause.fail, g_other_fallback);
+    } else {
+        fputs("null", f);
+    }
     fputs("}\n", f);
     if (fclose(f) != 0) { free(mem); return NULL; }
     *len = n;

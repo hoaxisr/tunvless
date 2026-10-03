@@ -96,10 +96,23 @@ static const char *oname_of(const struct onames *on, size_t idx) {
     return on->v[idx >= SPEC_ANON_BASE ? on->named + (idx - SPEC_ANON_BASE) : idx];
 }
 
-/* Апстрим DNS одним отображением `{ url: …, out: …, ips: […], bootstrap: […] }`. */
-static void dns_up_flow(FILE *f, const struct spec_dns_up *u, const struct onames *oname) {
+/* Апстрим DNS одним отображением `{ url: …, out: …, ips: […], bootstrap: […] }`, группа серверов —
+ * `{ servers: […], mode: … }` (mode печатается всегда: умолчание failover в спеке не очевидно). */
+static void dns_up_flow(FILE *f, const struct spec *s, const struct spec_dns_up *u,
+                        const struct onames *oname) {
     struct flow w = { f, 0 };
     fputs("{ ", f);
+    if (u->grp) {
+        const char **m = malloc((u->mem_n + 1) * sizeof(*m));
+        size_t n = 0;
+        for (size_t k = 0; m && k < u->mem_n; k++)
+            if (u->mem[k] < s->dns.up_n) m[n++] = s->dns.up[u->mem[k]].name;
+        if (m) fseq(&w, "servers", (const char *const *)m, n);
+        free(m);
+        fs(&w, "mode", u->grp == DNSG_RACE ? "race" : "failover");
+        fputs(" }", f);
+        return;
+    }
     fs(&w, "url", u->url);
     if (u->out >= 0) fs(&w, "out", oname_of(oname, (size_t)u->out));
     if (u->ips_n) fseq_s(&w, "ips", u->ips[0], sizeof(u->ips[0]), u->ips_n);
@@ -506,6 +519,8 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
         }
         if (s->dns.general && s->dns.general <= s->dns.up_n)
             fprintf(f, "  upstream: %s\n", s->dns.up[s->dns.general - 1].name);
+        if (s->dns.other && s->dns.other <= s->dns.up_n)
+            fprintf(f, "  other: %s\n", s->dns.up[s->dns.other - 1].name);
         if (named_up) {
             fputs("  upstreams:\n", f);
             for (size_t i = 0; i < s->dns.up_n; i++) {
@@ -513,7 +528,7 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
                 fputs("    ", f);
                 yq(f, s->dns.up[i].name);
                 fputs(": ", f);
-                dns_up_flow(f, &s->dns.up[i], &onm);
+                dns_up_flow(f, s, &s->dns.up[i], &onm);
                 fputc('\n', f);
             }
         }
@@ -544,7 +559,7 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
                 const struct spec_dns_up *du = &s->dns.up[ru->dns - 1];
                 if (du->inl) {
                     fk(&w, "dns");
-                    dns_up_flow(f, du, &onm);
+                    dns_up_flow(f, s, du, &onm);
                 } else {
                     fs(&w, "dns", du->name);
                 }

@@ -1557,8 +1557,10 @@ static void up_retire(struct dup *up) {
 static int cfg_same(const struct dup_cfg *a, const struct dup_cfg *b) {
     if (strcmp(a->u.name, b->u.name) || strcmp(a->u.url, b->u.url) || strcmp(a->via, b->via) ||
         a->mark != b->mark || a->need_mark != b->need_mark || a->u.ips_n != b->u.ips_n ||
-        a->u.boot_n != b->u.boot_n)
+        a->u.boot_n != b->u.boot_n || a->grp != b->grp || a->gm_n != b->gm_n)
         return 0;
+    /* Группа — те же члены на тех же местах настройки: паузы членов переживают перенастройку. */
+    for (size_t i = 0; i < a->gm_n; i++) if (a->gm[i] != b->gm[i]) return 0;
     for (size_t i = 0; i < a->u.ips_n; i++) if (strcmp(a->u.ips[i], b->u.ips[i])) return 0;
     for (size_t i = 0; i < a->u.boot_n; i++) if (strcmp(a->u.boot[i], b->u.boot[i])) return 0;
     return 1;
@@ -1599,6 +1601,8 @@ void dup_apply(const struct dup_cfg *c, size_t n) {
         int keep_n = up->c_n, keep_cap = up->c_cap;
         free(up->ips_own);                      /* личные копии адресов прежней настройки */
         free(up->boot_own);
+        free(up->gm_own);                       /* и номеров членов группы, их паузы */
+        free(up->gp);
         memset(up, 0, sizeof(*up));
         up->c = keepc;
         up->c_n = keep_n;
@@ -1618,6 +1622,20 @@ void dup_apply(const struct dup_cfg *c, size_t n) {
             up->boot_own = memdup(up->cfg.u.boot, up->cfg.u.boot_n * sizeof(*up->cfg.u.boot));
             up->cfg.u.boot = up->boot_own;
             if (!up->boot_own) up->cfg.u.boot_n = 0;
+        }
+        up->cfg.gm = NULL;
+        if (up->cfg.grp && c[i].gm_n) {
+            /* Группа: свои копии номеров членов и место паузы на каждого (dupgrp.c). */
+            up->gm_own = memdup(c[i].gm, c[i].gm_n * sizeof(*c[i].gm));
+            up->gp = calloc(c[i].gm_n, sizeof(*up->gp));
+            if (!up->gm_own || !up->gp) {
+                free(up->gm_own); free(up->gp);
+                up->gm_own = NULL; up->gp = NULL;
+                up->cfg.gm_n = 0;
+            }
+            up->cfg.gm = up->gm_own;
+        } else {
+            up->cfg.gm_n = 0;
         }
         up->cfg.own = 0;
         up->utag.magic = DTAG_MAGIC; up->utag.kind = DT_UDP; up->utag.obj = up;
@@ -1659,6 +1677,7 @@ void dup_apply(const struct dup_cfg *c, size_t n) {
 int dup_ask(size_t idx, const uint8_t *q, size_t n, dup_done_fn cb, void *ctx) {
     if (idx >= g_dups_n || !g_dups[idx] || n < 12 || n > DUP_QMAX) return -1;
     struct dup *up = g_dups[idx];
+    if (up->cfg.grp) return grp_ask(up, q, n, cb, ctx);
     if (up->cfg.u.proto == DNSP_NONE) return -1;
     if (up->cfg.need_mark && !up->cfg.mark) {
         up_err(up, "выход «%s» не размечен: запрос через него не отправить", up->cfg.via);
@@ -1821,10 +1840,11 @@ void dup_tick(void) {
             }
         }
     }
+    grp_tick(now_ms());
 }
 
 int dup_wait_ms(void) {
-    long now = now_ms(), best = -1;
+    long now = now_ms(), best = grp_deadline();
     for (int k = 0; k < g_req_cap; k++) {
         if (!RQ(k).used) continue;
         long t = RQ(k).deadline;
@@ -1861,14 +1881,14 @@ int dup_wait_ms(void) {
 
 int dup_busy(void) {
     for (int k = 0; k < g_req_cap; k++) if (RQ(k).used) return 1;
-    return 0;
+    return grp_busy();
 }
 
 void dup_close_all(void) {
     dup_apply(NULL, 0);
 }
 
-static const char *up_state(const struct dup *up) {
+const char *dup_state(const struct dup *up) {
     if (up->cfg.need_mark && !up->cfg.mark) return "unmarked";
     if (tls_proto(up) && !dup_have_tls()) return "no-tls";
     if (quic_proto(up) && !dup_have_quic()) return "no-tls";      /* нет библиотеки: как у DoT/DoH */
@@ -1901,11 +1921,18 @@ void dup_render(FILE *f) {
         int conns = 0, queued = 0;
         for (int k = 0; k < up->c_n; k++) conns += CN(up, k)->st == CS_READY;
         for (int k = 0; k < g_req_cap; k++) queued += RQ(k).used && RQ(k).up == up;
+        if (up->cfg.grp) {
+            /* Группа серверов: свои поля (dupgrp.c), имя и пустой url — как у сервера. */
+            fprintf(f, "%s{\"name\":\"%s\",\"url\":\"\",", i ? "," : "", up->cfg.u.name);
+            grp_render(f, up);
+            fputs(",\"error\":null,\"error_ago\":null}", f);
+            continue;
+        }
         fprintf(f, "%s{\"name\":\"%s\",\"url\":\"%s\",\"proto\":\"%s\",\"via\":", i ? "," : "",
                 up->cfg.u.name, up->cfg.u.url, proto_name(up->cfg.u.proto));
         if (up->cfg.via[0]) fprintf(f, "\"%s\"", up->cfg.via); else fputs("null", f);
         fprintf(f, ",\"state\":\"%s\",\"conns\":%d,\"inflight\":%d,\"sent\":%lu,\"ok\":%lu,\"failed\":%lu,"
-                   "\"last_ok_ago\":", up_state(up), conns, queued, up->q_sent, up->q_ok, up->q_fail);
+                   "\"last_ok_ago\":", dup_state(up), conns, queued, up->q_sent, up->q_ok, up->q_fail);
         if (up->ok_ms) fprintf(f, "%ld", (now - up->ok_ms) / 1000); else fputs("null", f);
         /* DoQ: сколько вопросов ушло в 0-RTT и сколько раз сервер его отверг. Только когда 0-RTT был. */
         if (up->q_early || up->q_early_rej)

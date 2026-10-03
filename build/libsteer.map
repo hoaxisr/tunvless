@@ -260,6 +260,7 @@ LIBSTEER_1 {
     sl_truthy;
     sl_utf8_trim_tail;
     sl_uuid_parse;
+    spec_dns_up_used;
     spec_is_mac;
     spec_line_family;
     spec_line_is_addr;
