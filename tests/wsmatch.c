@@ -636,8 +636,11 @@ static void *srv_main(void *arg) {
     int fd = accept(s->lfd, NULL, NULL);
     s->rc = -1;
     if (fd < 0) return NULL;
-    if (s->plan == P_HANGUP) { close(fd); s->rc = 0; return NULL; }
+    /* Закрыться, не ответив, — ПОСЛЕ того как запрос прочитан: закрытие сокета с непрочитанным
+     * запросом ядро отдаёт сбросом (RST), и клиент видел то конец потока, то обрыв — по тому,
+     * успел ли запрос прийти до close (на нагруженной машине стенд падал через раз). */
     if (rd_until(fd, s->req, sizeof(s->req), "\r\n\r\n") < 0) { close(fd); return NULL; }
+    if (s->plan == P_HANGUP) { close(fd); s->rc = 0; return NULL; }
     if (s->plan == P_SILENT) { sleep(2); close(fd); s->rc = 0; return NULL; }
     if (s->plan >= P_WS_ED) return srv_ed(s, fd);
 
