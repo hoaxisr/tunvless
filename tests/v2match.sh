@@ -522,7 +522,7 @@ outputs:
   wg1: { kind: interface, device: wg1 }
   l: { kind: group, pick: latency, members: [wg0, wg1], url: "https://www.gstatic.com/generate_204" }
 EOF
-refused "https в steer-mini — отказ с понятным текстом" "https:// в этой сборке нет (steer-mini без TLS)" 5
+refused "https в сборке без TLS — отказ с понятным текстом" "https:// в этой сборке нет (сборка без TLS)" 5
 
 y <<'EOF'
 version: 2

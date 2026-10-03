@@ -813,17 +813,18 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
                 o.grp.lat_interval_s = (int)lv;
                 lat_key = kk;
             } else if (!strcmp(ks, "url")) {
-                /* Адрес проверки urltest (docs/spec-v2.md). https — только в полном пакете: в
-                 * steer-mini нет TLS, и адрес, который замер не сможет спросить, лучше назвать
-                 * при разборе, чем молча мерить им «не измерено» у всех членов. */
+                /* Адрес проверки urltest (docs/spec-v2.md). https — только там, где есть TLS: в
+                 * статической сборке без него (микропакет tgws) его нет, и адрес, который замер не
+                 * сможет спросить, лучше назвать при разборе, чем молча мерить им «не измерено» у
+                 * всех членов. */
                 struct urltest_url u;
                 char why[160];
                 if (str_of(x, v, w, &sv)) return -1;
                 if (urltest_url_parse(sv, &u, why, sizeof(why)) != 0)
                     return fail(x, v, "%s: %s", w, why);
                 if (u.https && urltest_https_refused())
-                    return fail(x, v, "%s: https:// в этой сборке нет (steer-mini без TLS) — нужен полный "
-                                "пакет steer или адрес http://", w);
+                    return fail(x, v, "%s: https:// в этой сборке нет (сборка без TLS) — нужен пакет "
+                                "steer-core или адрес http://", w);
                 if (copy_to(x, v, w, sv, o.grp.url, sizeof(o.grp.url))) return -1;
                 lat_key = kk;
             } else if (!strcmp(ks, "idle_timeout")) {

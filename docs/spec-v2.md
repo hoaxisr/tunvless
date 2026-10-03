@@ -294,7 +294,7 @@ convert` печатает только отличное от умолчания.
 | `pick` | `order` — первый живой; `latency` — самый быстрый с допуском (urltest); `manual` — выбор человека командой `select`; `balance` — ядро раскидывает новые соединения по живым членам | `order` |
 | `tolerance` | `pick: latency`: допуск в мс, 0..60000 | умолчание сторожа (50) |
 | `interval` | `pick: latency`: интервал замера в секундах, 5..86400 (у демона — свой таймер группы, и интервал может быть короче периода сторожа) | умолчание сторожа (180) |
-| `url` | `pick: latency`: адрес проверки — `http://…` или `https://…` (https только в полном пакете steer; в steer-mini — отказ разбора) | `http://cp.cloudflare.com/generate_204` |
+| `url` | `pick: latency`: адрес проверки — `http://…` или `https://…` (https — в пакете `steer-core`; в статической сборке без TLS, микропакете tgws, — отказ разбора) | `http://cp.cloudflare.com/generate_204` |
 | `idle_timeout` | `pick: latency`: сколько секунд без трафика через группу замер не делается, 0..86400; `0` — мерить всегда | телефон — 1800, роутер — 0 |
 | `default` | `pick: manual`: член до первой команды `select` | первый |
 | `weights` | `pick: balance`: вес каждого члена по порядку `members`, 1..100 — доля новых соединений | все по 1 |
@@ -353,7 +353,7 @@ convert` печатает только отличное от умолчания.
 
 Отказы: члена нет; группа в себе самой; член дважды; член без устройства (direct, zapret, tgws);
 круг групп; `default` не из членов или не у `manual`; `tolerance`/`interval`/`url`/`idle_timeout` не
-у `latency`; `url` не `http(s)://хост[:порт][/путь]`, `https://` в steer-mini; `weights` не у
+у `latency`; `url` не `http(s)://хост[:порт][/путь]`, `https://` в сборке без TLS; `weights` не у
 `balance` или не по числу членов; `by` не у `balance` или не `connection`/`site`/`site_client`; группа `balance` членом группы `order`/`latency`/`manual` (у такой
 группы трафик идёт в одно устройство, а у balance устройство на каждое соединение своё); `device` у
 группы.
