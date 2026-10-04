@@ -116,7 +116,7 @@ static void usage(FILE *f) {
 "  -b, --bind-dev IFACE   send sockets to the server out of IFACE (SO_BINDTODEVICE)\n"
 "\n"
 "Other:\n"
-"  -t, --timeout S        probe and connect timeout, seconds (default 8)\n"
+"  -t, --timeout S        probe timeout at startup and for --probe, seconds (default 8)\n"
 "      --silence S        reset a connection whose server stays silent for S seconds\n"
 "                         (default 20, 0 — never)\n"
 "      --no-retry         exit when no candidate resolves or none answers at startup,\n"

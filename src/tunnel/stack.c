@@ -172,6 +172,9 @@ struct conn {
     time_t last;
     /* --- below: what the loop walk does NOT read; packet handling and setup only. --- */
     struct flow_key key;
+    /* The loop turn the slot was given to this connection (g_turn). Events from that turn's
+     * epoll_wait belong to the slot's previous connection. */
+    uint32_t born_turn;
     int fd;                   /* copy of the session's socket, for epoll_ctl and poll */
     int done;                 /* the connector has finished: read only with ACQUIRE */
     int rc;                   /* its result: 0 or the dialer's error code */
@@ -468,6 +471,8 @@ static int client_can_take_record(struct conn *c) {
  * fresh pages). Now a loop thread has one mapping (mmap) for the hot table, lists, buckets and
  * sessions, whose pages become resident only when touched. Only the pointers are __thread. */
 static __thread struct conn *g_conns;
+/* Loop turns of this thread: one per epoll_wait. */
+static __thread uint32_t g_turn;
 /* Dialer sessions, one per slot, g_sess_stride apart. The stride is per process: set from
  * dialer_ops.sess_size in stack_run before the threads start, read-only after. */
 static __thread unsigned char *g_sess;
@@ -1604,6 +1609,7 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
         if (!c) return;                             /* nothing to evict: the datagram is lost */
         memset(c, 0, sizeof(*c));
         c->used = 1;
+        c->born_turn = g_turn;
         c->is_udp = 1;
         c->key = *k;
         c->fd = -1;
@@ -1787,6 +1793,7 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         if (!c) return;                             /* all connections fresh: the client retries */
         memset(c, 0, sizeof(*c));
         c->used = 1;
+        c->born_turn = g_turn;
         c->key = k;
         c->fd = -1;
         /* Into the lists AFTER memset and AFTER the key: the hash uses the key, and memset would
@@ -2435,6 +2442,7 @@ static void *worker_loop(void *arg) {
          * too. A smaller limit would not lose an event (level-triggered epoll reports it again)
          * but would delay it by a turn. */
         int r = epoll_wait(ep, evs, MAX_CONNS + 2, wait_ms);
+        g_turn++;
         uint64_t after_poll = now_ns();
         loop_at = after_poll;
         g_now_ns = after_poll;
@@ -2503,10 +2511,12 @@ static void *worker_loop(void *arg) {
             struct conn *c = &g_conns[evs[i].data.u32];
             /* The slot may have been freed in this same turn (an RST from the client, a failed
              * send, an eviction) and even given to a new connection: conn_new hands out the most
-             * recently freed slot first. These checks skip a free slot and a new connection
-             * waiting for its connector, whose session must not be touched. A new connection
-             * that took a spare session is NOT pending and gets the old connection's event. */
-            if (!c->used || c->pending) continue;
+             * recently freed slot first. Skip a free slot, a connection waiting for its connector
+             * (its session must not be touched), and any connection born in this turn: the event
+             * was its predecessor's. Without the last check a new connection that took a spare
+             * session read its fresh link, which is blocking with no data yet, and stalled the
+             * whole loop for up to CONNECT_TIMEOUT_S. */
+            if (!c->used || c->pending || c->born_turn == g_turn) continue;
             /* The queue to the node has room: the held ACK can go (flush_acks below rechecks
              * readiness itself). Writability alone means nothing to read, so skip the read. */
             if (evs[i].events & EPOLLOUT) out_woke = 1;

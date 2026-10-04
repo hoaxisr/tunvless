@@ -93,7 +93,7 @@ tunvless [options] <vless://link | file>...
   -T, --table N          routing table for --route (default main)
   -m, --mark N           SO_MARK on sockets to the server
   -b, --bind-dev IFACE   send sockets to the server out of IFACE (SO_BINDTODEVICE)
-  -t, --timeout S        probe and connect timeout (default 8)
+  -t, --timeout S        probe timeout at startup and for --probe (default 8)
       --silence S        reset a connection whose server stays silent for S seconds (default 20)
       --no-retry         exit instead of retrying when no candidate resolves or answers at startup
 ```
