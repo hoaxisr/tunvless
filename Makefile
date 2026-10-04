@@ -79,7 +79,7 @@ T_CFLAGS  = -O1 -g $(WARN) -Wno-unused-function $(INC) -Itests $(if $(SANITIZE),
 TW_LIB   := $(T)/wolfssl/libwolfssl.a
 TW_FLAGS  = $(shell cat $(TW_LIB).cflags 2>/dev/null)
 
-UNIT := h2match xhupmatch wsmatch b3match visionmatch submatch subpq tungromatch tunnamematch tunnelmatch
+UNIT := h2match xhupmatch wsmatch b3match visionmatch submatch subpq tungromatch tunnamematch tunnelmatch rtxmatch
 CRYPTO_TESTS := scryptomatch hellofreeze echmatch vlessmatch takematch
 
 test: unit-test crypto-test
@@ -135,6 +135,10 @@ $(T)/tungromatch: tests/tungromatch.c src/tunnel/tun.c $(HDR)
 $(T)/tunnamematch: tests/tunnamematch.c src/tunnel/tun.c $(HDR)
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/tunnamematch.c src/tunnel/tun.c
+
+$(T)/rtxmatch: tests/rtxmatch.c src/tunnel/rtx.c src/tunnel/rtx.h
+	@mkdir -p $(T)
+	$(CC) $(T_CFLAGS) -o $@ tests/rtxmatch.c src/tunnel/rtx.c
 
 TUNNEL_TEST_SRC := src/tunnel/tun.c src/tunnel/rtx.c src/tunnel/ifcfg.c src/proto/vless/vless_proto.c \
                    src/proto/vless/vision.c src/proto/vless/vldial.c src/lib/osrand.c
