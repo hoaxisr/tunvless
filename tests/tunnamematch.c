@@ -16,11 +16,15 @@
  * TUNSETPERSIST) and disappears when its descriptors close, so there is nothing to clean up, but
  * whether it exists is checked in /sys/class/net.
  */
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <linux/if.h>
+#include <linux/if_tun.h>
 
 /* tun.c is linked, not included: only tun_open is under test. */
 #include "../src/tunnel/tun.h"
@@ -30,6 +34,7 @@
 #define NAME_OK   "xs-namechk-ok15"
 #define NAME_LONG "xs-namechk-long6"
 #define NAME_CUT  "xs-namechk-long"   /* what the kernel truncates NAME_LONG to */
+#define NAME_PROBE "xs-nc-probe"
 
 static int fails;
 
@@ -52,28 +57,43 @@ static void close_all(struct tun_dev *q, int n) {
     for (int i = 0; i < n; i++) close(q[i].fd);
 }
 
+/* Availability probe that does not go through tun_open: create a device with a short name by
+ * hand. Probing with tun_open would turn any bug that makes it fail into a skip, which exits 0. */
+static int tun_available(void) {
+    int fd = open("/dev/net/tun", O_RDWR);
+    if (fd < 0) return 0;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", NAME_PROBE);
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+    int ok = ioctl(fd, TUNSETIFF, &ifr) == 0;
+    close(fd);
+    return ok;
+}
+
 int main(void) {
     struct tun_dev q[4];
 
-    /* Availability probe: the same call the tunnel makes, with a name that surely fits. A failure
-     * here means missing privileges or module, not a bug. */
-    int probe = tun_open(q, 1, NAME_OK);
-    if (probe < 0) {
+    /* A failure here means missing privileges or module, not a bug. */
+    if (!tun_available()) {
         printf("SKIPPED: TUNSETIFF unavailable (no /dev/net/tun or CAP_NET_ADMIN)\n");
         printf("The test checks that tun_open fails when the kernel renames the device.\n");
         return 0;
     }
-    check("15-character name accepted", 1, probe >= 1);
-    check("device with that name created", 1, dev_exists(NAME_OK));
-    close_all(q, probe);
+
+    /* 15 characters, the longest name that fits, must work. */
+    int ok = tun_open(q, 1, NAME_OK);
+    check("15-character name accepted", 1, ok >= 1);
+    check("device with that name created", 1, ok >= 1 && dev_exists(NAME_OK));
+    if (ok > 0) close_all(q, ok);
 
     /* The main case: 16 characters. Without the name check tun_open returns the number of
      * queues, a success, and the tunnel goes on with NAME_LONG, which does not exist. */
     int n = tun_open(q, 1, NAME_LONG);
     check("16-character name rejected", 1, n < 0);
     if (n > 0) close_all(q, n);
+    /* The truncated name is the only one that can be left: no device can have 16 characters. */
     check("no device left under the truncated name", 0, dev_exists(NAME_CUT));
-    check("no device under the 16-character name", 0, dev_exists(NAME_LONG));
 
     printf("\n");
     if (fails) {
