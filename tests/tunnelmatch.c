@@ -85,6 +85,7 @@ int nanosleep(const struct timespec *req, struct timespec *rem) {
 static int g_sess_pipe[2] = { -1, -1 };
 static int g_send_rc;                 /* what transport_write returns: 0 or H2_EWINDOW */
 static int g_send_again_n;            /* return H2_EWINDOW this many times, then 0 */
+static int g_send_calls;
 static int g_recv_calls;
 static int g_recv_rc;                 /* what transport_read_zc returns: 0 or -1 (end of stream) */
 static unsigned char g_recv_buf[4096];
@@ -99,6 +100,7 @@ int vless_connect(const struct vless_node *node, struct transport *conn, int tim
 }
 int transport_write(struct transport *c, const unsigned char *d, size_t n) {
     (void)c; (void)d; (void)n;
+    g_send_calls++;
     if (g_send_again_n > 0) { g_send_again_n--; return H2_EWINDOW; }
     return g_send_rc;
 }
@@ -177,15 +179,11 @@ static struct flow_key cli_key(void) {
     return k;
 }
 
-/* What worker_loop does for a ready job: wait for the connector, up to a deadline. */
+/* What worker_loop does for a ready job: wait for the connector, up to a deadline, then
+ * conn_ready. -1 — no report, or the flow did not open. */
 static int wait_ready(struct conn *c, int ms) {
     for (int i = 0; i < ms; i++) {
-        if (__atomic_load_n(&c->done, __ATOMIC_ACQUIRE)) {
-            c->pending = 0;
-            c->fd = g_dl->ops->fd(SESS(c));
-            if (c->early) early_flush(c);
-            return 0;
-        }
+        if (__atomic_load_n(&c->done, __ATOMIC_ACQUIRE)) return conn_ready(c, &g_tun) ? -1 : 0;
         struct timespec ts = { 0, 1000000 };
         nanosleep(&ts, NULL);
     }
@@ -280,19 +278,24 @@ static void t_sendagain_retry(void) {
 }
 
 /* The server ends the stream on that same read. The connection must live until what was
- * already sent is acknowledged (srv_closed, as in drain_conn), not vanish with the ring. */
+ * already sent is acknowledged (srv_closed, as in drain_conn), not vanish with the ring. And the
+ * packet is not sent again into the ended stream: the window would allow it now (only the first
+ * send is refused), but it is neither sent nor acknowledged. */
 static void t_sendagain_eof(void) {
     struct conn *c = open_conn(65535);
     if (!c) { check(0, "SEND_AGAIN: test connection did not open"); return; }
     const unsigned char d[] = "GET / HTTP/1.1\r\n";
-    g_send_rc = H2_EWINDOW;
+    g_send_again_n = 1;
     g_recv_rc = -1;
+    int sends = g_send_calls;
     cli_send(1001, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d) - 1);
     struct flow_key k = cli_key();
     c = conn_find(&k);
     check(c && c->srv_closed && c->rtx.len == 1000,
           "SEND_AGAIN, end of stream: connection alive, 1000 bytes await ACK");
-    g_send_rc = 0;
+    check(c && g_send_calls == sends + 1 && c->client_seq == 1001 && !c->ack_due,
+          "SEND_AGAIN, end of stream: the packet is not retried, not acknowledged");
+    g_send_again_n = 0;
     g_recv_rc = 0;
     if (c) conn_drop(c);
     dev_drain(NULL);
@@ -390,28 +393,25 @@ static void t_window_scale(void) {
         n = ack_after_data(1001, &last);
         check(n == 1 && (last.tcp_flags & TCP_ACK) && last.ack == 1101 && last.window == 32768,
               "  data ACK: window field 32768, with shift 5 that is 1 MiB");
-        check(((uint32_t)last.window << g_rcv_shift) == g_rcv_wnd, "  field << 5 is the ceiling");
+        check(((uint32_t)last.window << 5) == (1u << 20), "  field << 5 is the ceiling");
     } else {
         check(0, "  connector did not report");
     }
     if (c) conn_drop(c);
     dev_drain(NULL);
 
-    /* Ceiling 65636, shift 1: the field is the ceiling divided by 2^shift, rounded up, so the
-     * window is not below the ceiling. 65636 is even, so this case does not tell rounding up from
-     * rounding down. */
-    rcv_window_set(65535);
-    check(g_rcv_shift == 0, "ceiling 65535: shift 0, the plain 65535 window");
-    rcv_window_set(65536 + 100);
-    c = NULL;
+    /* Ceiling 65537, shift 1: the field is the ceiling divided by 2^shift, rounded up, so the
+     * window is not below the ceiling: 32769, not 32768. The ceiling is odd: with an even one
+     * both roundings give the same field. */
+    rcv_window_set(65537);
     syn_opts(1500, 3);
     c = conn_find(&k);
     if (c && wait_ready(c, 2000) == 0) {
         cli_send(1501, 2, TCP_ACK, 65535, NULL, 0);
         dev_drain(NULL);
         n = ack_after_data(1501, &last);
-        check(n == 1 && last.window == (65636 + 1) / 2 && ((uint32_t)last.window << g_rcv_shift) >= g_rcv_wnd,
-              "ceiling 65636, shift 1: field 32818, window not below the ceiling");
+        check(n == 1 && g_rcv_shift == 1 && last.window == 32769,
+              "ceiling 65537, shift 1: field 32769, rounded up, window not below the ceiling");
     } else {
         check(0, "  connector did not report (rounding)");
     }
@@ -518,12 +518,21 @@ static void syn_bad(void *arg) {
     g_dial.ctx = &g_node;
 }
 
+static int bad_probe(const void *node, int t, char *why, size_t n) {
+    (void)node; (void)t; snprintf(why, n, "stub"); return -1;
+}
+static const char *bad_name(const void *node) { return ((const struct vless_node *)node)->name; }
+static const struct pool_proto bad_proto = { .ops = &vless_dialer, .probe = bad_probe,
+                                             .name = bad_name };
+
 static int g_run_rc;
 static void run_bad(void *arg) {
     /* A name longer than 15 characters: tun_open refuses it anyway, so no device appears even
-     * without the UUID check; what differs is whether the reason is named. */
+     * without the UUID check; what differs is whether the reason is named. The pool gets a
+     * protocol, so a run past the check reaches tun_open instead of crashing on the way. */
     struct tun_cfg tc = { .dev = "tunnelmatch-no-such-dev", .prefix = 32 };
-    struct pool_cfg pc = { .nodes = arg, .stride = sizeof(struct vless_node), .first = 0 };
+    struct pool_cfg pc = { .proto = &bad_proto, .nodes = arg, .stride = sizeof(struct vless_node),
+                           .first = 0 };
     g_run_rc = vless_tunnel_run(&tc, &pc, NULL, NULL);
 }
 
@@ -665,16 +674,17 @@ static int full_table_gives_udp(uint16_t dport, int idle_s) {
     return gave;
 }
 
-/* The table is full. A DNS flow (UDP to port 53) silent for 15 s is done, query and answer, and
- * must give up its slot: by the general 120 s threshold it would look active, and conn_new would
- * refuse new connections, plain TCP included. A live QUIC flow with the same idle time is left
- * alone, and so is a DNS flow whose answer may still come. */
+/* The table is full. A DNS flow (UDP to port 53) silent for DNS_IDLE_S (10 s) is done, query and
+ * answer, and must give up its slot: by the general 120 s threshold it would look active, and
+ * conn_new would refuse new connections, plain TCP included. A live QUIC flow with a longer idle
+ * time is left alone, and so is a DNS flow whose answer may still come (a second less). */
 static void t_dns_evict(void) {
     /* The fixture itself: a flow idle longer than IDLE_EVICT_S is evicted whatever its port. */
     check(full_table_gives_udp(443, IDLE_EVICT_S + 10), "full table: flow idle over 120 s evicted");
-    check(full_table_gives_udp(53, 15), "full table: DNS flow idle 15 s gives up its slot");
+    check(full_table_gives_udp(53, DNS_IDLE_S),
+          "full table: DNS flow idle DNS_IDLE_S gives up its slot");
     check(!full_table_gives_udp(443, 15), "full table: non-DNS UDP flow idle 15 s is kept");
-    check(!full_table_gives_udp(53, 3), "full table: DNS flow idle 3 s is kept");
+    check(!full_table_gives_udp(53, DNS_IDLE_S - 1), "full table: DNS flow idle 1 s less is kept");
 }
 
 /* Spare pool: a ready session is handed to a connection, and its slot is empty afterwards. The
@@ -907,8 +917,10 @@ static void pm_sweep(void) {
  * Checks (pl_check) are called by hand instead of from the health thread, so every step of a
  * failover is deterministic. */
 
+static int g_probes[5];                 /* probes per node */
 static int f_probe(const void *node, int t, char *why, size_t n) {
     (void)t;
+    g_probes[(const struct fnode *)node - g_fn]++;
     if (((const struct fnode *)node)->alive) return 0;
     snprintf(why, n, "test node is silent");
     return -1;
@@ -954,7 +966,7 @@ static void t_pool_setup(void) {
     pool_new(2, POOL_BY_CONNECTION, 3);
     uint64_t now = pl_now_ms();
     check(g_pl.slot[0].node == 0 && g_pl.slot[0].up && g_pl.slot[0].due > now + 50000 &&
-          g_pl.slot[1].node == -1 && g_pl.slot[1].due <= now,
+          g_pl.slot[0].due <= now + 60000 && g_pl.slot[1].node == -1 && g_pl.slot[1].due <= now,
           "startup: slot 0 holds the probed node, next check in a period; the empty slot searches now");
     pool_new_ex(1, POOL_BY_CONNECTION, 3, 0);
     check(g_pl.slot[0].node == 0 && g_pl.slot[0].due <= pl_now_ms(),
@@ -970,7 +982,7 @@ static void t_pool_stale(void) {
     struct conn *a = NULL, *b = NULL;
     for (uint16_t p = 51000; p < 51100 && (!a || !b); p++) {
         struct conn *c = pm_open(p, 0x0b0b0b0bu);
-        if (!c) continue;
+        if (!c) break;                      /* broken: do not wait 3 s a hundred times */
         const struct pl_sess *ps = SESS(c);
         if (ps->slot == 0 && !a) a = c;
         else if (ps->slot == 1 && !b) b = c;
@@ -983,12 +995,27 @@ static void t_pool_stale(void) {
     unsigned ep0 = __atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE);
     g_fn[0].alive = 0;
     pl_check(0);
-    check(g_pl.slot[0].up && g_pl.slot[0].node == 0 && __atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE) == ep0,
+    check(g_pl.slot[0].up && g_pl.slot[0].node == 0 &&
+              __atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE) == ep0 &&
+              g_pl.slot[0].due == g_pl.slot[0].checked_at + 3000,
           "one failed check — the node is still active (confirmed 3 s later)");
+    g_fn[0].alive = 1;
+    pl_check(0);
+    check(g_pl.slot[0].up && g_pl.slot[0].due == g_pl.slot[0].checked_at + 60000,
+          "the confirmation passes — the next check a period (60 s) later");
+    g_fn[0].alive = 0;
+    pl_check(0);
+    check(g_pl.slot[0].up && g_pl.slot[0].node == 0,
+          "  a failure after it is the first again, not the second in a row");
+    memset(g_probes, 0, sizeof g_probes);
     pl_check(0);
     check(g_pl.slot[0].up && g_pl.slot[0].node == 2,
           "two failed checks in a row — replaced by the next free candidate (1 is taken, 2 is used)");
-    check(__atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE) != ep0, "a replacement tells the stack the node set changed");
+    check(g_probes[0] == 1 && g_probes[1] == 0 && g_probes[2] == 1,
+          "  the search probes free candidates only: not the failed node again, not a taken one");
+    /* Death and replacement both tell it; each one alone is checked in t_pool_refill. */
+    check(__atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE) != ep0,
+          "a dead node replaced — the stack is told the node set changed");
     pm_sweep();
     unsigned fl;
     pm_drain(&fl, NULL);
@@ -1066,11 +1093,28 @@ static void t_pool_refill(void) {
     pl_check(2);
     check(g_pl.slot[1].node == 2 && g_pl.slot[2].node == 3,
           "empty slots fill in candidate order, a silent candidate skipped");
+    /* Connections, as the pool's session header: on slot 0's node, and (bound below) on it once
+     * dead, where pl_pick sends new ones when no slot is live. */
+    struct pl_sess on_live, on_dead;
+    pthread_mutex_lock(&g_pl.mu);
+    pl_bind(&on_live, 0);
+    pthread_mutex_unlock(&g_pl.mu);
     for (int i = 0; i < 5; i++) g_fn[i].alive = 0;
+    unsigned ep = __atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE);
     pl_check(0);
+    uint64_t t0 = pl_now_ms();
     pl_check(0);
-    check(!g_pl.slot[0].up && g_pl.slot[0].node == 0 && g_pl.slot[0].retry == PL_RETRY_S * 2,
-          "no replacement answers — the slot waits for the next round, the pause doubles");
+    uint64_t t1 = pl_now_ms();
+    check(!g_pl.slot[0].up && g_pl.slot[0].node == 0 && g_pl.slot[0].due >= t0 + 15000 &&
+              g_pl.slot[0].due <= t1 + 15000 && g_pl.slot[0].retry == 30,
+          "no replacement answers — the slot waits 15 s for the next round, the pause doubles");
+    check(__atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE) != ep,
+          "a dead node without a replacement still tells the stack the node set changed");
+    check(pl_stale(&g_pl, &on_live),
+          "  and its connections are stale at once, not on a replacement");
+    pthread_mutex_lock(&g_pl.mu);
+    pl_bind(&on_dead, 0);
+    pthread_mutex_unlock(&g_pl.mu);
     check(g_pl.said_up == 1, "other slots are alive — the pool is still up");
     for (int s = 1; s < 3; s++) { pl_check(s); pl_check(s); }
     check(g_pl.said_up == 0, "no live slot left — the pool says so");
@@ -1081,8 +1125,12 @@ static void t_pool_refill(void) {
     check(g_pl.slot[2].up && g_pl.slot[2].node == 3 && g_pl.said_up == 1,
           "a round: the slot's own node answers again — the slot lives on it, the pool is up again");
     g_fn[4].alive = 1;
+    ep = __atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE);
     pl_check(0);
-    check(g_pl.slot[0].up && g_pl.slot[0].node == 4, "a round: a free candidate answers — the slot takes it");
+    check(g_pl.slot[0].up && g_pl.slot[0].node == 4 &&
+              __atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE) != ep,
+          "a round: a free candidate answers — the slot takes it, the stack is told");
+    check(pl_stale(&g_pl, &on_dead), "  connections bound to the slot's dead node are stale then");
     int dup = 0;
     for (int i = 0; i < 3; i++)
         for (int j = i + 1; j < 3; j++)
@@ -1120,11 +1168,15 @@ static void t_pool_spares(void) {
     pl_bind(s, 1 - d->slot);
     pthread_mutex_unlock(&g_pl.mu);
     const void *want = s->node;
+    int want_slot = s->slot;
+    unsigned want_gen = s->gen;
     check(pl_match(&g_pl, dst, src) == 1, "by connection: a spare to any live node suits");
     ((struct fsess *)INNER(src))->fd = -1;
     pl_take(dst, src);
     const struct fsess *fd = INNER(dst);
-    check(d->node == want && fd->node == want && fd->flow_opens == 2,
+    /* The slot and generation move too: they decide when the connection is stale. */
+    check(d->node == want && d->slot == want_slot && d->gen == want_gen && fd->node == want &&
+              fd->flow_opens == 2,
           "a spare to another node — the connection moves to it, its flow set up again for that node");
 
     /* Spares go to the live slots in turn. */
@@ -1156,6 +1208,12 @@ static void t_pool_spares(void) {
     pl_seen(d, -1);
     check(g_pl.slot[0].kick == 1, "three failed connects in a row — check the node now");
     g_pl.slot[0].kick = 0;
+    pl_seen(d, 0);
+    struct pl_sess former = *d;                 /* a connection to the slot's previous node */
+    former.gen--;
+    for (int i = 0; i < 3; i++) pl_seen(&former, -1);
+    check(!g_pl.slot[0].kick,
+          "failed connects to the slot's previous node do not count against it");
     g_pl.slot[0].checked_at = pl_now_ms();
     pl_lost(&g_pl, d);
     check(!g_pl.slot[0].kick, "a cut right after a check does not call another (cuts come in bursts)");
@@ -1174,6 +1232,21 @@ static void t_pool_spares(void) {
     pl_check(0);
     check(g_pl.slot[0].up && g_pl.slot[0].node == 2,
           "a stall and one failed check — replaced without the 3 s confirmation");
+    g_fn[0].alive = 1;
+
+    /* A stall whose check passes is forgotten: a later failure waits for its confirmation. */
+    pool_new(2, POOL_BY_CONNECTION, 3);
+    pl_check(1);
+    g_pl.slot[0].checked_at = 0;
+    pthread_mutex_lock(&g_pl.mu);
+    pl_bind(d, 0);
+    pthread_mutex_unlock(&g_pl.mu);
+    pl_lost(&g_pl, d);
+    pl_check(0);
+    g_fn[0].alive = 0;
+    pl_check(0);
+    check(g_pl.slot[0].up && g_pl.slot[0].node == 0,
+          "a stall whose check passed — the next failure is confirmed again");
     g_fn[0].alive = 1;
 }
 
@@ -1228,7 +1301,8 @@ static void t_stack_abort(void) {
     n = pm_drain(&fl, &sq);
     check(n == 1 && (fl & TCP_RST) && sq == 778,
           "ACK without a connection (challenge ACK to our RST): RST with seq = its ack");
-    pm_send(50001, 0x0a0a0a0au, 5000, 779, TCP_RST, NULL, 0);
+    /* With ACK, as clients usually send it: a bare RST would be left unanswered for lacking one. */
+    pm_send(50001, 0x0a0a0a0au, 5000, 779, TCP_RST | TCP_ACK, NULL, 0);
     check(pm_drain(NULL, NULL) == 0, "RST without a connection: no answer");
 
     /* Silence threshold on the link socket. */
@@ -1426,7 +1500,10 @@ static void t_ack_paced(void) {
     stack_setup(&hd);
     pm_drain(NULL, NULL);
     struct conn *c = pm_open(41000, SRV_IP);
-    check(c != NULL, "queue: connection opened, its fd is the SEQPACKET pair");
+    int ty = 0;
+    socklen_t tl = sizeof ty;
+    check(c && getsockopt(c->fd, SOL_SOCKET, SO_TYPE, &ty, &tl) == 0 && ty == SOCK_SEQPACKET,
+          "queue: connection opened, its fd is the SEQPACKET pair");
     if (!c) return;
 
     /* The client's window. The stack's ceiling is megabytes (rcv_window_set), more than the
@@ -1518,6 +1595,7 @@ static int stack_part(void) {
 }
 
 int main(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0);       /* a crash or a hang keeps the checks printed so far */
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0 || pipe(g_sess_pipe) != 0) return 2;
     if (write(g_sess_pipe[1], "x", 1) != 1) return 2;
