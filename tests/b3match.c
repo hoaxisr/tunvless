@@ -1,10 +1,11 @@
-/* BLAKE3 против эталона: векторы сняты программой на Go с lukechampine.com/blake3 v1.4.1 — той самой
- * библиотекой, которой пользуется Xray-core (proxy/vless/encryption). Вход — байты i mod 251, длины
- * выбраны на границах блока (64), чанка (1024) и дерева (2, 3, 4, 31 и 100 чанков); второе значение —
- * DeriveKey с контекстом-строкой из тех же байт и материалом «VLESS-material-<длина>», то есть ровно
- * форма вызова NewAEAD (контекст длиннее килобайта попадает в дерево).
+/* BLAKE3 (src/lib/blake3.h) against reference values taken by a Go program with
+ * lukechampine.com/blake3 v1.4.1, the library Xray-core uses (proxy/vless/encryption). The input
+ * is the bytes i mod 251, at lengths on the block (64), chunk (1024) and tree (2, 3, 4, 31 and 100
+ * chunks) boundaries. The second value is DeriveKey with those bytes as the context and
+ * "VLESS-material-<length>" as the material: the shape of the NewAEAD call, where a context longer
+ * than a kilobyte goes through the tree.
  *
- * Библиотеки не нужно: src/lib/blake3.h самодостаточен, поэтому стенд идёт в `make test`. */
+ * blake3.h is self-contained, so this test needs no library and runs in `make test`. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,18 +50,17 @@ int main(void) {
         hex(hh, h, 32); hex(kh, k, 32);
         int ok = !strcmp(hh, V[i].hash) && !strcmp(kh, V[i].dk);
         if (!ok) fails++;
-        printf("BLAKE3 длина %-6zu хеш и derive_key %s\n", V[i].n, ok ? "ok" : "ПРОВАЛ");
+        printf("BLAKE3 length %-6zu hash and derive_key %s\n", V[i].n, ok ? "ok" : "FAIL");
         free(in);
     }
-    /* Расширяемый вывод: первые 32 байта при out_n = 64 те же, что при 32. */
     {
         unsigned char a[32], b[64];
         b3_derive_key(a, 32, "ctx", 3, "m", 1);
         b3_derive_key(b, 64, "ctx", 3, "m", 1);
         int ok = !memcmp(a, b, 32);
         if (!ok) fails++;
-        printf("BLAKE3 расширенный вывод согласован с коротким %s\n", ok ? "ok" : "ПРОВАЛ");
+        printf("BLAKE3 64-byte output starts with the 32-byte output %s\n", ok ? "ok" : "FAIL");
     }
-    printf(fails ? "ПРОВАЛОВ: %d\n" : "b3match: всё совпало\n", fails);
+    printf(fails ? "FAILED: %d\n" : "b3match: all matched\n", fails);
     return fails ? 1 : 0;
 }

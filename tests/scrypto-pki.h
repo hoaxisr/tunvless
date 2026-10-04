@@ -1,5 +1,5 @@
-/* Тестовая PKI для tests/scryptomatch.c. СГЕНЕРИРОВАН: sh tests/scrypto-pki.sh > tests/scrypto-pki.h
- * (OpenSSL 3.0.13, 2026-09-28). Руками не править — только перевыпуск целиком. */
+/* Test PKI for tests/scryptomatch.c: sh tests/scrypto-pki.sh > tests/scrypto-pki.h
+ * (OpenSSL 3.0.13, 2026-09-28). Generated; do not edit by hand, regenerate it whole. */
 #ifndef STEER_TESTS_SCRYPTO_PKI_H
 #define STEER_TESTS_SCRYPTO_PKI_H
 static const char PEM_ROOT[] =

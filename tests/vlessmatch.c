@@ -1,80 +1,57 @@
-/* Ветви отказа vless_connect: дескриптор и ключи после каждого «нет».
+/* vless_connect failure paths: the descriptor and the keys after each "no".
  *
- * ЗАЧЕМ ОТДЕЛЬНЫМ СТЕНДОМ. У установления соединения с узлом VLESS не было ни одного
- * стенда, который доходит до TLS. tests/fake-vless.py говорит только security=none и до
- * рукопожатия не добирается; tests/run-reality.sh требует sing-box, root и сетевых
- * пространств, поэтому не входит ни в `make test`, ни в `make crypto-test`. Всё, что охраняло
- * здесь освобождение — чтение кода глазами, тогда как у xsteer на ту же болезнь (I-067)
- * стенд стоит под AddressSanitizer с запуска 42. Разрыв назван в R-114; этот файл его
- * закрывает.
+ * WHAT IS CHECKED. Each failure path of connection setup decides on its own how to clean up:
+ * close(fd), transport_close, or nothing when it fails before the socket exists. The choice
+ * matters. Once the traffic keys are expanded, the connection holds cipher contexts that
+ * transport_close must wipe, and certificate verification allocates on the heap (wolfSSL chain
+ * parsing), which the descriptor does not hold. Callers do not clean up either: the spare pool
+ * only marks the slot empty, and the node probe returns at once. So a wrong choice leaks on EVERY
+ * attempt, and the attempts never stop: the pool refills on every SYN. On every path the test
+ * watches three things: the return code, the process descriptors (their count must come back to
+ * where it was) and the heap, through LeakSanitizer, checked after each case rather than in one
+ * report at exit.
  *
- * ЧТО ИМЕННО ПРОВЕРЯЕТСЯ. У vless_connect ДЕВЯТЬ путей выхода по ошибке (client.c:717, 737,
- * 739, 769, 777, 792, 822, 825, 827) и три успешных, и каждый путь отказа сам решает, чем
- * закрыться: четыре зовут close(fd), четыре — vless_close(conn), а самый первый уходит до
- * того, как дескриптор появился. Перечисление с разбором — A-139. Выбор не косметический —
- * после развёртывания ключей трафика в соединении живут развёрнутые контексты шифра (у
- * mbedtls, на которой стенд родился, — в КУЧЕ, через calloc внутри setkey; у wolfCrypt за
- * слоем scrypto — внутри struct tls13, но затереть их обязан всё тот же vless_close), а на пути
- * проверки сертификата куча есть и сейчас (разбор цепочки wolfSSL), и дескриптор её не держит.
- * Вызывающие тоже не убирают: пул запасных сессий на отказе лишь помечает слот пустым, а
- * проверка узла возвращается сразу. Значит цена ошибки в выборе — утечка НА КАЖДУЮ попытку
- * при том, что попытки не кончаются: пул пополняется на каждый SYN, сторож перебирает узлы
- * пачками. Стенд наблюдает три вещи на каждой ветви: код возврата, дескрипторы процесса
- * (их число обязано вернуться к исходному) и кучу — через LeakSanitizer, отдельной
- * проверкой после каждого случая, а не одним отчётом на выходе.
+ * Setup lives in the transport (src/proto/transport: transport_open, tr_link_open, security in
+ * trsec.c); vless_connect only hands it the node.
  *
- * С шага 2 выпуска 1.10 установление живёт в транспорте (src/proto/transport: transport_open,
- * tr_link_open, security в trsec.c), а vless_connect лишь отдаёт ему узел; ветви отказа и
- * способы закрыться на них — прежние, а номера строк выше указывают на client.c до переезда.
+ * HOW IT WORKS WITHOUT A NODE OR A NETWORK. TCP setup goes through the g_tcp_dial seam
+ * (src/proto/transport/trdial.c). The test hands the client one end of a socketpair and speaks
+ * the server half of TLS 1.3 on the other: it parses the ClientHello, takes its key_share,
+ * computes X25519, derives the handshake key schedule (RFC 8446 §7.1) and sends encrypted
+ * EncryptedExtensions, Certificate when needed, and Finished. tests/fake-vless.py speaks only
+ * security=none, and tests/run-reality.sh needs sing-box, root and network namespaces.
  *
- * КАК ЭТО РАБОТАЕТ БЕЗ УЗЛА И БЕЗ СЕТИ. Установление TCP вынесено в шов g_tcp_dial
- * (src/proto/transport/trdial.c) — так же, как замер задержки в failover.c. Стенд отдаёт клиенту конец
- * socketpair, а на другом конце сам говорит серверную половину TLS 1.3: разбирает
- * ClientHello, достаёт из него key_share, считает X25519, выводит расписание ключей
- * рукопожатия по RFC 8446 §7.1 и шлёт зашифрованные EncryptedExtensions, при надобности
- * Certificate, и Finished. Это ровно та половина, которой в проекте не было, и без неё до
- * серверного Finished не доходил ни один стенд.
+ * WHY THE SERVER HALF IS IN C, NOT PYTHON. The test is part of `make crypto-test`, and CI also runs
+ * it under qemu for other architectures; it needs nothing beyond the crypto library the client is
+ * built on. Second, the key schedule must match the client's to the byte: with both halves on
+ * the same primitives (the scrypto layer), a mismatch means a bug in our TLS code, not a
+ * difference between implementations. The HKDF label and the signature prefix are still built
+ * here by separate copies, or a bug in them would agree with itself.
  *
- * ПОЧЕМУ СЕРВЕРНАЯ ПОЛОВИНА ЗДЕСЬ, А НЕ НА ПИТОНЕ. Стенд живёт в `make crypto-test`, и его
- * гоняют и под qemu на чужих архитектурах (CI). Питона там может не быть вовсе, а
- * криптобиблиотека есть по построению — на ней и собран сам клиент.
- * Вторая причина: расписание ключей обязано совпасть с клиентским до байта, и когда обе
- * половины стоят на одних примитивах (слой scrypto), расхождение означает ошибку в нашем коде
- * TLS, а не разницу реализаций. Метка HKDF и приставка подписи при этом собираются здесь своими
- * копиями — иначе ошибка в них сошлась бы сама с собой.
+ * security=tls WITH OUR OWN ROOTS. Reality proves itself by an HMAC in the signature field of a
+ * temporary certificate: no X.509 chain, no root store. So the Reality cases never reach chain
+ * verification, and only security=tls tests it. The TR_ENOH2 path (traffic keys already expanded,
+ * so it must close through transport_close) is reachable only after a server check PASSES.
  *
- * Нужна настоящая криптобиблиотека, поэтому в `make test` стенд не входит, как xsloop и
- * spokematch.
+ * So the test issues its own chain: a root and leaves for the SNI name, ECDSA P-256 keys, validity
+ * from the current time (a certificate frozen in the repository would one day expire and fail
+ * the test for no fault of its own). The root goes to a PEM file whose path reaches the engine
+ * through the g_cert_roots seam in src/proto/tls/roots.c. The server half signs CertificateVerify
+ * with a real signature over the transcript up to and including Certificate (RFC 8446 §4.4.3,
+ * the prefix of 64 spaces and the label), and the client checks it with its own code: a mismatch
+ * here means a bug in the engine.
  *
- * ВТОРАЯ ПОЛОВИНА: security=tls СО СВОИМИ КОРНЯМИ (R-118). Ветвей Reality мало для того,
- * чтобы охватить установление соединения целиком: у Reality доказательством служит HMAC в
- * поле подписи временного сертификата, и для ОТКАЗА проверки не нужно ни цепочки X.509, ни
- * хранилища корней — то есть все шесть случаев выше проходят мимо certverify.c, у которого
- * не было ни одного стенда. Главное же в том, что при отказе проверки соединение не
- * доходит до конца никогда, а ровно та ветвь, ради которой в клиенте появился vless_close
- * (VLESS_CONN_ENOH2, ключи трафика уже развёрнуты в соединении), достижима
- * ТОЛЬКО через УДАВШУЮСЯ проверку сервера.
+ * Covered this way: full success (handshake, chain, name against sni), the TR_ENOH2 path with
+ * its transport_close, a wrong name, no CertificateVerify, a bad signature, a signature algorithm
+ * we did not offer, and a self-signed leaf.
  *
- * Поэтому стенд выпускает цепочку сам: корень и лист на имя SNI, ключи ECDSA P-256, сроки
- * от текущего времени (замороженный в репозитории сертификат однажды истёк бы и покрасил
- * стенд не по своей вине). Корень уезжает файлом PEM, путь к нему отдаётся движку швом
- * g_cert_roots в src/proto/tls/roots.c — вторым такой же природы, что g_tcp_dial. Серверная половина
- * подписывает CertificateVerify настоящей подписью над транскриптом по Certificate
- * включительно (RFC 8446 §4.4.3, приставка из 64 пробелов и метки), и клиент проверяет её
- * своим кодом, а не нашим: расхождение здесь означает ошибку в движке.
- *
- * Что этим накрыто: успех целиком (рукопожатие, проверка цепочки, имя против sni), ветвь
- * ENOH2 с её vless_close, имя не то, «не прислал подпись», подпись не сходится, алгоритм
- * подписи не из предложенных и лист, подписанный сам собой. Без второго стенда все семь
- * ветвей были недостижимы.
- *
- * Выпуск сертификатов — tests/certgen.c на wolfCrypt с WOLFSSL_CERT_GEN (его даёт библиотеке
- * стендов Makefile, crypto-test, в сборке движка выпуска нет). ext-test задаёт STEER_HAVE_X509WRITE
- * всегда; собранный руками без него стенд случаи security=tls ПРОПУСКАЕТ ГРОМКО и говорит об
- * этом сам — молчаливый пропуск читался бы как «прошло», ровно как в I-232.
+ * Certificates are issued by tests/certgen.c on wolfCrypt with WOLFSSL_CERT_GEN (the Makefile
+ * builds the tests' library with it; the program's build cannot issue certificates). The
+ * Makefile always defines STEER_HAVE_X509WRITE; built by hand without it, the test SKIPS the
+ * security=tls cases and says so loudly, since a silent skip would read as a pass.
  */
-/* До любого include: включаемые исходники просят расширения GNU, а первый подключённый
- * заголовок фиксирует набор. */
+/* Before any include: the included sources need GNU extensions, and the first header fixes the
+ * feature set. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <string.h>
@@ -83,11 +60,9 @@
 #include <dirent.h>
 #include <stdint.h>
 
-/* Исходники целиком, а не компоновка — ровно два, ради двух швов: g_tcp_dial (trdial.c) и
- * g_cert_roots (roots.c) статические, и дотянуться до них иначе значило бы объявить их в
- * заголовке — то есть завести в движке публичную точку подмены ради стенда. Тот же приём, что
- * в tests/failovermatch.c. Остальное — клиент VLESS и ярусы транспорта — компонуется
- * отдельными объектами (Makefile, crypto-test). */
+/* Two sources are included whole, not linked, to reach their static seams: g_tcp_dial (trdial.c)
+ * and g_cert_roots (roots.c). The VLESS client and the transport layers are linked as separate
+ * objects (Makefile). */
 #include "../src/proto/transport/trdial.c"
 #include "../src/proto/tls/roots.c"
 #include "client.h"
@@ -98,47 +73,44 @@
 # include "certgen.h"
 #endif
 
-/* Общий секрет с эфемерным ключом собеседника: та же функция, которой пользуется tls13.c,
- * а не копия — копия крипто-кода это два места, где может разойтись прижатие скаляра. */
+/* The shared secret with the peer's ephemeral key: the function tls13.c uses, not a copy. A
+ * copy of crypto code is a second place where scalar clamping could differ. */
 int x25519_shared_ext(const unsigned char priv[32], const unsigned char peer[32],
                       unsigned char out[32]);
 
-/* Заглушка того, что живёт в src/lib/run.c: ни команд, ни устройств стенду не нужно. Заглушки
- * bind_device (src/daemon/failover.c) нет: с 1.10 (шаг 3) модуль VLESS маршрут не привязывает. */
 int run_quiet(const char *const argv[]) { (void)argv; return 0; }
 
 #if defined(__SANITIZE_ADDRESS__)
 # include <sanitizer/lsan_interface.h>
 # define LEAK_CHECK() __lsan_do_recoverable_leak_check()
 #else
-/* Санитайзера нет — проверки кода возврата и дескрипторов всё равно идут, а про кучу
- * стенд молчать не имеет права: молчаливый пропуск читается как «прошло». Громко
- * говорится один раз, в main. */
+/* No sanitizer: the return code and descriptor checks still run, but the test must not stay
+ * silent about the heap, since a silent skip reads as a pass. main says so once. */
 # define LEAK_CHECK() 0
 #endif
 
 static int fails;
 
 static void check(const char *what, long want, long got) {
-    printf("%-64s %s\n", what, want == got ? "ok" : "ПРОВАЛ");
+    printf("%-64s %s\n", what, want == got ? "ok" : "FAIL");
     if (want != got) {
-        printf("     хочу: %ld\n     есть:  %ld\n", want, got);
+        printf("     want: %ld\n     got:  %ld\n", want, got);
         fails++;
     }
 }
 
 static void check_str(const char *what, const char *want, const char *got) {
     int ok = got && strstr(got, want) != NULL;
-    printf("%-64s %s\n", what, ok ? "ok" : "ПРОВАЛ");
+    printf("%-64s %s\n", what, ok ? "ok" : "FAIL");
     if (!ok) {
-        printf("     хочу подстроку: %s\n     есть:           %s\n", want, got ? got : "(нет)");
+        printf("     want substring: %s\n     got:            %s\n", want, got ? got : "(none)");
         fails++;
     }
 }
 
-/* Сколько дескрипторов открыто у процесса. Наблюдаемое напрямую: утечку дескриптора видно
- * без всякого санитайзера, и ровно эта утечка (ветка ENOH2, узел grpc с security=reality)
- * упирала процесс в RLIMIT_NOFILE за сутки опроса. */
+/* Descriptors open in the process. A descriptor leak shows here without any sanitizer; one per
+ * attempt on the TR_ENOH2 path (a grpc node with security=reality) reaches RLIMIT_NOFILE within
+ * a day of probing. */
 static int fd_count(void) {
     DIR *d = opendir("/proc/self/fd");
     if (!d) return -1;
@@ -149,64 +121,64 @@ static int fd_count(void) {
     return n;
 }
 
-/* ---- серверная половина TLS 1.3 ------------------------------------------------
+/* ---- server half of TLS 1.3 ----------------------------------------------------
  *
- * Ровно столько, сколько нужно, чтобы клиент дошёл до конца рукопожатия: один набор шифров
- * (0x1301, AES-128-GCM с SHA-256), одна группа (X25519), никакого возобновления. */
+ * Just enough for the client to finish the handshake: one cipher suite (0x1301, AES-128-GCM
+ * with SHA-256), one group (X25519), no resumption. */
 
 #define SUITE_HI 0x13
 #define SUITE_LO 0x01
-#define HLEN 32u                       /* SHA-256: и хеш транскрипта, и длина секретов */
+#define HLEN 32u                       /* SHA-256: both the transcript hash and the secret size */
 
 struct plan {
     const char *name;
-    int no_keyshare;      /* ServerHello без key_share — отказ ДО вывода ключей */
-    int bad_finished;     /* испортить серверный Finished */
-    int cert;             /* 0 — не присылать, 1 — мусорный Certificate, 2 — сжатый (0x19) */
-    const char *alpn;     /* строка ALPN в EncryptedExtensions, или NULL */
-    int hangup;           /* закрыть соединение сразу после ClientHello */
-    /* Ниже — путь security=tls: настоящая цепочка, выпущенная стендом (R-118). Поле cert у
-     * этих случаев не читается: чем именно отвечать, решает leaf. */
-    int chain;            /* 0 — не путь tls; иначе номер листа из g_leaf[] */
-    int no_cv;            /* прислать Certificate и НЕ прислать CertificateVerify */
-    int cv_bad_sig;       /* испортить байт подписи */
-    int cv_bad_alg;       /* подписать кодом, которого мы не предлагали (rsa_pkcs1_sha256) */
-    /* Шаг 5 выпуска 1.10: ws и httpupgrade поверх tls и reality — на настоящей библиотеке.
-     * reality_ok — временный сертификат Reality с настоящей подписью HMAC-SHA512 на authkey
-     * (единственный путь к УДАВШЕМУСЯ Reality в этом стенде); upg — после рукопожатия сервер
-     * ведёт и данные: ключи трафика, запрос Upgrade, ответ 101 с первыми данными ТОЙ ЖЕ записью
-     * и приём ответа клиента (1 — ws, 2 — httpupgrade). */
+    int no_keyshare;      /* ServerHello without key_share: fails BEFORE key derivation */
+    int bad_finished;     /* corrupt the server Finished */
+    int cert;             /* 0: send none, 1: a garbage Certificate, 2: a compressed one (0x19) */
+    const char *alpn;     /* ALPN string in EncryptedExtensions, or NULL */
+    int hangup;           /* close the connection right after ClientHello */
+    /* The security=tls path: a real chain issued by the test. `cert` is not read for these
+     * cases; `chain` decides what to send. */
+    int chain;            /* 0: not the tls path; otherwise the leaf index in g_leaf[] */
+    int no_cv;            /* send Certificate and NO CertificateVerify */
+    int cv_bad_sig;       /* corrupt a signature byte */
+    int cv_bad_alg;       /* sign with a scheme we did not offer (rsa_pkcs1_sha256) */
+    /* reality_ok: a Reality temporary certificate with a real HMAC-SHA512 signature over the
+     * authkey (the only way to a SUCCESSFUL Reality in this test). upg: after the handshake the
+     * server carries data too: traffic keys, the Upgrade request, a 101 answer with the first
+     * data in the SAME record, and the client's reply (1: ws, 2: httpupgrade). */
     int reality_ok;
     int upg;
-    /* ws с ранними данными (путь `?ed=2048`): клиент пишет «hello» ДО чтения, и оно обязано уехать
-     * в Sec-WebSocket-Protocol запроса — запрос у Xray при Ed > 0 откладывается до первой записи. */
+    /* ws with early data (path `?ed=2048`): the client writes "hello" BEFORE reading, and it
+     * must go in the request's Sec-WebSocket-Protocol: with Ed > 0 Xray holds the request until
+     * the first write. */
     int ed_first;
 };
 
 struct srv {
     int fd;
     const struct plan *plan;
-    /* Ключи записи сервера и счётчик записей. */
+    /* Server write keys and record counter. */
     unsigned char key[16], iv[12];
     unsigned char s_hs[HLEN];
     uint64_t seq;
-    struct sc_hash_ctx tr;             /* транскрипт рукопожатия */
-    int rc;                            /* !=0 — половина сломалась сама, а не по замыслу */
-    /* Путь данных (plan.upg): секреты рукопожатия и то, что увидел сервер. */
+    struct sc_hash_ctx tr;             /* handshake transcript */
+    int rc;                            /* != 0: the half broke by itself, not by plan */
+    /* Data path (plan.upg): handshake secrets and what the server saw. */
     unsigned char hs[HLEN], c_hs[HLEN];
-    int alpn_h11;                      /* в ClientHello ALPN — один http/1.1 */
-    char req[4096];                    /* запрос Upgrade, как пришёл */
-    int got_hello;                     /* ответ клиента после 101 дошёл и разобрался */
+    int alpn_h11;                      /* the ClientHello ALPN is http/1.1 alone */
+    char req[4096];                    /* the Upgrade request as received */
+    int got_hello;                     /* the client's "hello" arrived and parsed */
 };
 
-/* Постоянная пара сервера Reality для plan.reality_ok: pbk узла — её публичная половина. */
+/* Static key pair of the Reality server for plan.reality_ok: the node's pbk is its public half. */
 static unsigned char g_rs_priv[32], g_rs_pub[32];
-/* Что сервер увидел в ALPN последнего ClientHello (для прогонов через run_case). */
+/* What the server saw in the ALPN of the last ClientHello (for runs through run_case). */
 static volatile int g_seen_h11 = -1;
 
-/* HKDF-Expand-Label из RFC 8446 §7.1. Своя копия, а не вызов статической из tls13.c:
- * стенд обязан считать метку САМ, иначе ошибка в клиентской обёртке сошлась бы сама с
- * собой и осталась незамеченной. */
+/* HKDF-Expand-Label from RFC 8446 §7.1. Our own copy, not a call to the static one in tls13.c:
+ * the test must compute the label ITSELF, or a bug in the client's wrapper would agree with
+ * itself and go unnoticed. */
 static int xlabel(const unsigned char *secret, const char *label,
                   const unsigned char *ctx, size_t ctx_n,
                   unsigned char *out, size_t out_n) {
@@ -250,7 +222,7 @@ static int rd_all(int fd, unsigned char *b, size_t n) {
     return 0;
 }
 
-/* Одна запись: заголовок из пяти байт, затем тело. */
+/* One record: a five-byte header, then the body. */
 static int rd_rec(int fd, unsigned char *type, unsigned char *body, size_t cap, size_t *n) {
     unsigned char h[5];
     if (rd_all(fd, h, 5)) return -1;
@@ -262,23 +234,22 @@ static int rd_rec(int fd, unsigned char *type, unsigned char *body, size_t cap, 
     return 0;
 }
 
-/* ---- своя цепочка X.509 для security=tls (R-118) ------------------------------------
+/* ---- our own X.509 chain for security=tls -------------------------------------------
  *
- * Три листа, и каждый нужен ровно одной проверке:
- *   LEAF_OK   — на имя SNI, подписан корнем: единственный путь к УДАВШЕЙСЯ проверке, а
- *               значит и к ветви ENOH2, ради которой в клиенте появился vless_close;
- *   LEAF_NAME — тем же корнем, но на другое имя: проверка обязана отказать по имени, а не
- *               пропустить «цепочка же сошлась»;
- *   LEAF_SELF — подписан сам собой: корень не при чём, отказ по цепочке.
+ * Three leaves:
+ *   LEAF_OK   for the SNI name, signed by the root: the check passes, which is the way to the
+ *             TR_ENOH2 path and its transport_close;
+ *   LEAF_NAME signed by the same root, for another name: the check must fail on the name, not
+ *             pass because "the chain verified";
+ *   LEAF_SELF self-signed: the root plays no part, the chain check fails.
  *
- * Ключи ECDSA P-256, а не RSA: генерация RSA-2048 занимает секунды и делала бы стенд
- * заметно медленнее без всякой пользы для проверяемого — certverify.c принимает и то, и
- * другое, а подпись CertificateVerify проверяется одной и той же sc_cert_verify_sig (RSA и
- * PSS против подписей OpenSSL проверяет tests/scryptomatch.c).
+ * ECDSA P-256 keys, not RSA: RSA-2048 generation takes seconds and would slow the test with no
+ * gain for what is tested. certverify.c accepts both, and the CertificateVerify signature goes
+ * through the same sc_cert_verify_sig (tests/scryptomatch.c checks RSA and PSS against OpenSSL
+ * signatures).
  *
- * СРОКИ СЧИТАЮТСЯ ОТ ТЕКУЩЕГО ВРЕМЕНИ, а не зашиты строкой: замороженный сертификат
- * однажды истекает и красит стенд не по своей вине — это named risk у самого R-118, и
- * закрывается он тем, что срок выпускается заново на каждый прогон.
+ * Validity is counted FROM THE CURRENT TIME, not fixed in a string: a frozen certificate expires
+ * one day and fails the test for no fault of its own, so it is issued anew on every run.
  */
 #if defined(STEER_HAVE_X509WRITE)
 
@@ -286,25 +257,24 @@ static int rd_rec(int fd, unsigned char *type, unsigned char *body, size_t cap, 
 #define LEAF_NAME 2
 #define LEAF_SELF 3
 
-/* Имя, на которое выпущен годный лист, и оно же уезжает в SNI узла: сертификат проверяется
- * против sni, а не против host (client.c, verify_host). */
+/* The name the good leaf is issued for, also the node's SNI: the certificate is checked against
+ * sni, not host (trsec.c, verify_host). */
 #define TLS_SNI "tls.node.invalid"
 
 struct leaf {
     unsigned char der[2048];
     size_t der_n;
-    struct tcg_key *key;         /* ключ листа — им подписывается CertificateVerify */
+    struct tcg_key *key;         /* the leaf's key: it signs CertificateVerify */
 };
 
-static struct leaf g_leaf[4];        /* [0] не используется: номера совпадают с LEAF_* */
+static struct leaf g_leaf[4];        /* [0] unused: indexes match LEAF_* */
 static char g_roots_file[64];
 static int g_chain_ready;
 
-/* Корень, три листа и файл хранилища. Один раз на процесс: certverify.c разбирает корни
- * под pthread_once, и второе хранилище в том же процессе не подействовало бы (I-217) —
- * значит все случаи обязаны проверяться ОДНИМ набором корней. Сроки — от текущего времени
- * (tests/certgen.c), имя — в CN: SAN стенд не выпускает, и проверка имени обязана найти его
- * там, как находила прежде. */
+/* Root, three leaves and the store file, once per process: certverify.c loads the roots under
+ * pthread_once, so a second store in the same process would have no effect, and all cases must
+ * run against ONE root set. The name goes in the CN: the test issues no SAN, and the name check
+ * must find it there. */
 static int chain_build(void) {
     struct tcg_key *root_key = tcg_key_new();
     if (!root_key) return -1;
@@ -351,10 +321,10 @@ static void chain_free(void) {
     if (g_roots_file[0]) unlink(g_roots_file);
 }
 
-/* Сообщение Certificate из одного листа (RFC 8446 §4.4.2): байт контекста, список из трёх
- * байт длины, в нём запись «три байта длины + DER + два байта расширений». Корень в
- * список не кладётся намеренно: он уже в хранилище, и цепочка обязана сойтись без него —
- * иначе стенд проверял бы не проверку, а щедрость сервера. */
+/* A Certificate message with one leaf (RFC 8446 §4.4.2): a context byte, a list with a 3-byte
+ * length, holding one entry "3-byte length + DER + 2-byte extensions". The root is left out on
+ * purpose: it is already in the store, and the chain must verify without it, or the test would
+ * check the server's generosity instead of the verification. */
 static size_t cert_msg(const struct leaf *l, unsigned char *out, size_t cap) {
     size_t body = 1 + 3 + 3 + l->der_n + 2;
     if (4 + body > cap) return 0;
@@ -372,14 +342,14 @@ static size_t cert_msg(const struct leaf *l, unsigned char *out, size_t cap) {
     out[n++] = (unsigned char)(l->der_n >> 8);
     out[n++] = (unsigned char)l->der_n;
     memcpy(out + n, l->der, l->der_n); n += l->der_n;
-    out[n++] = 0x00; out[n++] = 0x00;                    /* extensions: пусто */
+    out[n++] = 0x00; out[n++] = 0x00;                    /* extensions: none */
     return n;
 }
 
-/* CertificateVerify: подпись над 64 пробелами, меткой, нулём и хешем транскрипта по
- * Certificate включительно. Приставка собирается ЗДЕСЬ, а не берётся из certverify.c: две
- * половины обязаны прийти к одному ответу независимо, иначе ошибка в приставке сошлась бы
- * сама с собой. */
+/* CertificateVerify: a signature over 64 spaces, the label, a zero byte and the transcript hash
+ * up to and including Certificate. The prefix is built HERE, not taken from certverify.c: the
+ * two halves must reach the same answer independently, or a bug in the prefix would agree with
+ * itself. */
 static size_t cv_msg(const struct leaf *l, const unsigned char thash[HLEN],
                      const struct plan *pl, unsigned char *out, size_t cap) {
     unsigned char content[64 + 33 + 1 + HLEN];
@@ -392,7 +362,7 @@ static size_t cv_msg(const struct leaf *l, const unsigned char thash[HLEN],
     unsigned char digest[HLEN];
     if (sc_hash(SC_SHA256, content, cn, digest) != 0) return 0;
 
-    /* DER-подпись ECDSA P-256 — не длиннее 72 байт; запас на любой вид. */
+    /* A DER ECDSA P-256 signature is at most 72 bytes; room to spare. */
     unsigned char sig[160];
     size_t sig_n = 0;
     if (tcg_sign_sha256(l->key, digest, sig, sizeof(sig), &sig_n) != 0) return 0;
@@ -402,10 +372,9 @@ static size_t cv_msg(const struct leaf *l, const unsigned char thash[HLEN],
     size_t n = 0;
     out[n++] = 0x0F;
     out[n++] = 0; out[n++] = 0; out[n++] = (unsigned char)(4 + sig_n);
-    /* 0x0403 — ecdsa_secp256r1_sha256, он в нашем signature_algorithms есть. 0x0401 —
-     * rsa_pkcs1_sha256, которым в TLS 1.3 подписывать CertificateVerify запрещено, и мы
-     * его не предлагаем: сервер, выбравший его, обязан получить отдельную причину, а не
-     * «подпись не сошлась». */
+    /* 0x0403 is ecdsa_secp256r1_sha256, which our signature_algorithms lists. 0x0401 is
+     * rsa_pkcs1_sha256, which TLS 1.3 forbids for CertificateVerify, and we do not offer it: a
+     * server choosing it must get its own reason, not "bad signature". */
     out[n++] = 0x04; out[n++] = pl->cv_bad_alg ? 0x01 : 0x03;
     out[n++] = (unsigned char)(sig_n >> 8);
     out[n++] = (unsigned char)sig_n;
@@ -414,9 +383,9 @@ static size_t cv_msg(const struct leaf *l, const unsigned char thash[HLEN],
 }
 #endif /* STEER_HAVE_X509WRITE */
 
-/* ClientHello: нужны серверная сторона обмена (key_share клиента) и session_id, который
- * сервер обязан вернуть как есть. Разбор по типам расширений, а не по смещениям: состав
- * Hello у reality.c меняется вместе с обликом браузера. */
+/* ClientHello: we need the client's key_share and the session_id, which the server must echo
+ * as is. Parsed by extension type, not by offset: reality.c's Hello changes with the browser
+ * look. */
 static int ch_pick(const unsigned char *b, size_t n, unsigned char pub[32],
                    unsigned char *sid, size_t *sid_n) {
     if (n < 40 || b[0] != 0x01) return -1;
@@ -442,9 +411,9 @@ static int ch_pick(const unsigned char *b, size_t n, unsigned char pub[32],
         p += 4;
         if (p + elen > end) return -1;
         if (etype == 0x0033) {
-            /* client_shares: длина списка(2), затем группа(2)+длина(2)+ключ. Берём именно
-             * X25519 (0x001d): reality.c умеет предлагать и постквантовую группу, и она в
-             * списке стоит первой. */
+            /* client_shares: list length (2), then group (2) + length (2) + key. Take X25519
+             * (0x001d) specifically: reality.c may offer the post-quantum group, and it comes
+             * first in the list. */
             size_t q = 2;
             while (q + 4 <= elen) {
                 unsigned grp = ((unsigned)b[p + q] << 8) | b[p + q + 1];
@@ -462,8 +431,8 @@ static int ch_pick(const unsigned char *b, size_t n, unsigned char pub[32],
     return -1;
 }
 
-/* Зашифрованная запись рукопожатия: одно сообщение на запись — клиент собирает их через
- * границы записей, и так проверяется в том числе это. */
+/* An encrypted handshake record with one message: the client collects messages across record
+ * boundaries, so this is tested too. */
 static int send_enc(struct srv *s, const unsigned char *msg, size_t n) {
     unsigned char out[4096];
     if (n + 1 + 16 + 5 > sizeof(out)) return -1;
@@ -472,14 +441,14 @@ static int send_enc(struct srv *s, const unsigned char *msg, size_t n) {
     out[3] = (unsigned char)(total >> 8);
     out[4] = (unsigned char)total;
     memcpy(out + 5, msg, n);
-    out[5 + n] = 0x16;                              /* настоящий тип записи */
+    out[5 + n] = 0x16;                              /* the real record type */
 
     unsigned char nonce[12];
     memcpy(nonce, s->iv, 12);
     for (int i = 0; i < 8; i++) nonce[11 - i] ^= (unsigned char)(s->seq >> (8 * i));
 
-    /* Одноразовый ключ на запись — половина сервера не про скорость. Контекст в куче: на
-     * стеке этого потока ему (больше килобайта) не место. */
+    /* A one-off key per record: the server half is not about speed. The context goes on the
+     * heap: at over a kilobyte it does not belong on this thread's stack. */
     struct sc_aead *g = malloc(sizeof(*g));
     if (!g) return -1;
     int rc = sc_aead_setkey(g, SC_AES128_GCM, s->key);
@@ -491,14 +460,14 @@ static int send_enc(struct srv *s, const unsigned char *msg, size_t n) {
     return wr_all(s->fd, out, 5 + total);
 }
 
-/* ---- путь данных после рукопожатия: ws и httpupgrade (plan.upg) ---------------------------
+/* ---- data path after the handshake: ws and httpupgrade (plan.upg) -------------------------
  *
- * Серверная половина здесь доводит соединение до данных — то, чего стенду прежде было не
- * нужно: ключи трафика приложения (RFC 8446 §7.1, от master secret и транскрипта по серверный
- * Finished), Finished клиента под ключом рукопожатия, запрос Upgrade, ответ 101 и за ним ТОЙ
- * ЖЕ записью первые данные потока (кадр ws или сырые байты httpupgrade — остаток, который
- * транспорт обязан не потерять), и приём того, что клиент пошлёт в ответ. Ключ и счётчик у
- * каждого направления свои (struct dir). */
+ * Here the server half takes the connection on to data: the application traffic keys (RFC 8446
+ * §7.1, from the master secret and the transcript up to the server Finished), the client
+ * Finished under the handshake key, the Upgrade request, a 101 answer followed in the SAME record
+ * by the first stream data (a ws frame or raw httpupgrade bytes: a remainder the transport must
+ * not lose), and whatever the client sends back. Each direction has its own key and counter
+ * (struct dir). */
 struct dir { struct sc_aead g; unsigned char iv[12]; uint64_t seq; int ready; };
 
 static int dir_set(struct dir *d, const unsigned char secret[HLEN]) {
@@ -517,7 +486,7 @@ static void dir_nonce(const struct dir *d, unsigned char n[12]) {
     for (int i = 0; i < 8; i++) n[11 - i] ^= (unsigned char)(d->seq >> (8 * i));
 }
 
-/* Следующая запись от клиента: ChangeCipherSpec пропускается, остальное расшифровывается. */
+/* The next record from the client: ChangeCipherSpec is skipped, the rest is decrypted. */
 static int rec_open(struct dir *d, int fd, unsigned char *out, size_t cap, size_t *n,
                     unsigned char *inner) {
     for (;;) {
@@ -569,7 +538,7 @@ static int app_phase_dirs(struct srv *s, struct dir *cd, struct dir *sd) {
     size_t n;
     unsigned char inner;
     if (dir_set(cd, s->c_hs) || rec_open(cd, s->fd, buf, sizeof(buf), &n, &inner) || inner != 0x16)
-        return -1;                                       /* Finished клиента */
+        return -1;                                       /* client Finished */
     if (dir_set(cd, c_ap) || dir_set(sd, s_ap)) return -1;
 
     size_t rn = 0;
@@ -591,7 +560,7 @@ static int app_phase_dirs(struct srv *s, struct dir *cd, struct dir *sd) {
         tr_ws_accept(key, acc);
         k = snprintf(resp, sizeof(resp), "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
                      "Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", acc);
-        resp[k++] = (char)0x82; resp[k++] = 5;           /* кадр сервера: без маски */
+        resp[k++] = (char)0x82; resp[k++] = 5;           /* server frame: unmasked */
         memcpy(resp + k, "FIRST", 5); k += 5;
     } else {
         k = snprintf(resp, sizeof(resp), "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n"
@@ -599,14 +568,15 @@ static int app_phase_dirs(struct srv *s, struct dir *cd, struct dir *sd) {
     }
     if (rec_seal(sd, s->fd, (const unsigned char *)resp, (size_t)k)) return -1;
 
-    /* Ранние данные ws (Ed > 0): «hello» клиента приехало в самом запросе, base64url без `=`. */
+    /* ws early data (Ed > 0): the client's "hello" came in the request itself, base64url
+     * without `=`. */
     if (s->plan->ed_first) {
         s->got_hello = strstr(s->req, "\r\nSec-WebSocket-Protocol: aGVsbG8\r\n") != NULL;
         return 0;
     }
     if (rec_open(cd, s->fd, buf, sizeof(buf), &n, &inner) || inner != 0x17) return -1;
     if (s->plan->upg == 1) {
-        /* 0x82, 0x80|5, маска, «hello» под маской. */
+        /* 0x82, 0x80|5, the mask, "hello" masked. */
         if (n != 11 || buf[0] != 0x82 || buf[1] != (0x80 | 5)) return -1;
         for (int i = 0; i < 5; i++) buf[6 + i] ^= buf[2 + (i & 3)];
         s->got_hello = !memcmp(buf + 6, "hello", 5);
@@ -636,8 +606,8 @@ static void *server_half(void *arg) {
     s->rc = -1;
     if (rd_rec(s->fd, &type, ch, sizeof(ch), &ch_n) || type != 0x16) return NULL;
     if (pl->hangup) { s->rc = 0; close(s->fd); s->fd = -1; return NULL; }
-    /* ALPN ровно «http/1.1» — расширение 0x0010 длиной 11, список длиной 9 (у ws и httpupgrade;
-     * у прочих транспортов там пара «h2, http/1.1»). */
+    /* ALPN exactly "http/1.1": extension 0x0010 of length 11, list of length 9 (ws and
+     * httpupgrade; the other transports send "h2, http/1.1"). */
     s->alpn_h11 = memmem(ch, ch_n, "\x00\x10\x00\x0b\x00\x09\x08http/1.1", 11) != NULL;
     g_seen_h11 = s->alpn_h11;
 
@@ -651,7 +621,7 @@ static void *server_half(void *arg) {
     /* ---- ServerHello ---- */
     unsigned char sh[256];
     size_t m = 0;
-    sh[m++] = 0x02; m += 3;                          /* длина впишется ниже */
+    sh[m++] = 0x02; m += 3;                          /* length filled in below */
     sh[m++] = 0x03; sh[m++] = 0x03;
     if (xc_random(sh + m, 32) != 0) return NULL;
     m += 32;
@@ -683,9 +653,9 @@ static void *server_half(void *arg) {
     sc_hash_update(&s->tr, ch, ch_n);
     sc_hash_update(&s->tr, sh, m);
 
-    if (pl->no_keyshare) { s->rc = 0; return NULL; }   /* дальше клиент уже не слушает */
+    if (pl->no_keyshare) { s->rc = 0; return NULL; }   /* the client stops listening here */
 
-    /* ---- расписание ключей рукопожатия, RFC 8446 §7.1 ---- */
+    /* ---- handshake key schedule, RFC 8446 §7.1 ---- */
     unsigned char zeros[HLEN] = {0}, empty[HLEN];
     unsigned char early[HLEN], derived[HLEN], hs[HLEN], ecdhe[32], th[HLEN];
     if (sc_hash(SC_SHA256, zeros, 0, empty) != 0) return NULL;
@@ -720,7 +690,7 @@ static void *server_half(void *arg) {
     sc_hash_update(&s->tr, ee, en);
 
 #if defined(STEER_HAVE_X509WRITE)
-    /* ---- Certificate и CertificateVerify настоящей цепочкой (путь security=tls) ---- */
+    /* ---- Certificate and CertificateVerify with a real chain (security=tls path) ---- */
     if (pl->chain) {
         const struct leaf *l = &g_leaf[pl->chain];
         unsigned char msg[3072];
@@ -730,10 +700,10 @@ static void *server_half(void *arg) {
         sc_hash_update(&s->tr, msg, mn);
 
         if (!pl->no_cv) {
-            /* Хеш снимается ПОСЛЕ Certificate и ДО CertificateVerify — ровно то, что
-             * подписывает сервер по RFC 8446 §4.4.3, и ровно то место, где клиент снимает
-             * свой (tls13.c, разбор сообщения 0x0F). Ошибка на один шаг здесь дала бы
-             * «подпись не сошлась» и выглядела бы находкой в движке. */
+            /* The hash is taken AFTER Certificate and BEFORE CertificateVerify: what the
+             * server signs per RFC 8446 §4.4.3, and where the client takes its own (tls13.c,
+             * message 0x0F). One step off here would give "bad signature" and look like a bug
+             * in the engine. */
             unsigned char th_cv[HLEN];
             tr_snapshot(&s->tr, th_cv);
             size_t cn = cv_msg(l, th_cv, pl, msg, sizeof(msg));
@@ -745,21 +715,22 @@ static void *server_half(void *arg) {
     }
 #endif
 
-    /* ---- Certificate или его сжатый вид ---- */
+    /* ---- Certificate or its compressed form ---- */
     if (pl->cert == 2) {
-        /* CompressedCertificate: клиент отвечает на него отказом сразу, не дожидаясь
-         * Finished — сжатый сертификат означает, что нас передали маскировочному сайту. */
+        /* CompressedCertificate: the client fails on it at once, without waiting for
+         * Finished; a compressed certificate means we were handed to the camouflage site. */
         unsigned char cc[16] = { 0x19, 0x00, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00,
                                  0x04, 0x01, 0x02, 0x03 };
         s->rc = send_enc(s, cc, 12) ? -1 : 0;
         return NULL;
     }
     if (pl->reality_ok) {
-        /* Временный сертификат Reality: ключ Ed25519 (любые 32 байта — его никто не проверяет
-         * как ключ) и поле подписи = HMAC-SHA512(authkey, ключ), где authkey — HKDF-SHA256 от
-         * ECDH(постоянный ключ сервера, эфемерный клиента) с солью Random[0..20) и info
-         * «REALITY» (reality.go у Xray; клиентская половина — reality.c). DER — ровно столько,
-         * сколько читает cert_reality_check: SEQUENCE { tbs с SPKI Ed25519, algid, BIT STRING }. */
+        /* Reality temporary certificate: an Ed25519 key (any 32 bytes: nobody checks it as a
+         * key) and the signature field = HMAC-SHA512(authkey, key), where authkey is
+         * HKDF-SHA256 of ECDH(server static key, client ephemeral key) with salt Random[0..20)
+         * and info "REALITY" (Xray's reality.go; the client half is reality.c). The DER is just
+         * what cert_reality_check reads:
+         * SEQUENCE { tbs with an Ed25519 SPKI, algid, BIT STRING }. */
         unsigned char shared[32], authkey[32], epub[32], sig[64];
         if (x25519_shared_ext(g_rs_priv, cpub, shared) != 0) return NULL;
         if (sc_hkdf(SC_SHA256, ch + 6, 20, shared, 32, "REALITY", 7, authkey, 32) != 0) return NULL;
@@ -769,8 +740,8 @@ static void *server_half(void *arg) {
                                               0x03, 0x21, 0x00 };
         unsigned char der[128];
         size_t dn = 0;
-        der[dn++] = 0x30; der[dn++] = 0x78;                  /* Certificate, 120 байт */
-        der[dn++] = 0x30; der[dn++] = 0x2C;                  /* tbsCertificate: только SPKI */
+        der[dn++] = 0x30; der[dn++] = 0x78;                  /* Certificate, 120 bytes */
+        der[dn++] = 0x30; der[dn++] = 0x2C;                  /* tbsCertificate: SPKI only */
         memcpy(der + dn, spki, sizeof(spki)); dn += sizeof(spki);
         memcpy(der + dn, epub, 32); dn += 32;
         static const unsigned char alg[] = { 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70 };
@@ -786,13 +757,13 @@ static void *server_half(void *arg) {
         cm[cn++] = 0; cm[cn++] = (unsigned char)(list >> 8); cm[cn++] = (unsigned char)list;
         cm[cn++] = 0; cm[cn++] = (unsigned char)(dn >> 8); cm[cn++] = (unsigned char)dn;
         memcpy(cm + cn, der, dn); cn += dn;
-        cm[cn++] = 0; cm[cn++] = 0;                          /* расширений записи нет */
+        cm[cn++] = 0; cm[cn++] = 0;                          /* no entry extensions */
         if (send_enc(s, cm, cn)) return NULL;
         sc_hash_update(&s->tr, cm, cn);
     }
     if (pl->cert == 1) {
-        /* Тело намеренно не разбирается ни в один сертификат: проверяется не разбор X.509,
-         * а то, чем закрывается отказ проверки. */
+        /* The body deliberately parses as no certificate at all: what is tested is not X.509
+         * parsing but how a failed check is closed. */
         unsigned char cr[40];
         cr[0] = 0x0B; cr[1] = 0; cr[2] = 0; cr[3] = 32;
         memset(cr + 4, 0xA5, 32);
@@ -820,7 +791,7 @@ finished:;
     return NULL;
 }
 
-/* ---- шов установления TCP ------------------------------------------------------ */
+/* ---- TCP setup seam ------------------------------------------------------------ */
 
 static int g_give_fd = -1;
 
@@ -829,17 +800,16 @@ static int fake_dial(const char *host, uint16_t port, int timeout_s) {
     int fd = g_give_fd;
     g_give_fd = -1;
     if (fd < 0) return TR_ECONNECT;
-    /* Ровно то, что делает tcp_connect с победившим сокетом: срок на чтение и запись.
-     * Без него ошибка в серверной половине вешала бы стенд, а не роняла его. */
+    /* What tcp_connect does with the winning socket: read and write timeouts. Without them a
+     * bug in the server half would hang the test instead of failing it. */
     sock_ready(fd, timeout_s);
     return fd;
 }
 
-/* Узел: Reality поверх tcp. Именно Reality, а не security=tls: доказательством подлинности
- * здесь служит подпись временного сертификата на authkey, и для отказа проверки не нужно
- * ни хранилища корней, ни цепочки X.509 — то есть ветвь ECERT достижима без второго
- * стенда под сертификаты. Ключ pbk произвольный: X25519 умножает любые 32 байта, а сервер
- * этой пары всё равно поддельный. */
+/* A Reality node over tcp. Reality, not security=tls: the proof here is the temporary
+ * certificate's signature over the authkey, so failing the check needs no root store and no
+ * X.509 chain, and the ECERT path is reachable without issuing certificates. The pbk is
+ * arbitrary: X25519 multiplies any 32 bytes, and the server for this pair is fake anyway. */
 static void node_reality(struct vless_node *n, const char *type) {
     memset(n, 0, sizeof(*n));
     snprintf(n->host, sizeof(n->host), "%s", "node.invalid");
@@ -854,11 +824,10 @@ static void node_reality(struct vless_node *n, const char *type) {
 }
 
 #if defined(STEER_HAVE_X509WRITE)
-/* Узел security=tls: доказательство подлинности — цепочка до корня и имя, больше ничего.
- * pbk/sid не заполняются вовсе, и это не небрежность: у обычного TLS их не бывает, а
- * reality_build_hello при .plain = 1 их и не читает (client.c). Имя обязано быть — и
- * проверяется оно против sni, а не против host, поэтому sni здесь то, на которое выпущен
- * годный лист. */
+/* A security=tls node: the proof is the chain to a root and the name, nothing else. pbk and sid
+ * are left empty on purpose: plain TLS has none, and reality_build_hello does not read them with
+ * .plain = 1 (trsec.c). The name is checked against sni, not host, so sni is the name the good
+ * leaf is issued for. */
 static void node_tls(struct vless_node *n, const char *type) {
     memset(n, 0, sizeof(*n));
     snprintf(n->host, sizeof(n->host), "%s", "node.invalid");
@@ -871,14 +840,13 @@ static void node_tls(struct vless_node *n, const char *type) {
 }
 #endif
 
-/* Один прогон: поднять пару, отдать один конец клиенту, второй — серверной половине.
+/* One run: make a socket pair, give one end to the client and the other to the server half.
  *
- * ctx_left, если он задан, получает число контекстов шифра, оставшихся РАЗВЁРНУТЫМИ в
- * соединении после возврата. Это наблюдаемая форма утверждения «освобождать было нечего»:
- * ветвь отказа рукопожатия закрывается одним close(fd), и безопасно это лишь пока tls13.c
- * разворачивает контексты трафика последним действием — уже после всех своих отказов.
- * Связь между двумя файлами, которую до этого стенда не охраняло ничто; проверка пойдёт
- * красной в тот день, когда порядок в tls13.c изменится. */
+ * ctx_left, if given, receives the number of cipher contexts left EXPANDED in the connection
+ * after return. This is the observable form of "there was nothing to free": a failed handshake
+ * closes with a plain close(fd), which is safe only while tls13.c expands the traffic contexts
+ * as its last step, after all its failure exits. Nothing else guards this link between the two
+ * files; the check fails the day the order in tls13.c changes. */
 static int run_case(const struct plan *pl, struct vless_node *n, char *reason, size_t rn,
                     int *ctx_left) {
     int sv[2];
@@ -909,14 +877,14 @@ static int run_case(const struct plan *pl, struct vless_node *n, char *reason, s
 
     pthread_join(th, NULL);
     if (s.fd >= 0) close(s.fd);
-    /* Свой конец пары закрывает сам vless_connect (или vless_close на успехе). Не закрыл —
-     * это и есть находка, и её видно проверкой по числу дескрипторов у вызывающего. */
+    /* The client's end of the pair is closed by vless_connect itself (or by transport_close on
+     * success). If it is not, that is the finding, and the caller's descriptor count shows it. */
     return rc;
 }
 
-/* Прогон ws или httpupgrade до данных: установление, первые данные за ответом 101 (они
- * приехали ОДНОЙ записью TLS с ответом), ответ клиента. 0 — всё сошлось; *srv_out — что
- * увидел сервер. */
+/* A ws or httpupgrade run through to data: setup, the first data after the 101 answer (it came
+ * in ONE TLS record with the answer), the client's reply. 0 if all of it worked; *s holds what
+ * the server saw. */
 static int run_upg(const struct plan *pl, struct vless_node *n, struct srv *s) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -100;
@@ -951,7 +919,7 @@ static int run_upg(const struct plan *pl, struct vless_node *n, struct srv *s) {
     return rc;
 }
 
-/* base64url без выравнивания — форма pbk в ссылке узла. */
+/* base64url without padding: the form of pbk in a node link. */
 static void b64url(const unsigned char *in, size_t n, char *out) {
     static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     size_t o = 0;
@@ -967,18 +935,15 @@ static void b64url(const unsigned char *in, size_t n, char *out) {
     out[o] = '\0';
 }
 
-/* Работает ли сама проверка кучи.
+/* Does the heap check itself work?
  *
- * Зачем это отдельной проверкой. Стенд, собранный С санитайзером, но запущенный с
- * ASAN_OPTIONS=detect_leaks=0, показывал бы «в куче ничего не осталось» на КАЖДОЙ ветви —
- * зелёный стенд, который больше не проверяет то, ради чего написан. Ровно этот класс
- * молчаливого отказа уже стоил проекту двух находок (I-066, I-067 не прогонялись ни разу),
- * и урок захода 75 сформулирован там же: барьер, который можно случайно выключить, обязан
- * говорить о своём состоянии сам.
+ * A test built WITH the sanitizer but run with ASAN_OPTIONS=detect_leaks=0 would report
+ * "nothing left on the heap" on EVERY path: a green test that no longer checks what it was
+ * written for. A safeguard that can be turned off by accident must report its own state.
  *
- * Утечка делается НАРОЧНО и тут же убирается: указатель спрятан исключающим ИЛИ, потому что
- * LeakSanitizer просматривает и стек, и регистры — живой указатель он не счёл бы утечкой.
- * Отчёт санитайзера, который появится ниже, — часть проверки, а не поломка. */
+ * The leak is made ON PURPOSE and cleaned up right away. The pointer is hidden by XOR because
+ * LeakSanitizer scans the stack and the registers too and would not count a live pointer as a
+ * leak. The sanitizer report printed below is part of the check, not a failure. */
 static volatile uintptr_t g_hidden;
 #define HIDE_MASK ((uintptr_t)0x5a5a5a5a5a5a5a5aULL)
 
@@ -989,20 +954,20 @@ static void heap_check_selftest(void) {
     memset(p, 0x11, 64);
     g_hidden = (uintptr_t)p ^ HIDE_MASK;
     p = NULL;
-    printf("-- ниже ОЖИДАЕМЫЙ отчёт об утечке: так стенд убеждается, что проверка кучи включена --\n");
+    printf("-- an EXPECTED leak report follows: it proves the heap check is on --\n");
     fflush(stdout);
     int seen = LEAK_CHECK();
-    printf("-- конец ожидаемого отчёта --\n");
-    check("проверка кучи включена (нарочная утечка замечена)", 1, seen);
+    printf("-- end of the expected report --\n");
+    check("heap check is on (the deliberate leak was seen)", 1, seen);
     free((void *)(g_hidden ^ HIDE_MASK));
     g_hidden = 0;
 #endif
 }
 
 int main(void) {
-    /* Серверная половина пишет в сокет, который клиент уже закрыл, — на отказе проверки он
-     * закрывается, не дочитав. Без этого стенд умирал бы от SIGPIPE вместо того, чтобы
-     * назвать результат. */
+    /* The server half writes to a socket the client has already closed: on a failed check the
+     * client closes without reading to the end. Without this the test would die of SIGPIPE
+     * instead of reporting the result. */
     signal(SIGPIPE, SIG_IGN);
 
     heap_check_selftest();
@@ -1010,94 +975,93 @@ int main(void) {
     struct vless_node node;
     node_reality(&node, "tcp");
 
-    /* Прогрев. Первое рукопожатие тянет за собой одноразовые выделения криптобиблиотеки и
-     * подъём потока, и без него первая же проверка кучи показала бы их как утечку. Что
-     * прогрев сработал, видно по коду возврата: он обязан быть тем же, что в первом
-     * измеряемом случае ниже. */
+    /* Warm-up. The first handshake brings one-time allocations of the crypto library and the
+     * thread start, and without it the first heap check would report them as a leak. The return
+     * code shows that the warm-up worked: it must equal that of the first measured case below. */
     {
-        struct plan warm = { .name = "прогрев", .cert = 0 };
+        struct plan warm = { .name = "warm-up", .cert = 0 };
         char why[256];
         int rc = run_case(&warm, &node, why, sizeof(why), NULL);
-        check("прогрев: рукопожатие дошло до проверки сертификата", TLS13_ECERT, rc);
+        check("warm-up: the handshake reached the certificate check", TLS13_ECERT, rc);
     }
 
     static const struct plan plans[] = {
-        { .name = "сервер не прислал сертификат", .cert = 0 },
-        { .name = "сертификат не сошёлся с authkey", .cert = 1 },
-        { .name = "сертификат приехал сжатым", .cert = 2 },
-        { .name = "ServerHello без key_share", .no_keyshare = 1 },
-        { .name = "серверный Finished не совпал", .bad_finished = 1 },
-        { .name = "сервер закрылся после ClientHello", .hangup = 1 },
+        { .name = "server sent no certificate", .cert = 0 },
+        { .name = "server certificate does not parse", .cert = 1 },
+        { .name = "certificate arrived compressed", .cert = 2 },
+        { .name = "ServerHello without key_share", .no_keyshare = 1 },
+        { .name = "server Finished does not match", .bad_finished = 1 },
+        { .name = "server closed after ClientHello", .hangup = 1 },
     };
     static const int want[] = {
         TLS13_ECERT, TLS13_ECERT, TLS13_ECERT,
         TLS13_ENOKEYSHARE, TLS13_EFINISHED, TLS13_ECLOSED,
     };
-    /* Причина отказа обязана дойти до вызывающего: без неё «узел не работает» и «узел не
-     * тот» выглядят одинаково. Проверяется у трёх ветвей ECERT — только у них она есть. */
+    /* The failure reason must reach the caller: without it "the node is down" and "the node is
+     * not ours" look the same. Checked for the three ECERT paths, the only ones with a reason. */
     static const char *why_want[] = {
-        "не прислал сертификат",
-        "не разобрался",
-        /* Сжатый сертификат назван «не признал ключ», а не словом про сжатие, и это
-         * намеренно: сервер Reality, признавший клиента, отвечает своим временным
-         * сертификатом и не сжимает его — значит отвечает маскировочный сайт. Проверка
-         * стоит здесь потому, что подмена этого текста на буквальный («сервер сжал
-         * сертификат») увела бы человека к сжатию, к которому он не имеет отношения. */
-        "не признал ключ",
+        "sent no certificate",
+        "cannot parse",
+        /* A compressed certificate is reported as "did not accept the key", not as anything
+         * about compression, on purpose: a Reality server that accepted the client answers
+         * with its temporary certificate and does not compress it, so the camouflage site is
+         * answering. The check is here because a literal text ("server compressed its
+         * certificate") would send the user after compression, which has nothing to do with
+         * it. */
+        "did not accept the key",
         "", "", "",
     };
 
     for (size_t i = 0; i < sizeof(plans) / sizeof(*plans); i++) {
-        /* Буфер стенда ВДВОЕ больше движкового (g_verify_reason[96]): стенд обязан
-         * мерить движок, а не себя. Совпадающие размеры показали бы обрезку
-         * собственным буфером как свойство движка — и наоборот. */
+        /* The test's buffer is TWICE the engine's (g_verify_reason[96]): the test must measure
+         * the engine, not itself. With equal sizes a cut by the test's own buffer would look
+         * like a property of the engine, and the other way round. */
         char what[160], why[256] = "";
         int fd0 = fd_count(), ctx_left = -1;
         int rc = run_case(&plans[i], &node, why, sizeof(why), &ctx_left);
 
-        snprintf(what, sizeof(what), "%s: код возврата", plans[i].name);
+        snprintf(what, sizeof(what), "%s: return code", plans[i].name);
         check(what, want[i], rc);
 
         if (why_want[i][0]) {
-            snprintf(what, sizeof(what), "%s: причина названа", plans[i].name);
+            snprintf(what, sizeof(what), "%s: reason reported", plans[i].name);
             check_str(what, why_want[i], why);
         }
 
-        /* Двадцать попыток подряд — то, что происходит на роутере: пул запасных сессий
-         * пополняется на каждый SYN, сторож перебирает узлы пачками. Утечка на попытку
-         * здесь и становится видимой, а не остаётся округлением. */
+        /* Twenty attempts in a row, as on a router, where the spare pool refills on every SYN.
+         * A per-attempt leak becomes visible here instead of staying a rounding error. */
         for (int k = 0; k < 20; k++) {
             int again = run_case(&plans[i], &node, NULL, 0, NULL);
             if (again != want[i]) { rc = again; break; }
         }
-        snprintf(what, sizeof(what), "%s: двадцать попыток дают тот же код", plans[i].name);
+        snprintf(what, sizeof(what), "%s: twenty more attempts, same code", plans[i].name);
         check(what, want[i], rc);
 
-        snprintf(what, sizeof(what), "%s: контекстов шифра не осталось развёрнутыми", plans[i].name);
+        snprintf(what, sizeof(what), "%s: no cipher context left expanded", plans[i].name);
         check(what, 0, ctx_left);
 
-        snprintf(what, sizeof(what), "%s: дескрипторы вернулись к исходному числу", plans[i].name);
+        snprintf(what, sizeof(what), "%s: descriptor count restored", plans[i].name);
         check(what, fd0, fd_count());
 
-        snprintf(what, sizeof(what), "%s: в куче ничего не осталось", plans[i].name);
+        snprintf(what, sizeof(what), "%s: nothing left on the heap", plans[i].name);
         check(what, 0, LEAK_CHECK());
     }
 
-    /* ---- удавшийся Reality и ws/httpupgrade поверх него (шаг 5 выпуска 1.10) ---------
+    /* ---- a successful Reality, and ws/httpupgrade over it ------------------------------
      *
-     * Сервер отвечает настоящим временным сертификатом Reality (подпись HMAC на authkey от
-     * своей постоянной пары, pbk узла — её публичная половина), то есть рукопожатие здесь
-     * УДАЁТСЯ, и дальше идут данные. У tcp проверяется только облик: ALPN прежний («h2,
-     * http/1.1» — Hello у tcp шагом не тронут). У ws и httpupgrade — всё до данных: ALPN один
-     * http/1.1, запрос Upgrade с путём без ed, ответ 101 и первые данные ОДНОЙ записью TLS (остаток
-     * не теряется), ответ клиента дошёл — у ws кадром с маской. */
+     * The server answers with a real Reality temporary certificate (an HMAC over the authkey
+     * from its static key pair; the node's pbk is the public half), so the handshake SUCCEEDS
+     * here and data follows. For tcp only the look is checked: the ALPN is not narrowed to
+     * http/1.1. For ws and httpupgrade everything up to data: ALPN http/1.1 alone, the Upgrade
+     * request with the path without ed, the 101 answer and the first data in ONE TLS record (the
+     * remainder is not lost), and the client's reply arriving (for ws as a masked frame). */
     if (xc_x25519_keypair(g_rs_priv, g_rs_pub) != 0) {
-        printf("%-64s %s\n", "пара сервера Reality", "ПРОВАЛ");
+        printf("%-64s %s\n", "Reality server key pair", "FAIL");
         fails++;
     } else {
-        /* ws — без ранних данных (ed=0: вырезается, Ed 0) и с ними (ed=2048: запрос уходит первой
-         * записью, «hello» — в Sec-WebSocket-Protocol); httpupgrade с ed=2048 — ответ 101 читается
-         * лениво, первым чтением. */
+        /* ws without early data (ed=0: stripped, Ed 0) and with it (ed=2048: the request goes
+         * out with the first write, "hello" in Sec-WebSocket-Protocol); httpupgrade with
+         * ed=2048: the 101 answer is read lazily, on the first read. */
         static const char *rtype[] = { "tcp", "ws", "httpupgrade", "ws ed" };
         static const char *rpath[] = { "/w?ed=0", "/w?ed=0", "/w?ed=2048", "/w?ed=2048" };
         for (int u = 0; u < 4; u++) {
@@ -1115,90 +1079,79 @@ int main(void) {
             if (u == 0) {
                 g_seen_h11 = -1;
                 rc = run_case(&up, &rn, NULL, 0, NULL);
-                check("reality: временный сертификат признан — соединение установлено", 0, rc);
-                check("reality + tcp: ALPN прежний, не один http/1.1", 0, g_seen_h11);
-                check("reality + tcp: дескрипторы вернулись к исходному числу", fd0, fd_count());
+                check("reality: temporary certificate accepted, connection established", 0, rc);
+                check("reality + tcp: ALPN is not http/1.1 alone", 0, g_seen_h11);
+                check("reality + tcp: descriptor count restored", fd0, fd_count());
                 continue;
             }
             rc = run_upg(&up, &rn, &s);
-            snprintf(what, sizeof(what), "reality + %s: соединение до данных", rtype[u]);
+            snprintf(what, sizeof(what), "reality + %s: connected, first data read", rtype[u]);
             check(what, 0, rc);
-            snprintf(what, sizeof(what), "reality + %s: в ALPN только http/1.1", rtype[u]);
+            snprintf(what, sizeof(what), "reality + %s: ALPN is http/1.1 alone", rtype[u]);
             check(what, 1, s.alpn_h11);
-            snprintf(what, sizeof(what), "reality + %s: запрос Upgrade — путь без ed, Host из host", rtype[u]);
+            snprintf(what, sizeof(what), "reality + %s: path without ed, Host from host", rtype[u]);
             check(what, 1, !strncmp(s.req, "GET /w HTTP/1.1\r\nHost: cdn.example\r\n", 36));
-            snprintf(what, sizeof(what), u == 3 ? "reality + %s: «hello» в Sec-WebSocket-Protocol запроса"
-                                                : "reality + %s: ответ клиента после 101 дошёл", rtype[u]);
+            snprintf(what, sizeof(what), u == 3 ? "reality + %s: 'hello' in Sec-WebSocket-Protocol"
+                                                : "reality + %s: reply after 101 arrived", rtype[u]);
             check(what, 1, s.got_hello);
-            snprintf(what, sizeof(what), "reality + %s: дескрипторы вернулись к исходному числу", rtype[u]);
+            snprintf(what, sizeof(what), "reality + %s: descriptor count restored", rtype[u]);
             check(what, fd0, fd_count());
-            snprintf(what, sizeof(what), "reality + %s: в куче ничего не осталось", rtype[u]);
+            snprintf(what, sizeof(what), "reality + %s: nothing left on the heap", rtype[u]);
             check(what, 0, LEAK_CHECK());
         }
     }
 
-    /* ---- security=tls со своими корнями (R-118) ---------------------------------
+    /* ---- security=tls with our own roots -------------------------------------------
      *
-     * Здесь и только здесь проверка сервера может ПРОЙТИ, а значит только здесь достижимы
-     * успешное установление целиком и ветвь ENOH2 — та, ради которой в клиенте появился
-     * vless_close вместо close(fd). Корни отдаются движку швом g_cert_roots; хранилище
-     * одно на весь процесс, потому что certverify.c разбирает его под pthread_once
-     * (I-217), и второе тут не подействовало бы. */
+     * Here the server check passes on a real X.509 chain, which makes full setup and the
+     * TR_ENOH2 path reachable; TR_ENOH2 must close through transport_close, not close(fd). The
+     * roots reach the engine through the g_cert_roots seam. There is one store for the whole
+     * process: certverify.c loads it under pthread_once, and a second one would have no effect. */
 #if defined(STEER_HAVE_X509WRITE)
     if (chain_build() != 0) {
-        printf("%-64s %s\n", "выпуск своей цепочки X.509", "ПРОВАЛ");
+        printf("%-64s %s\n", "issuing our own X.509 chain", "FAIL");
         fails++;
     } else {
         g_cert_roots = g_roots_file;
 
-        /* Прогрев второй половины: первое рукопожатие с проверкой цепочки тянет за собой
-         * разбор хранилища корней под pthread_once — 
-         * он остаётся в куче навсегда по замыслу (см. roots_load), и без прогрева первая
-         * же проверка кучи показала бы его утечкой. */
+        /* Warm-up for this half: the first handshake with chain verification loads the root
+         * store under pthread_once. It stays on the heap for good by design (see roots_load),
+         * and without the warm-up the first heap check would report it as a leak. */
         {
-            struct plan warm = { .name = "прогрев tls", .chain = LEAF_OK };
+            struct plan warm = { .name = "tls warm-up", .chain = LEAF_OK };
             struct vless_node w;
             node_tls(&w, "tcp");
             int rc = run_case(&warm, &w, NULL, 0, NULL);
-            check("прогрев tls: цепочка сошлась, соединение установлено", 0, rc);
+            check("tls warm-up: chain verified, connection established", 0, rc);
         }
 
         static const struct plan tls_plans[] = {
-            { .name = "tls: цепочка сошлась",            .chain = LEAF_OK },
-            { .name = "tls: сервер выбрал не h2",        .chain = LEAF_OK, .alpn = "http/1.1" },
-            { .name = "tls: лист выдан на другое имя",   .chain = LEAF_NAME },
-            { .name = "tls: лист подписан сам собой",    .chain = LEAF_SELF },
-            { .name = "tls: сертификат без подписи",     .chain = LEAF_OK, .no_cv = 1 },
-            { .name = "tls: подпись не сходится",        .chain = LEAF_OK, .cv_bad_sig = 1 },
-            { .name = "tls: алгоритм не из предложенных",.chain = LEAF_OK, .cv_bad_alg = 1 },
+            { .name = "tls: chain verifies",                .chain = LEAF_OK },
+            { .name = "tls: server chose http/1.1, not h2", .chain = LEAF_OK, .alpn = "http/1.1" },
+            { .name = "tls: leaf issued for another name",  .chain = LEAF_NAME },
+            { .name = "tls: self-signed leaf",              .chain = LEAF_SELF },
+            { .name = "tls: no CertificateVerify",          .chain = LEAF_OK, .no_cv = 1 },
+            { .name = "tls: signature does not verify",     .chain = LEAF_OK, .cv_bad_sig = 1 },
+            { .name = "tls: signature scheme not offered",  .chain = LEAF_OK, .cv_bad_alg = 1 },
         };
-        /* Транспорт: у случая с ALPN он ОБЯЗАН быть не raw. Для tcp ALPN не просят вовсе
-         * (transport.c: у tr_tcp alpn = NULL), и проверка «сервер назвал не h2» там не
-         * стоит — то есть на tcp этот случай молча прошёл бы успехом. */
+        /* The ALPN case MUST NOT run on tcp. tcp asks for no ALPN at all (transport.c: tr_tcp
+         * has alpn = NULL), so the "server did not choose h2" check is not made there, and on tcp
+         * this case would silently pass as a success. */
         static const char *tls_type[] = { "tcp", "grpc", "tcp", "tcp", "tcp", "tcp", "tcp" };
         static const int tls_want[] = {
             0, TR_ENOH2, TLS13_ECERT, TLS13_ECERT,
             TLS13_ECERT, TLS13_ECERT, TLS13_ECERT,
         };
-        /* ОЖИДАЕТСЯ ТО, ЧТО ДОХОДИТ СЕГОДНЯ, а не то, что написано в certverify.c, и разница
-         * здесь — находка I-236, а не небрежность стенда. Два самых длинных текста причин не
-         * влезают в g_verify_reason[96]: «сертификат не сошёлся с корнями или выдан не на это
-         * имя» это 100 байт, «сервер подписал алгоритмом, которого мы не предлагали» — 99.
-         * Обрезка у первого приходится НА СЕРЕДИНУ БУКВЫ. Поправить нельзя автономно: буфер
-         * живёт в tls13.c, а это защищённый путь (п.5.0) — заведён proposal. Проверка ниже
-         * («причина обрезана») меряет это числом, и когда буфер вырастет, она покраснеет —
-         * это и будет напоминанием заменить ожидания здесь на полные тексты. */
+        /* Each needle is the END of its reason in certverify.c or tls13.c, so a reason cut short
+         * (g_verify_reason in tls13.c is 96 bytes) fails the check. */
         static const char *tls_why[] = {
             "", "",
-            "выдан не на это",          /* CERTV_ECHAIN: имя проверяется третьим доводом verify */
-            "не сошёлся с корнями",     /* тот же код, другая половина его текста */
-            "не прислал подпись",       /* tls13.c различает «нет сертификата» и «нет подписи» */
-            "подпись сервера неверна",  /* CERTV_ESIG */
-            "которого мы не предлага",  /* CERTV_EALG — отдельная причина, а не «подпись плохая» */
+            "names another host",          /* CERTV_ECHAIN: the name is checked with the chain */
+            "does not chain to a root or names another host", /* self-signed: same code */
+            "sent no signature",           /* tls13.c tells "no certificate" from "no signature" */
+            "bad server signature",        /* CERTV_ESIG */
+            "algorithm we did not offer",  /* CERTV_EALG: its own reason, not "bad signature" */
         };
-        /* Сколько байт причины дошло. -1 — «не проверяем»; 95 — обрезано движковым буфером. */
-        static const int tls_why_len[] = { -1, -1, 95, -1, -1, -1, 95 };
-
         for (size_t i = 0; i < sizeof(tls_plans) / sizeof(*tls_plans); i++) {
             struct vless_node tn;
             node_tls(&tn, tls_type[i]);
@@ -1206,42 +1159,35 @@ int main(void) {
             int fd0 = fd_count(), ctx_left = -1;
             int rc = run_case(&tls_plans[i], &tn, why, sizeof(why), &ctx_left);
 
-            snprintf(what, sizeof(what), "%s: код возврата", tls_plans[i].name);
+            snprintf(what, sizeof(what), "%s: return code", tls_plans[i].name);
             check(what, tls_want[i], rc);
 
             if (tls_why[i][0]) {
-                snprintf(what, sizeof(what), "%s: причина названа", tls_plans[i].name);
+                snprintf(what, sizeof(what), "%s: reason reported", tls_plans[i].name);
                 check_str(what, tls_why[i], why);
-            }
-            if (tls_why_len[i] >= 0) {
-                /* КРАСНОЕ ЗДЕСЬ — ХОРОШАЯ НОВОСТЬ: значит g_verify_reason вырос и текст
-                 * доходит целиком (I-236). Тогда это число убирается, а ожидание причины
-                 * выше заменяется полным текстом из certverify.c. */
-                snprintf(what, sizeof(what), "%s: причина обрезана буфером движка (I-236)",
-                         tls_plans[i].name);
-                check(what, tls_why_len[i], (long)strlen(why));
             }
 
             for (int k = 0; k < 20; k++) {
                 int again = run_case(&tls_plans[i], &tn, NULL, 0, NULL);
                 if (again != tls_want[i]) { rc = again; break; }
             }
-            snprintf(what, sizeof(what), "%s: двадцать попыток дают тот же код", tls_plans[i].name);
+            snprintf(what, sizeof(what), "%s: twenty more attempts, same code", tls_plans[i].name);
             check(what, tls_want[i], rc);
 
-            snprintf(what, sizeof(what), "%s: контекстов шифра не осталось развёрнутыми", tls_plans[i].name);
+            snprintf(what, sizeof(what), "%s: no cipher context left expanded", tls_plans[i].name);
             check(what, 0, ctx_left);
 
-            snprintf(what, sizeof(what), "%s: дескрипторы вернулись к исходному числу", tls_plans[i].name);
+            snprintf(what, sizeof(what), "%s: descriptor count restored", tls_plans[i].name);
             check(what, fd0, fd_count());
 
-            snprintf(what, sizeof(what), "%s: в куче ничего не осталось", tls_plans[i].name);
+            snprintf(what, sizeof(what), "%s: nothing left on the heap", tls_plans[i].name);
             check(what, 0, LEAK_CHECK());
         }
-        /* Закрепления и явный отказ от проверки (Xray pinnedPeerCertSha256 / verifyPeerCertByName).
-         * Ожидания повторяют то, что снято со стенда против сервера Xray-core 26.9.9: закреплённый
-         * лист принимается БЕЗ цепочки и имени (тут — подписан сам собой), чужой отпечаток — отказ,
-         * vcn подменяет имя проверки, insecure снимает цепочку, но не подпись CertificateVerify. */
+        /* Pins and an explicit opt-out of verification (Xray pinnedPeerCertSha256 /
+         * verifyPeerCertByName). The expectations match what a test against an Xray-core 26.9.9
+         * server showed: a pinned leaf is accepted WITHOUT chain or name (here a self-signed
+         * one), another leaf's fingerprint fails, vcn replaces the name to check, and insecure
+         * drops the chain check but not the CertificateVerify signature. */
         {
             static const char HEX[] = "0123456789abcdef";
             char h_ok[65], h_name[65], h_self[65];
@@ -1253,14 +1199,14 @@ int main(void) {
                 hh[i].out[64] = '\0';
             }
             struct { const char *name; struct plan pl; const char *pcs, *vcn; int ins; int want; } pin[] = {
-                { "pcs: закреплён лист, подписанный сам собой", { .chain = LEAF_SELF }, h_self, NULL, 0, 0 },
-                { "pcs: закреплён лист на другое имя",          { .chain = LEAF_NAME }, h_name, NULL, 0, 0 },
-                { "pcs: отпечаток чужого листа — отказ",        { .chain = LEAF_OK },   h_name, NULL, 0, TLS13_ECERT },
-                { "pcs: несколько отпечатков, нужный вторым",   { .chain = LEAF_OK },   NULL,   NULL, 0, 0 },
-                { "vcn: имя проверки вместо sni",               { .chain = LEAF_NAME }, NULL,   "other.invalid", 0, 0 },
-                { "vcn: имя не то — отказ",                     { .chain = LEAF_OK },   NULL,   "other.invalid", 0, TLS13_ECERT },
-                { "insecure: лист подписан сам собой",          { .chain = LEAF_SELF }, NULL,   NULL, 1, 0 },
-                { "insecure: подпись CertificateVerify всё равно проверяется",
+                { "pcs: pinned self-signed leaf accepted",      { .chain = LEAF_SELF }, h_self, NULL, 0, 0 },
+                { "pcs: pinned leaf for another name accepted", { .chain = LEAF_NAME }, h_name, NULL, 0, 0 },
+                { "pcs: another leaf's fingerprint is refused", { .chain = LEAF_OK },   h_name, NULL, 0, TLS13_ECERT },
+                { "pcs: several fingerprints, match is second", { .chain = LEAF_OK },   NULL,   NULL, 0, 0 },
+                { "vcn: the name to check replaces sni",        { .chain = LEAF_NAME }, NULL,   "other.invalid", 0, 0 },
+                { "vcn: a wrong name is refused",               { .chain = LEAF_OK },   NULL,   "other.invalid", 0, TLS13_ECERT },
+                { "insecure: self-signed leaf accepted",        { .chain = LEAF_SELF }, NULL,   NULL, 1, 0 },
+                { "insecure: CertificateVerify signature still checked",
                                                                 { .chain = LEAF_OK, .cv_bad_sig = 1 }, NULL, NULL, 1, TLS13_ECERT },
             };
             char two[140];
@@ -1275,16 +1221,16 @@ int main(void) {
                 int fd0 = fd_count(), ctx_left = -1;
                 int rc = run_case(&pin[i].pl, &tn, NULL, 0, &ctx_left);
                 char what[160];
-                snprintf(what, sizeof what, "%s: код возврата", pin[i].name);
+                snprintf(what, sizeof what, "%s: return code", pin[i].name);
                 check(what, pin[i].want, rc);
-                snprintf(what, sizeof what, "%s: дескрипторы и контексты не текут", pin[i].name);
+                snprintf(what, sizeof what, "%s: no fd or cipher context leak", pin[i].name);
                 check(what, 0, (fd_count() - fd0) + (ctx_left > 0 ? ctx_left : 0));
-                snprintf(what, sizeof what, "%s: в куче ничего не осталось", pin[i].name);
+                snprintf(what, sizeof what, "%s: nothing left on the heap", pin[i].name);
                 check(what, 0, LEAK_CHECK());
             }
         }
-        /* ws и httpupgrade поверх обычного TLS со своей цепочкой: то же, что у Reality выше,
-         * плюс настоящая проверка сертификата — путь, которым идут узлы за CDN. */
+        /* ws and httpupgrade over plain TLS with our own chain: as for Reality above, plus a real
+         * certificate check. This is the path of nodes behind a CDN. */
         static const char *ttype[] = { "ws", "httpupgrade", "ws ed" };
         for (int u = 1; u <= 3; u++) {
             struct plan up = { .name = "tls", .chain = LEAF_OK, .upg = u == 2 ? 2 : 1, .ed_first = u == 3 };
@@ -1295,41 +1241,41 @@ int main(void) {
             int fd0 = fd_count();
             static struct srv s;
             int rc = run_upg(&up, &tn, &s);
-            snprintf(what, sizeof(what), "tls + %s: соединение до данных", ttype[u - 1]);
+            snprintf(what, sizeof(what), "tls + %s: connected, first data read", ttype[u - 1]);
             check(what, 0, rc);
-            snprintf(what, sizeof(what), "tls + %s: в ALPN только http/1.1", ttype[u - 1]);
+            snprintf(what, sizeof(what), "tls + %s: ALPN is http/1.1 alone", ttype[u - 1]);
             check(what, 1, s.alpn_h11);
-            snprintf(what, sizeof(what), "tls + %s: Host без host — sni", ttype[u - 1]);
+            snprintf(what, sizeof(what), "tls + %s: path without ed, Host from sni", ttype[u - 1]);
             check(what, 1, !strncmp(s.req, "GET /w HTTP/1.1\r\nHost: " TLS_SNI "\r\n",
                                     strlen("GET /w HTTP/1.1\r\nHost: " TLS_SNI "\r\n")));
-            snprintf(what, sizeof(what), "tls + %s: ответ клиента после 101 дошёл", ttype[u - 1]);
+            snprintf(what, sizeof(what), "tls + %s: client's 'hello' arrived", ttype[u - 1]);
             check(what, 1, s.got_hello);
-            snprintf(what, sizeof(what), "tls + %s: дескрипторы вернулись к исходному числу", ttype[u - 1]);
+            snprintf(what, sizeof(what), "tls + %s: descriptor count restored", ttype[u - 1]);
             check(what, fd0, fd_count());
-            snprintf(what, sizeof(what), "tls + %s: в куче ничего не осталось", ttype[u - 1]);
+            snprintf(what, sizeof(what), "tls + %s: nothing left on the heap", ttype[u - 1]);
             check(what, 0, LEAK_CHECK());
         }
-        /* Сервер за TLS выбрал h2 — а апгрейд идёт по HTTP/1.1: свой код, не «не согласился на
-         * HTTP/2». */
+        /* The server behind TLS chose h2, but the upgrade runs over HTTP/1.1: its own code, not
+         * "did not agree to HTTP/2". */
         {
             struct plan up = { .name = "tls h2", .chain = LEAF_OK, .alpn = "h2" };
             struct vless_node tn;
             node_tls(&tn, "ws");
             int rc = run_case(&up, &tn, NULL, 0, NULL);
-            check("tls + ws: сервер выбрал h2 — отказ TR_ENOH1", TR_ENOH1, rc);
+            check("tls + ws: server chose h2, refused with TR_ENOH1", TR_ENOH1, rc);
         }
         g_cert_roots = NULL;
         chain_free();
     }
 #else
-    printf("\nВНИМАНИЕ: собрано БЕЗ выпуска сертификатов (нет STEER_HAVE_X509WRITE, tests/certgen.c) —\n");
-    printf("          семь случаев security=tls ПРОПУЩЕНЫ: ни удавшаяся проверка сервера,\n");
-    printf("          ни ветвь ENOH2 с её vless_close здесь не проверены (R-118).\n\n");
+    printf("\nWARNING: built WITHOUT certificate issuing (no STEER_HAVE_X509WRITE, tests/certgen.c):\n");
+    printf("         the security=tls cases are SKIPPED: neither a passing server check\n");
+    printf("         nor the TR_ENOH2 path with its transport_close is tested here.\n\n");
 #endif
 
-    /* security=none: TLS нет вовсе, и путь выхода тут единственный успешный. Нужен не ради
-     * него самого, а как поверка стенда: если бы шов отдавал негодный сокет, «успех» тоже
-     * стал бы отказом, и все проверки выше прошли бы по неверной причине. */
+    /* security=none: no TLS at all. It checks the test rather than the client: if the seam
+     * handed over a bad socket, success would fail too, and the failure checks above would pass
+     * for the wrong reason. */
     {
         struct vless_node plain;
         memset(&plain, 0, sizeof(plain));
@@ -1345,18 +1291,18 @@ int main(void) {
         struct transport c;
         int rc = vless_connect(&plain, &c, 3);
         g_tcp_dial = NULL;
-        check("security=none поверх tcp: соединение установлено", 0, rc);
-        check("security=none: TLS не разворачивался", 1, c.link.plain);
+        check("security=none over tcp: connection established", 0, rc);
+        check("security=none: no TLS set up", 1, c.link.plain);
         if (rc == 0) transport_close(&c);
-        check("security=none: дескриптор закрыт vless_close", -1, c.link.fd);
+        check("security=none: transport_close closed the descriptor", -1, c.link.fd);
         close(sv[1]);
-        check("security=none: в куче ничего не осталось", 0, LEAK_CHECK());
+        check("security=none: nothing left on the heap", 0, LEAK_CHECK());
     }
 
 #if !defined(__SANITIZE_ADDRESS__)
-    printf("\nВНИМАНИЕ: собрано БЕЗ AddressSanitizer — проверки «в куче ничего не осталось»\n");
-    printf("          прошли пусто. Коды возврата и дескрипторы проверены, куча — НЕТ.\n");
+    printf("\nWARNING: built WITHOUT AddressSanitizer: the 'nothing left on the heap' checks\n");
+    printf("         are vacuous. Return codes and descriptors are checked, the heap is NOT.\n");
 #endif
-    printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
+    printf("\n%s\n", fails ? "SOME CHECKS FAILED" : "all checks passed");
     return fails ? 1 : 0;
 }

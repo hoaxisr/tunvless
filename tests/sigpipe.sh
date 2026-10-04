@@ -2,12 +2,10 @@
 # The tunnel survives the node closing connections at speed: a write to a socket the node has
 # closed is a failed write (EPIPE), not the death of the process by SIGPIPE.
 #
-# WHAT WAS FOUND (in steer, where this code comes from). A benchmark — iperf3 -P 8 upload through
-# the client against Xray — killed the client in most runs: the node closes a connection while the
-# stack is still writing client packets into it, the TLS record write (tls13_write — write() without
-# MSG_NOSIGNAL) gets EPIPE, and with the default SIGPIPE disposition the process dies. tunvless
-# ignores SIGPIPE in main (src/main.c): the write returns EPIPE and the stack closes THAT connection
-# with RST to the client.
+# WHY. The node may close a connection while the stack is still writing client packets into it.
+# The TLS record write (tls13_write: write() without MSG_NOSIGNAL) then gets EPIPE, and with the
+# default SIGPIPE disposition the process dies. tunvless ignores SIGPIPE in main (src/main.c): the
+# write returns EPIPE and the stack closes THAT connection with RST to the client.
 #
 # WHAT IS CHECKED. Two tunnels — over TLS 1.3 and without encryption, because the write takes
 # different paths: TLS — tls13_write (only the ignored SIGPIPE saves it), none — tr_link_write (it
@@ -117,14 +115,14 @@ C python3 "$HERE/sigpipe-client.py" $NONE --storm "$SECS" --up 4 --abort-up 2 --
 wait $P1 $P2
 echo "  $(cat "$tmp/cl-tls.out")"
 echo "  $(cat "$tmp/cl-none.out")"
-echo "  node TLS:  $(grep '^узел:' "$tmp/node-tls.err" | tail -n 1)"
-echo "  node none: $(grep '^узел:' "$tmp/node-none.err" | tail -n 1)"
+echo "  node TLS:  $(grep '^node:' "$tmp/node-tls.err" | tail -n 1)"
+echo "  node none: $(grep '^node:' "$tmp/node-none.err" | tail -n 1)"
 
 check "both tunnels are alive after the load (same pids)" "1 1" \
     "$(kill -0 $T1 2>/dev/null && echo 1 || echo 0) $(kill -0 $T2 2>/dev/null && echo 1 || echo 0)"
 ping_tunnel $TLS; check "TLS tunnel answers right after the load" "0" "$?"
 ping_tunnel $NONE; check "plain tunnel answers right after the load" "0" "$?"
-early() { grep '^узел:' "$1" | tail -n 1 | grep -o 'рано закрыто=[0-9]*' | sed 's/.*=//'; }
+early() { grep '^node:' "$1" | tail -n 1 | grep -o 'closed-early=[0-9]*' | sed 's/.*=//'; }
 e1="$(early "$tmp/node-tls.err")"; e2="$(early "$tmp/node-none.err")"
 check "the load reached the TLS node: at least 20 connections closed early" "1" "$([ "${e1:-0}" -ge 20 ] && echo 1 || echo 0)"
 check "  and the plain node: at least 10" "1" "$([ "${e2:-0}" -ge 10 ] && echo 1 || echo 0)"

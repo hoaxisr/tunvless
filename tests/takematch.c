@@ -1,9 +1,7 @@
 /* Spare sessions: a connection set up ahead of time is moved into the client's session, and the
  * pointers the transport keeps to itself must follow it.
  *
- * Taken from the steer device bring-up test, where it lived next to checks of the `ip` commands
- * (tunvless configures the device by netlink, src/tunnel/ifcfg.c). Needs the crypto library: the
- * VLESS dialer pulls in the transport, TLS 1.3 and Reality. */
+ * Needs the crypto library: the VLESS dialer pulls in the transport, TLS 1.3 and Reality. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,27 +13,25 @@
 static int fails;
 
 static void check(const char *what, long want, long got) {
-    printf("%-66s %s\n", what, want == got ? "ok" : "ПРОВАЛ");
+    printf("%-66s %s\n", what, want == got ? "ok" : "FAIL");
     if (want != got) {
-        printf("     хочу: %ld\n     есть: %ld\n", want, got);
+        printf("     want: %ld\n     got:  %ld\n", want, got);
         fails++;
     }
 }
 
 int main(void) {
-    /* ---- пул запасных: указатели после переезда структуры -----------------------
+    /* Taking a spare copies the link from the pool slot into the connection's session (memcpy),
+     * and the transport fixes its self-pointers (xhttp_moved). There are two: h2.io.ctx, and the
+     * xhttp upload's xh.up.h2.io.ctx, which up_request sets to &t->xh.up. In stream-up that
+     * happens while the link is still IN THE SLOT (up_open runs as the link opens). Left unfixed,
+     * it points into the abandoned slot, which the next spare reuses at once, and one
+     * connection's upload goes into another connection's socket.
      *
-     * Взятие запасной копирует связь из слота пула в сессию соединения (memcpy) и чинит
-     * самоуказатель — h2.io.ctx. Второй такой же живёт у выгрузки xhttp: up_request ставит
-     * xh.up.h2.io.ctx = &t->xh.up, и для stream-up это происходит ЕЩЁ В СЛОТЕ (up_open внутри
-     * открытия связи). После переезда он указывал в брошенный слот, который тут же
-     * переиспользовала следующая запасная — выгрузка одного соединения уезжала в сокет чужого.
-     *
-     * С шага 2 выпуска 1.10 переселение — у дайлера (vless_dialer.take), а чинит указатели
-     * транспорт (xhttp_moved); слот пула освобождает стек, и это проверяет tests/tunnelmatch.c.
-     * Здесь — оба самоуказателя на настоящем транспорте и то, что поток соединения (UUID и
-     * Vision, заведённые до взятия) переселение не затирает. */
-    printf("\n== пул запасных: оба самоуказателя чинятся после переезда ==\n");
+     * Both self-pointers are checked on the real transport, and so is that the move does not
+     * overwrite the connection's own state (UUID and Vision, set up before the take). Releasing
+     * the pool slot is the stack's job and is checked in tests/tunnelmatch.c. */
+    printf("\n== spare pool: both self-pointers fixed after the move ==\n");
     {
         static struct vl_sess spare, out;
         memset(&spare, 0, sizeof(spare));
@@ -48,13 +44,13 @@ int main(void) {
         out.uuid[0] = 0x5a;
         out.vis.need_uuid = 1;
         vless_dialer.take(&out, &spare);
-        check("связь переселена", 1, out.t.fr == &tr_xhttp && out.t.xh.up.started == 1);
-        check("h2.io.ctx указывает на новую структуру", 1, out.t.h2.io.ctx == &out.t.link);
-        check("up.h2.io.ctx указывает на новую структуру, а не в слот", 1,
+        check("transport state moved", 1, out.t.fr == &tr_xhttp && out.t.xh.up.started == 1);
+        check("h2.io.ctx points to the new struct", 1, out.t.h2.io.ctx == &out.t.link);
+        check("up.h2.io.ctx points to the new struct, not into the slot", 1,
               out.t.xh.up.h2.io.ctx == &out.t.xh.up);
-        check("поток соединения не затёрт", 1, out.uuid[0] == 0x5a && out.vis.need_uuid == 1);
+        check("UUID and Vision state kept", 1, out.uuid[0] == 0x5a && out.vis.need_uuid == 1);
     }
 
-    printf(fails ? "\nПРОВАЛОВ: %d\n" : "\nвсе проверки прошли\n", fails);
+    printf(fails ? "\nFAILED: %d\n" : "\nall checks passed\n", fails);
     return fails ? 1 : 0;
 }

@@ -1,8 +1,8 @@
 #!/bin/sh
-# Собрать и прогнать tests/tun-gso.c в своём сетевом пространстве.
+# Build tests/tun-gso.c and run it in its own network namespace.
 #
-# Пространство нужно не для чистоты, а чтобы тест не трогал сеть машины: он включает
-# пересылку, выключает проверку обратного пути и поднимает два устройства с адресами.
+# The namespace keeps the test away from the machine's network: it enables forwarding, turns off
+# reverse path filtering and brings up two devices with addresses.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -15,9 +15,9 @@ ip netns add "$NS"
 trap 'ip netns delete "$NS" 2>/dev/null || true' EXIT
 ip netns exec "$NS" ip link set lo up
 
-# Оба пути, а не только быстрый: без разгрузки суммы считаем мы сами, и это отдельный код,
-# который остаётся единственным на ядрах без IFF_VNET_HDR.
-echo "-- с разгрузкой"
+# Both paths, not only the fast one: without offload tunvless computes the checksums itself, in
+# separate code that is the only path on kernels without IFF_VNET_HDR.
+echo "-- with offload"
 ip netns exec "$NS" "$BIN"
-echo "-- без разгрузки (STEER_TUN_NOGSO)"
+echo "-- without offload (STEER_TUN_NOGSO)"
 ip netns exec "$NS" env STEER_TUN_NOGSO=1 "$BIN"

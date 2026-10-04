@@ -1,29 +1,33 @@
 #!/bin/sh
-# UDP по vision-записи против НАСТОЯЩИХ серверов: Xray-core (XRAY=/путь/к/xray) и sing-box (SINGBOX=/путь/к/sing-box).
+# UDP over a Vision flow against REAL servers: Xray-core (XRAY=/path/to/xray) and sing-box
+# (SINGBOX=/path/to/sing-box).
 #
-# Ради чего. У узла с flow=xtls-rprx-vision UDP идёт не командой 2, а Mux.Cool с рамками XUDP поверх потока
-# Vision (src/proto/vless/vldial.c, блок XUDP): команду 2 к такой записи не принимает ни Xray-core, ни sing-box.
-# Формат рамок сверялся по исходникам обоих серверов, но исходник — не провод: заголовок запроса Mux без порта
-# и адреса выяснился только прогоном (sing-box читал лишние байты как начало потока и рвал соединение).
-# Этот стенд гоняет провод: клиент — дайлер VLESS (tests/xudpprobe.c), сервер — настоящий, за ним эхо UDP.
+# With flow=xtls-rprx-vision UDP does not go as command 2 but as Mux.Cool with XUDP frames over
+# the Vision stream (src/proto/vless/vldial.c, the XUDP block): neither Xray-core nor sing-box
+# accepts command 2 on such a node. The frame format follows both servers' sources, but only a
+# live run shows wire mistakes: the Mux request header carries no port and address, and with
+# them sing-box read the extra bytes as stream data and dropped the connection. So this test
+# runs the real wire: the client is the VLESS dialer (tests/xudpprobe.c), the server is real,
+# with a UDP echo behind it.
 #
-# Сервер — TLS с самоподписанным листом (openssl), клиент закрепляет его отпечаток (`pcs`): заодно это ещё
-# одна проверка закрепления против настоящего сервера. Узел по имени localhost, а не по 127.0.0.1: разбор
-# подписки отбрасывает узлы «отвечать некому» (127.0.0.0/8), и стенд обязан идти тем же разбором.
+# The server uses TLS with a self-signed leaf (openssl), and the client pins its fingerprint
+# (`pcs`): one more pinning check against a real server. The node is named localhost, not
+# 127.0.0.1: link parsing rejects nodes with no peer (127.0.0.0/8), and the test must go through
+# the same parsing.
 #
-# Чего нет — пропуск ГРОМКИЙ (echo + выход 0), как у venc.sh: молчаливый пропуск читается как «прошло».
+# Anything missing is a LOUD skip (echo and exit 0), as in venc.sh: a silent skip reads as a pass.
 set -eu
 cd "$(dirname "$0")/.."
 BUILD=${BUILD:-build}
 PROBE="$BUILD/xudpprobe"
-[ -x "$PROBE" ] || { echo "xudp: нет $PROBE (собирает make interop)"; exit 2; }
+[ -x "$PROBE" ] || { echo "xudp: no $PROBE (built by make interop)"; exit 2; }
 command -v python3 >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1 || {
-	echo "xudp: ПРОПУСК — нужны python3 и openssl. Это не падение."; exit 0; }
+	echo "xudp: SKIPPED — needs python3 and openssl. Not a failure."; exit 0; }
 HAVE_X=0; HAVE_S=0
 [ -n "${XRAY:-}" ] && [ -x "$XRAY" ] && HAVE_X=1
 [ -n "${SINGBOX:-}" ] && [ -x "$SINGBOX" ] && HAVE_S=1
 if [ $HAVE_X = 0 ] && [ $HAVE_S = 0 ]; then
-	echo "xudp: ПРОПУСК — нет серверов (XRAY=/путь/к/xray и/или SINGBOX=/путь/к/sing-box). Это не падение."
+	echo "xudp: SKIPPED — no servers (XRAY=/path/to/xray, SINGBOX=/path/to/sing-box). Not a failure."
 	exit 0
 fi
 
@@ -51,7 +55,7 @@ PY
 PIDS="$PIDS $!"
 
 if [ $HAVE_X = 1 ]; then
-	# finalRules allow: freedom по умолчанию не соединяется с loopback и частными адресами.
+	# finalRules allow: by default freedom does not connect to loopback and private addresses.
 	cat > "$W/x.json" <<EOF
 {"log": {"loglevel": "warning"},
  "inbounds": [
@@ -65,7 +69,7 @@ if [ $HAVE_X = 1 ]; then
 EOF
 	"$XRAY" run -c "$W/x.json" >"$W/x.log" 2>&1 &
 	PIDS="$PIDS $!"
-	echo "xudp: сервер — $("$XRAY" version 2>/dev/null | head -1)"
+	echo "xudp: server — $("$XRAY" version 2>/dev/null | head -1)"
 fi
 if [ $HAVE_S = 1 ]; then
 	cat > "$W/s.json" <<EOF
@@ -77,12 +81,12 @@ if [ $HAVE_S = 1 ]; then
 EOF
 	"$SINGBOX" run -c "$W/s.json" >"$W/s.log" 2>&1 &
 	PIDS="$PIDS $!"
-	echo "xudp: сервер — $("$SINGBOX" version 2>/dev/null | head -1)"
+	echo "xudp: server — $("$SINGBOX" version 2>/dev/null | head -1)"
 fi
 sleep 2
 
 FAILS=0
-run() { # название порт flow
+run() { # LABEL PORT FLOW
 	name=$1; port=$2; flow=$3
 	url="vless://$U@localhost:$port?type=tcp&security=tls&sni=test.example&pcs=$PCS${flow:+&flow=$flow}"
 	for mode in single burst; do
@@ -95,8 +99,8 @@ run() { # название порт flow
 	done
 	unset BURST || true
 }
-[ $HAVE_X = 1 ] && run "Xray, vision: Mux и XUDP" $XP_VIS xtls-rprx-vision
-[ $HAVE_X = 1 ] && run "Xray, без flow: команда 2" $XP_PLAIN ""
-[ $HAVE_S = 1 ] && run "sing-box, vision: Mux и XUDP" $SB_VIS xtls-rprx-vision
+[ $HAVE_X = 1 ] && run "Xray, vision: Mux and XUDP" $XP_VIS xtls-rprx-vision
+[ $HAVE_X = 1 ] && run "Xray, no flow: command 2" $XP_PLAIN ""
+[ $HAVE_S = 1 ] && run "sing-box, vision: Mux and XUDP" $SB_VIS xtls-rprx-vision
 
-[ $FAILS = 0 ] && echo "xudp: все проверки прошли" || { echo "xudp: провалов: $FAILS"; exit 1; }
+[ $FAILS = 0 ] && echo "xudp: all checks passed" || { echo "xudp: failures: $FAILS"; exit 1; }
