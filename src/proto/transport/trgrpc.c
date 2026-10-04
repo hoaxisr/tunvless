@@ -90,8 +90,9 @@ static int grpc_unwrap(struct grpc_de *de, const unsigned char *in, size_t n,
             while (i < n && de->msg_left > 0) {
                 unsigned char b = in[i++];
                 de->msg_left--;
-                /* pb holds the tag and up to 7 varint bytes; a 32-bit length needs at most 5. */
-                if (de->pb_n >= sizeof(de->pb)) return TR_EGRPC;
+                /* The tag and at most 5 varint bytes: a 32-bit length needs no more, and a 6th
+                 * would be shifted past 32 bits below. */
+                if (de->pb_n >= 1 + 5) return TR_EGRPC;
                 if (de->pb_n == 0 && b != 0x0A) return TR_EGRPC;  /* only field 1 is expected */
                 de->pb[de->pb_n++] = b;
                 if (de->pb_n > 1 && !(b & 0x80)) { complete = 1; break; }

@@ -240,6 +240,8 @@ int main(void) {
         size_t fn = put_frame(feed, FR_WINDOW_UPDATE, 0, h.sid, inc, 4);
         put32(inc, 2000);
         fn += put_frame(feed + fn, FR_WINDOW_UPDATE, 0, 0, inc, 4);
+        put32(inc, 4000);
+        fn += put_frame(feed + fn, FR_WINDOW_UPDATE, 0, h.sid + 2, inc, 4);
         io.feed = feed; io.feed_n = fn; io.feed_pos = 0;
         unsigned char out[H2_MIN_READ_CAP];
         size_t got = 0;
@@ -248,6 +250,8 @@ int main(void) {
         check("WINDOW_UPDATE on our stream: the stream window grows by it", 66535, h.send_win);
         check("WINDOW_UPDATE on stream 0: the connection window grows by it",
               67535, h.send_win_conn);
+        check("WINDOW_UPDATE on another stream: neither window moves",
+              1, h.send_win == 66535 && h.send_win_conn == 67535);
     }
     {
         /* The same SETTINGS twice: the window must stay where it is. A shift counted from 65535
@@ -424,6 +428,12 @@ int main(void) {
         io.feed_n = put_frame(feed, FR_HEADERS, FLAG_END_HEADERS, h.sid, st502, sizeof st502);
         check("Huffman :status 502: H2_ESTATUS", H2_ESTATUS, h2_read(&h, out, sizeof(out), &got));
         check("Huffman :status 502: code 502 recorded", 502, g_last_status);
+        /* "5A0": 'A' has the 6-bit code 100001, past the digits' 011001..011111. Not a status,
+         * and not "610" either. */
+        static const unsigned char st5a0[] = { 0x6E, 0x10, 0x7F };
+        static const unsigned char st502h[] = { 0x6C, 0x02 };
+        check("Huffman decoder: \"502\" reads as 502", 502, status_huff(st502h, 2));
+        check("Huffman decoder: a non-digit symbol is not a status", -1, status_huff(st5a0, 3));
 
         h2_open(&h, &io);
         io.feed = feed; io.feed_pos = 0;

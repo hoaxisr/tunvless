@@ -162,6 +162,31 @@ static void t_packet_up_rst(void) {
     close(fd);
 }
 
+/* packet-up with the connection window too small for a chunk: the write is refused before its
+ * request opens, so the retry opens chunk 1 once, not a second stream for it. */
+static void t_packet_up_window(void) {
+    int fd;
+    if (new_pair(&fd) != 0) { check(0, "socket pair created"); return; }
+    struct transport c;
+    conn_init(&c, XH_PACKET_UP, fd);
+    int rc0 = transport_write(&c, piece, sizeof(piece));     /* chunk 0, stream 1 */
+    srv_drain();
+    srv_headers(1, 0x88, 1);
+    int32_t win = c.xh.up.h2.send_win_conn;
+    c.xh.up.h2.send_win_conn = (int32_t)sizeof(piece) - 1;
+    int rc1 = transport_write(&c, piece, sizeof(piece));
+    srv_drain();
+    int opened = seen("/xh/0f1e2d3c/1");
+    c.xh.up.h2.send_win_conn = win;
+    int rc2 = transport_write(&c, piece, sizeof(piece));
+    srv_drain();
+    check(rc0 == 0 && rc1 == H2_EWINDOW && !opened,
+          "packet-up: a chunk the window cannot take opens no request");
+    check(rc2 == 0 && seen("/xh/0f1e2d3c/1") && !seen("/xh/0f1e2d3c/2"),
+          "packet-up: the retry sends it as chunk 1");
+    close(fd);
+}
+
 /* stream-up: one long POST, and the refusal comes on that same stream. */
 static void t_stream_up(unsigned char hpack, int want_refused, const char *what) {
     int fd;
@@ -183,6 +208,7 @@ static void t_stream_up(unsigned char hpack, int want_refused, const char *what)
 int main(void) {
     t_packet_up(0x8C, 1, "packet-up: 400 to the previous chunk fails the next write, naming 400");
     t_packet_up(0x88, 0, "packet-up: 200 to the previous chunk is read and is not a refusal");
+    t_packet_up_window();
     t_packet_up_rst();
     t_stream_up(0x8C, 1, "stream-up: 400 to the upload fails the write, naming 400");
     t_stream_up(0x88, 0, "stream-up: 200 to the upload is read and is not a refusal");

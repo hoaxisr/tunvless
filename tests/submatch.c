@@ -1108,6 +1108,22 @@ int main(void) {
         n = vless_parse_sub(XO("{\"network\":\"ws\",\"wsSettings\":{\"headers\":{\"Upgrade\":\"x\"}}}"),
                             nodes, 4, &st);
         check_n("ws config with Upgrade in headers: skipped", 0, (long)n);
+        /* sing-box and Clash headers get the same checks: a raw line break in a value would
+         * add a header of its own to the request. */
+        n = vless_parse_sub("{\"outbounds\":[{\"type\":\"vless\",\"tag\":\"sb\",\"server\":\"h\","
+                            "\"server_port\":443,\"uuid\":\"8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124\","
+                            "\"transport\":{\"type\":\"ws\",\"headers\":{\"X-A\":\"1\r\nX-Evil: 2\"}}}]}",
+                            nodes, 4, &st);
+        check_n("sing-box header with a line break: skipped", 0, (long)n);
+        n = vless_parse_sub("{\"outbounds\":[{\"type\":\"vless\",\"tag\":\"sb\",\"server\":\"h\","
+                            "\"server_port\":443,\"uuid\":\"8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124\","
+                            "\"transport\":{\"type\":\"ws\",\"headers\":{\"X-A\":\"1\"}}}]}",
+                            nodes, 4, &st);
+        check("sing-box header: kept", "X-A: 1\n", n ? nodes[0].headers : "");
+        n = vless_parse_sub("proxies:\n  - {name: c, type: vless, server: h, port: 443, "
+                            "uuid: 8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124, network: ws, "
+                            "ws-opts: {path: /, headers: {\"X A\": 1}}}\n", nodes, 4, &st);
+        check_n("Clash header name with a space: skipped", 0, (long)n);
         /* For httpupgrade Xray accepts such a header (gorilla is not used there), and so does
          * this parser. */
         n = vless_parse_sub(XO("{\"network\":\"httpupgrade\",\"httpupgradeSettings\":{\"headers\":"

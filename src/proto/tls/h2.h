@@ -46,6 +46,7 @@ struct h2 {
     unsigned char frame_type;
     unsigned char frame_flags;
     int frame_ours;             /* the frame belongs to the current stream */
+    int frame_conn;             /* the frame is on stream 0, the connection's */
     /* Framing inside DATA and HEADERS bodies that is not data (RFC 7540 §6.1, §6.2):
      * pad_wait — the pad length byte is still ahead (PADDED); skip_left — HEADERS priority
      * bytes left to skip (PRIORITY); pad_left — padding length at the end of the frame. They

@@ -154,6 +154,7 @@ static uint32_t go_atoi_u32(const char *s, size_t n) {
     uint64_t v = 0;
     for (; i < n; i++) {
         if (s[i] < '0' || s[i] > '9') return 0;
+        if (v > (UINT64_MAX - 9) / 10) return 0;     /* the next digit would wrap uint64 */
         v = v * 10 + (uint64_t)(s[i] - '0');
         if (v > (uint64_t)INT64_MAX + (uint64_t)neg) return 0;
     }

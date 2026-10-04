@@ -98,6 +98,24 @@ static int fd_count(void) {
 
 /* ---- 1. path ----------------------------------------------------------------------- */
 
+/* Ed is Xray's uint32(strconv.Atoi(ed)): out of int64 range it is 0, never a wrapped value. */
+static void test_ed(void) {
+    static const struct { const char *path; uint32_t ed; } V[] = {
+        { "/p?ed=2048", 2048 },
+        { "/p?ed=9223372036854775807", 0xFFFFFFFFu },
+        { "/p?ed=9223372036854775808", 0 },
+        { "/p?ed=18446744073709551617", 0 },   /* 2^64 + 1: a wrapping parser gives 1 */
+        { "/p?ed=184467440737095516160", 0 },
+    };
+    for (size_t i = 0; i < sizeof(V) / sizeof(*V); i++) {
+        char out[256], what[128];
+        uint32_t ed = 12345;
+        int rc = tr_upgrade_target_ed(V[i].path, 1, out, sizeof(out), NULL, &ed);
+        snprintf(what, sizeof(what), "Ed of '%s' is %u", V[i].path, V[i].ed);
+        check(rc == 0 && ed == V[i].ed, what);
+    }
+}
+
 static void test_path(void) {
     /* Node path, request target for ws, for httpupgrade. NULL: refused (url.Parse fails in Go). */
     static const struct { const char *path, *ws, *hu; } V[] = {
@@ -1009,6 +1027,7 @@ int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("wsmatch: path\n");
     test_path();
+    test_ed();
     printf("wsmatch: Upgrade request\n");
     test_request();
     printf("wsmatch: client frames\n");

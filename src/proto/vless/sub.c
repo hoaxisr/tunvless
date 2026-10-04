@@ -245,6 +245,24 @@ static int ci_eq(const char *a, const char *b) {
  *     ws, Xray moves Host from headers into host (if that is empty) and drops it from headers,
  *     and so does this parser;
  *   - more than the node's buffer holds. */
+/* A header the request can carry as it is: a name of HTTP token characters, up to 40, and a value
+ * up to 250 without control characters (a line break would turn one header into two). */
+static int hdr_valid(const char *key, const char *val) {
+    size_t kn = strlen(key), vn = strlen(val);
+    if (!kn || kn > 40 || vn > 250) return 0;
+    for (size_t i = 0; i < kn; i++) {
+        unsigned char c = (unsigned char)key[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              strchr("!#$%&'*+-.^_`|~", c)))
+            return 0;
+    }
+    for (size_t i = 0; i < vn; i++) {
+        unsigned char c = (unsigned char)val[i];
+        if ((c < 0x20 && c != '\t') || c == 0x7f) return 0;
+    }
+    return 1;
+}
+
 static void xray_headers(struct sj *j, struct upg_cfg *u, int hu) {
     int f = 1;
     char key[64], val[256];
@@ -260,17 +278,7 @@ static void xray_headers(struct sj *j, struct upg_cfg *u, int hu) {
             else if (!u->host[0]) sl_set_field(u->host, sizeof(u->host), val, vn);
             continue;
         }
-        int ok = kn > 0 && kn <= 40 && vn <= 250;
-        for (size_t i = 0; ok && i < kn; i++) {
-            unsigned char c = (unsigned char)key[i];
-            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-                  (c && strchr("!#$%&'*+-.^_`|~", c))))
-                ok = 0;
-        }
-        for (size_t i = 0; ok && i < vn; i++) {
-            unsigned char c = (unsigned char)val[i];
-            if ((c < 0x20 && c != '\t') || c == 0x7f) ok = 0;
-        }
+        int ok = hdr_valid(key, val);
         if (!hu && (ci_eq(key, "upgrade") || ci_eq(key, "connection") ||
                     ci_eq(key, "sec-websocket-key") || ci_eq(key, "sec-websocket-version") ||
                     ci_eq(key, "sec-websocket-extensions")))
@@ -501,11 +509,12 @@ static void xray_settings(struct sj *j, struct vless_node *n) {
  * early_data_header_name; with the name Sec-WebSocket-Protocol this is Xray's `?ed=N`, which our
  * ws supports. With an empty name sing-box puts the data into the path, a form Xray does not
  * have; early data then stays off (a sing-box server accepts a plain request too). */
-/* Append "Name: value\n" to the headers buffer; -1 if it does not fit or the name is empty. No
- * snprintf: it warns about truncation that the length check already rules out. */
+/* Append "Name: value\n" to the headers buffer (sing-box and Clash); -1 if it does not fit or the
+ * header is not valid (hdr_valid). No snprintf: it warns about truncation that the length check
+ * already rules out. */
 static int hdr_append(char *dst, size_t cap, const char *k, const char *v) {
     size_t o = strlen(dst), kn = strlen(k), vn = strlen(v);
-    if (!kn || o + kn + vn + 4 >= cap) return -1;
+    if (!hdr_valid(k, v) || o + kn + vn + 4 >= cap) return -1;
     memcpy(dst + o, k, kn);
     dst[o + kn] = ':'; dst[o + kn + 1] = ' ';
     memcpy(dst + o + kn + 2, v, vn);

@@ -384,6 +384,9 @@ static int ctl_handle(struct h2 *h) {
 
         case FR_WINDOW_UPDATE: {
             if (h->ctl_n < 4) return 0;
+            /* A late one for an earlier stream (packet-up opens one per chunk) opens nothing of
+             * ours: adding it to the connection window would overrun the server's. */
+            if (!h->frame_ours && !h->frame_conn) return 0;
             int32_t inc = (int32_t)(get32(h->ctl) & 0x7FFFFFFF);
             /* The 2^31-1 limit is mandatory (RFC 7540 §6.9.1). Adding without the check is
              * signed overflow; in practice the window goes NEGATIVE for good, h2_write answers
@@ -438,7 +441,7 @@ static int status_huff(const unsigned char *p, size_t n) {
         else {
             if (bits < 6) return -1;
             unsigned c6 = (acc >> (bits - 6)) & 0x3F;
-            if (c6 < 0x19) return -1;
+            if (c6 < 0x19 || c6 > 0x1F) return -1;
             v = v * 10 + (int)(c6 - 0x19 + 3);
             bits -= 6;
         }
@@ -613,6 +616,7 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
          * parsing does that) and are dropped: their content is an empty 200 answer to an
          * upload. A non-200 status there goes to old_status. */
         h->frame_ours = (sid == h->sid);
+        h->frame_conn = (sid == 0);
         h->frame_peeked = 0;
         h->frame_left = len;
         h->ctl_n = 0;

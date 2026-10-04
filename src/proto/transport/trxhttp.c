@@ -276,6 +276,15 @@ static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
              * connection, while the tunnel calls send itself and knows nothing of time. So one
              * request per call: the honest price of a mode chosen when the others do not pass
              * at all. */
+            /* A chunk the windows cannot take now must not open its request: h2_write would
+             * refuse it after the HEADERS went out, leaving a stream without END_STREAM, and the
+             * retry would open another one for the same seq. Before the first request the
+             * windows are the default 65535. */
+            const struct h2 *h = &x->up.h2;
+            int32_t room = 65535;
+            if (x->up.started) room = h->send_win_conn < h->peer_init_win ? h->send_win_conn
+                                                                          : h->peer_init_win;
+            if ((int64_t)n > room) return H2_EWINDOW;
             int rc = up_request(t, (long long)x->seq);
             if (rc) return rc;
             rc = h2_write(&x->up.h2, d, n);
