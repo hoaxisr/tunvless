@@ -206,8 +206,6 @@ entware/                   Entware package recipe, init script, config
 tests/                     unit, crypto, namespace and interop tests
 ```
 
-Most comments in the code are in Russian, inherited from where the code comes from.
-
 ## Origin and license
 
 tunvless is the TUN + VLESS client of [steer](https://github.com/splify2/steer) 2.0.1, a rule-based
