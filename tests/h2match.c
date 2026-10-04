@@ -147,7 +147,11 @@ int main(void) {
         check("window exactly the data size: the write is allowed",
               0, h2_write(&h, payload, sizeof(payload)));
         check("after the write the stream window is 0", 0, h.send_win);
+        check("after the write the connection window is 0", 0, h.send_win_conn);
         check("window 0 on the next write: refused",
+              H2_EWINDOW, h2_write(&h, payload, 1));
+        h.send_win = 16384;
+        check("connection window spent by the write: refused with the stream window open",
               H2_EWINDOW, h2_write(&h, payload, 1));
     }
     {
@@ -186,6 +190,20 @@ int main(void) {
         check("DATA frame: h2_read succeeds", 0, rc);
         check("DATA frame: 4 body bytes returned", 4, (int)got);
         check("DATA frame: body unchanged", 0, memcmp(out, "abcd", 4));
+
+        /* The same frame with its header cut by a record boundary: the first five header bytes
+         * must wait for the other four, not be dropped or read as a frame of their own. */
+        h2_open(&h, &io);
+        io.feed = feed; io.feed_n = 5; io.feed_pos = 0;
+        rc = h2_read(&h, out, sizeof(out), &got);
+        size_t first = got;
+        io.feed = feed + 5; io.feed_n = 8; io.feed_pos = 0;
+        if (rc == 0) rc = h2_read(&h, out, sizeof(out), &got);
+        check("DATA header split by a record: no error", 0, rc);
+        check("DATA header split by a record: 4 body bytes, all after the rest of the header",
+              4, first == 0 ? (int)got : -1);
+        check("DATA header split by a record: body unchanged",
+              0, got == 4 ? memcmp(out, "abcd", 4) : 1);
     }
 
     {
@@ -210,6 +228,26 @@ int main(void) {
         int rc = h2_read(&h, out, sizeof(out), &got);
         check("WINDOW_UPDATE past 2^31-1: connection reset", H2_ERESET, rc);
         check("and the window did not go negative", 1, h.send_win >= 0);
+    }
+    {
+        /* A WINDOW_UPDATE that fits opens the window it names, by its increment: our stream's
+         * on our stream, the connection's on stream 0, and neither touches the other. */
+        struct h2 h;
+        struct fake_io io;
+        unsigned char feed[64], inc[4];
+        h2_open(&h, &io);
+        put32(inc, 1000);
+        size_t fn = put_frame(feed, FR_WINDOW_UPDATE, 0, h.sid, inc, 4);
+        put32(inc, 2000);
+        fn += put_frame(feed + fn, FR_WINDOW_UPDATE, 0, 0, inc, 4);
+        io.feed = feed; io.feed_n = fn; io.feed_pos = 0;
+        unsigned char out[H2_MIN_READ_CAP];
+        size_t got = 0;
+        check("WINDOW_UPDATE on our stream and on stream 0: no error",
+              0, h2_read(&h, out, sizeof(out), &got));
+        check("WINDOW_UPDATE on our stream: the stream window grows by it", 66535, h.send_win);
+        check("WINDOW_UPDATE on stream 0: the connection window grows by it",
+              67535, h.send_win_conn);
     }
     {
         /* The same SETTINGS twice: the window must stay where it is. A shift counted from 65535
@@ -238,8 +276,25 @@ int main(void) {
          * previous stream must be dropped, not put into the body of the next one. */
         struct h2 h;
         struct fake_io io;
+        unsigned char feed[64];
+        unsigned char out[H2_MIN_READ_CAP];
+        size_t got = 99;
         h2_open(&h, &io);
         check("first request: stream 1", 1, (int)h.sid);
+
+        /* The first chunk as it goes: 100 bytes of body, the server's INITIAL_WINDOW_SIZE of
+         * 1024, its 200 with END_STREAM. Stream state now differs from a fresh stream's, and the
+         * connection window from its starting value. */
+        static const unsigned char st200[] = { 0x88 };
+        unsigned char body[100];
+        memset(body, 'b', sizeof(body));
+        check("first request: 100 bytes written", 0, h2_write(&h, body, sizeof(body)));
+        size_t fn = settings_frame(feed, 0x0004, 1024);
+        fn += put_frame(feed + fn, FR_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, st200, 1);
+        io.feed = feed; io.feed_n = fn; io.feed_pos = 0;
+        check("first request: 200 with END_STREAM read", 0, h2_read(&h, out, sizeof(out), &got));
+        check("first request: status 200, stream ended, stream window 924",
+              1, h.status == 200 && h.done && h.send_win == 924);
 
         io.sent_n = 0;
         check("closing our half: no error", 0, h2_end_stream(&h));
@@ -259,17 +314,19 @@ int main(void) {
         /* STREAM state is fresh, CONNECTION state untouched: otherwise we would forget how many
          * bytes the server already allowed us and overflow the connection window. */
         check("next request: status reset", 0, h.status);
-        check("next request: connection window untouched", 65535, (int)h.send_win_conn);
+        check("next request: the previous stream's end forgotten", 0, h.done);
+        check("next request: stream window granted anew at the server's initial size",
+              1024, h.send_win);
+        check("next request: connection window untouched (65535 less the 100 sent)",
+              65435, (int)h.send_win_conn);
 
         /* A DATA frame from CLOSED stream 1 must not get into the body of stream 3. */
-        unsigned char feed[32];
         feed[0] = 0; feed[1] = 0; feed[2] = 4;
         feed[3] = FR_DATA; feed[4] = 0;
         put32(feed + 5, 1);
         memcpy(feed + 9, "zzzz", 4);
         io.feed = feed; io.feed_n = 13; io.feed_pos = 0;
-        unsigned char out[H2_MIN_READ_CAP];
-        size_t got = 99;
+        got = 99;
         check("frame of the previous stream: not an error", 0, h2_read(&h, out, sizeof(out), &got));
         check("frame of the previous stream: not in the body", 0, (int)got);
     }
@@ -298,27 +355,25 @@ int main(void) {
         unsigned char out[H2_MIN_READ_CAP];
         size_t got = 0;
 
-        /* --- case 1: a frame of the previous stream spends the connection window --- */
+        /* --- case 1: frames of the previous stream spend the connection window --- */
         h2_open(&h, &io);
-        /* 16384 bytes on the current stream: below the replenish threshold (32 KB), so no
-         * WINDOW_UPDATE yet. */
-        put_data(feed, h.sid, 16384);
-        io.feed = feed; io.feed_n = 9 + 16384; io.feed_pos = 0;
-        io.sent_n = 0;
-        while (io.feed_pos < io.feed_n)
-            if (h2_read(&h, out, sizeof(out), &got) != 0) break;
-        check("below the threshold: no window update", 0, (int)wu_sum(&io, 0));
-
-        /* As much again, but from the CLOSED previous stream: it does not go into the body,
-         * but it spends the window. */
         check("next chunk: no error",
               0, h2_next(&h, "example.org", "/x/sid/1", "application/grpc", NULL, H2_POST));
         io.sent_n = 0;
-        put_data(feed, 1, 16384);
+        size_t fn = put_data(feed, 1, 16384);
+        fn += put_data(feed + fn, 1, 16384);
+        /* The first 16384 bytes from the CLOSED previous stream: below the replenish threshold
+         * (32 KB), so no WINDOW_UPDATE yet. */
         io.feed = feed; io.feed_n = 9 + 16384; io.feed_pos = 0;
         while (io.feed_pos < io.feed_n)
             if (h2_read(&h, out, sizeof(out), &got) != 0) break;
-        check("frame of the previous stream: connection window returned in full",
+        check("below the threshold: no window update", 0, (int)wu_sum(&io, 0));
+        /* As much again: it does not go into the body, but it spends the window. 32 KB of them
+         * would also reach the stream threshold if the current stream counted them. */
+        io.feed_n = fn;
+        while (io.feed_pos < io.feed_n)
+            if (h2_read(&h, out, sizeof(out), &got) != 0) break;
+        check("frames of the previous stream: connection window returned in full",
               32768, (int)wu_sum(&io, 0));
         check("and the current stream gets no update for those bytes", 0, (int)wu_sum(&io, h.sid));
 
@@ -331,12 +386,22 @@ int main(void) {
             if (h2_read(&h, out, sizeof(out), &got) != 0) break;
         h2_next(&h, "example.org", "/x/sid/1", "application/grpc", NULL, H2_POST);
         io.sent_n = 0;
-        put_data(feed, h.sid, 16384);
+        fn = put_data(feed, h.sid, 16384);
+        fn += put_data(feed + fn, h.sid, 16384);
         io.feed = feed; io.feed_n = 9 + 16384; io.feed_pos = 0;
         while (io.feed_pos < io.feed_n)
             if (h2_read(&h, out, sizeof(out), &got) != 0) break;
         check("after h2_next: the debt to the connection window is kept",
               32768, (int)wu_sum(&io, 0));
+        /* The new stream's own count starts at zero: 16384 bytes on it, no update yet. The
+         * second 16384 reach the threshold, and the update carries the stream's count. */
+        check("after h2_next: the new stream counts its window from zero",
+              0, (int)wu_sum(&io, h.sid));
+        io.feed_n = fn;
+        while (io.feed_pos < io.feed_n)
+            if (h2_read(&h, out, sizeof(out), &got) != 0) break;
+        check("32 KB on the new stream: its window returned by its own count",
+              32768, (int)wu_sum(&io, h.sid));
     }
 
     {
@@ -365,6 +430,15 @@ int main(void) {
         io.feed_n = put_frame(feed, FR_HEADERS, FLAG_END_HEADERS, h.sid, st200, sizeof st200);
         check("Huffman :status 200: not an error", 0, h2_read(&h, out, sizeof(out), &got));
         check("Huffman :status 200: status 200", 200, h.status);
+
+        /* The same code with a zero bit for padding: not valid Huffman (RFC 7541 §5.2), so no
+         * status at all rather than a guessed 200. */
+        static const unsigned char st200z[] = { 0x48, 0x82, 0x10, 0x00 };
+        h2_open(&h, &io);
+        io.feed = feed; io.feed_pos = 0;
+        io.feed_n = put_frame(feed, FR_HEADERS, FLAG_END_HEADERS, h.sid, st200z, sizeof st200z);
+        h2_read(&h, out, sizeof(out), &got);
+        check("Huffman :status with zero padding: not read as a status", -1, h.status);
     }
 
     {
@@ -390,6 +464,32 @@ int main(void) {
         io.feed_pos = 0;
         io.feed_n = put_frame(feed, FR_RST_STREAM, 0, h.sid, no_error, 4);
         check("RST_STREAM of our stream: reset", H2_ERESET, h2_read(&h, out, sizeof(out), &got));
+    }
+
+    {
+        /* ---- the previous stream's answer does not stand for the current one's ---
+         *
+         * In packet-up the 200 to the previous chunk may come just before the current chunk's
+         * own answer. Its status is looked at for a refusal and then forgotten: the current
+         * stream's HEADERS must still be read, and a 404 there is a refusal. */
+        static const unsigned char st200[] = { 0x88 }, st404[] = { 0x8D };
+        struct h2 h;
+        struct fake_io io;
+        unsigned char feed[64];
+        unsigned char out[H2_MIN_READ_CAP];
+        size_t got = 0;
+
+        h2_open(&h, &io);
+        h2_end_stream(&h);
+        h2_next(&h, "example.org", "/x/sid/1", "application/grpc", NULL, H2_POST);
+        g_last_status = 0;
+        size_t fn = put_frame(feed, FR_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, st200, 1);
+        fn += put_frame(feed + fn, FR_HEADERS, FLAG_END_HEADERS, h.sid, st404, 1);
+        io.feed = feed; io.feed_n = fn; io.feed_pos = 0;
+        check("200 on the previous stream, then 404 on ours: H2_ESTATUS",
+              H2_ESTATUS, h2_read(&h, out, sizeof(out), &got));
+        check("200 on the previous stream, then 404 on ours: code 404 recorded",
+              404, g_last_status);
     }
 
     {
@@ -492,6 +592,7 @@ int main(void) {
         if (rc == 0 && got <= sizeof body) { memcpy(body, out, got); total = got; }
         io.feed = feed + cut; io.feed_n = fn - cut; io.feed_pos = 0;
         if (rc == 0) rc = h2_read(&h, out, sizeof(out), &got);
+        if (rc == 0 && total + got <= sizeof body) memcpy(body + total, out, got);
         if (rc == 0) total += got;
         check("DATA: boundary inside the padding, no error", 0, rc);
         check("DATA: boundary inside the padding, 4 bytes returned", 4, (int)total);
@@ -535,15 +636,18 @@ int main(void) {
         io.feed_n = n1 + n2;
         size_t total = 0;
         int rc = 0;
-        unsigned char last[4] = { 0 };
+        static unsigned char all[256], want[104];
         while (io.feed_pos < io.feed_n && rc == 0) {
             rc = h2_read(&h, out, sizeof(out), &got);
+            if (total + got <= sizeof all) memcpy(all + total, out, got);
             total += got;
-            if (got >= 4) memcpy(last, out + got - 4, 4);
         }
+        memset(want, 'q', 100);
+        memcpy(want + 100, "abcd", 4);
         check("after the refusal: the following reads succeed", 0, rc);
         check("after the refusal: both frames arrive whole", 104, (int)total);
-        check("after the refusal: the second frame's body unchanged", 0, memcmp(last, "abcd", 4));
+        check("after the refusal: the two bodies in order, no frame header among them",
+              0, total == 104 ? memcmp(all, want, 104) : 1);
     }
 
     printf("\n%s\n", fails ? "SOME CHECKS FAILED" : "all checks passed");

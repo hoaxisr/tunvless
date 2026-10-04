@@ -43,6 +43,7 @@
 #include "transport.h"
 #include "trpath.h"
 #include "reality.h"
+#include "vless.h"
 
 /* ---- TLS and Reality stubs: the test link is plain, they are never reached --------- */
 
@@ -120,6 +121,8 @@ static void test_path(void) {
         { "/p?q=1;2&ed=1&r", "/p?r=", "/p%3Fr=" },
         { "/(x)*!", "/(x)*!", "/%28x%29%2A%21" },
         { "/p?ed=1&ed=2&e=3", "/p?e=3", "/p%3Fe=3" },
+        { "/a%4a?ed=1", "/a%4a", "/a%254a" },
+        { "/p?x=a~b&ed=1", "/p?x=a~b", "/p%3Fx=a~b" },
     };
     for (size_t i = 0; i < sizeof(V) / sizeof(*V); i++) {
         char out[1024], what[160];
@@ -132,24 +135,45 @@ static void test_path(void) {
             else check_str(what, want, out);
         }
     }
-    /* Refusals that are not in the Go table: paths Xray would parse ambiguously. */
-    static const char *bad[] = { "/a\nb", "/a#b", "//h/p", "a:b/c" };
+    /* Every refusal with its reason. The reason becomes the node's skip_reason (upg_node_bad in
+     * sublink.c), so it must name what is wrong and fit there whole. The first four are paths
+     * Xray would parse ambiguously; they are not in the Go table. "path too long" has three
+     * causes: the path over the 1 KB buffers, a query of more pairs than strip_ed holds, and an
+     * out buffer too small for the result. */
+    static char huge[1100], pairs[160];
+    memset(huge, 'a', sizeof(huge) - 1);
+    huge[0] = '/';
+    strcpy(pairs, "/p?");
+    for (int i = 0; i < 65; i++) strcat(pairs, "a&");
+    strcat(pairs, "ed=1");
+    const struct { const char *path; int ws; size_t cap; const char *why, *note; } bad[] = {
+        { "/a\nb", 1, 64, "control character in path", "" },
+        { "/a#b", 1, 64, "# in path", "" },
+        { "//h/p", 1, 64, "path starts with //", "" },
+        { "a:b/c", 1, 64, "path with : and no leading /", "" },
+        { "/a%zz", 1, 64, "bad %XX in path", "" },
+        { huge, 0, 2048, "path too long", " (over 1 KB)" },
+        { pairs, 1, 2048, "path too long", " (65 query pairs)" },
+        { "/long/path", 1, 4, "path too long", " (out too small)" },
+    };
     for (size_t i = 0; i < sizeof(bad) / sizeof(*bad); i++) {
-        char out[64];
+        char out[2048], what[96];
         const char *why = NULL;
-        check(tr_upgrade_target(bad[i], 1, out, sizeof(out), &why) != 0 && why && why[0],
-              "unusual path: refused with a reason");
-        check(strlen(why) < 64, "the reason is under 64 bytes, fits skip_reason");
+        int rc = tr_upgrade_target(bad[i].path, bad[i].ws, out, bad[i].cap, &why);
+        snprintf(what, sizeof(what), "refused, reason \"%s\"%s", bad[i].why, bad[i].note);
+        check_str(what, bad[i].why, rc != 0 && why ? why : "(not refused)");
+        snprintf(what, sizeof(what), "the reason \"%s\"%s fits skip_reason whole", bad[i].why,
+                 bad[i].note);
+        check(why && strlen(why) < sizeof(((struct vless_node *)0)->skip_reason), what);
     }
-    char tiny[4];
-    check(tr_upgrade_target("/long/path", 1, tiny, sizeof(tiny), NULL) != 0, "out too small: refused");
 
     /* Ed as Xray's Build computes it: uint32(strconv.Atoi(the first ed value)) when ed is
      * stripped. */
     static const struct { const char *path; uint32_t ed; } E[] = {
         { "/w?ed=2048", 2048 }, { "/w?x=1&ed=16", 16 }, { "/w?ed=", 0 }, { "/w?ed=abc", 0 },
         { "/w?ed=+5", 0 } /* query '+' is a space */, { "/w?ed=%2B5", 5 }, { "/w?ed=-1", 4294967295u }, { "/w?ed=4294967296", 0 }, { "/w", 0 },
-        { "/a%zz?ed=9", 0 },
+        { "/a%zz?ed=9", 0 }, { "/w?ed=7&ed=9", 7 }, { "/w?ed=12x", 0 },
+        { "/w?ed=-9223372036854775809", 0 },
     };
     for (size_t i = 0; i < sizeof(E) / sizeof(*E); i++) {
         char out[256], what[96];
@@ -305,6 +329,11 @@ static void test_request(void) {
           "GET /w HTTP/1.1\r\nHost: h\r\nUser-Agent: Go-http-client/1.1\r\nConnection: Upgrade\r\n"
           "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
           "Upgrade: websocket\r\n\r\n" },
+        /* Not one of the words (Xray's switch on the value is exact): it goes as written. */
+        { "Firefox",
+          "GET /w HTTP/1.1\r\nHost: h\r\nUser-Agent: Firefox\r\nConnection: Upgrade\r\n"
+          "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+          "Upgrade: websocket\r\n\r\n" },
     };
     for (size_t i = 0; i < sizeof(B) / sizeof(*B); i++) {
         char hv[64], what[96];
@@ -399,6 +428,10 @@ static void test_frames_in(void) {
     check(parse_all(in, n, out, sizeof(out), &on, &r) == 0 && on == 5 && !memcmp(out, "Hello", 5),
           "fragments with a ping in between: whole \"Hello\"");
     check(r.pong_due && r.pong_n == 2 && !memcmp(r.pong, "pp", 2), "ping: pong due, same body");
+    /* The last fragment ends the message: a new one may follow. */
+    size_t n2 = n + srv_frame(in + n, 2, 1, "!", 1);
+    check(parse_all(in, n2, out, sizeof(out), &on, &r) == 0 && on == 6 && !memcmp(out, "Hello!", 6),
+          "after the last fragment: a new message is legal");
 
     /* Fed byte by byte, the same result: record and frame boundaries do not coincide. */
     memset(&r, 0, sizeof(r));
@@ -499,6 +532,15 @@ static void test_resp(void) {
         { "httpupgrade: Connection list: refused (Xray compares the whole value)",
           "HTTP/1.1 101 x\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n\r\n", 0, TR_ENOUPGRADE },
         { "not HTTP", "SSH-2.0-OpenSSH\r\n\r\n", 1, TR_EUPTOOBIG },
+        { "not HTTP, then a 101: refused at the first line", "SSH-2.0-OpenSSH\r\n"
+          "HTTP/1.1 101 x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", 0, TR_EUPTOOBIG },
+        { "status code of four digits: not HTTP",
+          "HTTP/1.1 1010 x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", 0, TR_EUPTOOBIG },
+        { "101, Accept cut short", "HTTP/1.1 101 x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+          "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZ\r\n\r\n", 1, TR_EWSACCEPT },
+        { "ws: Upgrade list: token found (gorilla)", "HTTP/1.1 101 x\r\nUpgrade: h2c, websocket\r\n"
+          "Connection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+          1, 0 },
         { "bare \\n lines: legal", "HTTP/1.1 101 x\nUpgrade: websocket\nConnection: Upgrade\n\n", 0, 0 },
     };
     for (size_t i = 0; i < sizeof(V) / sizeof(*V); i++) {
@@ -536,10 +578,14 @@ struct srv {
     unsigned char got[9000 + 8192];
     size_t got_n;
     int frames, masked_all, pong_ok, close_ok, ops_ok;
+    unsigned char keys[3][4];      /* mask keys of the first three frames */
     /* early data: what Sec-WebSocket-Protocol held, whether anything came before the response,
      * whether a close 1000 came when the client closed */
     char proto[128];
     int early_before_101, close1000;
+    /* ws early data: the client says on go right before its first write and waits for ack;
+     * req_at_open — the request was already readable then, i.e. open sent it */
+    int go[2], ack[2], req_at_open;
 };
 
 static int rd_until(int fd, char *buf, size_t cap, const char *end) {
@@ -564,6 +610,8 @@ static int rd_all(int fd, unsigned char *b, size_t n) {
     return 0;
 }
 
+static unsigned char g_last_key[4];   /* mask key of the last frame rd_cframe read */
+
 /* Read a client frame, which must be masked. The body is returned unmasked. */
 static int rd_cframe(int fd, int *op, int *fin, int *masked, unsigned char *body, size_t cap, size_t *bn) {
     unsigned char h[2];
@@ -574,6 +622,7 @@ static int rd_cframe(int fd, int *op, int *fin, int *masked, unsigned char *body
     else if (len == 127) { unsigned char e[8]; if (rd_all(fd, e, 8)) return -1; len = 0; for (int i = 0; i < 8; i++) len = (len << 8) | e[i]; }
     unsigned char key[4] = { 0 };
     if (*masked && rd_all(fd, key, 4)) return -1;
+    memcpy(g_last_key, key, 4);
     if (len > cap) return -1;
     if (rd_all(fd, body, (size_t)len)) return -1;
     for (size_t i = 0; i < len; i++) body[i] ^= key[i & 3];
@@ -642,6 +691,14 @@ static void *srv_main(void *arg) {
     int fd = accept(s->lfd, NULL, NULL);
     s->rc = -1;
     if (fd < 0) return NULL;
+    if (s->plan == P_WS_ED || s->plan == P_WS_EDBIG) {
+        char c;
+        struct pollfd pg = { .fd = s->go[0], .events = POLLIN, .revents = 0 };
+        if (poll(&pg, 1, 5000) <= 0 || read(s->go[0], &c, 1) != 1) { close(fd); return NULL; }
+        struct pollfd pc = { .fd = fd, .events = POLLIN, .revents = 0 };
+        s->req_at_open = poll(&pc, 1, 0) > 0;
+        if (write(s->ack[1], "k", 1) != 1) { close(fd); return NULL; }
+    }
     /* Close without answering AFTER the request is read: closing a socket with an unread
      * request makes the kernel send a reset (RST), and the client would see an end of stream or
      * a reset depending on whether the request arrived before close (on a loaded machine the test
@@ -712,6 +769,7 @@ static void *srv_main(void *arg) {
         size_t want_n = 9000 - s->got_n > 4096 ? 4096 : 9000 - s->got_n;
         if (op != want_op || fin != want_fin || bn != want_n) s->ops_ok = 0;
         if (!masked) s->masked_all = 0;
+        if (s->frames < 3) memcpy(s->keys[s->frames], g_last_key, 4);
         memcpy(s->got + s->got_n, body, bn);
         s->got_n += bn;
         s->frames++;
@@ -742,12 +800,21 @@ static int srv_start(struct srv *s, enum plan p, pthread_t *th) {
         getsockname(s->lfd, (struct sockaddr *)&a, &al))
         return -1;
     s->port = ntohs(a.sin_port);
+    if (pipe(s->go) || pipe(s->ack)) return -1;
     return pthread_create(th, NULL, srv_main, s);
 }
 
 static void srv_stop(struct srv *s, pthread_t th) {
     pthread_join(th, NULL);
     close(s->lfd);
+    close(s->go[0]); close(s->go[1]); close(s->ack[0]); close(s->ack[1]);
+}
+
+/* ws early data: tell the server the first write comes next, and wait until it has looked. */
+static void srv_go(struct srv *s) {
+    char c;
+    struct pollfd p = { .fd = s->ack[0], .events = POLLIN, .revents = 0 };
+    if (write(s->go[1], "w", 1) == 1 && poll(&p, 1, 5000) > 0) (void)!read(s->ack[0], &c, 1);
 }
 
 /* Wait as the tunnel loop does: for the transport's own unread data or a readable socket. A
@@ -810,7 +877,14 @@ static void test_socket(void) {
     check(!strncmp(s.req, "GET /w HTTP/1.1\r\nHost: cdn.example.com\r\n", 40), "ws: request line and Host");
     check(strstr(s.req, "Sec-WebSocket-Protocol") == NULL, "ws: no early data (ed stripped from path)");
     check(s.frames == 3 && s.ops_ok, "ws: 9000 bytes as 4096+4096+808 frames, binary then continuation, FIN last");
-    check(s.masked_all, "ws: every client frame masked");
+    /* A mask is only a mask with an unpredictable key (RFC 6455, 5.3): three frames from kernel
+     * randomness share a key or get a zero one with odds of about 2^-30. */
+    int keys_ok = s.frames == 3;
+    for (int i = 0; keys_ok && i < 3; i++) {
+        if (!memcmp(s.keys[i], "\0\0\0\0", 4)) keys_ok = 0;
+        for (int j = 0; j < i; j++) if (!memcmp(s.keys[i], s.keys[j], 4)) keys_ok = 0;
+    }
+    check(s.masked_all && keys_ok, "ws: every client frame masked, each with its own nonzero key");
     int same = s.got_n == 9000;
     for (size_t i = 0; same && i < 9000; i++) if (s.got[i] != (unsigned char)(i * 31)) same = 0;
     check(same, "ws: the server got exactly what was written");
@@ -848,11 +922,13 @@ static void test_socket(void) {
         n.port = (uint16_t)s.port;
         n.path = small ? "/w?ed=2048" : "/w?ed=16";
         rc = transport_open(&t, &n, 3);
+        const int opened = rc == 0;
         const char *tag = small ? "ws ed=2048, first write 5 bytes" : "ws ed=16, first write 9000 bytes";
         char what[160];
-        snprintf(what, sizeof(what), "%s: open without the request", tag);
+        snprintf(what, sizeof(what), "%s: open succeeds", tag);
         check(rc == 0, what);
         if (!rc) {
+            srv_go(&s);
             if (small) check(transport_write(&t, (const unsigned char *)"hello", 5) == 0, "ws ed: early data written");
             snprintf(what, sizeof(what), "%s: 9000-byte write before the 101 is queued", tag);
             check(transport_write(&t, big, sizeof(big)) == 0, what);
@@ -862,6 +938,8 @@ static void test_socket(void) {
             transport_close(&t);
         }
         srv_stop(&s, th);
+        snprintf(what, sizeof(what), "%s: open sends no request, the first write does", tag);
+        check(opened && !s.req_at_open && s.req[0], what);
         snprintf(what, sizeof(what), "%s: Sec-WebSocket-Protocol", tag);
         check_str(what, small ? "aGVsbG8" : "", s.proto);
         snprintf(what, sizeof(what), "%s: no frames before the 101", tag);
@@ -882,7 +960,8 @@ static void test_socket(void) {
     n.port = (uint16_t)s.port;
     n.path = "/u?ed=1";
     rc = transport_open(&t, &n, 3);
-    check(rc == 0, "httpupgrade ed, no TLS: open reads the 101");
+    /* Read in open, the 101 leaves the bytes that came with it held: ready without the socket. */
+    check(rc == 0 && transport_has_data(&t), "httpupgrade ed, no TLS: open reads the 101");
     if (!rc) {
         check(transport_write(&t, (const unsigned char *)"echo", 4) == 0, "httpupgrade ed: write after 101");
         const unsigned char *data = NULL;

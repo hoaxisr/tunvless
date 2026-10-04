@@ -10,10 +10,10 @@
  * The file includes the xhttp transport whole (src/proto/transport/trxhttp.c: up_drain and
  * up_request are static) and links the real h2.c and the other transport layers as separate
  * objects. The upload link is plain (as with security=none) on a socket pair: what the client
- * writes, the test reads and drops, and the "server" writes HTTP/2 frames to the other end by
- * hand. TLS and Reality are not needed and are stubbed out. No header stubs are needed: tls13.h
- * includes only src/lib/scrypto.h, which has no crypto library types. No network and no
- * privileges, so the test runs in `make test`. */
+ * writes, the test reads (and looks for the request paths in), and the "server" writes HTTP/2
+ * frames to the other end by hand. TLS and Reality are not needed and are stubbed out. No
+ * header stubs are needed: tls13.h includes only src/lib/scrypto.h, which has no crypto library
+ * types. No network and no privileges, so the test runs in `make test`. */
 #include "../src/proto/transport/trxhttp.c"
 
 #include <stdlib.h>
@@ -60,10 +60,25 @@ static void check(int ok, const char *what) {
 
 static int g_srv = -1;                /* the "server" end of the socket pair */
 
-/* Drop everything the client has written so far: preface, HEADERS, DATA. */
+/* What the client has written since the pair was made: preface, HEADERS, DATA. Kept to look for
+ * the request paths: HPACK sends them as plain literals (put_headers in h2.c). */
+static unsigned char g_seen[65536];
+static size_t g_seen_n;
+
 static void srv_drain(void) {
-    unsigned char b[8192];
-    while (recv(g_srv, b, sizeof(b), MSG_DONTWAIT) > 0) {}
+    ssize_t r;
+    while ((r = recv(g_srv, g_seen + g_seen_n, sizeof(g_seen) - g_seen_n, MSG_DONTWAIT)) > 0)
+        g_seen_n += (size_t)r;
+}
+
+static int seen(const char *s) {
+    return memmem(g_seen, g_seen_n, s, strlen(s)) != NULL;
+}
+
+/* Whether the client left unread bytes on its end: an answer up_drain never took. */
+static int unread(int fd) {
+    struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
+    return poll(&p, 1, 0) > 0;
 }
 
 /* HEADERS from the server on stream sid with one HPACK byte, a static index of :status:
@@ -72,6 +87,14 @@ static void srv_headers(uint32_t sid, unsigned char hpack, int end_stream) {
     unsigned char f[10] = { 0, 0, 1, 0x01, (unsigned char)(0x04 | (end_stream ? 0x01 : 0)),
                             (unsigned char)(sid >> 24), (unsigned char)(sid >> 16),
                             (unsigned char)(sid >> 8), (unsigned char)sid, hpack };
+    if (write(g_srv, f, sizeof(f)) != (ssize_t)sizeof(f)) { perror("write"); exit(2); }
+}
+
+/* RST_STREAM(NO_ERROR) from the server on stream sid. */
+static void srv_rst(uint32_t sid) {
+    unsigned char f[13] = { 0, 0, 4, 0x03, 0, (unsigned char)(sid >> 24),
+                            (unsigned char)(sid >> 16), (unsigned char)(sid >> 8),
+                            (unsigned char)sid, 0, 0, 0, 0 };
     if (write(g_srv, f, sizeof(f)) != (ssize_t)sizeof(f)) { perror("write"); exit(2); }
 }
 
@@ -91,6 +114,7 @@ static int new_pair(int *cli) {
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) return -1;
     if (g_srv >= 0) close(g_srv);
     g_srv = sp[1];
+    g_seen_n = 0;
     *cli = sp[0];
     return 0;
 }
@@ -112,7 +136,29 @@ static void t_packet_up(unsigned char hpack, int want_refused, const char *what)
         check(rc0 == 0 && rc1 == H2_ESTATUS &&
               strstr(transport_strerror(rc1), "400") != NULL, what);
     else
-        check(rc0 == 0 && rc1 == 0, what);
+        check(rc0 == 0 && rc1 == 0 && !unread(fd), what);
+    if (!want_refused)
+        check(seen("/xh/0f1e2d3c/0") && seen("/xh/0f1e2d3c/1") && !seen("/xh/0f1e2d3c/2"),
+              "packet-up: the two chunks go as requests numbered 0 and 1");
+    close(fd);
+}
+
+/* packet-up: the answer to a chunk already in the socket when the chunk is written, ended by
+ * RST_STREAM(NO_ERROR) as a Go server ends a finished handler's stream. up_drain then sees the
+ * reset on the current stream: the normal end of an answer, not a failure of the write. */
+static void t_packet_up_rst(void) {
+    int fd;
+    if (new_pair(&fd) != 0) { check(0, "socket pair created"); return; }
+    struct transport c;
+    conn_init(&c, XH_PACKET_UP, fd);
+    srv_headers(1, 0x88, 1);
+    srv_rst(1);
+    int rc0 = transport_write(&c, piece, sizeof(piece));     /* chunk 0 reads its own answer */
+    srv_drain();
+    int rc1 = transport_write(&c, piece, sizeof(piece));
+    srv_drain();
+    check(rc0 == 0 && rc1 == 0 && !unread(fd),
+          "packet-up: a chunk's 200 ended by RST_STREAM(NO_ERROR) is read, not a refusal");
     close(fd);
 }
 
@@ -130,15 +176,16 @@ static void t_stream_up(unsigned char hpack, int want_refused, const char *what)
     if (want_refused)
         check(ro == 0 && rc == H2_ESTATUS && strstr(transport_strerror(rc), "400") != NULL, what);
     else
-        check(ro == 0 && rc == 0, what);
+        check(ro == 0 && rc == 0 && !unread(fd), what);
     close(fd);
 }
 
 int main(void) {
     t_packet_up(0x8C, 1, "packet-up: 400 to the previous chunk fails the next write, naming 400");
-    t_packet_up(0x88, 0, "packet-up: 200 to the previous chunk is not a refusal");
+    t_packet_up(0x88, 0, "packet-up: 200 to the previous chunk is read and is not a refusal");
+    t_packet_up_rst();
     t_stream_up(0x8C, 1, "stream-up: 400 to the upload fails the write, naming 400");
-    t_stream_up(0x88, 0, "stream-up: 200 to the upload is not a refusal");
+    t_stream_up(0x88, 0, "stream-up: 200 to the upload is read and is not a refusal");
     printf(g_fail ? "\nxhupmatch: FAILED\n" : "\nall checks passed\n");
     return g_fail;
 }
