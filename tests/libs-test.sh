@@ -395,6 +395,18 @@ case "$o" in
        printf '%s\n' "$o" | grep -q ', 0 fail$' || printf '%s\n' "$full" | sed 's/^/    sigpipe: /' ;;
 esac
 
+# Окно приёма стека TUN с настоящим клиентом ядра: масштаб окна согласован (wscale в ss клиента), выгрузка
+# при задержке в LAN не упирается в 64 КБ на круг, STEER_TUN_RCVWND=0 возвращает прежнее окно, клиент без
+# масштаба работает. Нужны root, сетевые пространства, tc с netem и ss — нет их, и стенд сам говорит «пропуск».
+full="$(LIBS="$L" sh tests/rcvwnd.sh 2>&1)"
+o="$(printf '%s\n' "$full" | tail -n 1)"
+case "$o" in
+    *пропуск*) echo "libs-test: $o" ;;
+    *) check "окно приёма клиента: масштаб согласован, выгрузка не упирается в 64 КБ: стенд tests/rcvwnd.sh" "1" \
+           "$(printf '%s' "$o" | grep -c '^rcvwnd: [0-9]* ok, 0 fail$')"
+       printf '%s\n' "$o" | grep -q ', 0 fail$' || printf '%s\n' "$full" | sed 's/^/    rcvwnd: /' ;;
+esac
+
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
 printf '\nвсе проверки прошли\n'

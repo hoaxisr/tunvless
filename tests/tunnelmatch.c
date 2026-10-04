@@ -368,6 +368,128 @@ static void t_out_of_order_dupack(void) {
     dev_drain(NULL);
 }
 
+/* Масштаб окна приёма (RFC 7323). Клиент с опцией масштаба в SYN получает в SYN-ACK нашу опцию и окно без
+ * масштаба (в SYN и SYN-ACK окно не масштабируется никогда); в данных и подтверждениях поле окна — потолок,
+ * делённый на наш множитель, то есть настоящее окно выше 64 КБ. Клиент без опции в SYN не получает её в
+ * ответ (опция в SYN-ACK без опции в SYN — нарушение RFC 7323, 2.2) и видит 65535 во всех пакетах, как
+ * прежде.
+ *
+ * Стенд проверяет и сам расчёт множителя (rcv_window_set): наименьший, при котором поле вмещает потолок, и
+ * поле окна с округлением вверх (rcv_win_field): прежние 65535 при множителе 7 не должны стать 65408. */
+static void syn_opts(uint32_t seq, int wscale) {
+    unsigned char p[128];
+    size_t l = tcp_build(p, sizeof(p), CLI_IP, SRV_IP, CLI_PORT, SRV_PORT, seq, 0, TCP_SYN, NULL, 0,
+                         65535, 1460, wscale);
+    handle_packet(&g_tun, p, l);
+}
+
+/* Подтверждение 100 байт данных клиента: ключ последнего пакета, ушедшего в «устройство» (n — сколько их). */
+static int ack_after_data(uint32_t seq, struct flow_key *last) {
+    static const unsigned char d[100] = { 0 };
+    cli_send(seq, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d));
+    flush_acks(&g_tun);
+    memset(last, 0, sizeof(*last));
+    return dev_drain(last);
+}
+
+static void t_window_scale(void) {
+    uint32_t keep_wnd = g_rcv_wnd;
+    uint8_t keep_shift = g_rcv_shift;
+
+    rcv_window_set(100);
+    check(g_rcv_wnd == 65535 && g_rcv_shift == 0, "масштаб окна: потолок ниже 65535 — 65535, без множителя");
+    rcv_window_set(65535);
+    check(g_rcv_wnd == 65535 && g_rcv_shift == 0, "  ровно 65535 — множитель 0");
+    rcv_window_set(65536);
+    check(g_rcv_wnd == 65536 && g_rcv_shift == 1, "  65536 — множитель 1 (65535 << 0 не вмещает)");
+    rcv_window_set(1u << 20);
+    check(g_rcv_wnd == (1u << 20) && g_rcv_shift == 5, "  1 МиБ — множитель 5 (65535 << 4 = 1048560 не вмещает)");
+    rcv_window_set(4u << 20);
+    check(g_rcv_wnd == (4u << 20) && g_rcv_shift == 7, "  4 МиБ — множитель 7 (65535 << 6 = 4194240 не вмещает)");
+    rcv_window_set(0xFFFFFFFFu);
+    check(g_rcv_shift == 14 && g_rcv_wnd == (65535u << 14), "  больше предела — множитель 14 (RFC 7323, 2.3), потолок 65535 << 14");
+
+    /* Дальше — потолок 1 МиБ, множитель 5: в поле окна 32768. */
+    rcv_window_set(1u << 20);
+    struct flow_key k = cli_key(), last;
+    struct conn *c0 = conn_find(&k);
+    if (c0) conn_drop(c0);
+    dev_drain(NULL);
+
+    syn_opts(1000, 7);                                    /* клиент: опция масштаба 7 */
+    struct conn *c = conn_find(&k);
+    memset(&last, 0, sizeof(last));
+    int n = dev_drain(&last);
+    check(c && n == 1 && (last.tcp_flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK) && last.ws_seen &&
+              last.wscale == 5,
+          "SYN с опцией масштаба: SYN-ACK несёт нашу опцию с множителем 5");
+    check(n == 1 && last.window == 65535, "  окно в самом SYN-ACK — 65535, без масштаба");
+    check(c && c->ws_on && c->client_wscale == 7, "  у соединения: масштаб включён, множитель клиента 7 прочитан");
+    if (c && wait_ready(c, 2000) == 0) {
+        cli_send(1001, 2, TCP_ACK, 65535, NULL, 0);
+        n = ack_after_data(1001, &last);
+        check(n == 1 && (last.tcp_flags & TCP_ACK) && last.ack == 1101 && last.window == 32768,
+              "  подтверждение данных: поле окна 32768 — с множителем 5 это 1 МиБ");
+        check(((uint32_t)last.window << g_rcv_shift) == g_rcv_wnd, "  и настоящее окно (поле << 5) равно потолку");
+    } else {
+        check(0, "  установщик не доложил");
+    }
+    if (c) conn_drop(c);
+    dev_drain(NULL);
+
+    /* Множитель 7 и потолок 65535 (STEER_TUN_RCVWND=0 при клиенте с масштабом): поле округляется вверх. */
+    rcv_window_set(65535);
+    check(g_rcv_shift == 0, "потолок 65535 — множитель 0, окно прежнее");
+    rcv_window_set(65536 + 100);
+    c = NULL;
+    syn_opts(1500, 3);
+    c = conn_find(&k);
+    if (c && wait_ready(c, 2000) == 0) {
+        cli_send(1501, 2, TCP_ACK, 65535, NULL, 0);
+        dev_drain(NULL);
+        n = ack_after_data(1501, &last);
+        check(n == 1 && last.window == (65636 + 1) / 2 && ((uint32_t)last.window << g_rcv_shift) >= g_rcv_wnd,
+              "потолок не кратен множителю: поле округлено вверх (окно не меньше потолка)");
+    } else {
+        check(0, "  установщик не доложил (округление)");
+    }
+    if (c) conn_drop(c);
+    dev_drain(NULL);
+    rcv_window_set(1u << 20);
+
+    /* Опция масштаба с множителем 0 — всё равно опция: ответ обязателен, и окно масштабируется. */
+    syn_opts(2000, 0);
+    c = conn_find(&k);
+    memset(&last, 0, sizeof(last));
+    n = dev_drain(&last);
+    check(c && c->ws_on && n == 1 && last.ws_seen && last.wscale == 5 && c->client_wscale == 0,
+          "SYN с опцией масштаба 0: опция есть (ws_seen), SYN-ACK с нашим множителем");
+    if (c) wait_ready(c, 2000);                           /* заявка в работе закрыть нельзя */
+    if (c) conn_drop(c);
+    dev_drain(NULL);
+
+    /* SYN без опции масштаба. */
+    syn_opts(3000, -1);
+    c = conn_find(&k);
+    memset(&last, 0, sizeof(last));
+    n = dev_drain(&last);
+    check(c && !c->ws_on && n == 1 && !last.ws_seen && last.window == 65535,
+          "SYN без опции масштаба: SYN-ACK без опции, окно 65535");
+    if (c && wait_ready(c, 2000) == 0) {
+        cli_send(3001, 2, TCP_ACK, 65535, NULL, 0);
+        n = ack_after_data(3001, &last);
+        check(n == 1 && last.ack == 3101 && last.window == 65535,
+              "  и подтверждение данных — окно 65535, масштаб не применяется");
+    } else {
+        check(0, "  установщик не доложил");
+    }
+    if (c) conn_drop(c);
+    dev_drain(NULL);
+
+    rcv_window_set(keep_wnd);
+    g_rcv_shift = keep_shift;
+}
+
 /* I-193: установщик доложил за время ПОСЛЕДНЕГО сна ожидания. Прежде проверка стояла перед
  * сном, результат последнего не спрашивался, и приговор «не доложил за 15 с» ставился по
  * счётчику кругов — таблица при этом намеренно не освобождается. */
@@ -1223,6 +1345,7 @@ int main(void) {
     t_sendagain_retry();
     t_sendagain_eof();
     t_out_of_order_dupack();
+    t_window_scale();
     t_release_last_sleep();
     t_bad_uuid();
     t_send_refused();

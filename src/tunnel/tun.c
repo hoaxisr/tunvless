@@ -434,6 +434,7 @@ int ip_parse(const unsigned char *p, size_t n, struct flow_key *k, size_t *paylo
          * Опции разбираются только в SYN: дальше их не бывает, а множитель постоянен на
          * всё соединение. */
         k->wscale = 0;
+        k->ws_seen = 0;
         if ((k->tcp_flags & TCP_SYN) && doff > 20) {
             size_t o = ihl + 20, end = ihl + doff;
             while (o < end && o < n) {
@@ -445,6 +446,7 @@ int ip_parse(const unsigned char *p, size_t n, struct flow_key *k, size_t *paylo
                 if (olen < 2 || o + olen > end) break;
                 if (kind == 3 && olen == 3) {
                     k->wscale = p[o + 2] > 14 ? 14 : p[o + 2];
+                    k->ws_seen = 1;
                     break;
                 }
                 o += olen;
