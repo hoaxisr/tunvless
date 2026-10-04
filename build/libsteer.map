@@ -183,6 +183,7 @@ LIBSTEER_1 {
     qc_datagram_max;
     qc_datagram_send;
     qc_fd;
+    qc_flush_credit;
     qc_free;
     qc_on_readable;
     qc_on_timer;

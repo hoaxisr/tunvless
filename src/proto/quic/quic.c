@@ -119,6 +119,7 @@ struct qc {
     int       in_cb;            /* внутри колбэка потребителя: qc_free запрещён */
     int       brutal;
     int       flow_manual;      /* окна приёма продлевает потребитель (qc_stream_consumed) */
+    int       credit_dirty;     /* окна продлены, а пакет с их обновлением ещё не уходил (qc_flush_credit) */
     uint8_t  *txbuf;
     uint8_t  *rxbuf;
     /* Шов «фильтр датаграмм» (quic.h, struct qc_filter): обфускация всего, что идёт по сокету.
@@ -426,6 +427,10 @@ void qc_stream_consumed(struct qc *q, int64_t sid, size_t n) {
      * возвращается всё равно — иначе закрытые потоки съели бы его насовсем. */
     (void)ngtcp2_conn_extend_max_stream_offset(q->conn, sid, n);
     ngtcp2_conn_extend_max_offset(q->conn, n);
+    /* ngtcp2 только ставит MAX_STREAM_DATA и MAX_DATA в очередь, а пакет с ними пишется при
+     * следующей отправке. Из колбэка отправлять нельзя (мы внутри разбора пакета), и там об
+     * этом позаботится конец qc_on_readable; снаружи — сам потребитель зовёт qc_flush_credit. */
+    q->credit_dirty = 1;
 }
 
 int qc_set_cc(struct qc *q, uint64_t brutal_bps) {
@@ -661,6 +666,7 @@ static void closed(struct qc *q, int reason, const char *why) {
 /* Отправить всё, что можно сейчас. Возврат — 0 или причина закрытия (<0 из ngtcp2). */
 static int flush(struct qc *q) {
     if (q->closed || !q->conn) return QC_ECLOSED;
+    q->credit_dirty = 0;
     if (ngtcp2_conn_in_closing_period(q->conn) || ngtcp2_conn_in_draining_period(q->conn)) return 0;
     for (int rounds = 0; rounds < 64; rounds++) {
         ngtcp2_path_storage ps;
@@ -705,6 +711,17 @@ static void fail_close(struct qc *q, int err) {
         if (n > 0) send_udp(q, q->txbuf, (size_t)n);
     }
     closed(q, reason, why);
+}
+
+/* Окна продлены (qc_stream_consumed вне колбэка), а сервер о них ещё не знает — отправить. Без этого
+ * у потока, который сервер остановил окном, обновление ждало бы любого другого события QUIC: пакета
+ * от сервера (а он молчит — остановлен нами же), срока таймера (PING по молчанию, до десяти секунд)
+ * или чужой отправки. Медленный клиент, прочитавший восемь мегабайт, получал остальное пачками раз
+ * в десять секунд. */
+void qc_flush_credit(struct qc *q) {
+    if (!q || !q->credit_dirty || q->in_cb || q->closed || !q->conn) return;
+    int rv = flush(q);
+    if (rv != 0 && rv != QC_ECLOSED) fail_close(q, rv);
 }
 
 static void settings_fill(ngtcp2_settings *st, ngtcp2_transport_params *tp, uint64_t brutal_bps,

@@ -21,8 +21,13 @@
  * ОБРАТНОЕ ДАВЛЕНИЕ. Стек перестаёт читать дескриптор, когда окно клиента закрыто. Окно приёма
  * QUIC поэтому продлевается не сразу, а когда байты ушли в сокет клиента (cfg.flow_manual,
  * qc_stream_consumed): медленный клиент тормозит сервер, а не копит очередь в памяти роутера.
- * Обратное направление — qc_stream_send принимает не всё, остаток ждёт в потоке и досылается после
- * каждого события QUIC, пока не освободится буфер.
+ * Сама очередь к клиенту — цепочка блоков (pblk), память которых возвращается по мере отдачи, а её
+ * предел — окно потока (RX_STREAM_WIN), а не «сколько вырастет».
+ * В обратную сторону (клиент → узел) тормозит стек, а не мы: он не подтверждает данные клиента,
+ * пока очередь пары выше нижней отметки (DC_ACK_PACED, dialer.h), — то есть окно клиента равно
+ * месту в очереди, и она не переполняется. Мы же разбираем очередь по мере сил: qc_stream_send
+ * принимает не всё (буфер потока — send_buf), остаток ждёт в потоке (flow.up) и досылается после
+ * каждого события QUIC, пока не освободится буфер, а пока он ждёт, поток не читается.
  *
  * ЖИЗНЬ СОЕДИНЕНИЯ. Открывается сразу при запуске и держится, сколько живёт процесс, — с потоками и
  * без: PING QUIC (keepalive, quic.c) не даёт ему умереть по сроку простоя. Прежде соединение без
@@ -73,7 +78,29 @@
  * отказывал раньше сервера, у которого лимит выше. */
 #define CHUNK      16000       /* сообщение клиентской стороне: меньше буфера стека (TUNNEL_BUF) */
 #define RXB         65536
-#define PEND_MAX    (12u << 20) /* очередь к медленному клиенту: окно потока + запас */
+
+/* Окна приёма, которые мы выдаём серверу, — это и есть предел памяти под очереди к клиентам.
+ *
+ * Очередь к клиенту (flow.ph) копит ровно то, что сервер прислал, а клиент ещё не принял, и окно
+ * продлевается только за принятое (qc_stream_consumed). Поэтому во всех очередях туннеля лежит не
+ * больше RX_CONN_WIN байт, у одного потока — не больше RX_STREAM_WIN: сервер, соблюдающий
+ * управление потоком, сверх окна не пришлёт ни байта, а несоблюдающего ngtcp2 закрывает ошибкой
+ * управления потоком. Числа взяты не с потолка, а от двух вещей:
+ *   • пропускная способность на длинном пути: окно обязано вмещать «скорость × задержка» с
+ *     запасом вдвое (BBR держит в пути до двух BDP). 16 МиБ вмещают BDP в 8 МиБ — 270 Мбит/с при
+ *     250 мс; больше процессору роутера QUIC всё равно не тянет. Окно потока вдвое меньше: одна
+ *     закачка занимает не больше половины окна соединения (у самого hysteria — 8 и 20 МиБ);
+ *   • память: окно соединения — наихудший расход на очереди одного туннеля, и он назван числом.
+ *     Платится он только пока клиент медленнее сети: быстрый клиент держит очередь пустой, а
+ *     окно при этом стоит лишь строкой в параметрах транспорта.
+ * Цена меньшего окна — потолок скорости «окно / задержка» (4 МиБ на поток при 250 мс — 134
+ * Мбит/с), так что менять эти два числа вместе с замером на длинном пути. */
+#define RX_CONN_WIN    (16u << 20)
+#define RX_STREAM_WIN  (8u << 20)
+/* Очередь одного потока не больше окна потока; запас — на округление окна, а не на нарушителя:
+ * нарушителя закрывает ngtcp2, и если очередь всё же вышла за окно, это ошибка счёта кредита —
+ * такой поток закрывается с числами в журнале, а не растит память. */
+#define PEND_MAX       (RX_STREAM_WIN + (1u << 20))
 #define RSLOT       1400        /* место под фрагмент UDP при сборке */
 /* Фрагментов одной датаграммы UDP от сервера — не больше 64: датаграмма UDP не длиннее 65535
  * байт, а фрагмент несёт до RSLOT байт, так что 64 покрывают протокол целиком; заявленное
@@ -103,6 +130,14 @@ struct req {
 
 enum { FL_RESP, FL_OPEN };
 
+/* Блок очереди к клиенту: ровно одно сообщение клиентской стороне (CHUNK). off — сколько с головы
+ * уже отдано, len — сколько лежит. */
+struct pblk {
+    struct pblk *next;
+    uint32_t off, len;
+    uint8_t d[CHUNK];
+};
+
 struct flow {
     int fd;                     /* конец пары у мультиплексора */
     int udp;
@@ -118,9 +153,10 @@ struct flow {
     /* Ответ сервера на запрос TCP копится здесь, пока не разобран целиком. */
     uint8_t *hbuf;
     size_t hn;
-    /* Вниз, к клиенту: то, что не влезло в сокет. pend_off — сколько уже отдано. */
-    uint8_t *pend;
-    size_t pend_n, pend_cap, pend_off;
+    /* Вниз, к клиенту: то, что не влезло в сокет, — цепочка блоков (pblk), голова — самое
+     * старое. pend_n — сколько байт в цепочке всего. */
+    struct pblk *ph, *pt;
+    size_t pend_n;
     /* Вверх, к серверу: остаток, который qc_stream_send не принял. */
     uint8_t *up;
     size_t up_n;
@@ -296,8 +332,8 @@ static void make_cfg(const struct hy2_node *n, const char *ip, struct qc_cfg *c,
     c->idle_ms = g_idle_ms;
     c->keepalive_ms = g_idle_ms / 3 < 10000 ? g_idle_ms / 3 : 10000;
     c->flow_manual = 1;
-    c->max_data = 16u << 20;
-    c->max_stream_data = 8u << 20;
+    c->max_data = RX_CONN_WIN;
+    c->max_stream_data = RX_STREAM_WIN;
     c->sock_mark = mark;
     c->mark_required = mark_req;
     memset(ob, 0, sizeof *ob);
@@ -465,7 +501,7 @@ static uint32_t flow_ev(const struct flow *f) {
      * незачем, и оставить его значило бы крутить цикл. HUP и ERR приходят и без запроса. */
     uint32_t e = 0;
     if (f->state == FL_OPEN && !f->up_eof && !f->up_n) e |= EPOLLIN | EPOLLRDHUP;
-    if (f->pend_n > f->pend_off) e |= EPOLLOUT;
+    if (f->pend_n) e |= EPOLLOUT;
     return e;
 }
 
@@ -511,20 +547,86 @@ static struct flow *usid_find(uint32_t u) {
     return NULL;
 }
 
+/* ---- очередь к клиенту ------------------------------------------------------------------------ */
+
+/* Очередь к медленному клиенту — цепочка блоков по CHUNK байт, а не один растущий буфер.
+ *
+ * Прежде это был один буфер со смещением «уже отдано», и отданное место возвращалось, только когда
+ * очередь пустела ЦЕЛИКОМ. Под непрерывной загрузкой клиент отстаёт от узла постоянно (сеть быстрее
+ * его приёма — а здесь это обычное дело: узким местом бывает сама сторона клиента), и очередь не
+ * пустела никогда: дописывалось всё дальше, буфер удваивался (до 256 МиБ на поток), а живых байт в
+ * нём лежали мегабайты — их держало в узде окно потока, а отданный хвост не держал никто. Восемь
+ * потоков за двадцать секунд раздували процесс с 14 до 700 МБ (замер 2026-10-04). Блоки отдают
+ * память по мере отдачи клиенту и не копируются при росте: занято ровно то, что лежит, плюс
+ * неполный хвостовой блок. Предел самой очереди — RX_STREAM_WIN. */
+
+/* Дописать n байт в хвост. -1 — нет памяти: что успело лечь, осталось (pend_n честный). */
+static int pend_add(struct flow *f, const uint8_t *d, size_t n) {
+    while (n) {
+        struct pblk *b = f->pt;
+        if (!b || b->len == CHUNK) {
+            b = malloc(sizeof *b);
+            if (!b) return -1;
+            b->next = NULL;
+            b->off = b->len = 0;
+            if (f->pt) f->pt->next = b; else f->ph = b;
+            f->pt = b;
+        }
+        size_t k = CHUNK - b->len < n ? CHUNK - b->len : n;
+        memcpy(b->d + b->len, d, k);
+        b->len += (uint32_t)k;
+        f->pend_n += k;
+        d += k;
+        n -= k;
+    }
+    return 0;
+}
+
+/* Что отдать клиенту следующим: не длиннее CHUNK, из головного блока. NULL — очередь пуста. */
+static const uint8_t *pend_front(const struct flow *f, size_t *n) {
+    const struct pblk *b = f->ph;
+    if (!b) return NULL;
+    *n = b->len - b->off;
+    return b->d + b->off;
+}
+
+/* Из головы отдано k байт (не больше того, что вернул pend_front). Опустевший блок освобождается —
+ * в том числе неполный хвостовой: память следует за нагрузкой, а не за её наибольшим всплеском. */
+static void pend_take(struct flow *f, size_t k) {
+    struct pblk *b = f->ph;
+    b->off += (uint32_t)k;
+    f->pend_n -= k;
+    if (b->off == b->len) {
+        f->ph = b->next;
+        if (!f->ph) f->pt = NULL;
+        free(b);
+    }
+}
+
+static void pend_free(struct flow *f) {
+    while (f->ph) {
+        struct pblk *b = f->ph;
+        f->ph = b->next;
+        free(b);
+    }
+    f->pt = NULL;
+    f->pend_n = 0;
+}
+
 static void flow_free(struct flow *f, int rc, const char *msg) {
     if (f->req) {
         req_finish(f->req, rc ? rc : HY2E_DOWN, msg ? msg : "поток закрыт");
         f->req = NULL;
     }
     /* Окно соединения возвращаем и за то, что так и не отдали клиенту. */
-    if (f->pend_n > f->pend_off && E.qc) qc_stream_consumed(E.qc, f->udp ? 0 : f->sid, f->pend_n - f->pend_off);
+    if (f->pend_n && E.qc) qc_stream_consumed(E.qc, f->udp ? 0 : f->sid, f->pend_n);
     if (f->fd >= 0) close(f->fd);
     if (!f->udp) sid_del(f);
     else usid_del(f);
     for (unsigned i = 0; i < E.nfl; i++)
         if (E.fl[i] == f) { E.fl[i] = E.fl[--E.nfl]; break; }
     free(f->hbuf);
-    free(f->pend);
+    pend_free(f);
     free(f->up);
     free(f->rbuf);
     free(f);
@@ -570,7 +672,7 @@ static void flow_local_gone(struct flow *f) {
 /* Байты от сервера — клиенту: сколько можно сразу, остальное в очередь. */
 static void flow_down(struct flow *f, const uint8_t *d, size_t n) {
     size_t off = 0;
-    while (off < n && f->pend_n == f->pend_off) {
+    while (off < n && !f->pend_n) {
         size_t k = n - off < CHUNK ? n - off : CHUNK;
         int r = local_put(f, d + off, k);
         if (r < 0) { qc_stream_consumed(E.qc, f->sid, n - off); flow_local_gone(f); return; }
@@ -580,47 +682,45 @@ static void flow_down(struct flow *f, const uint8_t *d, size_t n) {
     }
     if (off < n) {
         size_t rest = n - off;
-        if (f->pend_n - f->pend_off + rest > PEND_MAX) {
-            /* Сервер не уважает окно, или окно больше очереди: рвём поток, а не растим память. */
-            fprintf(stderr, LOG_W2 "hysteria2: очередь к клиенту переполнена — поток закрыт\n");
+        if (f->pend_n + rest > PEND_MAX) {
+            /* Окно не бывает больше очереди: сюда доходят только при ошибке счёта кредита. Рвём
+             * поток, а не растим память, и называем числа. */
+            fprintf(stderr, LOG_W2 "hysteria2: очередь к клиенту %zu КиБ вышла за окно потока %u КиБ — "
+                            "поток закрыт\n", (f->pend_n + rest) >> 10, (unsigned)(PEND_MAX >> 10));
             qc_stream_consumed(E.qc, f->sid, rest);
             flow_local_gone(f);
             return;
         }
-        if (f->pend_off && f->pend_off == f->pend_n) f->pend_n = f->pend_off = 0;
-        if (f->pend_n + rest > f->pend_cap) {
-            size_t nc = f->pend_cap ? f->pend_cap : 32768;
-            while (nc < f->pend_n + rest) nc *= 2;
-            uint8_t *nb = realloc(f->pend, nc);
-            if (!nb) { qc_stream_consumed(E.qc, f->sid, rest); flow_local_gone(f); return; }
-            f->pend = nb;
-            f->pend_cap = nc;
+        size_t before = f->pend_n;
+        if (pend_add(f, d + off, rest) != 0) {
+            /* Что успело лечь в очередь, вернёт flow_free: кредит возвращаем только за остальное. */
+            qc_stream_consumed(E.qc, f->sid, rest - (f->pend_n - before));
+            flow_local_gone(f);
+            return;
         }
-        memcpy(f->pend + f->pend_n, d + off, rest);
-        f->pend_n += rest;
     }
     ep_sync(f);
 }
 
 static void flow_maybe_shut(struct flow *f) {
-    if (f->rx_fin && f->pend_n == f->pend_off && !f->shut) {
+    if (f->rx_fin && !f->pend_n && !f->shut) {
         f->shut = 1;
         shutdown(f->fd, SHUT_WR);
     }
 }
 
 static void flow_drain(struct flow *f) {
-    while (f->pend_n > f->pend_off) {
-        size_t k = f->pend_n - f->pend_off < CHUNK ? f->pend_n - f->pend_off : CHUNK;
-        int r = local_put(f, f->pend + f->pend_off, k);
+    size_t k;
+    const uint8_t *p;
+    while ((p = pend_front(f, &k)) != NULL) {
+        int r = local_put(f, p, k);
         if (r < 0) { flow_local_gone(f); return; }
         if (r == 0) break;
-        f->pend_off += k;
+        pend_take(f, k);
         qc_stream_consumed(E.qc, f->sid, k);
     }
-    if (f->pend_off == f->pend_n) f->pend_n = f->pend_off = 0;
     flow_maybe_shut(f);
-    if (f->closing && f->pend_n == 0) { flow_free(f, 0, NULL); return; }
+    if (f->closing && !f->pend_n) { flow_free(f, 0, NULL); return; }
     ep_sync(f);
 }
 
@@ -931,7 +1031,7 @@ static void on_stream_close(void *u, int64_t sid, uint64_t err) {
         if (rq) req_finish(rq, HY2E_DENIED, "сервер закрыл поток, не ответив");
         return;
     }
-    if (f->pend_n > f->pend_off) { f->closing = 1; f->rx_fin = 1; return; }   /* сперва дошлём клиенту */
+    if (f->pend_n) { f->closing = 1; f->rx_fin = 1; return; }   /* сперва дошлём клиенту */
     f->rx_fin = 1;
     flow_maybe_shut(f);
     /* Поток закрыт с обеих сторон: клиенту остался EOF, который он уже получил. */
@@ -1196,6 +1296,9 @@ static void *engine(void *arg) {
                 if (live && E.qc) flow_event(f, evs[i].events);
             }
         }
+        /* Окна, которые продлили события потоков выше (qc_stream_consumed из flow_drain и flow_down):
+         * сервер, остановленный окном, о них иначе не узнает до следующего события QUIC. */
+        if (E.qc && !E.dead) qc_flush_credit(E.qc);
         if (E.qc && qc_timeout_ms(E.qc) == 0 && qc_on_timer(E.qc) == QC_ECLOSED) E.dead = E.dead ? E.dead : 1;
         if (E.qc && !E.dead) eng_flush_blocked();
         if (E.dead) {
@@ -1219,6 +1322,9 @@ static void *engine(void *arg) {
         }
         expire(now_ms());
         process_queue(now_ms());
+        /* И закрытые потоки возвращают окно (flow_free): без этого окно соединения, занятое
+         * очередью ушедшего клиента, оставалось бы закрытым до следующего события QUIC. */
+        if (E.qc && !E.dead) qc_flush_credit(E.qc);
         pthread_mutex_lock(&E.mu);
         E.st.flows = E.nfl;
         if (E.qc && E.state == S_UP) {
