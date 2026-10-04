@@ -72,9 +72,15 @@ up() {
     done
     return 1
 }
-# Stop it the way an init script does (SIGTERM) and wait until the device is gone.
+# Stop it the way an init script does (SIGTERM) and wait until the device is gone. A tunnel that
+# does not stop within 5 s is killed, so the run goes on; DOWN_RC is its exit status (0 is a stop
+# by the signal; 137 means it had to be killed).
 down() {
-    kill "$TP" 2>/dev/null; wait "$TP" 2>/dev/null; TP=""
+    kill "$TP" 2>/dev/null
+    i=0
+    while kill -0 "$TP" 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    kill -9 "$TP" 2>/dev/null
+    wait "$TP" 2>/dev/null; DOWN_RC=$?; TP=""
     i=0
     while HX ip link show vl >/dev/null 2>&1 && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
 }
@@ -94,16 +100,20 @@ check "the node's name is gone for new lookups" "2" "$(HX getent hosts node.test
 check "download still works: the address was pinned at startup" "$WANT" "$(fetch)"
 echo "$NODE node.test" > /etc/netns/$H/hosts
 down
+check "SIGTERM stopped the tunnel, exit code 0" "0" "$DOWN_RC"
 check "SIGTERM removed the server's host route" "0" "$(HX ip route show $NODE/32 | grep -c .)"
 check "  and the device with the routes into it" "0" "$(HX ip route show 0.0.0.0/1 | grep -c .)"
 
 # ---- a host route the user already had is used, not replaced or removed ---------------------------
-HX ip route add $NODE/32 via $GW dev v0 proto static
+# Added the way a person would, with nothing to tell it from the tunnel's own (same gateway, same
+# default protocol): a stop that took it for the tunnel's would remove it.
+HX ip route add $NODE/32 via $GW dev v0
 up "$LINK" -d vl -r default
 check "tunnel up next to the user's host route" "0" "$?"
 check "download through the tunnel" "$WANT" "$(fetch)"
 down
-check "the user's host route survived the stop" "1" "$(HX ip route show $NODE/32 | grep -c 'proto static')"
+check "the user's host route survived the stop" "1" \
+    "$(HX ip route show $NODE/32 | grep -c "via $GW dev v0")"
 HX ip route del $NODE/32
 
 # ---- --bind-dev: no host route, the socket leaves through v0 ---------------------------------------
@@ -127,7 +137,7 @@ HX ip rule del fwmark 0x77 lookup 177 priority 100
 printf '%s\n%s\n' "vless://$UUID@$NODE:$((PORT + 1))?security=none&type=tcp#dead" \
     "vless://$UUID@$NODE:$PORT?security=none&type=tcp#alive" | base64 > "$W/sub.txt"
 check "--list numbers both usable nodes" "0 dead
-1 alive" "$("$BIN" --list "$W/sub.txt" | cut -f1,2 | tr '\t' ' ')"
+1 alive" "$(HX timeout 10 "$BIN" --list "$W/sub.txt" | cut -f1,2 | tr '\t' ' ')"
 up "$W/sub.txt" -d vl -r default -t 3
 check "tunnel up from the subscription" "0" "$?"
 check "the node that answered was chosen" "1" "$(grep -c 'chose alive' "$W/tun.log")"
@@ -135,11 +145,13 @@ check "download through the chosen node" "$WANT" "$(fetch)"
 down
 
 # ---- refusals ----------------------------------------------------------------------------------------
-"$BIN" --node 5 "$W/sub.txt" >/dev/null 2>&1
+# In the test namespace and under a timeout: a refusal that does not happen starts a tunnel.
+HX timeout 10 "$BIN" --node 5 "$W/sub.txt" >/dev/null 2>&1
 check "--node beyond the file exits 2" "2" "$?"
-"$BIN" "vless://not-a-uuid-at-all-and-far-too-long-to-be-one@$NODE:1?security=none" >/dev/null 2>&1
+HX timeout 10 "$BIN" "vless://not-a-uuid-at-all-and-far-too-long-to-be-one@$NODE:1?security=none" \
+    > /dev/null 2>&1
 check "an unusable link exits 2" "2" "$?"
-"$BIN" -r 300.0.0.0/8 "$LINK" >/dev/null 2>&1
+HX timeout 10 "$BIN" -r 300.0.0.0/8 "$LINK" >/dev/null 2>&1
 check "a bad --route exits 2" "2" "$?"
 
 echo "routes: $pass ok, $fail fail"

@@ -9,6 +9,9 @@
 # (tunvless) and wget as the client. Loss is added by an nft rule on INPUT from the tunnel
 # device, so exactly the packets we synthesized are lost.
 #
+# The verdict: every download is whole and byte for byte what the server sent. Retransmits and
+# the threads that carried traffic are printed for information, not checked.
+#
 # Usage: tests/run-tunnel.sh [loss_percent] [streams]
 set -eu
 cd "$(dirname "$0")/.."
@@ -81,12 +84,14 @@ fi
 # Wait ONLY for the downloads. A bare `wait` would also wait for the server and the tunnel, which
 # never exit, and the run would hang until an outside timeout, looking like a stuck tunnel.
 #
-# Download INTO A FILE and compare the size: exit code 0 without a length check can report an
-# absurd speed for a download that never happened.
+# Download INTO A FILE and compare it with what the server sent: exit code 0 without a length
+# check can report an absurd speed for a download that never happened, and a length check alone
+# passes a retransmission that resends the wrong bytes. One try: wget retries a reset or stalled
+# connection by itself, and a second connection would hide the failure of the first.
 s=$(date +%s.%N)
 pids=""
 i=1; while [ "$i" -le "$STREAMS" ]; do
-    ( ip netns exec "$NS" wget -q -O "$WORK/dl.$i" -T 120 "http://$TARGET/x" || true ) &
+    ( ip netns exec "$NS" wget -q --tries=1 -O "$WORK/dl.$i" -T 120 "http://$TARGET/x" || true ) &
     pids="$pids $!"
     i=$((i+1))
 done
@@ -94,10 +99,20 @@ for pid in $pids; do wait "$pid" || true; done
 e=$(date +%s.%N)
 
 want=$((MB * 1024 * 1024))
+# The body the server sends: its filler over and over (fake-vless.py, FILLER).
+python3 - "$WORK/body" "$want" <<'PY'
+import runpy, sys
+filler = runpy.run_path("tests/fake-vless.py")["FILLER"]
+n = int(sys.argv[2])
+open(sys.argv[1], "wb").write((filler * (n // len(filler) + 1))[:n])
+PY
 ok=0; i=1
 while [ "$i" -le "$STREAMS" ]; do
     got=$(wc -c < "$WORK/dl.$i" 2>/dev/null || echo 0)
-    if [ "$got" = "$want" ]; then ok=$((ok+1)); else echo "    stream $i: $got of $want bytes"; fi
+    if [ "$got" != "$want" ]; then echo "    stream $i: $got of $want bytes"
+    elif ! cmp -s "$WORK/body" "$WORK/dl.$i"; then
+        echo "    stream $i: not the bytes the server sent ($(cmp "$WORK/body" "$WORK/dl.$i"))"
+    else ok=$((ok+1)); fi
     i=$((i+1))
 done
 dropped=0
@@ -109,7 +124,7 @@ grep -o 'retransmits [0-9]*/s ([0-9.]* KB/s)' "$WORK/tun.log" 2>/dev/null |
     grep -v 'retransmits 0/s' | sort -u | tail -2 | sed 's/^/    /' || true
 # Which threads actually carried traffic: in the other numbers "got faster" and "everything
 # landed on one queue" look the same.
-busy=$(grep -o '^tun-stats\[[0-9]\]' "$WORK/tun.log" 2>/dev/null | sort -u | tr -d 'tun-satsm[]' | tr '\n' ' ')
+busy=$(grep -o '^tun-stats\[[0-9]\]' "$WORK/tun.log" 2>/dev/null | sort -u | tr -dc '0-9\n' | tr '\n' ' ')
 work=$(grep '^tun-stats' "$WORK/tun.log" 2>/dev/null | grep -v ' 0.0 MB/s ' |
     grep -o '^tun-stats\[[0-9]\]' | sort -u | wc -l)
 echo "  threads with traffic: $work (threads reporting: $busy)"

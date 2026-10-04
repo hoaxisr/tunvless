@@ -150,7 +150,7 @@ static void test_path(void) {
         { "/a\nb", 1, 64, "control character in path", "" },
         { "/a#b", 1, 64, "# in path", "" },
         { "//h/p", 1, 64, "path starts with //", "" },
-        { "a:b/c", 1, 64, "path with : and no leading /", "" },
+        { "a:b/c", 1, 64, "path has : before its first /", "" },
         { "/a%zz", 1, 64, "bad %XX in path", "" },
         { huge, 0, 2048, "path too long", " (over 1 KB)" },
         { pairs, 1, 2048, "path too long", " (65 query pairs)" },

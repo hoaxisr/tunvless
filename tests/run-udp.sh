@@ -7,10 +7,14 @@
 #   1. datagram boundaries. VLESS carries datagrams in a stream with a two-byte length, and the
 #      TLS record knows nothing of them: one datagram may span two records, and one record may
 #      bring one and a half datagrams. A reassembly bug looks like "works, but sometimes the data is
-#      wrong", so the CONTENT of every answer is compared, not only their count;
+#      wrong", so the CONTENT of every answer is compared, not only their count. The server
+#      echoes in pieces cut between the length bytes and inside datagrams (fake-vless.py,
+#      echo_in_pieces), so these records come every time, not by chance;
 #   2. sizes at the edges: 1 byte, exactly the MTU, and above the MTU (that one reaches the
 #      client in fragments, and its stack must reassemble them);
-#   3. one stream per address-port pair: two targets at once must not get mixed up;
+#   3. one stream per address-port pair: two targets at once must not get mixed up. Every answer
+#      must come from the address and port it was sent to, and the server must have been asked
+#      for exactly one stream to each pair;
 #   4. no ICMP refusal. If the tunnel answered UDP with "port unreachable", the client would
 #      decide the port is closed, and QUIC would fail even with datagrams carried correctly.
 #
@@ -69,10 +73,11 @@ fi
 # WHOLE and the same. ICMP is read on a raw socket: "port unreachable" would mean UDP is not
 # supported, and that must be SEEN, not show up as a timeout.
 rc=0
-ip netns exec "$NS" python3 - > "$WORK/out.txt" 2>&1 <<'PY' || rc=$?
-import socket, struct, sys, time
+ip netns exec "$NS" python3 - "$WORK/srv.log" > "$WORK/out.txt" 2>&1 <<'PY' || rc=$?
+import re, socket, sys, time
 
 TARGET_A, TARGET_B = "203.0.113.7", "203.0.113.9"
+SRV_LOG = sys.argv[1]
 fails = []
 
 def check(name, ok, detail=""):
@@ -98,18 +103,33 @@ def drain(sock):
             return n
 
 
-def echo(sock, host, port, payload, timeout=6.0):
-    """Send a datagram and return the answer (None on timeout)."""
-    drain(sock)
-    sock.sendto(payload, (host, port))
+def recv(sock, timeout):
+    """One datagram and where it came from, (None, None) on timeout."""
     end = time.time() + timeout
     while time.time() < end:
         try:
-            data, _ = sock.recvfrom(65535)
-            return data
+            return sock.recvfrom(65535)
         except BlockingIOError:
             time.sleep(0.02)
-    return None
+    return None, None
+
+
+def echo(sock, host, port, payload, timeout=6.0):
+    """Send a datagram and return the answer and its source.
+
+    The source matters as much as the bytes: the echo server answers on whatever stream the
+    datagram came by, so a datagram carried by another flow's stream comes back unchanged, but
+    from that flow's address or port.
+    """
+    drain(sock)
+    sock.sendto(payload, (host, port))
+    return recv(sock, timeout)
+
+
+def verdict(r, src, p, host, port):
+    if r == p and src == (host, port):
+        return True, ""
+    return False, "got %s from %s" % (None if r is None else len(r), src)
 
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.setblocking(False)
@@ -118,9 +138,7 @@ s.bind(("", 0))
 # 1. A plain datagram. Being the first, it also tests setup: the handshake with the node
 #    happens after the datagram is already in the early-data buffer.
 p = b"quic-ish-initial-" + bytes(range(200))
-r = echo(s, TARGET_A, 443, p)
-check("217-byte datagram echoed unchanged", r == p,
-      "" if r == p else "got %r" % (None if r is None else len(r)))
+check("217-byte datagram echoed unchanged", *verdict(*echo(s, TARGET_A, 443, p), p, TARGET_A, 443))
 
 # 2. Sizes at the edges. One byte is the minimum; 1472 is exactly the MTU (1500 - 20 - 8);
 #    3000 is above the MTU IN BOTH DIRECTIONS: upstream it arrives in fragments the tunnel
@@ -128,9 +146,8 @@ check("217-byte datagram echoed unchanged", r == p,
 #    broken the echo does not match.
 for n in (1, 1472, 3000):
     p = bytes((i * 37 + n) % 251 for i in range(n))
-    r = echo(s, TARGET_A, 443, p)
-    check("%d-byte datagram echoed unchanged" % n, r == p,
-          "" if r == p else "got %s" % (None if r is None else len(r)))
+    check("%d-byte datagram echoed unchanged" % n,
+          *verdict(*echo(s, TARGET_A, 443, p), p, TARGET_A, 443))
 
 # 3. A burst: boundaries must not merge. UDP promises no order, so the answers are compared
 #    as a set.
@@ -138,27 +155,36 @@ drain(s)
 sent = [bytes([i]) * (100 + i) for i in range(8)]
 for p in sent:
     s.sendto(p, (TARGET_A, 443))
-got, end = [], time.time() + 8
-while len(got) < len(sent) and time.time() < end:
-    try:
-        got.append(s.recvfrom(65535)[0])
-    except BlockingIOError:
-        time.sleep(0.02)
-check("burst of 8: all echoed unchanged", sorted(got) == sorted(sent),
+got = []
+while len(got) < len(sent):
+    r, src = recv(s, 8)
+    if r is None:
+        break
+    got.append((r, src))
+check("burst of 8: all echoed unchanged",
+      sorted(got) == sorted((p, (TARGET_A, 443)) for p in sent),
       "got %d of %d" % (len(got), len(sent)))
 
-# 4. Two targets at once: each has its own stream to the node, and they must not mix.
-s2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s2.setblocking(False)
+# 4. Two targets at once, from one socket: each has its own stream to the node, and they must
+#    not mix. Only the source of each answer can show it: a datagram sent into the other
+#    target's stream comes back unchanged, but from that target.
+drain(s)
 pa, pb = b"aaaa-to-A" * 10, b"bbbb-to-B" * 10
-ra = echo(s, TARGET_A, 443, pa)
-rb = echo(s2, TARGET_B, 443, pb)
-check("two targets did not mix", ra == pa and rb == pb,
-      "" if ra == pa and rb == pb else "A:%r B:%r" % (ra and len(ra), rb and len(rb)))
+s.sendto(pa, (TARGET_A, 443))
+s.sendto(pb, (TARGET_B, 443))
+got = {}
+for _ in range(2):
+    r, src = recv(s, 6)
+    if r is None:
+        break
+    got[r] = src
+check("two targets did not mix", got == {pa: (TARGET_A, 443), pb: (TARGET_B, 443)},
+      "" if len(got) == 2 else "got %d of 2" % len(got))
 
 # 5. Another port of the same address is a separate stream too.
-r = echo(s, TARGET_A, 51820, b"wireguard-keepalive")
-check("another port gets its own stream", r == b"wireguard-keepalive")
+p = b"wireguard-keepalive"
+check("another port gets its own stream",
+      *verdict(*echo(s, TARGET_A, 51820, p), p, TARGET_A, 51820))
 
 # 6. No ICMP destination unreachable (type 3) may arrive.
 unreach = 0
@@ -170,6 +196,13 @@ try:
 except BlockingIOError:
     pass
 check("no ICMP unreachable for UDP", unreach == 0, "got %d" % unreach)
+
+# 7. What the node saw: one stream per address-port pair, each asking for that address and
+#    port. The server logs a stream as it opens it, before the first echo.
+seen = sorted(re.findall(r"UDP stream to (\S+):(\d+)$", open(SRV_LOG).read(), re.M))
+want = sorted([(TARGET_A, "443"), (TARGET_B, "443"), (TARGET_A, "51820")])
+check("the node got one stream per address and port", seen == want,
+      "" if seen == want else "streams: %s" % seen)
 
 print("\nfailures: %d" % len(fails))
 sys.exit(1 if fails else 0)
@@ -186,13 +219,4 @@ if [ "$rc" -ne 0 ] || ! grep -q "^failures: 0" "$WORK/out.txt"; then
     tail -5 "$WORK/srv.log" | sed 's/^/    /' || true
     exit 1
 fi
-# How many streams to the node the tunnel opened: one per address-port pair, which is why UDP
-# costs more than TCP here. The server logs a stream when it CLOSES, so stop the tunnel first.
-kill "$TUN_PID" 2>/dev/null || true
-TUN_PID=""
-sleep 1
-# For information, not a verdict: the server may not log the last stream before it is
-# stopped. The number shows there are several streams (one per address-port pair), not one.
-echo "  UDP streams to the node: $(grep -c 'UDP stream closed' "$WORK/srv.log" || true) (2 addresses, 2 ports: up to 4)"
-echo "  datagrams the server received: $(sed -n 's/.* \([0-9]*\) datagrams$/\1/p' "$WORK/srv.log" | awk '{s+=$1} END {print s+0}')"
 exit 0

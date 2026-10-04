@@ -18,6 +18,7 @@ internet either.
 """
 import argparse
 import os
+import select
 import socket
 import socketserver
 import sys
@@ -26,6 +27,12 @@ import time
 
 ADDR_IPV4, ADDR_DOMAIN, ADDR_IPV6 = 1, 2, 3
 CMD_TCP, CMD_UDP = 1, 2
+
+# The body of every answer: this filler over and over (with --kbps, its first chunk bytes over
+# and over). Fixed, because generating 64 KB per chunk made Python, not the tunnel, the
+# bottleneck; at module level, so a test can rebuild the body and compare what it got
+# (tests/run-tunnel.sh).
+FILLER = bytes(i * 131 % 251 for i in range(64 * 1024))
 
 
 def recv_exactly(sock, n):
@@ -91,7 +98,7 @@ class Handler(socketserver.BaseRequestHandler):
             if self.server.udp_relay:
                 self.relay_udp(sock, addr, port)
             else:
-                self.serve_udp(sock)
+                self.serve_udp(sock, addr, port)
             return
 
         # Port 9 (discard): a connection that stays OPEN and silent.
@@ -187,7 +194,7 @@ class Handler(socketserver.BaseRequestHandler):
         print("fake-vless: sent %d bytes" % sent, file=sys.stderr, flush=True)
 
 
-    def serve_udp(self, sock):
+    def serve_udp(self, sock, addr, port):
         """A UDP stream (command 2): datagrams with a two-byte length, ECHOED back.
 
         An echo, because what is tested is the transfer itself: boundaries kept, bytes intact,
@@ -195,33 +202,62 @@ class Handler(socketserver.BaseRequestHandler):
 
         The answer reuses the length that ARRIVED: computing its own would hide exactly the
         error this checks for (a lost or shifted length).
+
+        The destination from the request is logged as the stream opens: the echo does not depend
+        on it, so the log is the only place a test can see which streams the tunnel opened.
         """
+        print("fake-vless: UDP stream to %s:%d" % (addr, port), file=sys.stderr, flush=True)
         sock.sendall(b"\x00\x00")               # VLESS response: version, no addon
         buf = b""
         n_dg = 0
         try:
             while True:
-                if len(buf) < 2:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                # What comes within 20 ms goes back together, so a burst is echoed as one run.
+                while select.select([sock], [], [], 0.02)[0]:
                     chunk = sock.recv(65536)
                     if not chunk:
                         break
                     buf += chunk
-                    continue
-                want = (buf[0] << 8) | buf[1]
-                if len(buf) < 2 + want:
-                    chunk = sock.recv(65536)
-                    if not chunk:
-                        break
-                    buf += chunk
-                    continue
-                payload = buf[2:2 + want]
-                buf = buf[2 + want:]
-                n_dg += 1
-                # Same framing back. A zero-length datagram is legal, and so is its echo.
-                sock.sendall(bytes([want >> 8, want & 255]) + payload)
+                frames = []
+                while len(buf) >= 2 and len(buf) >= 2 + ((buf[0] << 8) | buf[1]):
+                    want = (buf[0] << 8) | buf[1]
+                    # Same framing back. A zero-length datagram is legal, and so is its echo.
+                    frames.append(buf[:2 + want])
+                    buf = buf[2 + want:]
+                n_dg += len(frames)
+                self.echo_in_pieces(sock, frames)
         except OSError:
             pass
         print("fake-vless: UDP stream closed, %d datagrams" % n_dg, file=sys.stderr, flush=True)
+
+    @staticmethod
+    def echo_in_pieces(sock, frames):
+        """Send framed datagrams back in writes cut where a TLS node may cut its records, with a
+        pause after each, so the tunnel reads every piece as a record of its own.
+
+        Every other datagram is cut twice: between its two length bytes and in the middle. A
+        datagram that is not cut rides whole in the record with the tail of the one before it and
+        the first byte of the next. So records end between length bytes and inside a datagram,
+        and one record brings parts of three datagrams; a local echo in one write per datagram
+        would show none of it.
+        """
+        out = b"".join(frames)
+        if not out:
+            return
+        cuts, at = [], 0
+        for i, f in enumerate(frames):
+            if i % 2 == 0:
+                cuts += [at + 1, at + 2 + (len(f) - 2) // 2]
+            at += len(f)
+        prev = 0
+        for c in sorted(set(c for c in cuts if 0 < c < len(out))) + [len(out)]:
+            sock.sendall(out[prev:c])
+            time.sleep(0.005)
+            prev = c
 
 
     def relay_udp(self, sock, addr, port):
@@ -295,9 +331,7 @@ def main():
     srv.body_n = a.mb * 1024 * 1024
     srv.udp_relay = a.udp_relay
     srv.kbps = a.kbps
-    # A fixed filler: the content does not matter, and generating 64 KB per chunk made Python,
-    # not the tunnel, the bottleneck.
-    srv.filler = bytes(i * 131 % 251 for i in range(64 * 1024))
+    srv.filler = FILLER
     print("fake-vless: %s:%d, serves %d MB" % (a.bind, a.port, a.mb), flush=True)
     try:
         srv.serve_forever()
