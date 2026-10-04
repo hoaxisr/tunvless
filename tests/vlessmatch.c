@@ -17,9 +17,10 @@
  * HOW IT WORKS WITHOUT A NODE OR A NETWORK. TCP setup goes through the g_tcp_dial seam
  * (src/proto/transport/trdial.c). The test hands the client one end of a socketpair and speaks
  * the server half of TLS 1.3 on the other: it parses the ClientHello, takes its key_share,
- * computes X25519, derives the handshake key schedule (RFC 8446 §7.1) and sends encrypted
- * EncryptedExtensions, Certificate when needed, and Finished. tests/fake-vless.py speaks only
- * security=none, and tests/run-reality.sh needs sing-box, root and network namespaces.
+ * computes X25519, derives the handshake key schedule (RFC 8446 §7.1), sends encrypted
+ * EncryptedExtensions, Certificate when needed, and Finished, and checks the client's Finished as
+ * a real server would. tests/fake-vless.py speaks only security=none, and tests/run-reality.sh
+ * needs sing-box, root and network namespaces.
  *
  * WHY THE SERVER HALF IS IN C, NOT PYTHON. The test is part of `make crypto-test`, and CI also runs
  * it under qemu for other architectures; it needs nothing beyond the crypto library the client is
@@ -164,6 +165,7 @@ struct srv {
     uint64_t seq;
     struct sc_hash_ctx tr;             /* handshake transcript */
     int rc;                            /* != 0: the half broke by itself, not by plan */
+    int fin_sent;                      /* the server Finished went out */
     /* Data path (plan.upg): handshake secrets and what the server saw. */
     unsigned char hs[HLEN], c_hs[HLEN];
     int alpn_h11;                      /* the ClientHello ALPN is http/1.1 alone */
@@ -175,6 +177,9 @@ struct srv {
 static unsigned char g_rs_priv[32], g_rs_pub[32];
 /* What the server saw in the ALPN of the last ClientHello (for runs through run_case). */
 static volatile int g_seen_h11 = -1;
+/* After the last run_case: 1 if the client's Finished came and verifies, 0 if the client sent
+ * nothing after its ClientHello, -1 for anything else. */
+static int g_cfin = -1;
 
 /* HKDF-Expand-Label from RFC 8446 §7.1. Our own copy, not a call to the static one in tls13.c:
  * the test must compute the label ITSELF, or a bug in the client's wrapper would agree with
@@ -524,6 +529,40 @@ static int rec_seal(struct dir *d, int fd, const unsigned char *msg, size_t n) {
     return wr_all(fd, out, 5 + total);
 }
 
+/* The client's Finished (RFC 8446 §4.4.4), checked as a real server checks it: a record under the
+ * client handshake key holding an HMAC, keyed by the client finished key, over the transcript up
+ * to the server Finished. 1 if it verifies, -1 for anything else. */
+static int client_finished(struct srv *s, struct dir *d) {
+    unsigned char rec[512], th[HLEN], fkey[HLEN], vd[HLEN], inner;
+    size_t n;
+    tr_snapshot(&s->tr, th);
+    if (dir_set(d, s->c_hs) || rec_open(d, s->fd, rec, sizeof(rec), &n, &inner)) return -1;
+    if (inner != 0x16 || n != 4 + HLEN || memcmp(rec, "\x14\x00\x00\x20", 4)) return -1;
+    if (xlabel(s->c_hs, "finished", NULL, 0, fkey, HLEN)) return -1;
+    if (sc_hmac(SC_SHA256, fkey, HLEN, th, HLEN, vd) != 0) return -1;
+    return memcmp(rec + 4, vd, HLEN) ? -1 : 1;
+}
+
+/* Sec-WebSocket-Accept (RFC 6455 §1.3): base64 of SHA-1 over the key and the GUID. Computed
+ * here, not by tr_ws_accept: the client checks the answer with that function, and a bug in it
+ * would agree with itself. */
+static int ws_accept(const char *key, char out[29]) {
+    static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char in[96];
+    unsigned char h[21] = { 0 };                  /* SHA-1 and a zero byte: 7 groups of 3 */
+    int n = snprintf(in, sizeof(in), "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key);
+    if (n < 0 || (size_t)n >= sizeof(in) || sc_hash(SC_SHA1, in, (size_t)n, h) != 0) return -1;
+    for (int i = 0, o = 0; i < 21; i += 3) {
+        unsigned v = ((unsigned)h[i] << 16) | ((unsigned)h[i + 1] << 8) | h[i + 2];
+        out[o++] = T[(v >> 18) & 63];
+        out[o++] = T[(v >> 12) & 63];
+        out[o++] = T[(v >> 6) & 63];
+        out[o++] = i < 18 ? T[v & 63] : '=';
+    }
+    out[28] = '\0';
+    return 0;
+}
+
 static int app_phase_dirs(struct srv *s, struct dir *cd, struct dir *sd) {
     unsigned char zeros[HLEN] = {0}, empty[HLEN], derived[HLEN], master[HLEN], th[HLEN];
     unsigned char c_ap[HLEN], s_ap[HLEN];
@@ -537,8 +576,8 @@ static int app_phase_dirs(struct srv *s, struct dir *cd, struct dir *sd) {
     static __thread unsigned char buf[16384 + 256];
     size_t n;
     unsigned char inner;
-    if (dir_set(cd, s->c_hs) || rec_open(cd, s->fd, buf, sizeof(buf), &n, &inner) || inner != 0x16)
-        return -1;                                       /* client Finished */
+    /* A wrong client Finished ends the connection here, before the Upgrade answer. */
+    if (client_finished(s, cd) != 1) return -1;
     if (dir_set(cd, c_ap) || dir_set(sd, s_ap)) return -1;
 
     size_t rn = 0;
@@ -557,7 +596,7 @@ static int app_phase_dirs(struct srv *s, struct dir *cd, struct dir *sd) {
         const char *kp = strstr(s->req, "\r\nSec-WebSocket-Key: ");
         if (!kp) return -1;
         sscanf(kp + 21, "%31[^\r]", key);
-        tr_ws_accept(key, acc);
+        if (ws_accept(key, acc)) return -1;
         k = snprintf(resp, sizeof(resp), "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
                      "Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", acc);
         resp[k++] = (char)0x82; resp[k++] = 5;           /* server frame: unmasked */
@@ -607,8 +646,10 @@ static void *server_half(void *arg) {
     if (rd_rec(s->fd, &type, ch, sizeof(ch), &ch_n) || type != 0x16) return NULL;
     if (pl->hangup) { s->rc = 0; close(s->fd); s->fd = -1; return NULL; }
     /* ALPN exactly "http/1.1": extension 0x0010 of length 11, list of length 9 (ws and
-     * httpupgrade; the other transports send "h2, http/1.1"). */
-    s->alpn_h11 = memmem(ch, ch_n, "\x00\x10\x00\x0b\x00\x09\x08http/1.1", 11) != NULL;
+     * httpupgrade; the other transports send "h2, http/1.1"). All 15 bytes are compared, the
+     * name included. */
+    static const char H11[] = "\x00\x10\x00\x0b\x00\x09\x08http/1.1";
+    s->alpn_h11 = memmem(ch, ch_n, H11, sizeof(H11) - 1) != NULL;
     g_seen_h11 = s->alpn_h11;
 
     unsigned char cpub[32], sid[32];
@@ -785,6 +826,7 @@ finished:;
     memcpy(fin + 4, vd, HLEN);
     if (send_enc(s, fin, sizeof(fin))) return NULL;
     sc_hash_update(&s->tr, fin, sizeof(fin));
+    s->fin_sent = 1;
 
     if (pl->upg) { s->rc = app_phase(s); return NULL; }
     s->rc = 0;
@@ -876,6 +918,16 @@ static int run_case(const struct plan *pl, struct vless_node *n, char *reason, s
                               (c.xh.up.link.tls.wr.ctx_ready ? 1 : 0);
 
     pthread_join(th, NULL);
+    /* What the client sent after the server Finished. vless_connect has returned, so a Finished
+     * it sent is already in the socket: read without waiting. */
+    g_cfin = 0;
+    unsigned char b;
+    if (s.fd >= 0 && fcntl(s.fd, F_SETFL, O_NONBLOCK) == 0 && recv(s.fd, &b, 1, MSG_PEEK) > 0) {
+        struct dir *d = calloc(1, sizeof(*d));
+        g_cfin = d && s.fin_sent ? client_finished(&s, d) : -1;
+        if (d && d->ready) sc_aead_free(&d->g);
+        free(d);
+    }
     if (s.fd >= 0) close(s.fd);
     /* The client's end of the pair is closed by vless_connect itself (or by transport_close on
      * success). If it is not, that is the finding, and the caller's descriptor count shows it. */
@@ -969,6 +1021,12 @@ int main(void) {
      * client closes without reading to the end. Without this the test would die of SIGPIPE
      * instead of reporting the result. */
     signal(SIGPIPE, SIG_IGN);
+    /* Line by line: a leak still there at exit makes LeakSanitizer end the process before stdio
+     * flushes, and a buffered report would lose its last checks. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
+    /* Without /proc every descriptor check would compare -1 with -1 and pass. */
+    check("descriptors can be counted (/proc/self/fd)", 1, fd_count() > 0);
 
     heap_check_selftest();
 
@@ -1028,6 +1086,13 @@ int main(void) {
             check_str(what, why_want[i], why);
         }
 
+        /* Our Finished goes only to a server that has proved itself (tls13.c). Not after a
+         * hangup: the server's end is gone, and there is nothing to read. */
+        if (!plans[i].hangup) {
+            snprintf(what, sizeof(what), "%s: no client Finished sent", plans[i].name);
+            check(what, 0, g_cfin);
+        }
+
         /* Twenty attempts in a row, as on a router, where the spare pool refills on every SYN.
          * A per-attempt leak becomes visible here instead of staying a rounding error. */
         for (int k = 0; k < 20; k++) {
@@ -1080,6 +1145,7 @@ int main(void) {
                 g_seen_h11 = -1;
                 rc = run_case(&up, &rn, NULL, 0, NULL);
                 check("reality: temporary certificate accepted, connection established", 0, rc);
+                check("reality: the server verified the client's Finished", 1, g_cfin);
                 check("reality + tcp: ALPN is not http/1.1 alone", 0, g_seen_h11);
                 check("reality + tcp: descriptor count restored", fd0, fd_count());
                 continue;
@@ -1166,6 +1232,13 @@ int main(void) {
                 snprintf(what, sizeof(what), "%s: reason reported", tls_plans[i].name);
                 check_str(what, tls_why[i], why);
             }
+
+            /* The handshake completes for success and TR_ENOH2 (the ALPN is checked after it):
+             * then the server must have a Finished that verifies; otherwise none at all. */
+            const int done = tls_want[i] == 0 || tls_want[i] == TR_ENOH2;
+            snprintf(what, sizeof(what), done ? "%s: client Finished verifies"
+                                              : "%s: no client Finished sent", tls_plans[i].name);
+            check(what, done, g_cfin);
 
             for (int k = 0; k < 20; k++) {
                 int again = run_case(&tls_plans[i], &tn, NULL, 0, NULL);
@@ -1294,7 +1367,11 @@ int main(void) {
         check("security=none over tcp: connection established", 0, rc);
         check("security=none: no TLS set up", 1, c.link.plain);
         if (rc == 0) transport_close(&c);
-        check("security=none: transport_close closed the descriptor", -1, c.link.fd);
+        /* Closed, not only marked closed: the other end of the pair reads end of stream (the
+         * client wrote nothing, and nothing else holds its end). */
+        unsigned char b;
+        check("security=none: transport_close closed the descriptor", 0,
+              recv(sv[1], &b, 1, MSG_DONTWAIT));
         close(sv[1]);
         check("security=none: nothing left on the heap", 0, LEAK_CHECK());
     }
