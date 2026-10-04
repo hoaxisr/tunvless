@@ -157,8 +157,13 @@ static int grpc_read(struct transport *t, unsigned char *d, size_t cap, size_t *
  * the old location. */
 static void grpc_moved(struct transport *t) { t->h2.io.ctx = &t->link; }
 
+/* The end of the stream is known (END_STREAM came with the last data, or an end waits for the
+ * next h2_read: pend_err) but only the next read can report it. The socket stays silent once
+ * the server has sent everything, so without this the client got no FIN until idle cleanup. */
+static int grpc_pending(const struct transport *t) { return t->h2.done || t->h2.pend_err; }
+
 const struct transport_ops tr_grpc = {
     .name = "grpc", .alpn = "h2", .zc = 0,
     .open = grpc_open, .write = grpc_write, .read = grpc_read,
-    .moved = grpc_moved, .close = NULL,
+    .moved = grpc_moved, .close = NULL, .pending = grpc_pending,
 };

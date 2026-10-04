@@ -306,6 +306,10 @@ static int xhttp_read(struct transport *t, unsigned char *d, size_t cap, size_t 
  * the second link; for stream-up it is set before the move, during open). Fixing only the first
  * sends the upload of a connection taken from the spare pool through the second link of another
  * spare session, set up in the same slot right after. */
+/* The download's end is known but only the next read can report it (see grpc_pending). Only
+ * the download stream counts: the answers to upload chunks (up.h2) end with every chunk. */
+static int xhttp_pending(const struct transport *t) { return t->h2.done || t->h2.pend_err; }
+
 static void xhttp_moved(struct transport *t) {
     t->h2.io.ctx = &t->link;
     t->xh.up.h2.io.ctx = &t->xh.up;
@@ -326,5 +330,5 @@ static void xhttp_close(struct transport *t) {
 const struct transport_ops tr_xhttp = {
     .name = "xhttp", .alpn = "h2", .zc = 0,
     .open = xhttp_open, .write = xhttp_write, .read = xhttp_read,
-    .moved = xhttp_moved, .close = xhttp_close,
+    .moved = xhttp_moved, .close = xhttp_close, .pending = xhttp_pending,
 };

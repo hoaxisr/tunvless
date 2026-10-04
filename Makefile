@@ -136,9 +136,11 @@ $(T)/tunnamematch: tests/tunnamematch.c src/tunnel/tun.c $(HDR)
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/tunnamematch.c src/tunnel/tun.c
 
-$(T)/grpcmatch: tests/grpcmatch.c src/proto/transport/trgrpc.c $(HDR)
+# grpcmatch includes trgrpc.c (its framing functions are static) and links the rest for real.
+GRPC_TEST_SRC := $(filter-out src/proto/transport/trgrpc.c,$(XHUP_SRC)) src/proto/transport/trxhttp.c
+$(T)/grpcmatch: tests/grpcmatch.c tests/trvenc-stub.c src/proto/transport/trgrpc.c $(GRPC_TEST_SRC) $(HDR)
 	@mkdir -p $(T)
-	$(CC) $(T_CFLAGS) -o $@ tests/grpcmatch.c
+	$(CC) $(T_CFLAGS) -o $@ tests/grpcmatch.c tests/trvenc-stub.c $(GRPC_TEST_SRC) -lpthread
 
 $(T)/rtxmatch: tests/rtxmatch.c src/tunnel/rtx.c src/tunnel/rtx.h
 	@mkdir -p $(T)
@@ -202,10 +204,11 @@ $(T)/xudpprobe: tests/xudpprobe.c src/proto/vless/vldial.c $(CLIENT_SRC) $(T)/sc
 	$(CC) $(T_CFLAGS) -o $@ tests/xudpprobe.c src/proto/vless/vldial.c $(CLIENT_SRC) \
 		src/proto/transport/trdial.c src/proto/tls/roots.c $(T_CRYPTO)
 
-interop: $(T)/vencprobe $(T)/xudpprobe
+interop: $(T)/vencprobe $(T)/xudpprobe $(O)/tunvless
 	BUILD=$(T) sh tests/venc.sh
 	BUILD=$(T) sh tests/xudp.sh
 	BUILD=$(T) sh tests/ech.sh
+	TUNVLESS=$(O)/tunvless sh tests/run-grpc.sh
 
 e2e: $(O)/tunvless
 	TUNVLESS=$(O)/tunvless sh tests/run-tunnel.sh

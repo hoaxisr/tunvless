@@ -4,3 +4,4 @@
 /.build/
 # wolfSSL sources fetched by build/wolfssl/fetch.sh.
 /third_party/
+__pycache__/

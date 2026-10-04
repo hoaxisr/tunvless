@@ -46,7 +46,16 @@ struct h2 {
     unsigned char frame_type;
     unsigned char frame_flags;
     int frame_ours;             /* the frame belongs to the current stream */
-    int frame_conn;             /* the frame is on stream 0, the connection's */
+    uint32_t frame_sid;         /* the frame's stream: 0 the connection, sid ours, other closed */
+    /* An end (RST_STREAM, GOAWAY, a parse failure) found by h2_read after it had already
+     * gathered data in the same call. The data is returned (code 0) and this code by the next
+     * call: callers look at the code before got, and Xray sends a response's last data, the
+     * closing HEADERS and RST_STREAM(NO_ERROR) in one TLS record. 0: none. */
+    int pend_err;
+    /* GOAWAY came (RFC 9113 §6.8): no new streams on this connection; the current one, if its
+     * id is within last_stream_id and the code is NO_ERROR, is served to the end. */
+    unsigned char goaway;
+    char why[56];               /* how the server ended the stream: "RST_STREAM CANCEL" ... */
     /* Framing inside DATA and HEADERS bodies that is not data (RFC 7540 §6.1, §6.2):
      * pad_wait — the pad length byte is still ahead (PADDED); skip_left — HEADERS priority
      * bytes left to skip (PRIORITY); pad_left — padding length at the end of the frame. They

@@ -58,6 +58,9 @@
  * allows it in SETTINGS. */
 #define DEFAULT_MAX_FRAME 16384
 
+/* How the server last ended a stream, for h2_strerror. Per thread, like g_last_status. */
+static __thread char g_reset_why[64];
+
 static void put32(unsigned char *p, uint32_t v) {
     p[0] = (unsigned char)(v >> 24); p[1] = (unsigned char)(v >> 16);
     p[2] = (unsigned char)(v >> 8);  p[3] = (unsigned char)v;
@@ -293,6 +296,14 @@ int h2_start(struct h2 *h, const struct h2_io *io, const char *authority,
 int h2_next(struct h2 *h, const char *authority, const char *path,
             const char *content_type, const char *referer, int method) {
     if (!h->started) return H2_EPROTO;
+    /* After GOAWAY the server takes no new streams (RFC 9113 §6.8): the request would get no
+     * answer. Refusing now means reconnecting now, not after a timeout. */
+    if (h->goaway) {
+        snprintf(h->why, sizeof(h->why), "GOAWAY: no new streams");
+        snprintf(g_reset_why, sizeof(g_reset_why), "%s", h->why);
+        return H2_ERESET;
+    }
+    h->pend_err = 0;                 /* the previous chunk's end does not carry over */
 
     /* The id grows by two: client streams are odd (RFC 7540 §5.1.1). Reusing a closed
      * stream's id is a connection error, not a stream error: the whole connection drops. */
@@ -349,6 +360,26 @@ static int window_refill(struct h2 *h) {
     return 0;
 }
 
+
+/* The name of an HTTP/2 error code (RFC 9113 §7), for the log: CANCEL (the server finished its
+ * handler), FLOW_CONTROL_ERROR (we overran the window) and ENHANCE_YOUR_CALM (too many PINGs) are
+ * different problems. */
+static const char *h2_err_name(uint32_t code) {
+    static const char *const n[] = {
+        "NO_ERROR", "PROTOCOL_ERROR", "INTERNAL_ERROR", "FLOW_CONTROL_ERROR", "SETTINGS_TIMEOUT",
+        "STREAM_CLOSED", "FRAME_SIZE_ERROR", "REFUSED_STREAM", "CANCEL", "COMPRESSION_ERROR",
+        "CONNECT_ERROR", "ENHANCE_YOUR_CALM", "INADEQUATE_SECURITY", "HTTP_1_1_REQUIRED",
+    };
+    return code < sizeof(n) / sizeof(n[0]) ? n[code] : "unknown code";
+}
+
+/* Record how the stream ended and return H2_ERESET. Kept in the connection's state: other
+ * connections of the same loop thread may be read before the code reaches the caller. */
+static int h2_reset(struct h2 *h, const char *what, uint32_t code) {
+    snprintf(h->why, sizeof(h->why), "%s %s", what, h2_err_name(code));
+    return H2_ERESET;
+}
+
 /* Handles a control frame whose body is complete. */
 static int ctl_handle(struct h2 *h) {
     switch (h->frame_type) {
@@ -386,7 +417,7 @@ static int ctl_handle(struct h2 *h) {
             if (h->ctl_n < 4) return 0;
             /* A late one for an earlier stream (packet-up opens one per chunk) opens nothing of
              * ours: adding it to the connection window would overrun the server's. */
-            if (!h->frame_ours && !h->frame_conn) return 0;
+            if (h->frame_sid != 0 && !h->frame_ours) return 0;
             int32_t inc = (int32_t)(get32(h->ctl) & 0x7FFFFFFF);
             /* The 2^31-1 limit is mandatory (RFC 7540 §6.9.1). Adding without the check is
              * signed overflow; in practice the window goes NEGATIVE for good, h2_write answers
@@ -396,7 +427,7 @@ static int ctl_handle(struct h2 *h) {
              * window would disagree with the server's count and stall anyway, for no visible
              * reason. */
             int64_t w = (int64_t)(h->frame_ours ? h->send_win : h->send_win_conn) + inc;
-            if (w > 0x7FFFFFFF) return H2_ERESET;
+            if (w > 0x7FFFFFFF) return h2_reset(h, "window past 2^31-1,", 3);
             if (h->frame_ours) h->send_win = (int32_t)w;
             else h->send_win_conn = (int32_t)w;
             return 0;
@@ -407,12 +438,24 @@ static int ctl_handle(struct h2 *h) {
              * RST_STREAM(NO_ERROR) on a stream whose handler has finished; with packet-up it
              * arrives for an earlier chunk while the next one is open. */
             if (!h->frame_ours) return 0;
-            return H2_ERESET;
+            return h2_reset(h, "RST_STREAM", h->ctl_n >= 4 ? get32(h->ctl) : 0);
 
-        case FR_GOAWAY:
-            /* GOAWAY is always on stream 0, so it is never "ours", yet it always concerns us:
-             * it ends the CONNECTION, which accepts no new requests after it. */
-            return H2_ERESET;
+        case FR_GOAWAY: {
+            /* The end of the CONNECTION: no new streams after it (h2_next refuses). The current
+             * stream is not necessarily over: last_stream_id says how far the server will go
+             * (RFC 9113 §6.8). A Go server closes gracefully with GOAWAY(NO_ERROR, the highest
+             * id), then PING and a second GOAWAY, and finishes the streams in progress. The
+             * stream ends here only on an error code or when our id is past last_stream_id. */
+            uint32_t last = h->ctl_n >= 4 ? get32(h->ctl) & 0x7FFFFFFFu : 0;
+            uint32_t code = h->ctl_n >= 8 ? get32(h->ctl + 4) : 0;
+            h->goaway = 1;
+            if (code != 0) return h2_reset(h, "GOAWAY", code);
+            if (h->sid > last) {
+                snprintf(h->why, sizeof(h->why), "GOAWAY: stream not accepted");
+                return H2_ERESET;
+            }
+            return 0;
+        }
     }
     return 0;
 }
@@ -493,9 +536,19 @@ static void status_peek(struct h2 *h, const unsigned char *p, size_t n) {
     }
 }
 
-int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
+/* Stop parsing the record with rc. Data this call has already put in out is RETURNED and rc
+ * postponed to the next call (pend_err): callers look at the code before got. */
+#define H2_STOP(code) do { int e_ = (code); if (*got) { h->pend_err = e_; goto deliver; } return e_; } while (0)
+
+static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
     *got = 0;
     if (!h->started) return H2_EPROTO;
+    if (h->pend_err) {
+        int e = h->pend_err;
+        h->pend_err = 0;
+        h->done = 1;                 /* the same end from now on */
+        return e;
+    }
     if (h->done) return H2_ERESET;
     /* The contract is checked BEFORE reading. A failure mid-frame (below) would drop the
      * record already read while the body counter stays, and the next frame would be read as a
@@ -525,7 +578,7 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
                  * frame, or it is a protocol error (RFC 7540 §6.1), not a reason to read past
                  * the end. */
                 h->pad_wait = 0;
-                if ((uint32_t)rec[p] + h->skip_left > h->frame_left - 1) return H2_EPROTO;
+                if ((uint32_t)rec[p] + h->skip_left > h->frame_left - 1) H2_STOP(H2_EPROTO);
                 h->pad_left = rec[p];
                 if (h->frame_type == FR_DATA) {
                     h->recv_credit_conn += 1;
@@ -556,7 +609,7 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
                  * frame (RFC 7540 §6.9.1). */
                 h->recv_credit_conn += (int32_t)take;
                 if (h->frame_ours) {
-                    if (*got + real > cap) return H2_ETOOBIG;
+                    if (*got + real > cap) H2_STOP(H2_ETOOBIG);
                     memcpy(out + *got, rec + p, real);
                     *got += real;
                     h->recv_credit += (int32_t)take;
@@ -589,7 +642,7 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
             if (h->frame_left == 0) {
                 if (h->frame_type != FR_DATA && h->frame_type != FR_HEADERS) {
                     rc = ctl_handle(h);
-                    if (rc) return rc;
+                    if (rc) H2_STOP(rc);
                 }
                 if ((h->frame_flags & FLAG_END_STREAM) && h->frame_ours &&
                     (h->frame_type == FR_DATA || h->frame_type == FR_HEADERS))
@@ -616,7 +669,7 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
          * parsing does that) and are dropped: their content is an empty 200 answer to an
          * upload. A non-200 status there goes to old_status. */
         h->frame_ours = (sid == h->sid);
-        h->frame_conn = (sid == 0);
+        h->frame_sid = sid;
         h->frame_peeked = 0;
         h->frame_left = len;
         h->ctl_n = 0;
@@ -628,7 +681,7 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
             h->pad_wait = (h->frame_flags & FLAG_PADDED) != 0;
             if (h->frame_type == FR_HEADERS && (h->frame_flags & FLAG_PRIORITY))
                 h->skip_left = 5;
-            if (h->pad_wait + h->skip_left > len) return H2_EPROTO;
+            if (h->pad_wait + h->skip_left > len) H2_STOP(H2_EPROTO);
         }
 
         /* A frame without a body is handled at once: the loop above would wait for bytes
@@ -636,15 +689,17 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
         if (len == 0) {
             if (h->frame_type != FR_DATA && h->frame_type != FR_HEADERS) {
                 rc = ctl_handle(h);
-                if (rc) return rc;
+                if (rc) H2_STOP(rc);
             }
             if ((h->frame_flags & FLAG_END_STREAM) && h->frame_ours) h->done = 1;
             h->frame_type = 0xFF;
         }
     }
 
+deliver:
     if (h->status > 0 && h->status != 200) { g_last_status = h->status; return H2_ESTATUS; }
     if (h->old_status) { g_last_status = h->old_status; return H2_ESTATUS; }
+    if (h->pend_err) return 0;       /* the stream is over: no point growing its window */
     rc = window_refill(h);
     if (rc) return rc;
     /* Zero bytes is a legal result: the record may have held only a PING or SETTINGS. An
@@ -652,6 +707,13 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
      * "nothing to give" from "end of stream", which is why the end comes as a code (H2_ERESET
      * from the next call), not as zero. */
     return 0;
+}
+
+int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
+    int rc = h2_read_in(h, out, cap, got);
+    if (rc == H2_ERESET)
+        snprintf(g_reset_why, sizeof(g_reset_why), "%s", h->why[0] ? h->why : "end of stream");
+    return rc;
 }
 
 /* Sends the data WHOLE or not at all.
@@ -699,7 +761,12 @@ const char *h2_strerror(int rc) {
             else                   snprintf(st, sizeof st, "server answered with a status other than 200");
             return st;
         }
-        case H2_ERESET: return "stream closed by the server (RST/GOAWAY)";
+        case H2_ERESET: {
+            static __thread char rs[112];
+            if (g_reset_why[0]) snprintf(rs, sizeof rs, "stream closed by the server (%s)", g_reset_why);
+            else                snprintf(rs, sizeof rs, "stream closed by the server (RST/GOAWAY)");
+            return rs;
+        }
         case H2_ETOOBIG: return "HTTP/2 frame too large";
         case H2_EWINDOW: return "HTTP/2 window closed";
         default: return "unknown HTTP/2 error";

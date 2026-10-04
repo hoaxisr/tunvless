@@ -660,6 +660,110 @@ int main(void) {
               0, total == 104 ? memcmp(all, want, 104) : 1);
     }
 
+    {
+        /* ---- the end of a stream in the SAME record as the last data -------------------
+         *
+         * Xray (grpc-go) ends a stream whose target has closed by flushing the data, the closing
+         * HEADERS with END_STREAM and RST_STREAM(NO_ERROR) in one TLS record. The data must be
+         * returned and the end come from the NEXT call: callers look at the code before got, so
+         * returning the reset at once dropped the data (a node probe failed on a working node,
+         * and the end of client responses was lost). */
+        static const unsigned char hdr200[] = { 0x88 };
+        static const unsigned char trailers[] = { 0x88 };      /* not read */
+        static const unsigned char no_error[4] = { 0, 0, 0, 0 };
+        struct h2 h;
+        struct fake_io io;
+        static unsigned char feed[512];
+        unsigned char out[H2_MIN_READ_CAP];
+        size_t got = 0, n = 0;
+
+        h2_open(&h, &io);
+        n += put_frame(feed + n, FR_HEADERS, FLAG_END_HEADERS, h.sid, hdr200, sizeof hdr200);
+        n += put_frame(feed + n, FR_DATA, 0, h.sid, (const unsigned char *)"hello", 5);
+        n += put_frame(feed + n, FR_DATA, 0, h.sid, (const unsigned char *)" world", 6);
+        n += put_frame(feed + n, FR_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, h.sid, trailers,
+                       sizeof trailers);
+        n += put_frame(feed + n, FR_RST_STREAM, 0, h.sid, no_error, 4);
+        io.feed = feed; io.feed_n = n; io.feed_pos = 0;
+        int rc = h2_read(&h, out, sizeof(out), &got);
+        check("data + END_STREAM + RST_STREAM in one record: first call, no error", 0, rc);
+        check("  all the data returned (11 bytes)", 11, (int)got);
+        check("  and intact", 0, got == 11 ? memcmp(out, "hello world", 11) : 1);
+        io.feed_pos = io.feed_n;
+        rc = h2_read(&h, out, sizeof(out), &got);
+        check("  second call: end of stream", H2_ERESET, rc);
+        check("  the reason names RST_STREAM and its code", 1,
+              strstr(h2_strerror(H2_ERESET), "RST_STREAM NO_ERROR") != NULL);
+        check("  and the same end after that", H2_ERESET, h2_read(&h, out, sizeof(out), &got));
+
+        /* The same without END_STREAM: the server reset the stream mid-response. */
+        h2_open(&h, &io);
+        n = 0;
+        n += put_frame(feed + n, FR_DATA, 0, h.sid, (const unsigned char *)"abc", 3);
+        static const unsigned char cancel[4] = { 0, 0, 0, 8 };
+        n += put_frame(feed + n, FR_RST_STREAM, 0, h.sid, cancel, 4);
+        io.feed = feed; io.feed_n = n; io.feed_pos = 0;
+        rc = h2_read(&h, out, sizeof(out), &got);
+        check("data + RST_STREAM(CANCEL): data returned", 3, rc == 0 ? (int)got : -1);
+        rc = h2_read(&h, out, sizeof(out), &got);
+        check("  then the reset, with its code named", 1,
+              rc == H2_ERESET && strstr(h2_strerror(rc), "CANCEL") != NULL);
+
+        /* RST_STREAM with no data before it: the reset at once. */
+        h2_open(&h, &io);
+        n = put_frame(feed, FR_RST_STREAM, 0, h.sid, cancel, 4);
+        io.feed = feed; io.feed_n = n; io.feed_pos = 0;
+        check("RST_STREAM without data: reset at once", H2_ERESET, h2_read(&h, out, sizeof(out), &got));
+    }
+
+    {
+        /* ---- GOAWAY (RFC 9113 §6.8) ------------------------------------------------------
+         *
+         * GOAWAY(NO_ERROR) with last_stream_id at or above our id is a graceful close: the
+         * server finishes the streams in progress. The stream ends only on an error code
+         * (ENHANCE_YOUR_CALM for too many PINGs, PROTOCOL_ERROR ...) or when our id is past
+         * last_stream_id. */
+        struct h2 h;
+        struct fake_io io;
+        static unsigned char feed[256];
+        unsigned char out[H2_MIN_READ_CAP];
+        size_t got = 0, n;
+        unsigned char ga[8];
+
+        h2_open(&h, &io);
+        put32(ga, 0x7FFFFFFFu); put32(ga + 4, 0);
+        n = put_frame(feed, FR_GOAWAY, 0, 0, ga, 8);
+        n += put_frame(feed + n, FR_DATA, 0, h.sid, (const unsigned char *)"tail", 4);
+        io.feed = feed; io.feed_n = n; io.feed_pos = 0;
+        int rc = h2_read(&h, out, sizeof(out), &got);
+        check("GOAWAY(NO_ERROR, last >= our id): the stream goes on", 0, rc);
+        check("  data after GOAWAY arrives", 4, (int)got);
+        check("  the connection is marked: no new streams", 1, h.goaway);
+        check("  h2_next after GOAWAY: refused at once",
+              H2_ERESET, h2_next(&h, "example.org", "/x/sid/1", "application/grpc", NULL, H2_POST));
+
+        h2_open(&h, &io);
+        put32(ga, 1); put32(ga + 4, 11);
+        n = put_frame(feed, FR_DATA, 0, h.sid, (const unsigned char *)"xy", 2);
+        n += put_frame(feed + n, FR_GOAWAY, 0, 0, ga, 8);
+        io.feed = feed; io.feed_n = n; io.feed_pos = 0;
+        rc = h2_read(&h, out, sizeof(out), &got);
+        check("data + GOAWAY(ENHANCE_YOUR_CALM): data returned", 2, rc == 0 ? (int)got : -1);
+        rc = h2_read(&h, out, sizeof(out), &got);
+        check("  then the end, the reason names the code", 1,
+              rc == H2_ERESET && strstr(h2_strerror(rc), "GOAWAY ENHANCE_YOUR_CALM") != NULL);
+
+        /* Our stream past last_stream_id was never reached: the end, NO_ERROR or not. */
+        h2_open(&h, &io);
+        h2_end_stream(&h);
+        h2_next(&h, "example.org", "/x/sid/1", "application/grpc", NULL, H2_POST);   /* stream 3 */
+        put32(ga, 1); put32(ga + 4, 0);
+        n = put_frame(feed, FR_GOAWAY, 0, 0, ga, 8);
+        io.feed = feed; io.feed_n = n; io.feed_pos = 0;
+        rc = h2_read(&h, out, sizeof(out), &got);
+        check("GOAWAY(last=1) on stream 3: the end", H2_ERESET, rc);
+    }
+
     printf("\n%s\n", fails ? "SOME CHECKS FAILED" : "all checks passed");
 
     return fails ? 1 : 0;
