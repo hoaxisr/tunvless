@@ -67,13 +67,27 @@ int main(void) {
 
     check("encryption of a foreign kind: node skipped", url("encryption=aes-128-gcm&type=tcp&security=none#n", &n) == 1);
     check_s("skip reason named", "encryption is not supported", n.skip_reason);
-    check("unknown mode: skipped",
-          url("encryption=mlkem768x25519plus.weird.0rtt.YHD4th3rx6hr8R22ZLUA6ivhJdHWNt8bsAcNYrNKxkQ&type=tcp&security=none#n", &n) == 1);
+    /* Each string below breaks one rule and keeps the rest, so that it is refused for that
+     * rule: the mode has six letters like the known ones, the key has a valid base64url length,
+     * the padding is valid. */
+#define ENC(mid) "encryption=mlkem768x25519plus." mid "&type=tcp&security=none#n"
+#define KEY "YHD4th3rx6hr8R22ZLUA6ivhJdHWNt8bsAcNYrNKxkQ"
+    check("first padding of exactly 35, a 32-byte key: usable",
+          url(ENC("native.0rtt.100-35-35." KEY), &n) == 0);
+    check("unknown mode: skipped", url(ENC("custom.0rtt." KEY), &n) == 1);
+    /* 40 characters: 30 bytes. */
     check("key neither 32 nor 1184 bytes: skipped",
-          url("encryption=mlkem768x25519plus.native.0rtt.YHD4th3rx6hr8R22ZLUA6ivhJdHWNt8bsAcNYrNKx&type=tcp&security=none#n", &n) == 1);
-    check("no key: skipped", url("encryption=mlkem768x25519plus.native.0rtt&type=tcp&security=none#n", &n) == 1);
-    check("first padding shorter than 35: skipped",
-          url("encryption=mlkem768x25519plus.native.0rtt.100-10-20.YHD4th3rx6hr8R22ZLUA6ivhJdHWNt8bsAcNYrNKxkQ&type=tcp&security=none#n", &n) == 1);
+          url(ENC("native.0rtt.YHD4th3rx6hr8R22ZLUA6ivhJdHWNt8bsAcNYrNK"), &n) == 1);
+    check("no key: skipped", url(ENC("native.0rtt.100-111-1111"), &n) == 1);
+    /* The first padding: probability 100, both lengths at least 35. */
+    check("first padding with a lower bound below 35: skipped",
+          url(ENC("native.0rtt.100-34-111." KEY), &n) == 1);
+    check("first padding with an upper bound below 35: skipped",
+          url(ENC("native.0rtt.100-111-34." KEY), &n) == 1);
+    check("first padding with a probability below 100: skipped",
+          url(ENC("native.0rtt.99-111-111." KEY), &n) == 1);
+#undef ENC
+#undef KEY
 
     /* --- pqv --- */
     snprintf(q, sizeof q, "type=tcp&security=reality&pbk=K4ALTVxNnrDTywBj_Stb5bomQ21QlSWOlGGT44n9Nng&sid=01&sni=example.com&fp=chrome&pqv=%s#p", PQV_KEY);
@@ -82,6 +96,11 @@ int main(void) {
     snprintf(q, sizeof q, "type=tcp&security=reality&pbk=K4ALTVxNnrDTywBj_Stb5bomQ21QlSWOlGGT44n9Nng&sid=01&sni=example.com&pqv=%.100s#p", PQV_KEY);
     check("short pqv: skipped", url(q, &n) == 1);
     check_s("pqv skip reason named", "pqv: not an ML-DSA-65 key", n.skip_reason);
+    /* Exactly 1952 bytes: a longer key (2607 characters, 1955 bytes) is not ML-DSA-65 either. */
+    snprintf(q, sizeof q,
+             "type=tcp&security=reality&pbk=K4ALTVxNnrDTywBj_Stb5bomQ21QlSWOlGGT44n9Nng"
+             "&sid=01&sni=example.com&pqv=%sAAAA#p", PQV_KEY);
+    check("long pqv: skipped", url(q, &n) == 1);
 
     /* --- flow --- */
     check("flow vision-udp443 becomes vision",
@@ -161,22 +180,35 @@ int main(void) {
             "\"public_key\":\"K4ALTVxNnrDTywBj_Stb5bomQ21QlSWOlGGT44n9Nng\",\"short_id\":\"0123456789abcdef\"}}},"
             "{\"type\":\"vless\",\"tag\":\"sb-ws\",\"server\":\"cdn.example.org\",\"server_port\":443,\"uuid\":\"" UUID "\","
             "\"tls\":{\"enabled\":true,\"server_name\":\"cdn.example.org\"},"
-            "\"transport\":{\"type\":\"ws\",\"path\":\"/ws\",\"headers\":{\"Host\":[\"front.example.org\"]},"
+            "\"transport\":{\"type\":\"ws\",\"path\":\"/ws\","
+            "\"headers\":{\"Host\":[\"front.example.org\",\"other.example.org\"]},"
             "\"max_early_data\":2048,\"early_data_header_name\":\"Sec-WebSocket-Protocol\"}},"
             "{\"type\":\"trojan\",\"tag\":\"t\",\"server\":\"x\",\"server_port\":1}]}");
         struct vless_node out[8];
         struct vless_sub_stats st;
         size_t cnt = vless_parse_sub(js, out, 8, &st);
         check("sing-box: two vless nodes", cnt == 2);
+        /* selector and trojan are not VLESS nodes: neither usable nor skipped. */
+        check("sing-box: selector and trojan not counted as skipped VLESS nodes", st.skipped == 0);
         if (cnt == 2) {
             check("sing-box: reality: pbk, sid, sni, fp, port, name, flow",
                   !strcmp(out[0].security, "reality") && !strcmp(out[0].pbk, "K4ALTVxNnrDTywBj_Stb5bomQ21QlSWOlGGT44n9Nng") &&
                   !strcmp(out[0].sid, "0123456789abcdef") && !strcmp(out[0].sni, "example.com") && !strcmp(out[0].fp, "chrome") &&
                   out[0].port == 443 && !strcmp(out[0].name, "sb-reality") && !strcmp(out[0].flow, "xtls-rprx-vision"));
             check_s("sing-box: ws path with early data", "/ws?ed=2048", out[1].path);
-            check_s("sing-box: ws Host from the array", "front.example.org", out[1].http_host);
+            check_s("sing-box: ws Host, the first of the array", "front.example.org",
+                    out[1].http_host);
             check("sing-box: tls and type ws", !strcmp(out[1].security, "tls") && !strcmp(out[1].type, "ws"));
         }
+        /* Without early_data_header_name sing-box sends early data in the path, a form Xray does
+         * not have: early data stays off. */
+        snprintf(js, sizeof js,
+            "{\"outbounds\":[{\"type\":\"vless\",\"tag\":\"a\",\"server\":\"x.example\","
+            "\"server_port\":443,\"uuid\":\"" UUID "\","
+            "\"transport\":{\"type\":\"ws\",\"path\":\"/ws\",\"max_early_data\":2048}}]}");
+        cnt = vless_parse_sub(js, out, 8, &st);
+        check("sing-box: early data without the header name: path without ed",
+              cnt == 1 && !strcmp(out[0].path, "/ws"));
     }
 
     /* --- Clash / Mihomo --- */
@@ -187,7 +219,8 @@ int main(void) {
             "  - name: \"clash-block\"   # комментарий\n"
             "    type: vless\n    server: example.org\n    port: 443\n    uuid: " UUID "\n"
             "    network: tcp\n    tls: true\n    udp: true\n    flow: xtls-rprx-vision\n"
-            "    servername: example.com\n    client-fingerprint: chrome\n    encryption: \"\"\n"
+            "    servername: example.com   # SNI\n"
+            "    client-fingerprint: chrome\n    encryption: \"\"\n"
             "    alpn:\n      - h2\n      - http/1.1\n"
             "    reality-opts:\n      public-key: K4ALTVxNnrDTywBj_Stb5bomQ21QlSWOlGGT44n9Nng\n      short-id: 0123456789abcdef\n"
             "  - {name: clash-flow, type: vless, server: cdn.example.org, port: 8443, uuid: " UUID ", network: ws, tls: true, servername: cdn.example.org, "
@@ -202,7 +235,8 @@ int main(void) {
         size_t cnt = vless_parse_sub(y, out, 8, &st);
         check("Clash: four vless nodes, one foreign", cnt == 4 && st.foreign == 1);
         if (cnt == 4) {
-            check("Clash (block style): reality, sni, fp, pbk, sid, flow, name without comment",
+            /* The comments: after a quoted name, and after a plain value (servername). */
+            check("Clash (block style): reality, sni, fp, pbk, sid, flow, name; comments dropped",
                   !strcmp(out[0].security, "reality") && !strcmp(out[0].sni, "example.com") && !strcmp(out[0].fp, "chrome") &&
                   !strcmp(out[0].pbk, "K4ALTVxNnrDTywBj_Stb5bomQ21QlSWOlGGT44n9Nng") && !strcmp(out[0].sid, "0123456789abcdef") &&
                   !strcmp(out[0].flow, "xtls-rprx-vision") && !strcmp(out[0].name, "clash-block") && out[0].encryption == NULL);
@@ -305,8 +339,21 @@ int main(void) {
         snprintf(q, sizeof q, "security=tls&sni=t.example&ech=%s", "AEX%2BDQBBNwAgACANG785NbYxf2vAoHiUugO7PDLchnWNz2f%2B95epg2DJewAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA%3D");
         check("ech= in a link: node usable", url(q, &n) == 0);
         check_s("  value decoded from percent-encoding", ECH, n.ech);
-        check("ech= not an ECHConfigList: node unusable", url("security=tls&sni=t.example&ech=AAAA", &n) == 1);
-        check_s("  skip reason named", "ech: not a base64 ECHConfigList", n.skip_reason);
+        /* One 0xfe0d entry of two bytes, the smallest list that passes; then lists each wrong in
+         * one part, so that every part of the form check is needed to refuse them. */
+        check("ech= of one minimal 0xfe0d entry: node usable",
+              url("security=tls&sni=t.example&ech=AAb+DQACAAA=", &n) == 0);
+        static const char *const bad_ech[][2] = {
+            { "AAAA", "ech= not an ECHConfigList (3 bytes): node unusable" },
+            { "AAf+DQACAAA=", "ech= not an ECHConfigList (length 7, 6 bytes): node unusable" },
+            { "AAb+DQAFAAA=", "ech= not an ECHConfigList (entry past the end): node unusable" },
+            { "AAb+CgACAAA=", "ech= not an ECHConfigList (only 0xfe0a): node unusable" },
+        };
+        for (size_t i = 0; i < sizeof bad_ech / sizeof *bad_ech; i++) {
+            snprintf(q, sizeof q, "security=tls&sni=t.example&ech=%s", bad_ech[i][0]);
+            check(bad_ech[i][1], url(q, &n) == 1);
+            check_s("  skip reason named", "ech: not a base64 ECHConfigList", n.skip_reason);
+        }
         check("ech= as 'domain+https://...' (a DNS lookup): node unusable",
               url("security=tls&sni=t.example&ech=cloudflare-ech.com%2Bhttps://1.1.1.1/dns-query", &n) == 1);
         check_s("  skip reason named", "ech: DNS lookup is not supported", n.skip_reason);

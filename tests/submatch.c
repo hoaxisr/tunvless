@@ -70,10 +70,13 @@ static int utf8_ok(const char *s) {
 }
 
 /* A malformed Xray config comes from the internet, and parsing must return, not hang. The alarm
- * turns a hang into a test failure. */
+ * turns a hang into a test failure. The output is flushed first: _exit does not, and when stdout
+ * is a pipe or a file (a CI log) the report would end without saying what hung. */
+static size_t g_json_case;
 static void on_alarm(int sig) {
     (void)sig;
-    printf("HANG: parsing did not return within 2 s\n");
+    printf("HANG: parsing malformed JSON %zu did not return within 2 s\n", g_json_case);
+    fflush(stdout);
     _exit(1);
 }
 
@@ -91,6 +94,9 @@ int main(void) {
         n = b64_decode("Pz8_", 4, out, sizeof(out));
         check("base64 URL-safe: _ decodes as /", "??\?", out);
         check_n("base64 URL-safe: length", 3, (long)n);
+        n = b64_decode("Pj4-", 4, out, sizeof(out));
+        check("base64 URL-safe: - decodes as +", ">>>", out);
+        check_n("base64 URL-safe: - length", 3, (long)n);
 
         /* Padding inside the text: concatenated base64 blocks, each with its own '='. The bits
          * left before '=' end the block, and the next block starts with an empty accumulator;
@@ -131,6 +137,10 @@ int main(void) {
         check_n("reality: port", 8443, (long)n.port);
         check("reality: uuid", "11111111-2222-3333-4444-555555555555", n.uuid);
         check("reality: sni", "www.microsoft.com", n.sni);
+        check("reality: security", "reality", n.security);
+        check("reality: pbk", "ABCDEF", n.pbk);
+        check("reality: sid", "aa11", n.sid);
+        check("reality: fingerprint", "chrome", n.fp);
         check("reality: flow", "xtls-rprx-vision", n.flow);
         /* The name arrives percent-encoded and must be shown decoded. */
         check("name is percent-decoded", "Узел", n.name);
@@ -254,7 +264,9 @@ int main(void) {
                 (long)(n + st.skipped + st.foreign));
     }
     /* The reason goes into the subscription stats whole: st.reasons[].reason has the size of the
-     * node's skip_reason. */
+     * node's skip_reason. The reasons written today are at most 51 bytes, so a stats field cut
+     * anywhere above that would pass with every one of them; a reason that fills skip_reason is
+     * given to sl_skip_note, the one way into the stats, to check the whole size. */
     {
         struct vless_node nodes[4];
         struct vless_sub_stats st;
@@ -262,8 +274,27 @@ int main(void) {
         size_t n = vless_parse_sub("vless://11111111-2222-3333-4444-555555555555@b.test:443"
                                    "?security=tls&sni=b.test&allowInsecure=1#B\n", nodes, 4, &st);
         check_n("allowInsecure without --insecure: node skipped", 0, (long)n);
-        check("  reason in skipped_reasons is not cut",
+        check("allowInsecure: reason in skipped_reasons",
               "allowInsecure: needs --insecure", st.reasons[0].reason);
+
+        struct vless_node t;
+        memset(&t, 0, sizeof(t));
+        memset(t.skip_reason, 'r', sizeof(t.skip_reason) - 1);
+        memset(&st, 0, sizeof(st));
+        sl_skip_note(&st, &t, t.skip_reason);
+        check("reason that fills skip_reason: not cut in skipped_reasons",
+              t.skip_reason, st.reasons[0].reason);
+
+        /* A node without a name is reported by host:port; the example field is longer than the
+         * host field so that the longest host fits with the longest port. */
+        char host[sizeof(t.host)], link[256], want[sizeof(t.host) + 8];
+        memset(host, 'h', sizeof(host) - 1);
+        host[sizeof(host) - 1] = '\0';
+        snprintf(link, sizeof(link), "vless://u@%s:65535?type=kcp\n", host);
+        snprintf(want, sizeof(want), "%s:65535", host);
+        vless_parse_sub(link, nodes, 4, &st);
+        check("node without a name: example is the longest host:port, whole", want,
+              st.reasons[0].example);
     }
     {
         /* The same glue, longer than the line buffer. A really long link and a glued pair
@@ -448,8 +479,7 @@ int main(void) {
         size_t n = vless_parse_sub(sub, nodes, 16, &st);
         check_n("overflow: no node usable", 0, (long)n);
         check_n("overflow: nine skipped", 9, (long)st.skipped);
-        check_n("overflow: eight reasons fit", VLESS_SKIP_REASONS,
-                (long)st.reasons_n);
+        check_n("overflow: eight reasons fit", 8, (long)st.reasons_n);
         check_n("overflow: ninth counted as dropped", 1, (long)st.reasons_dropped);
         size_t sum = st.reasons_dropped;
         for (size_t i = 0; i < st.reasons_n; i++) sum += st.reasons[i].count;
@@ -621,9 +651,17 @@ int main(void) {
         check_n("loopback node is unusable", 1,
                 vless_parse_url("vless://11111111-2222-3333-4444-555555555555@127.0.0.1:443"
                                 "?security=none#Петля", &n));
+        /* All of 127.0.0.0/8: stubs use 127.0.0.53 too. */
+        check_n("loopback node other than 127.0.0.1 is unusable", 1,
+                vless_parse_url("vless://11111111-2222-3333-4444-555555555555@127.0.0.53:443"
+                                "?security=none#Петля", &n));
         check_n("host starting with 127 but not loopback is usable", 0,
                 vless_parse_url("vless://11111111-2222-3333-4444-555555555555@127a.example.com:443"
                                 "?security=none#Имя", &n));
+        /* "127." followed by a name: only an address of digits and dots is loopback. */
+        check_n("name whose first label is 127 is usable", 0,
+                vless_parse_url("vless://11111111-2222-3333-4444-555555555555"
+                                "@127.node.example.com:443?security=none#Имя", &n));
     }
 
     /* A whole subscription: nodes with both kinds of id are taken, the one with a bad id is
@@ -691,6 +729,8 @@ int main(void) {
         check("Xray config: flow", "xtls-rprx-vision", nodes[0].flow);
         check("Xray config: second config read too", "de01_grpc", nodes[1].name);
         check("Xray config: grpc serviceName", "svc", nodes[1].service);
+        /* tcp above is also the default: network is read only if grpc is. */
+        check("Xray config: transport of the second node", "grpc", nodes[1].type);
         check_n("Xray config: port of the second node", 2087, (long)nodes[1].port);
         check_n("Xray config: freedom and blackhole not counted as skipped", 0, (long)st.skipped);
         check_n("Xray config: freedom and blackhole not counted as foreign", 0, (long)st.foreign);
@@ -730,12 +770,12 @@ int main(void) {
         check_n("extra: lower bound", 50, (int)n.pad_from);
         check_n("extra: upper bound", 150, (int)n.pad_to);
 
-        /* A long extra: headers of hundreds of characters before xPaddingBytes, three times
-         * longer once percent-encoded. The JSON must not be cut before decoding, or the range
-         * is lost. */
+        /* A long extra: headers before xPaddingBytes, about 1500 bytes once percent-encoded,
+         * more than a buffer of 512 or 1024 bytes holds. The JSON must not be cut before
+         * decoding, or the range is lost. */
         {
             char big[2048] = "%7B%22headers%22%3A%7B";
-            for (int i = 0; i < 12; i++) {
+            for (int i = 0; i < 40; i++) {
                 char kv[96];
                 snprintf(kv, sizeof(kv), "%s%%22h%d%%22%%3A%%22" "vvvvvvvvvvvvvvvv" "%%22",
                          i ? "%2C" : "", i);
@@ -897,11 +937,12 @@ int main(void) {
               "Неправильный клиент", st.reasons[0].example);
     }
     {
-        /* The form is told by the first character, not by a search for "://": an Xray config
-         * has "://" in its DNS settings. */
+        /* The form is told by the first character. A config with "://" (a DNS URL) would also
+         * pass a search for "://", so this one has none: only the first character keeps it
+         * from being decoded as base64. */
         char dec[256];
-        const char *json = "  [{\"dns\":{\"servers\":[\"https://x/y\"]},\"outbounds\":[]}]";
-        check("form: config returned as is", json,
+        const char *json = "  [{\"dns\":{\"servers\":[\"1.1.1.1\"]},\"outbounds\":[]}]";
+        check("form: config without \"://\" returned as is", json,
               vless_sub_text(json, strlen(json), dec, sizeof(dec)));
         const char *links = "vless://a@h:443#n\n";
         check("form: link list returned as is", links,
@@ -953,6 +994,22 @@ int main(void) {
                  "?security=reality&sni=a.example&pbk=k&fp=chrome#%%D0%%A3%%D0%%B7%%D0%%B5%%D0%%BB");
         check_n("short name: node parses", 0, vless_parse_url(url, &n));
         check("short name not cut", "Узел", n.name);
+
+        /* A cut inside an escape: a prefix of five or six letters leaves "%D" or "%" at the
+         * end, which is dropped rather than shown as text; the 20 whole letters stay. */
+        for (int pre = 5; pre <= 6; pre++) {
+            char cut[512], want[64];
+            snprintf(cut, sizeof(cut), "%.*s", pre, "nodexy");
+            snprintf(want, sizeof(want), "%.*s", pre, "nodexy");
+            for (int i = 0; i < 70; i++) strcat(cut, "%D0%9F");
+            for (int i = 0; i < 20; i++) strcat(want, "\xD0\x9F");
+            snprintf(url, sizeof(url),
+                     "vless://11111111-2222-3333-4444-555555555555@example.com:8443"
+                     "?security=reality&sni=a.example&pbk=k&fp=chrome#%s", cut);
+            vless_parse_url(url, &n);
+            check(pre == 5 ? "long name cut after \"%D\": the fragment dropped"
+                           : "long name cut after \"%\": the fragment dropped", want, n.name);
+        }
     }
 
     /* ---- malformed JSON: parsing returns ------------------------------------- */
@@ -968,6 +1025,7 @@ int main(void) {
         for (size_t i = 0; i < sizeof(bad) / sizeof(*bad); i++) {
             struct vless_node nodes[4];
             struct vless_sub_stats st;
+            g_json_case = i;
             alarm(2);
             size_t n = vless_parse_sub(bad[i], nodes, 4, &st);
             alarm(0);
@@ -1090,6 +1148,8 @@ int main(void) {
                                    nodes, 1, &st);
         check_n("one slot: one node taken", 1, (long)n);
         check_n("second vless link counted as skipped", 1, (long)st.skipped);
+        /* A usable node without a slot must not read as a link that did not parse. */
+        check("  reason: more nodes than fit", "more nodes than fit", st.reasons[0].reason);
         check_n("foreign link past the slots counted", 1, (long)st.foreign);
     }
 
