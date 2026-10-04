@@ -796,8 +796,15 @@ static void xray_remarks(struct sj *j, char *out, size_t n) {
  * Обрезка возможна только у remarks длиной почти в весь буфер имени; тогда номер до имени
  * не доедет и два узла снова совпадут. Это лучше, чем ради номера отрезать человеку имя. */
 static void xray_name(struct vless_node *nd, const char *remarks, size_t ord) {
-    if (ord == 0) snprintf(nd->name, sizeof(nd->name), "%s", remarks);
-    else snprintf(nd->name, sizeof(nd->name), "%s (%zu)", remarks, ord + 1);
+    char num[24] = "";
+    if (ord) snprintf(num, sizeof(num), " (%zu)", ord + 1);
+    size_t room = sizeof(nd->name) - 1;
+    size_t rl = strnlen(remarks, room);
+    size_t nl = strlen(num);
+    if (nl > room - rl) nl = room - rl;
+    memcpy(nd->name, remarks, rl);
+    memcpy(nd->name + rl, num, nl);
+    nd->name[rl + nl] = '\0';
     sl_utf8_trim_tail(nd->name);
 }
 

@@ -57,7 +57,7 @@ static const unsigned char MAX_NONCE[12] = { 255,255,255,255,255,255,255,255,255
 
 /* Причина последнего отказа — строкой (поток), как tls13_verify_reason: код один на класс, а слова
  * нужны человеку («сервер ответил шумом» и «ключ реле не тот» — разные разговоры). */
-static __thread char g_reason[96];
+static __thread char g_reason[128];
 const char *tr_venc_reason(void) { return g_reason; }
 static int fail(int rc, const char *why) {
     snprintf(g_reason, sizeof g_reason, "%s", why);
@@ -370,7 +370,7 @@ int tr_venc_open(struct transport *t, const struct tr_node *node, int timeout_s)
     unsigned char t_pfs[64], t_tk[16];
     const int zrtt = c.zero_rtt && tk_get(e->tk_id, t_pfs, t_tk);
     if (getenv("STEER_VENC_TRACE"))
-        fprintf(stderr, "steer[venc]: %s, режим %s, ключей %u, шифр %s\n",
+        fprintf(stderr, "tunvless[venc]: %s, режим %s, ключей %u, шифр %s\n",
                 zrtt ? "0-RTT по билету" : "полное рукопожатие",
                 c.xor_mode == 2 ? "random" : c.xor_mode == 1 ? "xorpub" : "native", c.nkeys,
                 e->use_aes ? "AES-256-GCM" : "ChaCha20-Poly1305");

@@ -33,7 +33,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <errno.h>
-#include <sys/random.h>
+#include "osrand.h"
 #include <stdlib.h>
 #if defined(__aarch64__)
 #include <sys/auxv.h>
@@ -91,7 +91,7 @@ static int hex_decode(const char *in, unsigned char *out, size_t out_n) {
 static int fill_random(unsigned char *buf, size_t n) {
     size_t got = 0;
     while (got < n) {
-        ssize_t r = getrandom(buf + got, n - got, 0);
+        ssize_t r = os_getrandom(buf + got, n - got, 0);
         if (r < 0) {
             if (errno == EINTR) continue;
             return -1;

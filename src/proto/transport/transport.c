@@ -29,9 +29,8 @@ int tr_link_write(void *ctx, const unsigned char *d, size_t n) {
         size_t sent = 0;
         while (sent < n) {
             /* send с MSG_NOSIGNAL, а не write: закрытый узлом сокет — отказ записи (EPIPE), а не
-             * SIGPIPE, даже у процесса, который его не выключал (проба узла, стенды). Поверх TLS
-             * ту же роль для tls13_write играет выключенный SIGPIPE модульных команд
-             * (cli/modcmd.c): tls13.c защищён от правок, и флага там не поставить. */
+             * SIGPIPE, даже у процесса, который его не выключал (стенды). Поверх TLS ту же роль
+             * для tls13_write играет SIGPIPE, выключенный в main (src/main.c). */
             ssize_t w = send(l->fd, d + sent, n - sent, MSG_NOSIGNAL);
             if (w <= 0) {
                 if (w < 0 && errno == EINTR) continue;

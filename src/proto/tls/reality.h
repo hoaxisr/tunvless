@@ -150,8 +150,8 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
                               const struct reality_carrier *car,
                               unsigned char *out, size_t out_n, size_t *out_len);
 
-/* Примитивы этого файла наружу — для xsteer (src/proto/xsteer/xshake.c). Объяснение, почему обёртки,
- * а не копии, стоит у их определений в reality.c. */
+/* Примитивы этого файла наружу — для TLS 1.3, ECH и VLESS encryption (tls13.c, ech.c, trvenc.c).
+ * Объяснение, почему обёртки, а не копии, стоит у их определений в reality.c. */
 int xc_random(unsigned char *out, size_t n);
 /* base64url (с выравниванием или без) в байты; длина результата либо -1. Для ключей узла (pqv). */
 int xc_b64url_decode(const char *in, unsigned char *out, size_t out_n);

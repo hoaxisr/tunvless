@@ -24,7 +24,7 @@
  */
 #define _GNU_SOURCE
 #include <string.h>
-#include <sys/random.h>
+#include "osrand.h"
 #include <errno.h>
 
 #include "vision.h"
@@ -40,7 +40,7 @@
 static int rnd_bytes(unsigned char *b, size_t n) {
     size_t got = 0;
     while (got < n) {
-        ssize_t r = getrandom(b + got, n - got, 0);
+        ssize_t r = os_getrandom(b + got, n - got, 0);
         if (r < 0) { if (errno == EINTR) continue; return -1; }
         got += (size_t)r;
     }

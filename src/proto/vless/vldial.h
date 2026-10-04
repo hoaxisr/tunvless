@@ -6,6 +6,7 @@
 #include "dialer.h"
 #include "transport.h"
 #include "vision.h"
+#include "stack.h"
 
 /* Сессия VLESS на одно соединение клиента: состояние потока и связь с узлом.
  *
@@ -52,14 +53,11 @@ extern const struct dialer_ops vless_dialer;
 /* Трассировка разбора (STEER_TUN_TRACE) — та же, что у стека, и в тот же поток журнала. */
 void vl_set_trace(int on);
 
-/* Поднять туннель выхода на пуле узлов pc (src/tunnel/pool.h; узлы — struct vless_node, первый
- * активный — pc->first): проверка узла, которую нельзя отложить до первого соединения, и стек с
- * дайлером VLESS под пулом (pool_run). ready — как у stack_run (stack.h, stack_ready_fn): устройство
- * поднято; up демону говорит пул, модуль — только своё; NULL — ничего. Возвращает код выхода
- * процесса, всегда ненулевой — успешного выхода у цикла нет. */
-struct output;
-struct pool_cfg;
-int vless_tunnel_run(struct output *o, const struct pool_cfg *pc,
-                     void (*ready)(void *arg, const char *dev), void *arg);
+/* Bring the tunnel up: the node check that cannot wait for the first connection (its UUID), then
+ * the stack with the VLESS dialer to this node (stack_run, src/tunnel/stack.h). silence_s — stall
+ * threshold of the node on a live connection (struct dialer), 0 — none. Returns the process exit
+ * code, never 0: the loop has no successful exit. */
+int vless_tunnel_run(const struct tun_cfg *tc, const struct vless_node *node, int silence_s,
+                     stack_ready_fn ready, void *arg);
 
 #endif

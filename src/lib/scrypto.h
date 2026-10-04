@@ -1,10 +1,9 @@
-/* Слой криптографических примитивов steer — всё, что протоколам нужно от криптобиблиотеки.
+/* Слой криптографических примитивов — всё, что протоколам нужно от криптобиблиотеки.
  *
- * ЗАЧЕМ СЛОЙ. Код протоколов (src/proto/tls, xsteer, tgws) не зовёт криптобиблиотеку сам: он
- * зовёт эти функции, а за ними стоит wolfCrypt (решение владельца 2026-09-28; docs/architecture.md,
- * «Криптография»). Прежде протоколы звали mbedtls напрямую — шестьдесят разных
+ * ЗАЧЕМ СЛОЙ. Код протоколов (src/proto) не зовёт криптобиблиотеку сам: он зовёт эти функции, а
+ * за ними стоит wolfCrypt. Прежде протоколы звали mbedtls напрямую — шестьдесят разных
  * функций в шести файлах, — и смена библиотеки означала бы правку каждого из них, включая
- * защищённые (reality.c, tls13.c, xshake.c). Теперь библиотека видна ровно в одном файле,
+ * защищённые (reality.c, tls13.c). Теперь библиотека видна ровно в одном файле,
  * scrypto.c, и её смена — это правка одного файла под неизменный заголовок.
  *
  * ТИПОВ БИБЛИОТЕКИ ЗДЕСЬ НЕТ, и это обещание, а не удобство: заголовок подключают tls13.h и
@@ -30,13 +29,6 @@
  *     памяти (см. прежний STEER_AES_ALIGN16 в tgws.c). Здесь выравнивание — свойство типа, и
  *     стоит оно одно на все места, где контекст живёт.
  *
- * Цена решения — связь раскладки: libsteer и libsteer-wolfssl (шаг 4) обязаны быть собраны с
- * одним user_settings.h. Это и так условие правильности (раскладка структур wolfSSL зависит от
- * опций), и пакеты ставятся одной версией. Размеры SC_*_CTX_SIZE теперь — ABI между двумя
- * файлами, и держат его две проверки: в сборке (build/wolfssl/abi.c, те же _Static_assert, что
- * ниже в scrypto.c, но для библиотеки) и при загрузке (sc_abi_check в scrypto.c сверяет размеры
- * структур, из которых собрана загруженная libsteer-wolfssl.so, с теми, что знает libsteer).
- *
  * ПОТОКИ. Каждый контекст принадлежит одному потоку; функции без контекста (sc_hash, sc_hmac,
  * sc_hkdf_*, sc_x25519*) безопасны из любого. Хранилище корней (struct sc_roots) — общее на
  * процесс, проверка цепочки внутри себя сериализована.
@@ -58,10 +50,6 @@
 
 /* Выравнивание хранилища контекстов: столько требуют AES-NI и ARMv8 Crypto для раундовых ключей. */
 #define SC_ALIGN _Alignas(16)
-
-/* Отпечаток сборки библиотеки: сколько полей в steer_wolfssl_abi (build/wolfssl/abi.c) — версия
- * wolfSSL, размеры структур, размеры хранилищ. Порядок полей — sc_abi_expect в scrypto.c. */
-#define SC_ABI_N 13
 
 /* ---- хеши ---------------------------------------------------------------------------------- */
 
@@ -160,38 +148,6 @@ void sc_aesctr_free(struct sc_aesctr *c);
  * стоило бы килобайт. */
 int sc_aes_block(const unsigned char *key, size_t key_n, int decrypt,
                  const unsigned char in[16], unsigned char out[16]);
-
-/* ---- XChaCha20-Poly1305 ------------------------------------------------------------------- */
-
-/* AEAD с 24-байтовым nonce (draft-irtf-cfrg-xchacha) — датаграммы shadowsocks
- * 2022-blake3-chacha20-poly1305: у каждой свой случайный nonce, а ключ — сам PSK. Одним вызовом:
- * ключ на каждую датаграмму свой подключом HChaCha20, разворачивать заранее нечего. Тег — 16 байт
- * сразу за данными: seal пишет n + 16 байт в out, open читает n байт (с тегом) и пишет n - 16. */
-int sc_xchacha_seal(const unsigned char key[32], const unsigned char nonce[24],
-                    const void *aad, size_t aad_n, const unsigned char *in, size_t n,
-                    unsigned char *out);
-int sc_xchacha_open(const unsigned char key[32], const unsigned char nonce[24],
-                    const void *aad, size_t aad_n, const unsigned char *in, size_t n,
-                    unsigned char *out);
-
-/* ---- SHAKE128 (FIPS 202) потоком ---------------------------------------------------------- */
-
-/* Маска длины кусков VMess (ChunkMasking): каждый кусок тела берёт из SHAKE128(IV) два байта
- * маски длины и, при GlobalPadding, ещё два на длину набивки — и так до конца соединения, то есть
- * вывод бесконечный и читается понемногу. Вход один и короткий (16 байт IV) — он поглощается при
- * заведении. Хранилище — wc_Shake wolfSSL (около 430 байт; размер сверяют scrypto.c и
- * build/wolfssl/abi.c), плюс выжатый, но ещё не отданный блок. */
-#define SC_SHAKE_CTX_SIZE 512
-#define SC_SHAKE128_RATE 168
-struct sc_shake {
-    int ready;
-    uint16_t pos;                              /* сколько байт blk уже отдано */
-    unsigned char blk[SC_SHAKE128_RATE];
-    SC_ALIGN unsigned char st[SC_SHAKE_CTX_SIZE];
-};
-int  sc_shake128_init(struct sc_shake *s, const void *in, size_t n);
-int  sc_shake128_read(struct sc_shake *s, unsigned char *out, size_t n);
-void sc_shake128_free(struct sc_shake *s);
 
 /* ---- X25519 (RFC 7748) -------------------------------------------------------------------- */
 

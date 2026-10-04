@@ -16,12 +16,12 @@
 #
 # Xray: XRAY=/путь/к/бинарнику либо docker с образом XRAY_IMAGE (умолчание ghcr.io/xtls/xray-core:latest);
 # нет ни того, ни другого — громкий пропуск (код 0), не молчание. Клиент — $BUILD/vencprobe (его собирает
-# tests/ext-test.sh на настоящей wolfSSL). Контейнеры и временные файлы убираются при любом выходе.
+# make interop на настоящей wolfSSL). Контейнеры и временные файлы убираются при любом выходе.
 set -eu
 cd "$(dirname "$0")/.."
 BUILD=${BUILD:-build}
 PROBE="$BUILD/vencprobe"
-[ -x "$PROBE" ] || { echo "venc: нет $PROBE (собирает tests/ext-test.sh)"; exit 2; }
+[ -x "$PROBE" ] || { echo "venc: нет $PROBE (собирает make interop)"; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo "venc: ПРОПУСК — нужен python3"; exit 0; }
 
 IMG=${XRAY_IMAGE:-ghcr.io/xtls/xray-core:latest}

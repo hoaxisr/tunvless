@@ -22,9 +22,6 @@
  * ничего: узел приходит ему struct tr_node — теми полями ссылки, которые касаются транспорта,
  * указателями в узел подписки. Поэтому следующий протокол поверх тех же транспортов (trojan,
  * shadowsocks через ws) — это новый дайлер, а не правка этого слоя.
- *
- * При выпуске 1.10 (шаг 4) весь этот каталог уходит в разделяемую libsteer вместе с TLS: модули
- * протоколов пользуются им, а не носят свою копию.
  */
 #ifndef STEER_TRANSPORT_H
 #define STEER_TRANSPORT_H
@@ -346,9 +343,18 @@ void transport_close(struct transport *t);
 
 const char *transport_strerror(int rc);
 
-/* Метка сокетов к узлу (SO_MARK до connect) — для `via`/`over`, см. «вложенные выходы» в
- * spec.h. 0 — не метить. required — метка обязательна: без неё соединение не открывается. */
+/* SO_MARK on sockets to the node, set before connect (--mark): policy routing can then keep them
+ * out of the tunnel. 0 — no mark. required — a socket the mark cannot be set on is not used. */
 void transport_set_sock_mark(uint32_t mark, int required);
+
+/* SO_BINDTODEVICE on sockets to the node (--bind-dev); NULL or "" — none. */
+void transport_set_bind_dev(const char *ifname);
+
+/* Resolve host once and use these addresses for every later connection to it, instead of a DNS
+ * query per connection (trdial.c says why). Number of IPv4 addresses, or TR_EDNS. */
+int transport_pin_host(const char *host);
+/* The addresses pinned for host (network order), at most max: how many. */
+int transport_pinned_addrs(const char *host, uint32_t *out, int max);
 
 /* Сколько места обязан дать вызывающий transport_read: транспорты поверх HTTP/2 отдают за
  * один раз до целой записи TLS. */
@@ -424,9 +430,6 @@ int tr_ws_parse(struct ws_rx *r, const unsigned char *in, size_t n,
 
 /* TCP до узла по всем адресам имени (trdial.c). Дескриптор либо отрицательный код TR_*. */
 int tr_dial(const char *host, uint16_t port, int timeout_s);
-/* Соединённый неблокирующий сокет UDP к узлу с той же меткой, что у TCP (trdial.c): датаграммы
- * протоколов прокси (shadowsocks, SOCKS5). Дескриптор либо отрицательный код TR_*. */
-int tr_dial_udp(const char *host, uint16_t port);
 
 /* Безопасность по полю ссылки: none, tls, иначе reality (trsec.c). */
 const struct security_ops *tr_security(const char *name);

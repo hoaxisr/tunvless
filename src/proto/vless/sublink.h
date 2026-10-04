@@ -1,12 +1,8 @@
 /* Ссылка узла в форме Xray: строки ссылки и поля транспорта (sublink.c).
  *
- * Вынесено из разбора подписки VLESS (sub.c), когда тем же полям понадобился второй хозяин — модуль
- * steer-proxy (src/proto/proxy): ссылка trojan:// и JSON vmess:// несут ровно те же поля транспорта и
- * безопасности, что vless:// (type, security, sni, fp, pbk, sid, path, host, serviceName, mode,
- * extra, pcs, vcn, ech, allowInsecure, pqv, headerType), и годность их обязана решаться одним
- * правилом: узел, пригодный у одного протокола и непригодный с тем же транспортом у другого, —
- * это два правила, которые разойдутся. Поэтому файл живёт в libsteer и общий у модулей steer-vless
- * и steer-proxy, как общий у них сам транспорт (src/proto/transport).
+ * Половина ссылки узла, которая касается транспорта и безопасности: type, security, sni, fp, pbk,
+ * sid, path, host, serviceName, mode, extra, pcs, vcn, ech, allowInsecure, pqv, headerType — и
+ * годность узла для транспорта.
  *
  * Узел — struct vless_node: его половина транспорта и безопасности здесь, а VLESS-своё (flow,
  * encryption, UUID) разбирает и проверяет sub.c. Чего здесь нет — подписок целиком (список ссылок,
@@ -48,7 +44,7 @@ char *sl_param_dup(const char *v, size_t vlen);
 
 /* ---- длинные значения и проверка сертификата ------------------------------------------------ */
 
-/* Метки непригодных значений: указатель сравнивается с адресом, поэтому они — одни на libsteer. */
+/* Метки непригодных значений: указатель сравнивается с адресом, поэтому они — одни на процесс. */
 extern const char SL_BAD_PQV[], SL_FULL[], SL_BAD_PIN[], SL_BAD_ECH[], SL_ECH_DNS[];
 /* Общая таблица длинных строк (pqv, encryption, отпечатки): одинаковые значения — один экземпляр. */
 const char *sl_intern(const char *v, size_t n);

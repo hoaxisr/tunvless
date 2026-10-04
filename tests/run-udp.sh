@@ -17,18 +17,20 @@
 #      даже при исправном переносе датаграмм.
 #
 # Стенд: своё сетевое пространство, поддельный сервер VLESS (tests/fake-vless.py) с эхом на
-# команде 2, поднятый steer туннель и питон как клиент UDP.
+# команде 2, поднятый tunvless туннель и питон как клиент UDP.
 #
 # Использование: tests/run-udp.sh
 set -eu
 cd "$(dirname "$0")/.."
 
-BIN="${STEER:-./build/steer-ext-check}"
-[ -x "$BIN" ] || { echo "нет бинарника: $BIN (собери extended)"; exit 2; }
+BIN="${TUNVLESS:-./out/tunvless}"
+[ -x "$BIN" ] || { echo "нет бинарника: $BIN (make)"; exit 2; }
 
-NS=steer-udp
+NS=tunvless-udp
 UUID=8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124
 PORT=10800
+# Узел — не в 127.0.0.0/8: такой отвергается как «отвечать некому» (sublink.c).
+NODE=10.66.0.1
 WORK="$(mktemp -d)"
 
 cleanup() {
@@ -40,36 +42,30 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-printf '%s\n' "vless://$UUID@127.0.0.1:$PORT?security=none&type=tcp#local" > "$WORK/sub.txt"
-cat > "$WORK/spec.json" <<SPEC
-{"schema":1,
- "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$WORK/sub.txt","node":0}},
- "channels":[]}
-SPEC
+LINK="vless://$UUID@$NODE:$PORT?security=none&type=tcp#local"
 
 ip netns delete "$NS" 2>/dev/null || true
 ip netns add "$NS"
 ip netns exec "$NS" ip link set lo up
+ip netns exec "$NS" ip addr add "$NODE/32" dev lo
 
-ip netns exec "$NS" python3 tests/fake-vless.py --port "$PORT" --uuid "$UUID" --mb 1 \
+ip netns exec "$NS" python3 tests/fake-vless.py --port "$PORT" --uuid "$UUID" --mb 1 --bind "$NODE" \
     > "$WORK/srv.log" 2>&1 &
 SRV_PID=$!
 sleep 1
 
-ip netns exec "$NS" env STEER_TUN_STATS=1 "$BIN" vless vl \
-    --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/tun.log" 2>&1 &
+# Куда угодно, кроме localhost: поддельному серверу адрес безразличен, важно попасть в туннель.
+ip netns exec "$NS" env STEER_TUN_STATS=1 "$BIN" "$LINK" -d vl -r 203.0.113.0/24 \
+    > "$WORK/tun.log" 2>&1 &
 TUN_PID=$!
 
 for _ in $(seq 50); do
-    ip netns exec "$NS" ip link show vl >/dev/null 2>&1 && break
+    ip netns exec "$NS" ip route show 203.0.113.0/24 2>/dev/null | grep -q 'dev vl' && break
     sleep 0.2
 done
-if ! ip netns exec "$NS" ip link show vl >/dev/null 2>&1; then
-    echo "устройство vl не поднялось:"; sed 's/^/  /' "$WORK/tun.log"; exit 1
+if ! ip netns exec "$NS" ip route show 203.0.113.0/24 2>/dev/null | grep -q 'dev vl'; then
+    echo "устройство vl или маршрут в него не поднялись:"; sed 's/^/  /' "$WORK/tun.log"; exit 1
 fi
-
-# Куда угодно, кроме localhost: поддельному серверу адрес безразличен, важно попасть в туннель.
-ip netns exec "$NS" ip route replace 203.0.113.0/24 dev vl
 
 # Клиент внутри пространства: своим сокетом UDP, потому что ни один готовый инструмент не
 # умеет сказать «пришла ли ответная датаграмма ЦЕЛОЙ и той же». ICMP слушаем сырым сокетом —

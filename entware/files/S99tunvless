@@ -1,0 +1,96 @@
+#!/bin/sh
+# tunvless — Entware init script. Settings: /opt/etc/tunvless/tunvless.conf.
+#
+# The tunnel runs in the background with its log in syslog (logread). It needs no supervisor to
+# come up late: while the node does not resolve or does not answer (no WAN yet at boot) it retries
+# by itself. `stop` sends SIGTERM: tunvless removes the host route it may have added for the
+# server, and the device with every route into it goes with the process.
+
+PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PROC=tunvless
+BIN=/opt/bin/tunvless
+CONF=/opt/etc/tunvless/tunvless.conf
+
+ENABLED=no
+NODES=/opt/etc/tunvless/nodes.txt
+NODE=
+DEVICE=tunvless0
+ADDRESS=198.51.100.1/32
+ROUTES=
+TABLE=
+MARK=
+BIND_DEV=
+OPTS=
+[ -f "$CONF" ] && . "$CONF"
+
+running() { [ -n "$(pidof $PROC)" ]; }
+
+start() {
+    if [ "$ENABLED" != yes ]; then
+        echo "tunvless: disabled (ENABLED=yes in $CONF)"
+        return 0
+    fi
+    if running; then
+        echo "tunvless: already running"
+        return 0
+    fi
+    [ -c /dev/net/tun ] || { modprobe tun 2>/dev/null || insmod tun 2>/dev/null; }
+
+    set -- "$NODES" -d "$DEVICE" -a "$ADDRESS"
+    [ -n "$NODE" ] && set -- "$@" -n "$NODE"
+    for r in $ROUTES; do set -- "$@" -r "$r"; done
+    [ -n "$TABLE" ] && set -- "$@" -T "$TABLE"
+    [ -n "$MARK" ] && set -- "$@" -m "$MARK"
+    [ -n "$BIND_DEV" ] && set -- "$@" -b "$BIND_DEV"
+
+    # OPTS is split on spaces on purpose: it holds several options.
+    # shellcheck disable=SC2086
+    if command -v logger >/dev/null 2>&1; then
+        ( exec </dev/null >/dev/null 2>&1; "$BIN" "$@" $OPTS 2>&1 | logger -t $PROC ) &
+    else
+        ( exec </dev/null >/dev/null 2>&1; exec "$BIN" "$@" $OPTS ) &
+    fi
+
+    # The device appears once a node is chosen: usually within seconds; with no WAN yet the
+    # tunnel keeps trying in the background.
+    i=0
+    while [ $i -lt 20 ]; do
+        [ -d "/sys/class/net/$DEVICE" ] && { echo "tunvless: $DEVICE is up"; return 0; }
+        running || { echo "tunvless: exited — see logread -e tunvless"; return 1; }
+        sleep 1
+        i=$((i + 1))
+    done
+    echo "tunvless: started, $DEVICE not up yet (waiting for the node) — see logread -e tunvless"
+    return 0
+}
+
+stop() {
+    running || { echo "tunvless: not running"; return 0; }
+    killall $PROC 2>/dev/null
+    i=0
+    while running && [ $i -lt 10 ]; do sleep 1; i=$((i + 1)); done
+    if running; then
+        killall -9 $PROC 2>/dev/null
+        sleep 1
+    fi
+    running && { echo "tunvless: would not stop"; return 1; }
+    echo "tunvless: stopped"
+}
+
+check() {
+    if running; then
+        if [ -d "/sys/class/net/$DEVICE" ]; then echo "tunvless: running, $DEVICE up"
+        else echo "tunvless: running, $DEVICE not up yet"; fi
+        return 0
+    fi
+    echo "tunvless: not running"
+    return 1
+}
+
+case "$1" in
+    start) start ;;
+    stop) stop ;;
+    restart) stop; start ;;
+    check|status) check ;;
+    *) echo "Usage: $0 {start|stop|restart|check|status}"; exit 1 ;;
+esac

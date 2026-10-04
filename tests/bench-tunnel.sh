@@ -21,14 +21,14 @@ cd "$(dirname "$0")/.."
 MB="${1:-32}"
 IDLE="${2:-0}"
 STREAMS="${3:-1}"
-BIN="${STEER:-./build/steer-ext-check}"
+BIN="${TUNVLESS:-./out/tunvless}"
 [ -x "$BIN" ] || { echo "нет бинарника: $BIN"; exit 2; }
 
-NS=steer-bench
+NS=tunvless-bench
 UUID=8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124
 PORT=10800
-# Узел стенда — на обычном адресе, а не на петле: движок отвергает узел в 127.0.0.0/8
-# как «отвечать некому» (sub.c), и стенд от этого не поднимался вовсе.
+# Узел стенда — на обычном адресе, а не на 127.0.0.0/8: такой узел отвергается как «отвечать
+# некому» (sublink.c).
 NODE=10.66.0.1
 WORK="$(mktemp -d)"
 
@@ -42,20 +42,14 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-printf '%s\n' "vless://$UUID@$NODE:$PORT?security=none&type=tcp#local" > "$WORK/sub.txt"
-cat > "$WORK/spec.json" <<SPEC
-{"schema":1,
- "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$WORK/sub.txt","node":0}},
- "channels":[]}
-SPEC
+LINK="vless://$UUID@$NODE:$PORT?security=none&type=tcp#local"
+TARGET=203.0.113.7
 
 ip netns delete "$NS" 2>/dev/null || true
 ip netns add "$NS"
 ip netns exec "$NS" ip link set lo up
-# Адрес узла живёт на dummy внутри пространства: снаружи он не виден, а петлёй не является.
-ip netns exec "$NS" ip link add stand type dummy
-ip netns exec "$NS" ip addr add "$NODE/32" dev stand
-ip netns exec "$NS" ip link set stand up
+# Адрес узла — на lo внутри пространства: снаружи он не виден, а в 127.0.0.0/8 не входит.
+ip netns exec "$NS" ip addr add "$NODE/32" dev lo
 
 ip netns exec "$NS" python3 tests/fake-vless.py --port "$PORT" --uuid "$UUID" --mb "$MB" --bind "$NODE" \
     > "$WORK/srv.log" 2>&1 &
@@ -64,19 +58,16 @@ sleep 1
 
 # ОДНО ядро и ОДИН поток: на роутере их столько и есть, а на восьми ядрах разница между
 # «цикл дорогой» и «цикл дешёвый» размазывается по свободным ядрам и не видна.
-ip netns exec "$NS" taskset -c 0 env STEER_TUN_THREADS=1 "$BIN" vless vl \
-    --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/tun.log" 2>&1 &
+ip netns exec "$NS" taskset -c 0 env STEER_TUN_THREADS=1 "$BIN" "$LINK" -d vl -r "$TARGET/32" \
+    > "$WORK/tun.log" 2>&1 &
 TUN_PID=$!
 
 for _ in $(seq 50); do
-    ip netns exec "$NS" ip link show vl >/dev/null 2>&1 && break
+    ip netns exec "$NS" ip route show "$TARGET/32" 2>/dev/null | grep -q 'dev vl' && break
     sleep 0.2
 done
-ip netns exec "$NS" ip link show vl >/dev/null 2>&1 || {
-    echo "устройство vl не поднялось:"; sed 's/^/  /' "$WORK/tun.log"; exit 1; }
-
-TARGET=203.0.113.7
-ip netns exec "$NS" ip route replace "$TARGET/32" dev vl
+ip netns exec "$NS" ip route show "$TARGET/32" 2>/dev/null | grep -q 'dev vl' || {
+    echo "устройство vl или маршрут в него не поднялись:"; sed 's/^/  /' "$WORK/tun.log"; exit 1; }
 
 # Молчащие соединения: открыть и держать. Порт 9 — тот, на котором поддельный сервер
 # сознательно молчит (см. fake-vless.py).

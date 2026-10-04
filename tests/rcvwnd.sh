@@ -9,8 +9,7 @@
 # прежний потолок — 100-250 Мбит/с на соединение, сколько бы ни давали узел и процессор. Без задержки (veth,
 # круг в доли миллисекунды) окно скорость выгрузки не ограничивало: её держит узел.
 #
-# ЧТО ПРОВЕРЯЕТ СТЕНД. Модуль steer-vless (прямой запуск, без демона: маршрут на цель — в TUN, как у
-# tests/run-tunnel.sh) принимает выгрузку настоящего клиента ядра, между клиентом и роутером — netem в
+# ЧТО ПРОВЕРЯЕТ СТЕНД. tunvless (маршрут на цель — в TUN, как у tests/run-tunnel.sh) принимает выгрузку настоящего клиента ядра, между клиентом и роутером — netem в
 # обе стороны (круг 6 мс), узел — приёмник без шифрования (tests/sigpipe-node.py, порт 82). Дважды:
 #   * по умолчанию — клиент видит в `ss -ti` масштаб окна роутера (wscale:<наш>,<его>), объявленное окно
 #     (snd_wnd) выше 64 КБ, и выгрузка быстрее потолка «64 КБ на круг» больше чем втрое;
@@ -21,13 +20,13 @@
 # (клиент её всё равно проигнорировал бы, и в ss этого не видно).
 #
 # Нужны root, unshare -nm, ip, tc (netem), ss, nsenter и python3 — иначе пропуск, а не падение.
-# LIBS — раскладка libs (tests/libs-test.sh, build/libs-host).
+# TUNVLESS — бинарник (по умолчанию ./out/tunvless).
 set -u
-LIBS="$(cd "${LIBS:-build/libs-host}" 2>/dev/null && pwd)"
 skip() { echo "rcvwnd: $1 — пропуск"; exit 0; }
-[ -x "$LIBS/steerd" ] && [ -x "$LIBS/steer-vless" ] || skip "нет раскладки libs ($LIBS, tests/libs-test.sh)"
+BIN="${TUNVLESS:-./out/tunvless}"
+[ -x "$BIN" ] || skip "нет бинарника $BIN (make)"
+BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"; export TUNVLESS="$BIN"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-LD_LIBRARY_PATH="$LIBS"; export LD_LIBRARY_PATH
 pass=0 fail=0
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); echo "ok   $1"; else
@@ -48,9 +47,8 @@ fi
 mount --make-rprivate / 2>/dev/null
 mount -t sysfs sysfs /sys 2>/dev/null || skip "свой /sys не смонтировать"
 ip link set lo up
-ip link add nemprobe type dummy 2>/dev/null && tc qdisc add dev nemprobe root netem delay 1ms 2>/dev/null \
-    || skip "netem недоступен (sch_netem)"
-ip link del nemprobe
+tc qdisc add dev lo root netem delay 1ms 2>/dev/null || skip "netem недоступен (sch_netem)"
+tc qdisc del dev lo root
 sysctl -qw net.ipv4.ip_forward=1 net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0
 
 UUID=8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124
@@ -70,7 +68,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 1' INT TERM
 
-# ---- сеть: роутер (это пространство), клиент за veth, узел на dummy роутера ---------------------------
+# ---- сеть: роутер (это пространство), клиент за veth, узел на lo роутера ------------------------------
 unshare -n sleep 1800 & CPID=$!
 sleep 0.3
 C() { nsenter -t "$CPID" -n "$@"; }
@@ -82,9 +80,7 @@ C ip link set lo up
 C ip addr add 10.78.1.2/24 dev c0
 C ip link set c0 up
 C ip route add default via 10.78.1.1
-ip link add node0 type dummy
-ip addr add 10.78.0.1/32 dev node0
-ip link set node0 up
+ip addr add 10.78.0.1/32 dev lo
 # Круг в LAN: задержка в каждую сторону (исходящее клиента и исходящее роутера клиенту). limit — с запасом:
 # netem держит в очереди всё, что «в полёте» по задержке, и со штатным 1000 пакетов терял бы сам.
 C tc qdisc add dev c0 root netem delay "${DELAY}ms" limit 100000
@@ -92,12 +88,7 @@ tc qdisc add dev p0 root netem delay "${DELAY}ms" limit 100000
 
 python3 "$HERE/sigpipe-node.py" --bind 10.78.0.1 --port 10444 --uuid "$UUID" >"$tmp/node.out" 2>"$tmp/node.err" & NP=$!
 wait_for 'grep -q ready "$tmp/node.out"' 10
-printf 'vless://%s@10.78.0.1:10444?security=none&type=tcp#node\n' "$UUID" > "$tmp/sub.txt"
-cat > "$tmp/spec.json" <<EOF
-{"schema":1,
- "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$tmp/sub.txt","node":0}},
- "channels":[]}
-EOF
+LINK="vless://$UUID@10.78.0.1:10444?security=none&type=tcp#node"
 
 # Клиент: выгрузка на порт 82 узла (приёмник, который не закрывается) SECS секунд; соединение держится
 # открытым, пока стенд не снимет ss.
@@ -118,14 +109,12 @@ print("клиент: послал", flush=True)
 time.sleep(30)
 PY
 
-# Один прогон: модуль (env — «К=З» или пусто), выгрузка, ss клиента в середине и в конце. Печатает в $tmp/run.*
+# Один прогон: туннель (env — «К=З» или пусто), выгрузка, ss клиента в середине и в конце. Печатает в $tmp/run.*
 run() {
     name="$1"; shift
-    env "$@" "$LIBS/steerd" vless vl --spec "$tmp/spec.json" --state-dir "$tmp/st" >"$tmp/mod.log" 2>&1 &
+    env "$@" "$BIN" "$LINK" -d vl -r "$TARGET/32" >"$tmp/mod.log" 2>&1 &
     MP=$!
-    wait_for 'ip link show vl >/dev/null 2>&1' 20
-    wait_for 'grep -q "запасных сессий" "$tmp/mod.log"' 20
-    ip route replace "$TARGET/32" dev vl
+    wait_for 'ip route show "$TARGET/32" 2>/dev/null | grep -q "dev vl"' 20
     # nsenter напрямую, а не функцией C: у функции $! — подоболочка, и kill её не убил бы сам python.
     nsenter -t "$CPID" -n python3 "$tmp/up.py" "$TARGET" "$SECS" >"$tmp/cl.$name" 2>&1 & CL=$!
     sleep "$(awk -v s="$SECS" 'BEGIN { print s / 2 }')"

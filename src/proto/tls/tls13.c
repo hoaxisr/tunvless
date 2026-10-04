@@ -487,7 +487,7 @@ static int handshake(struct tls13 *t, int fd,
     unsigned char ecdhe[SC_MLKEM768_SS + 32];
     size_t ecdhe_n = 32;
     if (have_kem) {
-        if (getenv("STEER_PQ_TRACE")) fprintf(stderr, "steer[pq]: сервер выбрал X25519MLKEM768\n");
+        if (getenv("STEER_PQ_TRACE")) fprintf(stderr, "tunvless[pq]: сервер выбрал X25519MLKEM768\n");
         if (sc_mlkem768_decaps(ecdhe, auth->mlkem_dk, kem_ct) != 0) return TLS13_ECRYPTO;
         if (x25519_shared_ext(our_priv, server_pub, ecdhe + SC_MLKEM768_SS) != 0) return TLS13_ECRYPTO;
         ecdhe_n = sizeof(ecdhe);

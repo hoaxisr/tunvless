@@ -36,7 +36,11 @@
 #include <sys/uio.h>
 
 #include "tun.h"
-#include "platform.h"
+
+/* The TUN clone device. On Entware it comes from the firmware's tun kernel module, never from a
+ * package. */
+#define TUN_DEV  "/dev/net/tun"
+#define TUN_HINT "load the tun kernel module (modprobe tun, or the firmware component that ships it)"
 
 /* Заголовок разгрузки virtio, тот самый, который принимает IFF_VNET_HDR.
  *
@@ -78,7 +82,7 @@ static int g_open_stage;      /* 1 — не открылся узел TUN, 2 —
 static char g_open_got[IFNAMSIZ];   /* имя, которое вернуло ядро при stage 3 */
 
 static int queue_open(const char *name, short flags) {
-    int fd = open(plat()->tun_dev, O_RDWR);
+    int fd = open(TUN_DEV, O_RDWR);
     if (fd < 0) {
         if (!g_open_errno) { g_open_errno = errno; g_open_stage = 1; }
         return -1;
@@ -211,21 +215,21 @@ int tun_open(struct tun_dev *d, int max_queues, const char *name) {
      * ни строки, и «туннель не поднялся» выглядело как «туннель просто не работает». */
     if (g_open_stage == 1 && (g_open_errno == ENOENT || g_open_errno == ENXIO ||
                               g_open_errno == ENODEV)) {
-        fprintf(stderr, "steer[warn] tunnel: нет %s (%s) — %s\n", plat()->tun_dev,
-                strerror(g_open_errno), plat()->tun_hint);
+        fprintf(stderr, "tunvless[warn] tunnel: нет %s (%s) — %s\n", TUN_DEV,
+                strerror(g_open_errno), TUN_HINT);
         return TUN_ENODEV;
     }
     if (g_open_stage == 3) {
-        fprintf(stderr, "steer[warn] tunnel: ядро создало устройство с другим именем: "
+        fprintf(stderr, "tunvless[warn] tunnel: ядро создало устройство с другим именем: "
                 "просили %s, получили %s%s\n", name, g_open_got,
                 strlen(name) >= IFNAMSIZ
                     ? " — имя длиннее предела ядра (IFNAMSIZ, 15 значащих символов)" : "");
         return TUN_ESETUP;
     }
-    fprintf(stderr, "steer[warn] tunnel: устройство %s не создалось: %s (%s%s)\n", name,
+    fprintf(stderr, "tunvless[warn] tunnel: устройство %s не создалось: %s (%s%s)\n", name,
             strerror(g_open_errno ? g_open_errno : EINVAL),
             g_open_stage == 1 ? "не открылся " : "отказал TUNSETIFF",
-            g_open_stage == 1 ? plat()->tun_dev : "");
+            g_open_stage == 1 ? TUN_DEV : "");
     return TUN_ESETUP;
 }
 

@@ -1,11 +1,12 @@
-/* Откуда брать корни при проверке сертификата. Подробности — в roots.c. */
+/* Where the trusted roots come from. Details in roots.c. */
 #ifndef STEER_ROOTS_H
 #define STEER_ROOTS_H
 
-/* Хранилище корней для auth.roots у tls13_handshake_auth: шов стенда, на телефоне — склейка
- * системного каталога, на роутере — NULL (умолчание certverify). Одни корни на весь движок:
- * их спрашивают и транспорт security=tls (proto/transport/trsec.c), и замер urltest по HTTPS
- * (urltls.c). */
+/* PEM bundle for auth.roots of tls13_handshake_auth (proto/transport/trsec.c); NULL leaves the
+ * choice to certverify's default. */
 const char *tls_cert_roots(void);
+
+/* --ca: use this bundle instead of the defaults. */
+void tls_set_cert_roots(const char *path);
 
 #endif

@@ -6,11 +6,8 @@
  * носителя для рукопожатия xsteer, и стенд hellofreeze сверяет с ними результат ПОСЛЕ:
  * пока сверка сходится, отпечаток не поехал ни на бит.
  *
- * Второе применение — стенду chellomatch: разбор Hello проверяется на настоящем Hello, а не
- * на выдуманном, и для этого криптобиблиотека не нужна вовсе.
- *
- * Как пересобрать: `make ext-test` (собирает build/hellofreeze), затем
- *     ./build/hellofreeze --emit > tests/chello-frozen.h
+ * Как пересобрать: `make crypto-test` (собирает out/tests/hellofreeze), затем
+ *     ./out/tests/hellofreeze --emit > tests/chello-frozen.h
  * и вернуть эту шапку: --emit печатает короткую.
  *
  * Байты session_id (44-75) переморожены 28 сентября 2026 с кода main до переезда на wolfSSL

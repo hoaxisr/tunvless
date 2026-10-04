@@ -9,8 +9,6 @@
  * связь с узлом (struct transport). Связь можно установить заранее — адрес назначения в VLESS
  * едет в заголовке запроса вместе с первыми данными, а до того связь ничья (DC_PRECONNECT), —
  * поэтому у стека есть пул запасных связей, и take переселяет из запасной только связь.
- *
- * При выпуске 1.10 (шаг 4) этот файл уходит в бинарник модуля steer-vless.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -18,17 +16,16 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
-#include <sys/random.h>
+#include "osrand.h"
 
 #include "vless.h"
 #include "vless_proto.h"
 #include "vision.h"
 #include "client.h"
 #include "vldial.h"
-#include "pool.h"
 #include "stack.h"
 
-#define LOG_W  "steer[warn] tunnel: "
+#define LOG_W  "tunvless[warn] tunnel: "
 
 /* Буфер стека обязан вмещать целую запись транспорта и запас на заголовок и набивку Vision
  * (см. TUNNEL_BUF в dialer.h). Число там записано числом, а проверяется — здесь. */
@@ -55,8 +52,6 @@ static void vl_describe(const void *ctx, char *out, size_t n) {
 
 /* ---- связь ----------------------------------------------------------------------------- */
 
-/* Исход установления слежке за узлом докладывает пул узлов (src/tunnel/pool.c): он знает, к какому
- * из активных узлов шло соединение. */
 static int vl_connect(const void *ctx, void *sess, int timeout_s) {
     struct vl_sess *s = sess;
     return vless_connect(ctx, &s->t, timeout_s);
@@ -172,7 +167,7 @@ enum { XS_LEN = 0, XS_META, XS_DLEN, XS_DATA, XS_SKIP };
 static unsigned char g_xudp_key[16];
 static pthread_once_t g_xudp_once = PTHREAD_ONCE_INIT;
 static void xudp_key_init(void) {
-    if (getrandom(g_xudp_key, sizeof g_xudp_key, 0) != (ssize_t)sizeof g_xudp_key) {
+    if (os_getrandom(g_xudp_key, sizeof g_xudp_key, 0) != (ssize_t)sizeof g_xudp_key) {
         struct timespec t;
         clock_gettime(CLOCK_REALTIME, &t);
         memcpy(g_xudp_key, &t, sizeof t < sizeof g_xudp_key ? sizeof t : sizeof g_xudp_key);
@@ -629,22 +624,24 @@ static int vl_deliver(const void *ctx, void *sess, int udp, const unsigned char 
 
 /* ---- подъём ---------------------------------------------------------------------------- */
 
-int vless_tunnel_run(struct output *o, const struct pool_cfg *pc,
-                     void (*ready)(void *arg, const char *dev), void *arg) {
+int vless_tunnel_run(const struct tun_cfg *tc, const struct vless_node *node, int silence_s,
+                     stack_ready_fn ready, void *arg) {
     /* Идентификатор узла — ДО устройства и потоков, пока узел ещё можно назвать. Дальше он
      * разбирается заново на каждое соединение (vl_flow_open), и отказ там означал бы туннель,
      * который поднят, но закрывает всё подряд (I-097). */
-    const struct vless_node *node = (const struct vless_node *)pc->nodes + pc->first;
     unsigned char id[16];
     if (vless_uuid_parse(node->uuid, id) != 0) {
-        fprintf(stderr, "steer[warn]: у узла %s не разбирается UUID — туннель %s не поднят; "
-                        "проверьте ссылку узла\n", node->name, o->device);
+        fprintf(stderr, "tunvless[warn]: у узла %s не разбирается UUID — туннель %s не поднят; "
+                        "проверьте ссылку узла\n", node->name, tc->dev);
         return 1;
     }
     g_trace = getenv("STEER_TUN_TRACE") != NULL;
-    /* Узлы соединений выбирает пул (src/tunnel/pool.c): активных может быть несколько, у каждого
-     * соединения свой, и замена умершего — без перезапуска процесса. */
-    return pool_run(o, pc, ready, arg);
+    /* One node: it is the dialer's ctx, and the stack asks nothing about other nodes. */
+    static struct dialer d;
+    d.ops = &vless_dialer;
+    d.ctx = node;
+    d.silence_s = silence_s;
+    return stack_run(tc, &d, ready, arg);
 }
 
 const struct dialer_ops vless_dialer = {

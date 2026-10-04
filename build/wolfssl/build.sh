@@ -1,34 +1,27 @@
 #!/bin/sh
-# Собрать wolfSSL из исходников в статический архив — одним и тем же рецептом для всех целей.
+# Build wolfSSL from source into a static archive — one recipe for every target.
 #
-#     sh build/wolfssl/build.sh <исходники wolfSSL> <выход .a> [asm|noasm]
+#     sh build/wolfssl/build.sh <wolfSSL sources> <output .a> [asm|noasm]
 #
-# Компилятор и флаги — из окружения: CC (по умолчанию cc; zig — «zig cc -target …»), CFLAGS (цель,
-# оптимизация), AR (по умолчанию «ar»; у zig — «zig ar», busybox ar архив создавать не умеет).
-# STEER_WOLFSSL_DEFS — добавочные ключи библиотеки, которых нет в user_settings.h: их даёт только
-# tests/ext-test.sh (выпуск сертификатов для стендов, WOLFSSL_CERT_GEN), сборки движка — никогда.
+# Compiler and flags come from the environment: CC (default cc), CFLAGS (target, optimization),
+# AR (default ar). STEER_WOLFSSL_DEFS adds library options that are not in user_settings.h: only
+# the crypto tests use it (certificate issuing and a TLS server for the peer side, see the
+# Makefile); tunvless builds never do.
 #
-# Рядом с архивом кладётся <выход>.cflags — ровно те ключи, с которыми обязан компилироваться
-# src/lib/scrypto.c против этого архива (определения и -I). Не «примерно те же»: ключ
-# STEER_WOLFSSL_ASM меняет раскладку Aes (поля AES-NI), и scrypto.c, собранный без него рядом с
-# библиотекой, собранной с ним, писал бы мимо полей. Поэтому вызывающий берёт ключи из файла, а не
-# выводит их сам.
+# Next to the archive goes <output>.cflags — exactly the flags src/lib/scrypto.c must be compiled
+# with against this archive (defines and -I). Not "roughly the same": STEER_WOLFSSL_ASM changes the
+# layout of Aes (the AES-NI fields), and scrypto.c compiled without it next to a library built with
+# it would write past the fields. So callers read the flags from the file instead of deriving them.
 #
-# ПОЧЕМУ СВОЙ РЕЦЕПТ, А НЕ configure. Движок собирается zig под девять архитектур из одного образа
-# и NDK под телефон; configure wolfSSL на каждую цель — это autotools в образе, проба компилятора
-# под чужую архитектуру и опции, размазанные по командной строке. Официальный путь wolfSSL для
-# встраиваемых сборок — ровно такой: список .c, ключ -DWOLFSSL_USER_SETTINGS и один заголовок
-# опций (build/wolfssl/user_settings.h — там же, почему опции именно такие). Этим же заголовком
-# и этим же списком собирает Android.bp (сверяет tests/buildmatch.sh), а шаг 4 (пакет
-# libsteer-wolfssl) — .so из того же набора.
+# WHY A RECIPE AND NOT configure. Cross builds (the Entware SDK, any CC=...) get one list of .c
+# files, -DWOLFSSL_USER_SETTINGS and one options header (build/wolfssl/user_settings.h — the
+# reasons for each option are there) — wolfSSL's own way for embedded builds — instead of
+# autotools probing a foreign compiler.
 #
-# СПИСОК ФАЙЛОВ — ЯВНЫЙ, а не «всё из wolfcrypt/src»: там больше сотни файлов, из которых нам
-# нужна треть, и лишний файл под нашими опциями компилируется в пустоту — то есть ничего не
-# стоит на флеше, но стоит времени сборки на девяти архитектурах. Забытый нужный файл виден сразу:
-# неопределённая ссылка при компоновке движка или стенда.
+# THE FILE LIST IS EXPLICIT, not "everything in wolfcrypt/src": more than a hundred files of which a
+# third are needed. A forgotten one shows at once as an undefined reference at link time.
 #
-# ОШИБКА КОМПИЛЯЦИИ ФАЙЛА НЕ ГЛУШИТСЯ и называется словами «не удалась» — их читает барьер
-# релиза (.github/workflows/release.yml грепает build.log), ровно как прежде у цикла mbedtls.
+# A FILE THAT FAILS TO COMPILE IS NOT HIDDEN: its errors are printed and the build stops.
 set -eu
 
 SRC="${1:?нужен каталог исходников wolfSSL}"
@@ -40,9 +33,9 @@ AR="${AR:-ar}"
 CFLAGS="${CFLAGS:--O2}"
 HERE=$(cd "$(dirname "$0")" && pwd)
 
-# Сам список — функцией, чтобы его же печатал вызов `build.sh list` для сверки с Android.bp.
+# The list is a function, so that `build.sh list` can print it.
 wolfssl_c_files() {
-    for f in internal keys ssl tls tls13 quic wolfio; do echo "src/$f.c"; done
+    for f in internal keys ssl tls tls13 wolfio; do echo "src/$f.c"; done
     # ge_operations.c — групповая математика Ed25519: X25519 берёт её для открытого ключа там, где
     # у кривой свой ассемблер (aarch64, CURVED25519_ASM_64BIT); на остальных целях файл пуст.
     for f in aes asn chacha chacha20_poly1305 coding cpuid curve25519 ecc error fe_operations \
@@ -52,7 +45,7 @@ wolfssl_c_files() {
     done
     # Встроенный ассемблер aarch64 (WOLFSSL_ARMASM_INLINE в user_settings.h). Файлы в каждом
     # списке, а не только у aarch64: вне его они компилируются в пустоту (#ifdef __aarch64__
-    # внутри), и список остаётся одним на все цели и на Android.bp.
+    # внутри), и список остаётся одним на все цели.
     for f in aes-asm_c chacha-asm_c poly1305-asm_c sha256-asm_c sha512-asm_c curve25519_c sha3-asm_c; do
         echo "wolfcrypt/src/port/arm/armv8-$f.c"
     done
@@ -77,8 +70,8 @@ esac
 
 DEFS="-DWOLFSSL_USER_SETTINGS $ASMDEF ${STEER_WOLFSSL_DEFS:-}"
 OBJ="$OUT.obj"
-# Отпечаток сборки: опции, флаги, компилятор. Архив с тем же отпечатком не пересобирается — у
-# девяти архитектур это минуты, — а любая правка user_settings.h или флагов пересобирает его.
+# Отпечаток сборки: опции, флаги, компилятор. Архив с тем же отпечатком не пересобирается, а любая
+# правка user_settings.h или флагов пересобирает его.
 STAMP="$(cat "$HERE/user_settings.h" "$0"; echo "$CC|$CFLAGS|$DEFS|$TRIPLE")"
 if [ -f "$OUT" ] && [ -f "$OUT.stamp" ] && [ "$(cat "$OUT.stamp")" = "$STAMP" ]; then
     exit 0

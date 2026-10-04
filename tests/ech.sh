@@ -19,7 +19,7 @@ set -eu
 cd "$(dirname "$0")/.."
 BUILD=${BUILD:-build}
 PROBE="$BUILD/vencprobe"
-[ -x "$PROBE" ] || { echo "ech: нет $PROBE (собирает tests/ext-test.sh)"; exit 2; }
+[ -x "$PROBE" ] || { echo "ech: нет $PROBE (собирает make interop)"; exit 2; }
 command -v python3 >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1 || {
 	echo "ech: ПРОПУСК — нужны python3 и openssl. Это не падение."; exit 0; }
 [ -n "${XRAY:-}" ] && [ -x "$XRAY" ] || {

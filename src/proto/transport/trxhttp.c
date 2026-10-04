@@ -15,7 +15,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <poll.h>
-#include <sys/random.h>
+#include "osrand.h"
 
 #include "transport.h"
 
@@ -47,7 +47,7 @@ static enum xhttp_mode xhttp_mode_of(const struct tr_node *n) {
  * приложений и ничем не выделяется. */
 static void session_id(char *out, size_t cap) {
     unsigned char r[16];
-    if (getrandom(r, sizeof r, 0) != (ssize_t)sizeof r) {
+    if (os_getrandom(r, sizeof r, 0) != (ssize_t)sizeof r) {
         /* Источник случайности отказал. Нули здесь были бы ХУЖЕ отказа: сессия стала бы
          * предсказуемой, оставаясь на вид рабочей. Пусть будет заведомо негодная строка —
          * сервер её примет, но такой узел не поднимется, и это заметят. */
@@ -83,7 +83,7 @@ static int xhttp_referer(char *out, size_t cap, const char *authority, const cha
     size_t lo = pt ? pf : 100;
     size_t hi = pt ? pt : 1000;
     unsigned char r = 0;
-    if (getrandom(&r, 1, 0) != 1) r = 128;
+    if (os_getrandom(&r, 1, 0) != 1) r = 128;
     size_t pad = lo + (size_t)r * (hi - lo + 1) / 256;
     if (pad < lo) pad = lo;
     if (pad > hi) pad = hi;

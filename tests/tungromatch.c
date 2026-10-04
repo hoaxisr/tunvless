@@ -48,6 +48,7 @@ static void setup(int gso) {
     int big = 1 << 20;
     setsockopt(g_pair[0], SOL_SOCKET, SO_SNDBUF, &big, sizeof(big));
     setsockopt(g_pair[1], SOL_SOCKET, SO_RCVBUF, &big, sizeof(big));
+    free(g_dev.rx);              /* приёмный буфер разбора: заводится при первом чтении */
     memset(&g_dev, 0, sizeof(g_dev));
     g_dev.fd = g_pair[0];
     g_dev.gso = gso;
@@ -482,6 +483,7 @@ int main(void) {
         check("круг: разобрано столько же пакетов", 4, back);
         check("круг: пакеты и суммы сошлись", 1, same);
         close(pr[0]); close(pr[1]);
+        free(in.rx);
     }
 
     /* Неполная сумма на ОДИНОЧНОМ пакете: так ядро отдаёт пакеты своих сокетов, оставляя сумму
@@ -582,5 +584,6 @@ int main(void) {
         }
     }
 
+    free(g_dev.rx);
     return unit_done("tungromatch");
 }

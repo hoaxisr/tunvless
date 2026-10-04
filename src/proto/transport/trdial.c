@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <net/if.h>
 
 #include "transport.h"
 
@@ -100,17 +101,74 @@ static void sock_ready(int fd, int timeout_s) {
      * дальше». Пределы живут в net.ipv4.tcp_rmem и настраиваются системой, а не нами. */
 }
 
-/* МЕТКА СОКЕТА К УЗЛУ — для `via` (см. «вложенные выходы» в spec.h). Её называет модуль
- * протокола при старте: out_underlay_mark выхода (underlay_setup в proto/vless/vlmain.c).
- * Своя копия того, что в obfs.c делает obfs_mark_sock, а не вызов: этот файл собирают стенды
- * без obfs.c (xhupmatch), а кода здесь три строки. required — задан via: тогда отказ SO_MARK —
- * отказ соединения, иначе оно молча ушло бы мимо выхода-цели напрямую. */
+/* --mark: SO_MARK on every socket to the node, set before connect — the route, and with it the
+ * device and the source address, is chosen there, by the mark. required: a socket the mark cannot
+ * be set on is not used, or it would silently take the unmarked route — into the tunnel. */
 static uint32_t g_sock_mark;
 static int g_sock_mark_req;
 
 void transport_set_sock_mark(uint32_t mark, int required) {
     g_sock_mark = mark;
     g_sock_mark_req = mark && required;
+}
+
+/* --bind-dev: sockets to the node leave through this interface (SO_BINDTODEVICE) whatever the
+ * routing table says — the other way, next to SO_MARK, to keep them out of the tunnel when the
+ * default route points into it. A socket that cannot be bound is not used: unbound, it would go
+ * into the tunnel and loop. */
+static char g_bind_dev[IFNAMSIZ];
+
+void transport_set_bind_dev(const char *ifname) {
+    snprintf(g_bind_dev, sizeof(g_bind_dev), "%s", ifname ? ifname : "");
+}
+
+/* Addresses of a node resolved once, at startup (transport_pin_host). Once the routes point into
+ * the tunnel, the DNS query for the node's name would itself go into the tunnel and wait for a
+ * connection that is waiting for that query. Filled before the loop threads start and only read
+ * afterwards, so no lock. */
+#define PIN_MAX 4
+static struct { char host[128]; struct in_addr ip[ADDR_MAX]; unsigned n; } g_pin[PIN_MAX];
+static unsigned g_pin_n;
+
+static unsigned resolve(const char *host, struct in_addr out[ADDR_MAX]) {
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return 0;
+    unsigned an = 0;
+    for (struct addrinfo *p = res; p && an < ADDR_MAX; p = p->ai_next)
+        if (p->ai_family == AF_INET)
+            out[an++] = ((struct sockaddr_in *)p->ai_addr)->sin_addr;
+    freeaddrinfo(res);
+    return an;
+}
+
+int transport_pin_host(const char *host) {
+    for (unsigned i = 0; i < g_pin_n; i++)
+        if (!strcmp(g_pin[i].host, host)) return (int)g_pin[i].n;
+    if (g_pin_n >= PIN_MAX || strlen(host) >= sizeof(g_pin[0].host)) return TR_EDNS;
+    unsigned an = resolve(host, g_pin[g_pin_n].ip);
+    if (!an) return TR_EDNS;
+    snprintf(g_pin[g_pin_n].host, sizeof(g_pin[0].host), "%s", host);
+    g_pin[g_pin_n].n = an;
+    g_pin_n++;
+    return (int)an;
+}
+
+static unsigned pinned(const char *host, struct in_addr out[ADDR_MAX]) {
+    for (unsigned i = 0; i < g_pin_n; i++)
+        if (!strcmp(g_pin[i].host, host)) {
+            memcpy(out, g_pin[i].ip, g_pin[i].n * sizeof(out[0]));
+            return g_pin[i].n;
+        }
+    return 0;
+}
+
+int transport_pinned_addrs(const char *host, uint32_t *out, int max) {
+    struct in_addr a[ADDR_MAX];
+    unsigned n = pinned(host, a);
+    int k = 0;
+    for (unsigned i = 0; i < n && k < max; i++) out[k++] = a[i].s_addr;
+    return k;
 }
 
 /* Запускает неблокирующий connect. Возвращает fd (соединение уже установлено или в
@@ -126,9 +184,21 @@ static int attempt_start(struct in_addr ip, uint16_t port, int *done) {
         static int told;
         if (!told) {
             told = 1;
-            fprintf(stderr, "steer[warn] via: метка 0x%08x на сокет к узлу не встала (%s) — "
-                            "соединение не открываю: без метки оно ушло бы мимо выхода via\n",
+            fprintf(stderr, "tunvless[warn]: mark 0x%08x not set on a socket to the node (%s) — "
+                            "not connecting: unmarked, it would go into the tunnel\n",
                     g_sock_mark, strerror(errno));
+        }
+        close(fd);
+        return -1;
+    }
+    if (g_bind_dev[0] &&
+        setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, g_bind_dev, (socklen_t)strlen(g_bind_dev) + 1) != 0) {
+        static int told;
+        if (!told) {
+            told = 1;
+            fprintf(stderr, "tunvless[warn]: socket to the node not bound to %s (%s) — not "
+                            "connecting: unbound, it would go into the tunnel\n",
+                    g_bind_dev, strerror(errno));
         }
         close(fd);
         return -1;
@@ -141,18 +211,9 @@ static int attempt_start(struct in_addr ip, uint16_t port, int *done) {
 }
 
 static int tcp_connect(const char *host, uint16_t port, int timeout_s) {
-    char portstr[8];
-    snprintf(portstr, sizeof(portstr), "%u", port);
-    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
-    struct addrinfo *res = NULL;
-    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return TR_EDNS;
-
     struct in_addr addr[ADDR_MAX];
-    unsigned an = 0;
-    for (struct addrinfo *p = res; p && an < ADDR_MAX; p = p->ai_next)
-        if (p->ai_family == AF_INET)
-            addr[an++] = ((struct sockaddr_in *)p->ai_addr)->sin_addr;
-    freeaddrinfo(res);
+    unsigned an = pinned(host, addr);
+    if (an == 0) an = resolve(host, addr);
     if (an == 0) return TR_EDNS;
 
     /* Прошлый победитель — вперёд. В устойчивом состоянии это означает одно соединение за
@@ -232,14 +293,13 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_s) {
     if (win < 0) {
         for (unsigned i = 0; i < nf; i++) close(fd[i]);
         /* Сообщение называет масштаб: «ни один из N адресов» — это про имя узла, а не
-         * про сеть, и лечится сменой узла, а не настройкой роутера. Приставка «steer vless»
-         * — прежняя: по ней журнал читают, а соединяется этим путём пока только VLESS. */
-        fprintf(stderr, "steer vless: %s:%u — ни один адрес не ответил (адресов %u, отпало %u)\n",
+         * про сеть, и лечится сменой узла, а не настройкой роутера. */
+        fprintf(stderr, "tunvless: %s:%u — ни один адрес не ответил (адресов %u, отпало %u)\n",
                 host, port, an, dead);
         return TR_ECONNECT;
     }
     if (dead)
-        fprintf(stderr, "steer vless: %s:%u — соединился, пропущено мёртвых адресов: %u из %u\n",
+        fprintf(stderr, "tunvless: %s:%u — соединился, пропущено мёртвых адресов: %u из %u\n",
                 host, port, dead, an);
     sock_ready(win, timeout_s);
     return win;
@@ -264,29 +324,4 @@ static int (*g_tcp_dial)(const char *host, uint16_t port, int timeout_s);
 int tr_dial(const char *host, uint16_t port, int timeout_s) {
     if (g_tcp_dial) return g_tcp_dial(host, port, timeout_s);
     return tcp_connect(host, port, timeout_s);
-}
-
-/* Сокет UDP к узлу — для протоколов, у которых датаграммы идут датаграммами (shadowsocks, SOCKS5 UDP
- * ASSOCIATE; src/proto/proxy). Та же метка, что у TCP (`over`/`via`), и тем же правилом: метка
- * обязательна — без неё сокет не открывается. Первый адрес IPv4 имени: перебора, как у TCP, нет —
- * у UDP нет рукопожатия, по которому мёртвый адрес видно сразу. Дескриптор неблокирующий и
- * соединённый (connect), либо отрицательный код TR_*. */
-int tr_dial_udp(const char *host, uint16_t port) {
-    char portstr[8];
-    snprintf(portstr, sizeof(portstr), "%u", port);
-    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM };
-    struct addrinfo *res = NULL;
-    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return TR_EDNS;
-    struct sockaddr_in sa = *(struct sockaddr_in *)res->ai_addr;
-    freeaddrinfo(res);
-    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (fd < 0) return TR_ESOCK;
-    if (g_sock_mark &&
-        setsockopt(fd, SOL_SOCKET, SO_MARK, &g_sock_mark, sizeof(g_sock_mark)) != 0 &&
-        g_sock_mark_req) {
-        close(fd);
-        return TR_ESOCK;
-    }
-    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) { close(fd); return TR_ECONNECT; }
-    return fd;
 }

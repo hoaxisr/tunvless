@@ -7,8 +7,8 @@
 # восстановилось после потерь» было не отличить от «узел лёг», и дважды именно на этом всё и
 # остановилось.
 #
-# Стенд: своё сетевое пространство, в нём поддельный сервер VLESS на 127.0.0.1 (tests/
-# fake-vless.py), поднятый steer туннель и wget как клиент. Потери вносятся правилом nft на
+# Стенд: своё сетевое пространство, в нём поддельный сервер VLESS (tests/fake-vless.py), поднятый
+# tunvless туннель и wget как клиент. Потери вносятся правилом nft на
 # ВХОДЕ с устройства туннеля — то есть теряются ровно те пакеты, которые синтезировали мы.
 #
 # Использование: tests/run-tunnel.sh [потери_в_процентах] [потоков]
@@ -23,14 +23,14 @@ STREAMS="${2:-1}"
 # его ядро придерживает подтверждение отложенным таймером. На настоящей сети сегмент
 # нарезается, подтверждения идут густо, и этого замедления нет.
 MB=8
-BIN="${STEER:-./build/steer-ext-check}"
-[ -x "$BIN" ] || { echo "нет бинарника: $BIN (собери extended)"; exit 2; }
+BIN="${TUNVLESS:-./out/tunvless}"
+[ -x "$BIN" ] || { echo "нет бинарника: $BIN (make)"; exit 2; }
 
-NS=steer-tunnel
+NS=tunvless-tunnel
 UUID=8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124
 PORT=10800
-# Узел стенда — на обычном адресе, а не на петле: движок отвергает узел в 127.0.0.0/8
-# как «отвечать некому» (sub.c), и стенд от этого не поднимался вовсе.
+# Узел стенда — на обычном адресе, а не на 127.0.0.0/8: такой узел отвергается как «отвечать
+# некому» (sublink.c).
 NODE=10.66.0.1
 WORK="$(mktemp -d)"
 
@@ -43,20 +43,15 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-printf '%s\n' "vless://$UUID@$NODE:$PORT?security=none&type=tcp#local" > "$WORK/sub.txt"
-cat > "$WORK/spec.json" <<SPEC
-{"schema":1,
- "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$WORK/sub.txt","node":0}},
- "channels":[]}
-SPEC
+LINK="vless://$UUID@$NODE:$PORT?security=none&type=tcp#local"
+# Куда угодно, кроме localhost: адрес поддельному серверу не важен, важно попасть в туннель.
+TARGET=203.0.113.7
 
 ip netns delete "$NS" 2>/dev/null || true
 ip netns add "$NS"
 ip netns exec "$NS" ip link set lo up
-# Адрес узла живёт на dummy внутри пространства: снаружи он не виден, а петлёй не является.
-ip netns exec "$NS" ip link add stand type dummy
-ip netns exec "$NS" ip addr add "$NODE/32" dev stand
-ip netns exec "$NS" ip link set stand up
+# Адрес узла — на lo внутри пространства: снаружи он не виден, а в 127.0.0.0/8 не входит.
+ip netns exec "$NS" ip addr add "$NODE/32" dev lo
 
 # Сервер и туннель — внутри пространства: сервер слушает на 127.0.0.1, туннель туда и ходит.
 ip netns exec "$NS" python3 tests/fake-vless.py --port "$PORT" --uuid "$UUID" --mb "$MB" --bind "$NODE" \
@@ -64,23 +59,19 @@ ip netns exec "$NS" python3 tests/fake-vless.py --port "$PORT" --uuid "$UUID" --
 SRV_PID=$!
 sleep 1
 
-ip netns exec "$NS" env STEER_TUN_STATS=1 "$BIN" vless vl \
-    --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/tun.log" 2>&1 &
+ip netns exec "$NS" env STEER_TUN_STATS=1 "$BIN" "$LINK" -d vl -r "$TARGET/32" \
+    > "$WORK/tun.log" 2>&1 &
 TUN_PID=$!
 
-# Ждём появления устройства, а не спим наугад: подъём занимает разное время.
+# Ждём маршрута в устройство, а не спим наугад: подъём занимает разное время.
 for _ in $(seq 50); do
-    ip netns exec "$NS" ip link show vl >/dev/null 2>&1 && break
+    ip netns exec "$NS" ip route show "$TARGET/32" 2>/dev/null | grep -q 'dev vl' && break
     sleep 0.2
 done
-if ! ip netns exec "$NS" ip link show vl >/dev/null 2>&1; then
-    echo "устройство vl не поднялось:"; sed 's/^/  /' "$WORK/tun.log"; exit 1
+if ! ip netns exec "$NS" ip route show "$TARGET/32" 2>/dev/null | grep -q 'dev vl'; then
+    echo "устройство vl или маршрут в него не поднялись:"; sed 's/^/  /' "$WORK/tun.log"; exit 1
 fi
 sed -n 's/^/  /p' "$WORK/tun.log" | grep -iE "разгрузк|потоков" || true
-
-# Куда угодно, кроме localhost: адрес поддельному серверу не важен, важно попасть в туннель.
-TARGET=203.0.113.7
-ip netns exec "$NS" ip route replace "$TARGET/32" dev vl
 
 if [ "$LOSS" != 0 ]; then
     ip netns exec "$NS" nft add table inet loss

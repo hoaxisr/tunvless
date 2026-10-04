@@ -21,7 +21,7 @@ set -eu
 cd "$(dirname "$0")/.."
 
 SB="${SINGBOX:-./build/sing-box}"
-BIN="${STEER:-./build/steer-ext-check}"
+BIN="${TUNVLESS:-./out/tunvless}"
 MASK="${MASK:-prod.vkimages.io}"          # маскировочный домен: обязан уметь TLS 1.3 и h2
 TARGET="${TARGET:-205.234.175.175}"       # куда просим сходить через туннель
 TPATH="${TPATH:-/1mb.test}"
@@ -30,7 +30,7 @@ THOST="${THOST:-cachefly.cachefly.net}"
 [ -x "$SB" ] || { echo "нет sing-box: $SB (SINGBOX=путь)"; exit 2; }
 [ -x "$BIN" ] || { echo "нет бинарника: $BIN"; exit 2; }
 
-NS=steer-reality
+NS=tunvless-reality
 W="$(mktemp -d)"
 cleanup() {
     [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null || true
@@ -68,26 +68,20 @@ cat > "$W/server.json" <<CFG
  "outbounds":[{"type":"direct","tag":"out"}]}
 CFG
 
-printf '%s\n' "vless://$UUID@10.90.0.1:18443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=$MASK&pbk=$PUB&sid=$SID&fp=chrome#local" > "$W/sub.txt"
-cat > "$W/spec.json" <<SPEC
-{"schema":1,
- "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$W/sub.txt","node":0}},
- "channels":[]}
-SPEC
+LINK="vless://$UUID@10.90.0.1:18443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=$MASK&pbk=$PUB&sid=$SID&fp=chrome#local"
 
 "$SB" run -c "$W/server.json" > "$W/srv.log" 2>&1 &
 SRV=$!
 sleep 2
 grep -q "tcp server started" "$W/srv.log" || { echo "сервер не поднялся:"; tail -5 "$W/srv.log"; exit 1; }
 
-ip netns exec "$NS" env STEER_TUN_STATS=1 "$BIN" vless vl \
-    --spec "$W/spec.json" --state-dir "$W/state" > "$W/tun.log" 2>&1 &
+ip netns exec "$NS" env STEER_TUN_STATS=1 "$BIN" "$LINK" -d vl -r "$TARGET/32" > "$W/tun.log" 2>&1 &
 for _ in $(seq 40); do
-    ip netns exec "$NS" ip link show vl >/dev/null 2>&1 && break
+    ip netns exec "$NS" ip route show "$TARGET/32" 2>/dev/null | grep -q 'dev vl' && break
     sleep 0.2
 done
-ip netns exec "$NS" ip link show vl >/dev/null 2>&1 || { echo "vl не поднялся:"; tail -5 "$W/tun.log"; exit 1; }
-ip netns exec "$NS" ip route replace "$TARGET/32" dev vl
+ip netns exec "$NS" ip route show "$TARGET/32" 2>/dev/null | grep -q 'dev vl' ||
+    { echo "vl не поднялся:"; tail -5 "$W/tun.log"; exit 1; }
 
 echo "  маскировка $MASK, цель $TARGET"
 ip netns exec "$NS" curl -s -o "$W/dl.bin" \

@@ -7,19 +7,17 @@
  * то есть тот случай, когда правка «рядом» поехала в собранный Hello и никто не заметил.
  *
  * КАК ЭТО ВОЗМОЖНО. Hello целиком выводится из случайности, времени и порядка шифров.
- * Случайность здесь подменяется детерминированным генератором (getrandom заменяется
+ * Случайность здесь подменяется детерминированным генератором (os_getrandom заменяется
  * макросом ДО включения исходника, поэтому подменяются и ключевая пара, и перемешивание
  * расширений, и весь шум), время фиксируется, порядок шифров пинится через STEER_CIPHER —
  * он зависит от процессора, и без пиннинга «эталон» отличался бы от машины к машине.
  *
  * ПОЧЕМУ НЕ В make test. Нужна настоящая криптобиблиотека: Hello здесь СОБИРАЕТСЯ (X25519 и
- * AES-GCM аутентификатора — через слой src/lib/scrypto.h). Стенд идёт в `make ext-test`
- * (tests/ext-test.sh) — прежде его собирали руками, и он полгода стоял красным незамеченным
- * (см. ниже). Разбор того же Hello проверяет tests/chellomatch.c, который берёт байты из
- * заморозки и потому библиотеки не требует, — он в make test входит.
+ * AES-GCM аутентификатора — через слой src/lib/scrypto.h). Стенд идёт в `make crypto-test` —
+ * прежде его собирали руками, и он полгода стоял красным незамеченным (см. ниже).
  *
- *     make ext-test                      # соберёт и сверит с tests/chello-frozen.h
- *     ./build/hellofreeze --emit > tests/chello-frozen.h   # заново заморозить (после ext-test)
+ *     make crypto-test                   # соберёт и сверит с tests/chello-frozen.h
+ *     ./out/tests/hellofreeze --emit > tests/chello-frozen.h   # заново заморозить
  *
  * Заново замораживать можно ТОЛЬКО вместе с перехватом рядом с браузером: заморозка
  * фиксирует то, что есть, и молча узаконит любую поломку отпечатка.
@@ -35,8 +33,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/types.h>
-#include <sys/random.h>
 #include <time.h>
+/* The declaration first: the macro below would otherwise rewrite it too. */
+#include "osrand.h"
 
 /* Детерминированная замена getrandom. Тот же генератор, что был при первой заморозке;
  * менять его — значит менять эталон, то есть заново замораживать. */
@@ -76,10 +75,10 @@ static ssize_t det_getrandom(void *buf, size_t n, unsigned int flags) {
 }
 static time_t det_time(time_t *p) { (void)p; return (time_t)1700000000; }
 
-#define getrandom(b, n, f) det_getrandom((b), (n), (f))
+#define os_getrandom(b, n, f) det_getrandom((b), (n), (f))
 #define time(p) det_time(p)
 #include "../src/proto/tls/reality.c"
-#undef getrandom
+#undef os_getrandom
 #undef time
 
 #include "chello-frozen.h"

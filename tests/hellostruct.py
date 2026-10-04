@@ -5,7 +5,7 @@
 
     hellostruct.py эталон.bin наш.bin [--show]
 
-Эталон снимает tests/utls/hello.go; наш Hello — `build/hellofreeze --raw-pq файл`. Длина ECH и padding у
+Эталон снимает tests/utls/hello.go; наш Hello — `out/tests/hellofreeze --raw-pq файл`. Длина ECH и padding у
 uTLS случайна в пределах, поэтому сравниваются размеры расширений, но не значения. Сверено 2026-09-30:
 uTLS Chrome 133 (HelloChrome_Auto) и Hello с гибридом — одни и те же 17 расширений одинаковой длины,
 1757 байт."""

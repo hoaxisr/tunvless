@@ -16,7 +16,7 @@ set -eu
 cd "$(dirname "$0")/.."
 BUILD=${BUILD:-build}
 PROBE="$BUILD/xudpprobe"
-[ -x "$PROBE" ] || { echo "xudp: нет $PROBE (собирает tests/ext-test.sh)"; exit 2; }
+[ -x "$PROBE" ] || { echo "xudp: нет $PROBE (собирает make interop)"; exit 2; }
 command -v python3 >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1 || {
 	echo "xudp: ПРОПУСК — нужны python3 и openssl. Это не падение."; exit 0; }
 HAVE_X=0; HAVE_S=0

@@ -15,17 +15,15 @@
 # Что FIN и данные действительно шли одним сегментом, считает правило nft на выходе в vl.
 #
 # Использование: tests/run-tunnel-fin.sh   (нужен root: своё сетевое пространство)
-#   STEER=<бинарник>      по умолчанию ./build/steer-ext-check
+#   TUNVLESS=<бинарник>   по умолчанию ./out/tunvless
 #   TRACE=1               журнал разбора пакетов туннеля (печатается при провале)
-#   STEER_PRELOAD=<.so>   подгрузить в движок библиотеку — для сборки на glibc, где потокам
-#                         установщика не хватает стека под __thread-буферы (см. отчёт I-319)
 set -eu
 cd "$(dirname "$0")/.."
 
-BIN="${STEER:-./build/steer-ext-check}"
-[ -x "$BIN" ] || { echo "нет бинарника: $BIN (собери extended)"; exit 2; }
+BIN="${TUNVLESS:-./out/tunvless}"
+[ -x "$BIN" ] || { echo "нет бинарника: $BIN (make)"; exit 2; }
 
-NS=steer-tunfin
+NS=tunvless-tunfin
 UUID=8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124
 PORT=10800
 NODE=10.66.0.1
@@ -41,19 +39,12 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-printf '%s\n' "vless://$UUID@$NODE:$PORT?security=none&type=tcp#local" > "$WORK/sub.txt"
-cat > "$WORK/spec.json" <<SPEC
-{"schema":1,
- "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$WORK/sub.txt","node":0}},
- "channels":[]}
-SPEC
+LINK="vless://$UUID@$NODE:$PORT?security=none&type=tcp#local"
 
 ip netns delete "$NS" 2>/dev/null || true
 ip netns add "$NS"
 ip netns exec "$NS" ip link set lo up
-ip netns exec "$NS" ip link add stand type dummy
-ip netns exec "$NS" ip addr add "$NODE/32" dev stand
-ip netns exec "$NS" ip link set stand up
+ip netns exec "$NS" ip addr add "$NODE/32" dev lo
 
 ip netns exec "$NS" python3 tests/fake-vless.py --port "$PORT" --uuid "$UUID" --mb 1 --bind "$NODE" \
     > "$WORK/srv.log" 2>&1 &
@@ -63,16 +54,14 @@ sleep 1
 # Без запасных сессий: иначе и «early» получает готовый поток и дорожка «пока поток
 # открывается» не проверяется вовсе.
 ip netns exec "$NS" env STEER_TUN_SPARES=0 ${TRACE:+STEER_TUN_TRACE=1} \
-    ${STEER_PRELOAD:+LD_PRELOAD=$STEER_PRELOAD} "$BIN" vless vl --spec "$WORK/spec.json" --state-dir "$WORK/state" \
-    > "$WORK/tun.log" 2>&1 &
+    "$BIN" "$LINK" -d vl -r "$TARGET/32" > "$WORK/tun.log" 2>&1 &
 TUN_PID=$!
 for _ in $(seq 50); do
-    ip netns exec "$NS" ip link show vl >/dev/null 2>&1 && break
+    ip netns exec "$NS" ip route show "$TARGET/32" 2>/dev/null | grep -q 'dev vl' && break
     sleep 0.2
 done
-ip netns exec "$NS" ip link show vl >/dev/null 2>&1 ||
-    { echo "устройство vl не поднялось:"; sed 's/^/  /' "$WORK/tun.log"; exit 1; }
-ip netns exec "$NS" ip route replace "$TARGET/32" dev vl
+ip netns exec "$NS" ip route show "$TARGET/32" 2>/dev/null | grep -q 'dev vl' ||
+    { echo "устройство vl или маршрут в него не поднялись:"; sed 's/^/  /' "$WORK/tun.log"; exit 1; }
 
 # Сегменты клиента с FIN и данными: ip-длина больше голого заголовка с опциями (20+32).
 ip netns exec "$NS" nft add table inet fin

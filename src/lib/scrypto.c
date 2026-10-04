@@ -59,7 +59,6 @@ _Static_assert(sizeof(Aes) <= SC_AESCTR_CTX_SIZE, "SC_AESCTR_CTX_SIZE мал д�
 _Static_assert(sizeof(wc_Sha) <= SC_HASH_CTX_SIZE && _Alignof(wc_Sha) <= 16, "SC_HASH_CTX_SIZE мал для wc_Sha");
 _Static_assert(sizeof(wc_Sha224) <= SC_HASH_CTX_SIZE && _Alignof(wc_Sha224) <= 16, "SC_HASH_CTX_SIZE мал для wc_Sha224");
 _Static_assert(sizeof(wc_Md5) <= SC_HASH_CTX_SIZE && _Alignof(wc_Md5) <= 16, "SC_HASH_CTX_SIZE мал для wc_Md5");
-_Static_assert(sizeof(wc_Shake) <= SC_SHAKE_CTX_SIZE && _Alignof(wc_Shake) <= 16, "SC_SHAKE_CTX_SIZE мал для wc_Shake");
 
 /* ChaCha20-Poly1305: развёрнутый ключ ChaCha плюс рабочий Poly1305 (его ключ свой на каждую
  * запись, RFC 8439 §2.6). Лежат рядом в одном хранилище. */
@@ -398,72 +397,6 @@ int sc_aes_block(const unsigned char *key, size_t key_n, int decrypt,
     return rc == 0 ? 0 : SC_ECRYPTO;
 }
 
-/* ---- XChaCha20-Poly1305 --------------------------------------------------------------------- */
-
-int sc_xchacha_seal(const unsigned char key[32], const unsigned char nonce[24],
-                    const void *aad, size_t aad_n, const unsigned char *in, size_t n,
-                    unsigned char *out) {
-    static const unsigned char empty[1];
-    if (n > UINT32_MAX - 16 || aad_n > UINT32_MAX) return SC_EINVAL;
-    int rc = wc_XChaCha20Poly1305_Encrypt(out, n + 16, n ? in : empty, n, aad_n ? aad : empty,
-                                          aad_n, nonce, 24, key, 32);
-    return rc == 0 ? 0 : SC_ECRYPTO;
-}
-
-int sc_xchacha_open(const unsigned char key[32], const unsigned char nonce[24],
-                    const void *aad, size_t aad_n, const unsigned char *in, size_t n,
-                    unsigned char *out) {
-    static const unsigned char empty[1];
-    if (n < 16 || n > UINT32_MAX || aad_n > UINT32_MAX) return SC_EINVAL;
-    /* Пустая датаграмма: выход нулевой длины, но wolfSSL не берёт NULL и на отказе тега обнуляет
-     * весь переданный ему размер выхода — поэтому ему отдаётся свой байт, а не out вызывающего. */
-    unsigned char none[1];
-    int rc = wc_XChaCha20Poly1305_Decrypt(n > 16 ? out : none, n > 16 ? n - 16 : 1, in, n,
-                                          aad_n ? aad : empty, aad_n, nonce, 24, key, 32);
-    if (rc == WC_NO_ERR_TRACE(MAC_CMP_FAILED_E)) return SC_EAUTH;
-    return rc == 0 ? 0 : SC_ECRYPTO;
-}
-
-/* ---- SHAKE128 потоком ----------------------------------------------------------------------- */
-
-/* Absorb wolfSSL поглощает вход и сразу закрывает его набивкой SHAKE (0x1f), после чего
- * SqueezeBlocks отдаёт блоки по 168 байт подряд — ровно поток вывода XOF. Блок отдаётся
- * вызывающему кусками, остаток лежит в s->blk до следующего чтения. */
-int sc_shake128_init(struct sc_shake *s, const void *in, size_t n) {
-    static const unsigned char empty[1];
-    s->ready = 0;
-    s->pos = SC_SHAKE128_RATE;
-    if (n > UINT32_MAX) return SC_EINVAL;
-    wc_Shake *k = (wc_Shake *)s->st;
-    if (wc_InitShake128(k, NULL, INVALID_DEVID) != 0) return SC_ECRYPTO;
-    if (wc_Shake128_Absorb(k, n ? in : empty, (word32)n) != 0) { wc_Shake128_Free(k); return SC_ECRYPTO; }
-    s->ready = 1;
-    return 0;
-}
-
-int sc_shake128_read(struct sc_shake *s, unsigned char *out, size_t n) {
-    if (!s->ready) return SC_EINVAL;
-    while (n) {
-        if (s->pos >= SC_SHAKE128_RATE) {
-            if (wc_Shake128_SqueezeBlocks((wc_Shake *)s->st, s->blk, 1) != 0) return SC_ECRYPTO;
-            s->pos = 0;
-        }
-        size_t take = SC_SHAKE128_RATE - s->pos;
-        if (take > n) take = n;
-        memcpy(out, s->blk + s->pos, take);
-        s->pos = (uint16_t)(s->pos + take);
-        out += take;
-        n -= take;
-    }
-    return 0;
-}
-
-void sc_shake128_free(struct sc_shake *s) {
-    if (!s->ready) return;
-    wc_Shake128_Free((wc_Shake *)s->st);
-    wc_ForceZero(s, sizeof(*s));
-}
-
 /* ---- X25519 --------------------------------------------------------------------------------- */
 
 /* wolfSSL принимает только ПРИЖАТЫЙ скаляр (и отказывает на любом другом), а функция X25519 из
@@ -514,8 +447,7 @@ static int ct_equal(const unsigned char *a, const unsigned char *b, size_t n) {
 /* ---- ML-KEM-768 ------------------------------------------------------------------------------ */
 
 /* Ключ заводится на время вызова через wc_MlKemKey_New (куча), а не значением в структуре вызывающего:
- * так его размер не входит в ABI между libsteer и libsteer-wolfssl (sc_abi_check) и не раздувает
- * struct tls13. Цена — один malloc на рукопожатие, ничто по сравнению с самим ML-KEM. */
+ * так его размер не раздувает struct tls13. Цена — один malloc на рукопожатие, ничто по сравнению с самим ML-KEM. */
 static MlKemKey *kem_new(void) {
     return wc_MlKemKey_New(WC_ML_KEM_768, NULL, INVALID_DEVID);
 }
@@ -596,6 +528,7 @@ static int mgf_of(enum sc_hash h) {
         case SC_SHA256: return WC_MGF1SHA256;
         case SC_SHA384: return WC_MGF1SHA384;
         case SC_SHA512: return WC_MGF1SHA512;
+        default: break;
     }
     return WC_MGF1NONE;
 }
@@ -700,40 +633,6 @@ struct sc_roots {
     WOLFSSL_X509_STORE *store;
     pthread_mutex_t mu;
 };
-
-/* ---- сверка с загруженной libsteer-wolfssl.so ---------------------------------------------
- *
- * steer_wolfssl_abi определён в libsteer-wolfssl.so (build/wolfssl/abi.c — порядок полей там тот
- * же, см. комментарий у него). В статической сборке символа нет — слабая ссылка нулевая, и сверять
- * нечего: библиотека там собрана в тот же бинарник теми же опциями. В libsteer.so ссылка обязана
- * быть видна за пределы библиотеки (visibility default), иначе компоновщик разрешил бы её нулём.
- *
- * Расхождение — не ошибка, которую можно вернуть: хранилища контекстов слоя уже расставлены по
- * структурам вызывающих. Поэтому процесс гасится сразу, при загрузке (конструктор), строкой,
- * которая называет причину и лечение, а не падает позже в чужом поле. */
-extern const unsigned long steer_wolfssl_abi[SC_ABI_N] __attribute__((weak, visibility("default")));
-
-struct chachapoly_sz { ChaCha c; Poly1305 p; };
-
-__attribute__((constructor)) static void sc_abi_check(void) {
-    if (!steer_wolfssl_abi) return;
-    const unsigned long want[SC_ABI_N] = {
-        LIBWOLFSSL_VERSION_HEX,
-        sizeof(wc_Sha256), sizeof(wc_Sha512), sizeof(wc_Sha384),
-        sizeof(Aes), sizeof(struct chachapoly_sz),
-        SC_HASH_CTX_SIZE, SC_AEAD_CTX_SIZE, SC_AESCTR_CTX_SIZE,
-        sizeof(WOLFSSL_X509_STORE), offsetof(WOLFSSL_X509_STORE, cm),
-        sizeof(wc_Shake), SC_SHAKE_CTX_SIZE,
-    };
-    for (int i = 0; i < SC_ABI_N; i++) {
-        if (steer_wolfssl_abi[i] == want[i]) continue;
-        static const char msg[] =
-            "steer: libsteer-wolfssl.so другой сборки, чем libsteer.so (версия wolfSSL или размеры "
-            "структур не совпали) — обновите пакеты libsteer и libsteer-wolfssl вместе\n";
-        (void)!write(2, msg, sizeof(msg) - 1);
-        _exit(3);
-    }
-}
 
 static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 static int g_init_rc = -1;

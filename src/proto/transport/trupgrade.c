@@ -76,7 +76,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <time.h>
-#include <sys/random.h>
+#include "osrand.h"
 
 #include "transport.h"
 #include "trpath.h"
@@ -90,7 +90,7 @@
 int tr_h1_random(unsigned char *out, size_t n) {
     size_t got = 0;
     while (got < n) {
-        ssize_t r = getrandom(out + got, n - got, 0);
+        ssize_t r = os_getrandom(out + got, n - got, 0);
         if (r < 0) {
             if (errno == EINTR) continue;
             return -1;

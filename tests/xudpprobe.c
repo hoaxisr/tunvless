@@ -10,7 +10,7 @@
  * склеивает early_hold стека, пока идёт рукопожатие) и затем датаграмма 1400 байт: рамки нескольких
  * датаграмм в одной записи и рамка, которая не влезает в одну запись TLS у мелкого MTU.
  *
- * Стек подменён заглушками ниже: vldial.c зовёт из него три функции, а стек в стенд не входит. */
+ * Стек подменён заглушками ниже: vldial.c зовёт из него две функции, а стек в стенд не входит. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,15 +22,10 @@
 #include "vldial.h"
 #include "dialer.h"
 #include "stack.h"
-#include "pool.h"
 
 time_t stack_now_s(void) { return time(NULL); }
-int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, void *arg) {
-    (void)o; (void)d; (void)ready; (void)arg;
-    return 1;
-}
-int pool_run(struct output *o, const struct pool_cfg *pc, stack_ready_fn ready, void *arg) {
-    (void)o; (void)pc; (void)ready; (void)arg;
+int stack_run(const struct tun_cfg *tc, const struct dialer *d, stack_ready_fn ready, void *arg) {
+    (void)tc; (void)d; (void)ready; (void)arg;
     return 1;
 }
 

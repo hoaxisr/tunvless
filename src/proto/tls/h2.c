@@ -712,7 +712,7 @@ const char *h2_strerror(int rc) {
          * есть между тремя совершенно разными разговорами с владельцем узла. Без кода все
          * три выглядели одинаково, и на живом узле пришлось гадать. */
         case H2_ESTATUS: {
-            static __thread char st[48];
+            static __thread char st[64];
             if (g_last_status > 0) snprintf(st, sizeof st, "сервер ответил %d, а не 200", g_last_status);
             else                   snprintf(st, sizeof st, "сервер ответил не 200");
             return st;

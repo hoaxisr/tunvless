@@ -18,18 +18,14 @@
  *   X25519           — RFC 7748 §5.2 (неприжатый скаляр), §5.2 итерации, §6.1 (Алиса и Боб);
  *   AES-256-CTR      — NIST SP 800-38A F.5.5, целиком и кусками разной длины;
  *   MD5, SHA-1, SHA-224 — RFC 1321 и FIPS 180-4 («abc», пустая строка), HMAC-MD5 и HMAC-SHA1 —
- *                      RFC 2202, случай 1; HKDF-SHA1 — RFC 5869, случай 4 (подключ shadowsocks);
+ *                      RFC 2202, случай 1; HKDF-SHA1 — RFC 5869, случай 4;
  *   AES одним блоком — FIPS 197, приложение C.1 и C.3, туда и обратно;
- *   XChaCha20-Poly1305 — draft-irtf-cfrg-xchacha-03, A.3.1, и отказ на подменённом теге;
- *   SHAKE128         — FIPS 202 (пустой вход) и 400 байт вывода от 16 байт входа против hashlib
- *                      Python, целиком и кусками через границу блока (маска длины VMess).
  * Плюс то, что векторы не ловят: работа НА МЕСТЕ на размерах записи TLS (до 16401 байта — граница,
  * на которой когда-то ломался тег, см. прежний tests/gcm-size.c), отказ на подменённом теге и AAD,
  * нулевой секрет X25519 на точке малого порядка, отсутствие «хвоста» временных промежуточных после
  * проверки цепочки и параллельные проверки из нескольких потоков.
  *
- * Библиотека нужна настоящая, поэтому стенд — в `make ext-test` (tests/ext-test.sh), а не в
- * `make test`. */
+ * Библиотека нужна настоящая, поэтому стенд — в `make crypto-test`. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -354,63 +350,6 @@ static void test_proxy_prims(void) {
     check_mem("AES-256 блок обратно", pt, back, 16);
     check("AES блок: ключ 24 байта не принимается", SC_EINVAL, sc_aes_block(key, 24, 0, pt, ct));
 
-    unsigned char xk[32], xn[24], xa[12], xc[160], xp[160];
-    for (int i = 0; i < 32; i++) xk[i] = (unsigned char)(0x80 + i);
-    for (int i = 0; i < 24; i++) xn[i] = (unsigned char)(0x40 + i);
-    unhex("50515253c0c1c2c3c4c5c6c7", xa, 12);
-    static const char lad[] = "Ladies and Gentlemen of the class of '99: If I could offer you only one "
-                              "tip for the future, sunscreen would be it.";
-    size_t ln = sizeof lad - 1;
-    check("XChaCha20-Poly1305: шифрование", 0, sc_xchacha_seal(xk, xn, xa, 12, (const unsigned char *)lad, ln, xc));
-    check_bytes("XChaCha20-Poly1305 draft A.3.1",
-                "bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb731c7f1b0b4aa644"
-                "0bf3a82f4eda7e39ae64c6708c54c216cb96b72e1213b4522f8c9ba40db5d945b11b69b982c1bb9e"
-                "3f3fac2bc369488f76b2383565d3fff921f9664c97637da9768812f615c68b13b52e"
-                "c0875924c1c7987947deafd8780acf49", xc, ln + 16);
-    check("XChaCha20-Poly1305: расшифровка", 0, sc_xchacha_open(xk, xn, xa, 12, xc, ln + 16, xp));
-    check_mem("XChaCha20-Poly1305: обратно", lad, xp, ln);
-    xc[ln] ^= 1;
-    check("XChaCha20-Poly1305: подменённый тег", SC_EAUTH, sc_xchacha_open(xk, xn, xa, 12, xc, ln + 16, xp));
-    /* Пустая датаграмма (один тег): open пишет n - 16 = 0 байт — ни байта в out ни при годном теге,
-     * ни при подменённом (wolfSSL на отказе обнуляет переданный ему размер выхода). */
-    unsigned char canary[2] = { 0xa5, 0xa5 };
-    check("XChaCha20-Poly1305: пустое — шифрование", 0, sc_xchacha_seal(xk, xn, xa, 12, NULL, 0, xc));
-    check("XChaCha20-Poly1305: пустое — расшифровка", 0, sc_xchacha_open(xk, xn, xa, 12, xc, 16, canary));
-    xc[0] ^= 1;
-    check("XChaCha20-Poly1305: пустое, подменённый тег", SC_EAUTH, sc_xchacha_open(xk, xn, xa, 12, xc, 16, canary));
-    check("XChaCha20-Poly1305: пустое — out не тронут", 0xa5a5, canary[0] << 8 | canary[1]);
-
-    struct sc_shake sh;
-    check("SHAKE128: заведение", 0, sc_shake128_init(&sh, "", 0));
-    sc_shake128_read(&sh, out, 32);
-    check_bytes("SHAKE128() FIPS 202", "7f9c2ba4e88f827d616045507605853ed73b8093f6efbc88eb1a6eacfa66ef26", out, 32);
-    sc_shake128_free(&sh);
-    static const char shk400[] =
-        "98481946de85c670a7a84432ab4091a81ec7a3126d0f60d33a589bd82714fbcf239f3a1a2926f1951544f80c6d3e94eb"
-        "6b57916a06f811bc2a3068cb86a492a62163e6fd78bc41220b4a2e2820f1f00e56e74dbcf1a8f8388d7baaaf2c1be63a"
-        "668837747a65d48b9da6cddc53193b6d9ae9d392a1cb58592451ab0e4b4ef00fce414938a195ec45bbf309bebfc96423"
-        "2c397e92fec91f9ab5e9d6acc9aeecab05561835370b43c9da5e2a1918f46a78c204d6e673ac9f689296b8f93f54fb81"
-        "6a934d1175a56d8a1327ff8028134df303cce5c366e8498d1442b6f34dcb59b766860087505e9102d0172ba8070f3719"
-        "7e6a27ed2645235634c43264793b13796160e66d965d63183648254fb9b617e9166e8aea790fadd640d8c138abec8d9c"
-        "6ddc9adb9852e14ee862298225a5983dd28e7e18a1ca86fde3d431618b8a9c6aeb9d095b084123ff3fdfdf9931c767ad"
-        "93d37612ada2655f8d1de240e5788b98c61686fe6961c5ee70417bf13bd96c5d1f5ebbf99d16123815ce961f73acf9f1"
-        "071e93eb742e6ca35f749e3e85ed2501";
-    unsigned char iv[16], whole[400], parts[400];
-    for (int i = 0; i < 16; i++) iv[i] = (unsigned char)i;
-    sc_shake128_init(&sh, iv, 16);
-    sc_shake128_read(&sh, whole, 400);
-    sc_shake128_free(&sh);
-    check_bytes("SHAKE128(00..0f), 400 байт — hashlib", shk400, whole, 400);
-    /* Кусками по два и по четыре байта — как читает маска длины VMess, через границы блока 168. */
-    sc_shake128_init(&sh, iv, 16);
-    for (size_t off = 0; off < 400; ) {
-        size_t k = (off / 2) % 2 ? 4 : 2;
-        if (off + k > 400) k = 400 - off;
-        sc_shake128_read(&sh, parts + off, k);
-        off += k;
-    }
-    sc_shake128_free(&sh);
-    check_mem("SHAKE128 кусками = целиком", whole, parts, 400);
 }
 
 /* ---- X25519 ---------------------------------------------------------------------------------- */

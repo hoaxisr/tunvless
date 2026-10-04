@@ -5,14 +5,8 @@
  * открываем свой поток к узлу и дальше переносим байты, подтверждая клиенту приём так, как
  * это сделал бы настоящий стек.
  *
- * ПРОТОКОЛА ЗДЕСЬ НЕТ. До шага 2 выпуска 1.10 этот файл назывался tunnel.c и был сварен с
- * VLESS: толстая половина соединения держала `struct vless_conn`, отправка клеила заголовок
- * VLESS и кадры Vision, приём разбирал ответ VLESS, а в конце файла жили подкоманды
- * `steer vless`, `vless-nodes` и `vless-probe`. Теперь всё, что знает про узел, — у дайлера
- * (dialer.h): сессия соединения для стека непрозрачна, а VLESS — один из дайлеров
- * (proto/vless/vldial.c), и его точка входа — в модуле протокола (proto/vless/vlmain.c).
- * Поведение при этом не менялось ни в чём, вплоть до порядка строк журнала: разделение
- * проведено по швам, которые в файле уже были (upstream_send, downstream_pump, установщик).
+ * ПРОТОКОЛА ЗДЕСЬ НЕТ. Всё, что знает про узел, — у дайлера (dialer.h): сессия соединения для
+ * стека непрозрачна, а VLESS — дайлер proto/vless/vldial.c. Точка входа — src/main.c.
  *
  * Почему это НЕ полный стек TCP и почему так можно. Алгоритмов перегрузки здесь нет — их
  * делает клиент на своей стороне и сервер на своей. Наша задача уже: подтвердить SYN,
@@ -53,12 +47,11 @@
 #include "rtx.h"
 #include "dialer.h"
 #include "stack.h"
-#include "spec.h"
-#include "run.h"
+#include "ifcfg.h"
 
 /* ---- журнал с уровнем --------------------------------------------------------
  *
- * Формат: `steer[warn] tunnel: …`. Уровень идёт РОВНО в этом виде и первым — это контракт с
+ * Формат: `tunvless[warn] tunnel: …`. Уровень идёт РОВНО в этом виде и первым — это контракт с
  * интерфейсом, а не украшение. Прежде все строки уходили в stderr, procd помечал их как
  * daemon.err, и «поток не открылся» стояло рядом с «узлов 26» одинаково красным: интерфейс не
  * мог их различить, а человек не мог понять, на что смотреть.
@@ -71,8 +64,8 @@
  * то, что случилось при штатной работе. Третий уровень («ошибка») не нужен: процесс, которому
  * совсем плохо, завершается с ненулевым кодом, и это видно иначе.
  */
-#define LOG_W  "steer[warn] tunnel: "
-#define LOG_I  "steer[info] tunnel: "
+#define LOG_W  "tunvless[warn] tunnel: "
+#define LOG_I  "tunvless[info] tunnel: "
 
 /* Сколько соединений держим одновременно. Каждое — это сокет к серверу плюс TLS-состояние,
  * то есть около 3 КБ; 64 соединения это ~200 КБ, что для роутера с 15 МБ приемлемо, а для
@@ -393,7 +386,7 @@ typedef char conn_hot_size_check[sizeof(struct conn) <= 192 ? 1 : -1];
  * SYN-ACK: win 65535, options [mss 1460,nop,wscale 0]. Потолок окна менялся STEER_TUN_RCVWND на том же
  * стенде (поток / восемь потоков, Мбит/с): 64 КБ — 83 / 621, 256 КБ — 325 / 1340, 1 МиБ — 1164 / 1521,
  * 4 МиБ — 1286 / 1477. Без задержки (круг 0,1 мс) выгрузка одним потоком от окна не зависит вовсе —
- * 1351 против 1381 Мбит/с: там потолок у узла (Xray упирается в 0,99 ядра, steer-vless — 0,32), а не
+ * 1351 против 1381 Мбит/с: там потолок у узла (Xray упирается в 0,99 ядра, наш клиент — 0,32), а не
  * у окна.
  *
  * Опция масштаба в SYN-ACK стояла и раньше, с множителем 0, и не «забыли поставить»: RFC 7323 включает
@@ -621,11 +614,8 @@ static int client_can_take_record(struct conn *c) {
  * ТАБЛИЦЫ ПОТОКА — В КУЧЕ, А НЕ В __thread (шаг 2 выпуска 1.10). Прежде g_conns и сессии были
  * массивами `static __thread` — около 14 МБ статического TLS. В статическом бинарнике это
  * обходилось даром: musl отдаёт TLS потока свежими страницами, и память занимали только
- * тронутые. В разделяемой libsteer (шаг 4) — нет: статический TLS библиотеки, загруженной при
- * запуске, заводится КАЖДОМУ потоку КАЖДОГО процесса, который с ней слинкован, то есть и
- * steerd, и всем модулям, а glibc к тому же зануляет его memset'ом — 14 МБ резидентной
- * памяти на поток. Решение владельца было «таблицам не место в .so»; куча выполняет его, не
- * требуя от модуля нести свою копию стека: у потока цикла одно отображение (mmap) под
+ * тронутые. С glibc — нет: она зануляет статический TLS каждого потока memset'ом, и это 14 МБ
+ * резидентной памяти на поток. В куче же у потока цикла одно отображение (mmap) под
  * горячую таблицу, списки, корзины и сессии, и страницы в нём, как и прежде в TLS, берутся
  * только по факту обращения. Установщикам и слежке за узлом таблицы теперь не достаются
  * вовсе — прежде у каждого из них было по 14 МБ адресного пространства TLS, которые они не
@@ -865,11 +855,6 @@ static void stats_dump(uint64_t window_ns) {
 static int g_trace;
 #define TR(...) do { if (g_trace) fprintf(stderr, "tun: " __VA_ARGS__); } while (0)
 
-/* Слежка за узлом (клиент под демоном сам говорит, жив ли узел) жила здесь, переехала в модуль
- * протокола (proto/vless/vlwatch.c), а оттуда — в пул узлов выхода (tunnel/pool.c): N активных узлов,
- * мера — проверка протокола (у VLESS — vless_probe), исходы рукопожатий и обрывы связи доходят до неё
- * через дайлер пула (connect, lost). */
-
 /* ---- пул установщиков ------------------------------------------------------
  *
  * Рукопожатие вынесено из цикла в отдельные потоки. Пул, а не поток на соединение, по двум
@@ -1028,8 +1013,8 @@ static int connq_push(const struct connjob *j) {
             pthread_t t;
             err = pthread_create(&t, &a, connector, NULL);
             /* EINVAL при скромном стеке: минимум потока у glibc включает статическую TLS всех
-             * загруженных библиотек, а у libsteer.so она под 300 КБ (thread-local буферы), так что
-             * 128 КБ оказываются меньше минимума. Повторяем с запасом; занятой станет лишь
+             * загруженных библиотек (thread-local буферы — под 300 КБ), так что 128 КБ
+             * оказываются меньше минимума. Повторяем с запасом; занятой станет лишь
              * использованная часть виртуальной памяти. */
             if (err == EINVAL && !made) {
                 pthread_attr_setstacksize(&a, 1024 * 1024);
@@ -1085,7 +1070,7 @@ static int spare_checkout(void *out) {
             sp->state = SPARE_EMPTY;
             continue;
         }
-        /* Узлов несколько (пул, pool.c): запасная связь — к своему узлу, и годится не всякому
+        /* Узлов несколько (dialer_ops.match): запасная связь — к своему узлу, и годится не всякому
          * соединению; связь к узлу, который больше не активен, — выбросить. */
         int m = d->match ? d->match(g_dl->ctx, out, sp->sess) : 1;
         if (m < 0) {
@@ -1934,6 +1919,60 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
     conn_drop(c);
 }
 
+/* ---- flows we closed with our own FIN --------------------------------------------------
+ *
+ * When the server closes first, the stack sends the client a FIN and frees the slot at once
+ * (conn_deadlines). The client's kernel still answers: an ACK of that FIN right away, and its own
+ * FIN when the application closes. Without a memory of the flow, both look like segments for an
+ * unknown connection and get RST — and the application, which did nothing wrong, sees its next
+ * shutdown() or write() fail with ENOTCONN or ECONNRESET instead of an orderly close
+ * (tests/run-tunnel-fin.sh, `separate`). So each loop thread keeps the last FIN_RECENT such flows
+ * for FIN_RECENT_S seconds: the ACK of our FIN is taken silently, the client's FIN is
+ * acknowledged, everything else for the flow still gets RST. Searched only for segments without a
+ * connection, which are rare. */
+#define FIN_RECENT   64
+#define FIN_RECENT_S 60
+
+static __thread struct fin_recent {
+    uint32_t src, dst;          /* the client's flow, as in its packets */
+    uint16_t sport, dport;
+    uint32_t fin_end;           /* our FIN's sequence number + 1: what the client acknowledges */
+    time_t at;
+} g_fin_recent[FIN_RECENT];
+static __thread unsigned g_fin_recent_i;
+
+static void fin_recent_add(const struct conn *c) {
+    struct fin_recent *r = &g_fin_recent[g_fin_recent_i++ % FIN_RECENT];
+    r->src = c->key.src;
+    r->dst = c->key.dst;
+    r->sport = c->key.sport;
+    r->dport = c->key.dport;
+    r->fin_end = c->our_seq + 1;
+    r->at = g_now_s ? g_now_s : 1;
+}
+
+/* A segment without a connection that belongs to a flow we closed with FIN: 1 — handled (taken
+ * silently or its FIN acknowledged), 0 — not ours, the caller answers RST. */
+static int fin_recent_take(const struct tun_dev *tun, const struct flow_key *k, size_t data_n) {
+    for (unsigned i = 0; i < FIN_RECENT; i++) {
+        struct fin_recent *r = &g_fin_recent[i];
+        if (!r->at || r->src != k->src || r->dst != k->dst || r->sport != k->sport ||
+            r->dport != k->dport || g_now_s - r->at > FIN_RECENT_S ||
+            !(k->tcp_flags & TCP_ACK) || k->ack != r->fin_end)
+            continue;
+        if (k->tcp_flags & TCP_FIN) {
+            unsigned char ack[64];
+            size_t al = tcp_build(ack, sizeof(ack), k->dst, k->src, k->dport, k->sport,
+                                  r->fin_end, k->seq + (uint32_t)data_n + 1, TCP_ACK,
+                                  NULL, 0, 0, 0, -1);
+            if (al) tun_write_ctl(tun, ack, al);
+            r->at = 0;          /* both halves closed: the flow is over */
+        }
+        return 1;
+    }
+    return 0;
+}
+
 /* Один пакет из TUN. */
 static void drain_conn(struct conn *c, const struct tun_dev *tun);
 
@@ -2110,10 +2149,11 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
          * принял: номер не совпал с ожидаемым, и он ответил «challenge ACK» (RFC 5961, см.
          * conn_reset). Молчать значит оставить приложение ждать своего таймаута на соединении,
          * которого больше нет; RST по правилу TCP (RFC 793: номер — его подтверждение, на RST не
-         * отвечаем) — и оно переподключится сразу. Подтверждение нашего же FIN после закрытия
-         * тоже получит RST — клиент в это время уже дочитал поток, и закрыть его раньше срока
-         * TIME_WAIT ничего не ломает. Только при одном потоке цикла (g_one_worker). */
-        if (g_one_worker && !(k.tcp_flags & TCP_RST) && (k.tcp_flags & TCP_ACK)) {
+         * отвечаем) — и оно переподключится сразу. Подтверждение нашего же FIN после закрытия и
+         * FIN клиента вслед за ним — не чужие сегменты: их берёт fin_recent_take. Только при
+         * одном потоке цикла (g_one_worker). */
+        if (g_one_worker && !(k.tcp_flags & TCP_RST) && (k.tcp_flags & TCP_ACK) &&
+            !fin_recent_take(tun, &k, n - off)) {
             unsigned char rst[64];
             size_t rl = tcp_build(rst, sizeof(rst), k.dst, k.src, k.dport, k.sport,
                                   k.ack, 0, TCP_RST, NULL, 0, 0, 0, -1);
@@ -2305,74 +2345,6 @@ static void flush_acks(const struct tun_dev *tun) {
     }
 }
 
-/* Поднять устройство и дать ему адрес.
- *
- * Делает это движок, а не управляющий слой, потому что устройство создаёт тоже движок:
- * между «TUN появился» и «TUN готов нести трафик» нет никого, кому это можно было бы
- * поручить. Без этого apply не находит рабочего устройства, ставит blackhole (при
- * on_fail=drop) и трафик стоит — притом что процесс запущен, узел выбран и в логе всё
- * выглядит успешным. Ровно тот случай, когда «настроено» и «работает» расходятся молча.
- *
- * Адрес нужен не нам: наш клиент читает из TUN пакеты и открывает по ним потоки, source
- * в них не участвует вовсе. Нужен он ядру и фаерволу — маршрут на устройство без адреса
- * ядро считает непригодным для локально порождённых пакетов.
- *
- * 198.51.100.0/24 — это TEST-NET-2 из RFC 5737: диапазон, отведённый под документацию и
- * НЕ маршрутизируемый в интернете. Поэтому он не может столкнуться ни с чужим сервисом,
- * ни с локальной сетью, которую кто-то себе выбрал. Пул fake-IP (198.18.0.0/15) здесь
- * брать нельзя — он занят под другую задачу, и пересечение перепутало бы одно с другим.
- *
- * Номер адреса берётся из таблицы маршрутизации выхода: она уже уникальна и уже лежит в
- * реестре, то есть переживает перезагрузку. Выдумывать для этого второй счётчик значило
- * бы завести второе место, где номера могут разъехаться. */
-void tun_bring_up(const char *dev, int table) {
-    char addr[40];
-    /* Без знака: таблица приходит из файла реестра, и отрицательное число оттуда давало
-     * адрес 198.51.100.-N, который ip не примет (I-322). */
-    snprintf(addr, sizeof(addr), "198.51.100.%u/32", 1u + ((unsigned)table % 200u));
-    const char *a[] = { "ip", "addr", "replace", addr, "dev", dev, NULL };
-    /* Отказы называются по одному, и тон у них разный, потому что разная и цена.
-     *
-     * Дотуда, где это заметно, движок доходит успешным: очереди открыты, узел выбран, в
-     * журнале стоит штатное «<dev> -> <узел>». Поэтому немой отказ здесь — это не
-     * недостающая строка, а расхождение «настроено» и «работает» без единого следа, тот же
-     * класс, за который этот путь правили дважды (имя устройства и привязка таблицы). */
-    if (run_quiet(a) != 0)
-        fprintf(stderr, LOG_W "%s: адрес %s не встал — ядро сочтёт маршрут на это "
-                        "устройство непригодным для локально порождённых пакетов\n",
-                dev, addr);
-    const char *u[] = { "ip", "link", "set", "dev", dev, "up", NULL };
-    if (run_quiet(u) != 0)
-        fprintf(stderr, LOG_W "%s: устройство не поднялось — через него не пойдёт "
-                        "ничего\n", dev);
-    /* Очередь устройства — 500 пакетов по умолчанию, и она про направление ЯДРО → МЫ, а не
-     * про наши записи. Прежнее объяснение здесь («полная очередь означает EAGAIN и ожидание
-     * на каждой записи») замера не выдержало: 200 000 неблокирующих записей в TUN на ядре
-     * 6.8 дали НОЛЬ EAGAIN и ноль rx_dropped — запись в устройство в txqueuelen не упирается
-     * вовсе. А вот пакеты, которые ядро отдаёт нам, лежат в этой очереди ровно txqueuelen
-     * штук: из 20 000 отправленных при 500 до нас доехали 500 (остальные 19 501 сосчитаны
-     * как tx_dropped устройства), при 4096 — 4096.
-     *
-     * То есть выигрыш настоящий, но он про другое: сколько пакетов уцелеет, пока цикл занят
-     * предыдущим витком (криптографией, записью в сокеты, разбором). Вчетверо с лишним
-     * больший запас — вчетверо реже потери на пиках. Памяти это не стоит заранее: очередь
-     * занимает столько, сколько в ней реально лежит.
-     *
-     * Почему это важно назвать точно, а не «работает и так»: по этому объяснению уже
-     * сверялись. В реализации на Go тот же механизм пересказан в комментарии к Write
-     * («EAGAIN на записи означает переполненную очередь устройства»), а txqueuelen там не
-     * поднимается ни клиентом, ни хабом — I-115. */
-    const char *q[] = { "ip", "link", "set", "dev", dev, "txqueuelen", "4096", NULL };
-    /* Тон здесь ОСВЕДОМЛЯЮЩИЙ, а не тревожный: трафик пойдёт и с ядерной очередью, потеряна
-     * будет скорость. Предупреждать об этом значило бы на системах, где txqueuelen не
-     * принимают вовсе, встречать каждый штатный запуск красной строкой — и научить не
-     * смотреть в журнал вообще. */
-    if (run_quiet(q) != 0)
-        fprintf(stderr, LOG_I "%s: очередь передачи осталась ядерной — просили 4096 "
-                        "пакетов, не приняли; ждать чтения их сможет 500, остальные ядро "
-                        "на пиках отбросит\n", dev);
-}
-
 /* ВЫЧЕРПАТЬ сокет соединения, а не прочитать по одной записи за виток цикла.
  *
  * Разница принципиальная. Пока мы не читаем, у сервера закрывается окно, и заново открыть
@@ -2545,6 +2517,7 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
                               c->our_seq, c->client_seq, TCP_FIN | TCP_ACK,
                               NULL, 0, 0, 0, -1);
         if (fl) tun_write_ctl(tun, fin, fl);
+        if (!c->is_udp) fin_recent_add(c);
         conn_drop(c);
         return 1;
     }
@@ -2976,8 +2949,8 @@ static void stack_setup(const struct dialer *d) {
     for (int i = 0; i < SPARE_MAX; i++) g_spares[i].sess = m + (size_t)i * g_sess_stride;
 }
 
-int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, void *arg) {
-    const char *dev = o->device;
+int stack_run(const struct tun_cfg *tc, const struct dialer *d, stack_ready_fn ready, void *arg) {
+    const char *dev = tc->dev;
     g_trace = getenv("STEER_TUN_TRACE") != NULL;
     g_stats = getenv("STEER_TUN_STATS") != NULL;
 
@@ -3013,22 +2986,10 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
         workers[i].tun = queues[i];
         workers[i].id = i;
     }
-    tun_bring_up(dev, o->table);
+    ifcfg_bring_up(dev, tc->addr, tc->prefix);
 
-    /* Устройство готово — сказать об этом модулю, а маршрут НЕ трогать.
-     *
-     * До 1.10 здесь стоял bind_device: apply к этому моменту уже прошёл и, не найдя устройства,
-     * поставил запрет, а момент готовности TUN знает только тот, кто его создал, — вот стек и
-     * привязывал таблицу выхода сам. Момент по-прежнему знаем только мы, но привязка — работа
-     * демона (решение владельца; docs/architecture.md, «4а», «Дети и здоровье»): там же страж
-     * правил, сторож и postrouting_guard, и маршрутизация с её моделью не должна ехать в бинарник
-     * модуля на libsteer (шаг 4). Поэтому стек только зовёт ready, модуль пишет демону up с
-     * именем устройства (evline.h, поле dev), и демон привязывает тем же bind_device в своём
-     * процессе. Зовётся ДО потоков цикла, на том же месте, где стояла привязка: порядок «сначала
-     * устройство, потом маршрут в него» не меняется, меняется только процесс, который ставит
-     * маршрут. До привязки таблица выхода держит то, что поставили apply или сторож (запрет у
-     * on_fail=drop, «напрямую» у direct и zapret), а помеченный пакет не в устройство выхода
-     * отбрасывает postrouting_guard, так что окно — «ещё не работает», а не «мимо туннеля». */
+    /* The device is up and has its address: the caller adds its routes into it now (tunvless:
+     * --route), before the loop threads start — first the device, then the routes into it. */
     if (ready) ready(arg, dev);
     char desc[512];
     d->ops->describe(d->ctx, desc, sizeof(desc));
@@ -3079,6 +3040,3 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
     return 1;
 }
 
-/* Подкоманды `steer vless`, `vless-nodes` и `vless-probe` жили здесь и переехали в модуль
- * протокола — proto/vless/vlmain.c; туда же и проверка узла перед подъёмом (vless_tunnel_run в
- * vldial.c). */

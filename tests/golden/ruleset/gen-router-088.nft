@@ -1,4 +1,0 @@
-# args: apply --dry-run --spec TMP/pr.json --state-dir TMP/st-pr
-# exit: 2
-# env: STEER_NFT_INGRESS=0
-# stderr: steer: channels.p: неизвестный proto «sctp» (нужен tcp, udp или both)
