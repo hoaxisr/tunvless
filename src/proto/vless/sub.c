@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include "vless.h"
 #include "sublink.h"
 /* vless_uuid_form: the rule that turns the id into 16 bytes lives in one place, vless_proto.c
@@ -1313,8 +1314,17 @@ const char *vless_sub_text(const char *raw, size_t raw_n, char *dec, size_t dec_
     return dec;
 }
 
-/* A whole subscription file. Buffers and the node array are on the heap, sized by the file:
- * there are as many node slots as links ("://") and Xray outbounds ("\"protocol\"") in the text.
+/* How many times "vless" occurs in text, in any case: every VLESS node has it in its own text
+ * (vless://, "protocol": "vless", "type": "vless", type: vless), so this bounds the node count. */
+static size_t count_vless(const char *text) {
+    size_t n = 0;
+    for (const char *q = text; *q; q++)
+        if ((*q == 'v' || *q == 'V') && !strncasecmp(q, "vless", 5)) n++;
+    return n;
+}
+
+/* A whole subscription file. Buffers and the node array are on the heap, sized by the file: one
+ * node slot per "vless" in the text.
  * The 64 MiB cap guards against a file that is not a subscription (a thousand nodes take hundreds
  * of kilobytes). NULL — the file did not open, is too large, or no memory; otherwise an array to
  * free, *cnt — usable nodes. */
@@ -1336,9 +1346,7 @@ struct vless_node *vless_load_sub(const char *path, size_t *cnt, struct vless_su
     raw[n] = '\0';
     dec[0] = '\0';
     const char *text = vless_sub_text(raw, n, dec, sz + 16);
-    size_t hint = 1;
-    for (const char *q = text; (q = strstr(q, "://")); q += 3) hint++;
-    for (const char *q = text; (q = strstr(q, "\"protocol\"")); q += 10) hint++;
+    size_t hint = 1 + count_vless(text);
     struct vless_node *nodes = calloc(hint, sizeof(*nodes));
     if (nodes) *cnt = vless_parse_sub(text, nodes, hint, st);
     free(raw);

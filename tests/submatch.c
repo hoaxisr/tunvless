@@ -955,11 +955,6 @@ int main(void) {
         check("short name not cut", "Узел", n.name);
     }
 
-    printf("\n%d checks passed", g_pass);
-    if (g_fail) {
-        printf(", %d FAILED\n", g_fail);
-        return 1;
-    }
     /* ---- malformed JSON: parsing returns ------------------------------------- */
     {
         static const char *const bad[] = {
@@ -1116,6 +1111,44 @@ int main(void) {
         free(nodes);
     }
 
-    printf("\nall checks passed\n");
+    /* ---- sing-box and Clash files: one slot per node, though they have no "://" ---------- */
+    {
+        static const char *const files[] = {
+            "{\"outbounds\":["
+            "{\"type\":\"vless\",\"tag\":\"sb1\",\"server\":\"h1\",\"server_port\":443,"
+            "\"uuid\":\"8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124\"},"
+            "{\"type\":\"vless\",\"tag\":\"sb2\",\"server\":\"h2\",\"server_port\":443,"
+            "\"uuid\":\"8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124\"},"
+            "{\"type\":\"vless\",\"tag\":\"sb3\",\"server\":\"h3\",\"server_port\":443,"
+            "\"uuid\":\"8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124\"}]}",
+            "proxies:\n"
+            "  - name: c1\n    type: vless\n    server: h1\n    port: 443\n"
+            "    uuid: 8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124\n"
+            "  - {name: c2, type: vless, server: h2, port: 443, uuid: 8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124}\n"
+            "  - name: c3\n    type: vless\n    server: h3\n    port: 443\n"
+            "    uuid: 8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124\n",
+        };
+        static const char *const what[] = { "sing-box file: 3 nodes", "Clash file: 3 nodes" };
+        for (int k = 0; k < 2; k++) {
+            char path[64];
+            snprintf(path, sizeof(path), "/tmp/submatch-cfg.%d", (int)getpid());
+            FILE *f = fopen(path, "w");
+            if (f) { fputs(files[k], f); fclose(f); }
+            struct vless_sub_stats st;
+            size_t n = 0;
+            struct vless_node *nodes = vless_load_sub(path, &n, &st);
+            unlink(path);
+            check_n(what[k], 3, (long)n);
+            check_n("  none skipped for lack of slots", 0, (long)st.skipped);
+            free(nodes);
+        }
+    }
+
+    printf("\n%d checks passed", g_pass);
+    if (g_fail) {
+        printf(", %d FAILED\n", g_fail);
+        return 1;
+    }
+    printf("\n");
     return 0;
 }
