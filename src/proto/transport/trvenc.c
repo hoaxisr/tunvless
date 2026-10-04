@@ -2,11 +2,12 @@
  * records over a ready transport. A byte-exact port of Xray-core proxy/vless/encryption
  * (client.go, common.go, xor.go).
  *
- * PLACE. Between the transport (tcp/ws/grpc/xhttp... over none/tls/reality) and the VLESS header:
- * in Xray it is `conn = encryption.Handshake(conn)` before the request is written, and the
- * request, the response and the Vision frames all travel inside this layer's records. Same here:
- * transport_open calls tr_venc_open after opening the transport, and transport_write and
- * transport_read then go through this file. The transport itself knows nothing of encryption.
+ * WHERE IT SITS. Between the transport (tcp/ws/grpc/xhttp... over none/tls/reality) and the
+ * VLESS header: in Xray it is `conn = encryption.Handshake(conn)` before the request is written,
+ * and the request, the response and the Vision frames all travel inside this layer's records.
+ * Same here: transport_open calls tr_venc_open after opening the transport, and transport_write
+ * and transport_read then go through this file. The transport itself knows nothing of
+ * encryption.
  *
  * ON THE WIRE (1-RTT).
  *   client: iv(16) ‖ relay... ‖ AEAD(length 1232) ‖ AEAD(ML-KEM ek ‖ X25519 pub) ‖ padding;
@@ -55,6 +56,8 @@
 #define REC_MAX_DATA 8192              /* data per sent record (Xray: no extra copy at the peer) */
 #define REC_MAX_LEN  16640             /* max record body length accepted on receive */
 #define REC_MIN_LEN  17
+/* Raw input: a whole record of the largest accepted size plus room for one transport read,
+ * which needs TRANSPORT_MIN_READ_CAP free (raw_fill). */
 #define RBUF_CAP     (5 + REC_MAX_LEN + (16384 + 16) + 16)
 
 static const unsigned char MAX_NONCE[12] = { 255,255,255,255,255,255,255,255,255,255,255,255 };
@@ -193,7 +196,7 @@ struct venc {
     int use_aes, xor2, zero_rtt_try;
     unsigned char united[96];
     struct v_aead wr, rd;
-    unsigned char tk_id[32];               /* ticket key; empty without 0rtt */
+    unsigned char tk_id[32];               /* ticket table key: blake3 of the encryption string */
     unsigned char tk_pfs[64];              /* pfsKey of the ticket in use (for tk_expire) */
     /* Receive. */
     int rs;                                /* RS_PAD, RS_RAND, RS_REC */
@@ -212,7 +215,7 @@ struct venc {
     int have_out_ctr, have_in_ctr;
     unsigned char out_mask[5];
     /* Send. */
-    unsigned char *prewrite;               /* 0-RTT: iv ‖ relay ‖ ticket, sent first */
+    unsigned char *prewrite;               /* 0-RTT: iv ‖ relay ‖ ticket, sent with record 1 */
     size_t prewrite_n;
 };
 
@@ -247,7 +250,7 @@ static int64_t now_ms(void) {
  * to deadline. Otherwise 0 means "not enough yet" (e->rlen < need); negative: transport failure. */
 static int raw_fill(struct transport *t, struct venc *e, size_t need, int block, int64_t deadline) {
     while (e->rlen < need) {
-        if (e->rcap - e->rlen < TRANSPORT_MIN_READ_CAP) return TR_EVENC;   /* caller bug */
+        if (e->rcap - e->rlen < TRANSPORT_MIN_READ_CAP) return TR_EVENC;   /* need too big: a bug */
         size_t got = 0;
         int rc = t->fr->read(t, e->rbuf + e->rlen, e->rcap - e->rlen, &got);
         if (rc) return rc;
@@ -256,7 +259,7 @@ static int raw_fill(struct transport *t, struct venc *e, size_t need, int block,
         if (!block) return 0;
         if (transport_has_data(t)) continue;
         int64_t left = deadline - now_ms();
-        if (left <= 0) return fail(TR_EVENC, "no server answer to the handshake");
+        if (left <= 0) return fail(TR_EVENC, "the server did not answer the handshake");
         struct pollfd p = { .fd = t->link.fd, .events = POLLIN };
         int pr = poll(&p, 1, left > 1000 ? 1000 : (int)left);
         if (pr < 0 && errno != EINTR) return TR_EIO;
@@ -364,7 +367,7 @@ int tr_venc_open(struct transport *t, const struct tr_node *node, int timeout_s)
     unsigned char h32[VENC_MAX_KEYS][32];
     for (unsigned j = 0; j < c.nkeys; j++) {
         int kl = b64url_key(c.key[j], c.key_len[j], keys[j], 1184);
-        if (kl != 32 && kl != 1184) { rc = fail(TR_EVENC, "encryption: unparsable key"); goto out; }
+        if (kl != 32 && kl != 1184) { rc = fail(TR_EVENC, "a key in the encryption string does not parse"); goto out; }
         klen[j] = (size_t)kl;
         sc_blake3_hash(h32[j], keys[j], klen[j]);
         relays_len += kl == 32 ? 32 + 32 : 1088 + 32;
@@ -403,7 +406,7 @@ int tr_venc_open(struct transport *t, const struct tr_node *node, int timeout_s)
         } else {
             unsigned char rnd[SC_MLKEM768_RND];
             if (xc_random(rnd, sizeof rnd) != 0) { rc = TR_EIO; goto out; }
-            if (sc_mlkem768_encaps(rel, nfs, keys[j], rnd) != 0) { rc = fail(TR_EVENC, "invalid ML-KEM key in encryption"); goto out; }
+            if (sc_mlkem768_encaps(rel, nfs, keys[j], rnd) != 0) { rc = fail(TR_EVENC, "invalid ML-KEM relay key"); goto out; }
             index = 1088;
         }
         if (c.xor_mode > 0) {           /* mask with a relay key keystream: looks random */
@@ -484,7 +487,7 @@ int tr_venc_open(struct transport *t, const struct tr_node *node, int timeout_s)
             }
             if (i < ng) sleep_ms(pgaps[i]);
         }
-        if (off != hello_n) { rc = fail(TR_EVENC, "padding does not match the length"); goto out; }
+        if (off != hello_n) { rc = fail(TR_EVENC, "padding chunks do not add up"); goto out; }
     }
 
     /* Server answer: AEAD(ML-KEM ct ‖ X25519 pub) under the relay key; the record keys derive
@@ -523,7 +526,7 @@ int tr_venc_open(struct transport *t, const struct tr_node *node, int timeout_s)
     if (va_open(&e->rd, NULL, NULL, 0, lb, 2, e->rbuf + 2) != 0) { rc = fail(TR_EVENCAUTH, "server padding length failed authentication"); goto out; }
     rb_drop(e, 18);
     e->peer_pad = ((size_t)lb[0] << 8) | lb[1];
-    if (e->peer_pad < 16) { rc = fail(TR_EVENC, "server padding shorter than the tag"); goto out; }
+    if (e->peer_pad < 16) { rc = fail(TR_EVENC, "server padding is shorter than the AEAD tag"); goto out; }
     e->rs = RS_PAD;
     if (e->xor2) {
         if (ctr_new(&e->out_ctr, e->united, 96, iv) != 0) { rc = TR_EIO; goto out; }
@@ -582,7 +585,8 @@ int tr_venc_write(struct transport *t, const unsigned char *d, size_t n) {
         if (rc) {
             free(big);
             /* send holds a masked header, but the state has not moved and obuf is rebuilt on
-             * the retry, so nothing is spoiled. */
+             * the retry, so nothing is spoiled. After a partial send (done > 0) a retry of the
+             * same bytes would repeat the chunks already sent, so that is a hard failure. */
             return done ? TR_EIO : rc;
         }
         free(big);
@@ -592,7 +596,8 @@ int tr_venc_write(struct transport *t, const unsigned char *d, size_t n) {
         out_mask_next(e);
         if (rekey) {
             /* A record whose nonce wrapped past the maximum is the last under this key: the
-             * next key derives from the record itself (context: header ‖ ciphertext, unmasked). */
+             * next key derives from the record itself (context: header ‖ ciphertext ‖ tag, the
+             * header unmasked). */
             unsigned char plainrec[5 + REC_MAX_DATA + 16];
             memcpy(plainrec, obuf, rec_n);
             memcpy(plainrec, hdr, 5);
@@ -671,7 +676,7 @@ int tr_venc_read(struct transport *t, unsigned char *d, size_t cap, size_t *got)
                 tk_expire(e->tk_id, e->tk_pfs);
                 return fail(TR_EVENC0RTT, "0-RTT ticket rejected, next connect: full handshake");
             }
-            return fail(TR_EVENC, "record not in VLESS encryption format");
+            return fail(TR_EVENC, "invalid record header");
         }
         rc = raw_fill(t, e, 5 + (size_t)l, 0, 0);
         if (rc) return rc;

@@ -6,14 +6,16 @@
  * library built with one set next to a caller built with another corrupts memory silently. So
  * the options live nowhere else — not on command lines, not in configure.
  *
- * WHAT IS NEEDED. The TLS 1.3 and REALITY client is our own (src/proto/tls); wolfSSL provides
+ * WHAT IS NEEDED. The TLS and REALITY client is our own (src/proto/tls); wolfSSL provides
  * primitives only: SHA-256/384/512, HMAC, HKDF, AES-GCM, ChaCha20-Poly1305, AES-CTR (VLESS
  * encryption), X25519, ML-KEM-768 and ML-DSA-65 verification, and X.509 chain verification with
  * name and validity (RSA PKCS#1 v1.5 and PSS, ECDSA P-256/P-384 signatures). The chain is checked
  * by wolfSSL's X509 store, which is why part of its TLS layer (OPENSSL_EXTRA) is built.
  *
- * WHAT IS LEFT OUT ON PURPOSE: TLS 1.2 and older, a TLS server, QUIC, DH, DSA, DES, RC4, MD4,
- * PSK, PBKDF, the filesystem (certverify.c reads the roots itself, into a buffer) and socket I/O.
+ * WHAT IS LEFT OUT ON PURPOSE: wolfSSL's TLS 1.2 and older (tls13.c has its own minimal TLS 1.2
+ * client), a TLS server, QUIC, DH, DSA, DES, RC4, MD4, PSK, PBKDF, Ed25519 and P-521 (certverify.c
+ * reads the Ed25519 Reality certificate itself), the filesystem (certverify.c reads the roots
+ * itself, into a buffer) and socket I/O.
  *
  * SIZE. tunvless links wolfSSL statically with -ffunction-sections and --gc-sections, so what is
  * built but never called does not reach the binary.
@@ -86,8 +88,8 @@ extern int os_rand_seed(unsigned char *out, unsigned int n);
 #define HAVE_HASHDRBG
 
 #define HAVE_AESGCM
-/* A 4-bit GHASH table (256 bytes per key), not 8-bit (4 KB): there is a key per direction of
- * every connection, and at 64 connections the 8-bit table would cost half a megabyte. */
+/* A 4-bit GHASH table (512 bytes per key), not 8-bit (4 KB): there is a key per direction of
+ * every connection, and with hundreds of connections the 8-bit table would cost megabytes. */
 #define GCM_TABLE_4BIT
 /* AES-CTR — the masking stream of VLESS encryption (src/proto/transport/trvenc.c). DIRECT is needed
  * for setting a key without a mode (wc_AesSetKeyDirect) and for encrypting one block. */
@@ -153,8 +155,8 @@ extern int os_rand_seed(unsigned char *out, unsigned int n);
 #define WC_RSA_BLINDING
 #define TFM_TIMING_RESISTANT
 #define WOLFSSL_SP_MATH_ALL
-/* Big-number math serves only the chain check of security=tls, a few operations per handshake,
- * so code size matters more than speed here. */
+/* Big-number math serves only the certificate checks of security=tls (chain and
+ * CertificateVerify), a few operations per handshake, so code size matters more than speed. */
 #define WOLFSSL_SP_SMALL
 
 #define WOLFSSL_ASN_TEMPLATE

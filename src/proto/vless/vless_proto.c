@@ -138,7 +138,7 @@ int vless_uuid_parse(const char *s, unsigned char out[16]) {
 
 /* The request header. The address goes as a name when one is known, so the server resolves
  * it and the lookup does not leak through local DNS. Traffic from TUN has only an address.
- * Returns the header length, 0 if it does not fit in cap. */
+ * Returns the header length, or 0 if it does not fit in cap or the flow or host is too long. */
 size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
                            const char *host, const unsigned char ip4[4],
                            uint16_t port, const char *flow,
@@ -170,9 +170,9 @@ size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
     }
     out[i++] = (unsigned char)cmd;
     /* Mux (command 3) has no port and address in the header: the v1.mux.cool:666 service is
-     * implied by the command. Neither Xray-core (proxy/vless/encoding, EncodeRequestHeader)
-     * nor sing-box (vless.ReadRequest) reads past the command, so extra bytes would become the
-     * start of the Mux stream. */
+     * implied by the command. Xray-core (proxy/vless/encoding, EncodeRequestHeader) writes
+     * nothing after the command and sing-box (vless.ReadRequest) reads nothing after it, so
+     * extra bytes would become the start of the Mux stream. */
     if (cmd == VLESS_CMD_MUX) return i;
     out[i++] = (unsigned char)(port >> 8);
     out[i++] = (unsigned char)port;
@@ -199,7 +199,7 @@ size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
  * from silent failure. */
 int vless_parse_response(const unsigned char *buf, size_t n, size_t *skip) {
     if (n < 2) return VLESS_EAGAIN;
-    if (buf[0] != 0) return VLESS_EPROTO;      /* not our version: almost surely the cover site */
+    if (buf[0] != 0) return VLESS_EPROTO;      /* not our version: almost surely the real site */
     size_t extra = buf[1];
     if (n < 2 + extra) return VLESS_EAGAIN;
     *skip = 2 + extra;

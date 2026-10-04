@@ -1,6 +1,6 @@
 /* Link security: security=none, tls and reality — the handshake over the socket to the node (the
- * middle layer of transport.h). The handshake is shared by every link, the main one and xhttp's
- * second one; the only difference is the alpn the transport passes in.
+ * middle layer in transport.h). Every link, the main one and xhttp's second one, uses this one
+ * handshake; the only difference is the alpn the transport passes in.
  *
  * Reality has no negative answer. A server that does not recognise the client does not refuse:
  * it proxies the connection to the real site it hides behind. The handshake can complete and
@@ -33,14 +33,15 @@ static int sec_none(struct tr_link *l, const struct tr_node *n, const char *alpn
 /* security=tls (plain TLS) and security=reality.
  *
  * They differ in exactly three things, all required. Plain TLS sends a ClientHello without the
- * authenticator (the server would see harmless garbage in session_id). It needs a NAME: Reality
- * allows an empty SNI (the server expects a Hello without the extension), but plain TLS without a
- * name has nothing to send and nothing to check the certificate against. And it verifies the
- * certificate, the only proof of the server's identity here.
+ * Reality authenticator (a TLS server would only see meaningless bytes in session_id). It needs a
+ * NAME: Reality allows an empty SNI (the server expects a Hello without the extension), but plain
+ * TLS without a name has nothing to send and nothing to check the certificate against. And it
+ * verifies the certificate, the only proof of the server's identity here.
  *
  * The name is sni, with host only as a fallback: sni is what the server is asked for, so the
- * certificate is checked against it. A node given only as an address is checked against the
- * address and fails if the certificate was not issued for it; Xray does the same.
+ * certificate is checked against it. With an IP address and no sni the check would be against the
+ * address, as in Xray; certificates are almost never issued to an IP, so the subscription parser
+ * (sublink.c) skips such a node before it gets here.
  *
  * The Reality state (our ephemeral key and the authenticator key) lives on this function's stack,
  * not in the connection: nothing needs it after the handshake. */
@@ -56,14 +57,14 @@ static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *
         .plain = is_tls,
         /* The X25519MLKEM768 hybrid in the ClientHello, as in Chrome 131+, uTLS
          * HelloChrome_Auto and Go 1.24+, so in any Xray client with fp=chrome or no fp. Without
-         * it the Hello looks like an old Chrome both by size (537 bytes instead of about 1760)
-         * and by supported_groups. STEER_NOPQ=1 turns it off, for debugging a middlebox that
-         * drops a Hello longer than one segment. */
+         * it the Hello looks like an old Chrome, both by size (about 540 bytes instead of about
+         * 1760) and by supported_groups. Setting STEER_NOPQ (to any value) turns it off, for
+         * debugging a middlebox that drops a Hello longer than one segment. */
         .pq = !getenv("STEER_NOPQ"),
     };
     /* pqv: an ML-DSA-65 key, base64url. Decoded BEFORE the Hello is sent: a broken key fails the
      * node rather than letting the handshake go on without checking the signature. The
-     * subscription parser (sub.c) already rejects such keys; this is the second line. */
+     * subscription parser (sublink.c) already rejects such keys; this is the second line. */
     unsigned char pqv[SC_MLDSA65_PK];
     const int have_pqv = !is_tls && n->pqv && n->pqv[0];
     if (have_pqv && xc_b64url_decode(n->pqv, pqv, sizeof pqv) != SC_MLDSA65_PK) return REALITY_EBADKEY;
@@ -85,7 +86,7 @@ static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *
     /* ECH (security=tls, the node's `ech=`): the Hello built above, with the real SNI, becomes the
      * inner one; the outer one with public_name from the ECHConfig goes on the wire (ech.h). The
      * buffers are on the heap: the outer Hello holds an encrypted copy of the inner one, twice the
-     * usual size, and worker thread stacks are small. */
+     * usual size, and the threads that run handshakes have small stacks (connectors: 128 KB). */
     struct ech_heap {
         struct ech_cfg cfg;
         struct ech_state st;
@@ -162,7 +163,7 @@ const struct security_ops tr_sec_none    = { .name = "none",    .handshake = sec
 const struct security_ops tr_sec_tls     = { .name = "tls",     .handshake = sec_tls };
 const struct security_ops tr_sec_reality = { .name = "reality", .handshake = sec_reality };
 
-/* Anything that is not none or tls is reality: the subscription parser (sub.c) rejects an
+/* Anything that is not none or tls is reality: the subscription parser (sublink.c) rejects an
  * unsupported value before the node gets here. */
 const struct security_ops *tr_security(const char *name) {
     if (!strcmp(name, "none")) return &tr_sec_none;

@@ -2,21 +2,22 @@
  * mlkem768x25519plus.<mode>.<rtt>.<padding>.<key>[.<key>...]
  *
  * Strings only, no cryptography, so this is a header of static functions: both the subscription
- * parser (sub.c, built into `make test` without the crypto library) and the encryption itself
- * (trvenc.c) include it. The rule is what Xray-core does when it builds the config
- * (infra/conf/vless.go, VLessOutboundConfig.Build) and the client
+ * parser (sub.c and sublink.c, built into `make test` without the crypto library) and the
+ * encryption itself (trvenc.c) include it. The rule is what Xray-core does when it builds the
+ * config (infra/conf/vless.go, VLessOutboundConfig.Build) and the client
  * (proxy/vless/outbound/outbound.go, New):
  *
  *     mlkem768x25519plus . native|xorpub|random . 1rtt|0rtt . [padding .]... key [. key]...
  *
- *   - mode: native — records as they are; xorpub — the handshake public keys (X25519, ML-KEM
+ *   - mode: native — records are sent as is; xorpub — the handshake public keys (X25519, ML-KEM
  *     ciphertext) are masked with a keystream so they look like random bytes; random — the
  *     headers of all records are masked too, so the whole stream is indistinguishable from noise;
  *   - 0rtt lets the client resume with a ticket the server issued (no new key exchange); 1rtt is
  *     always a full handshake. A client that declares 0rtt may still not use a ticket;
  *   - padding — tokens shorter than 20 characters like "100-111-1111" (probability, from, to),
  *     alternating length, gap, length...; the server hands them to the client in the link.
- *     None — Xray's default;
+ *     Without them Xray's default applies. The first length must be at least 100-35-35:
+ *     always applied, and at least 35 bytes;
  *   - key — a token of 20 characters or more, base64url without padding: 32 bytes (X25519, the
  *     relay's public key) or 1184 (ML-KEM-768 encapsulation key). Relays form a chain, in order.
  *
@@ -45,6 +46,7 @@ struct venc_cfg {
     uint16_t gaps[VENC_MAX_PAD][3];
 };
 
+/* The decoded length of unpadded base64url, or -1 for a bad character or length. */
 static inline int vencp_b64url_len(const char *s, size_t n) {
     for (size_t i = 0; i < n; i++) {
         char c = s[i];
@@ -69,7 +71,7 @@ static inline int vencp_triple(const char *s, size_t n, uint16_t out[3]) {
     return 0;
 }
 
-/* 0 — valid; otherwise -1 and why (a short reason, a static string). */
+/* 0 — valid; otherwise -1 and *why (a short reason, a static string). why may be NULL. */
 static inline int vencp_parse(const char *s, struct venc_cfg *c, const char **why) {
     memset(c, 0, sizeof(*c));
     const char *w = "";
@@ -95,21 +97,21 @@ static inline int vencp_parse(const char *s, struct venc_cfg *c, const char **wh
              * shorter than 20 characters, and a key cannot be shorter than 20. */
             if (c->nkeys) { w = "encryption: padding after a key"; goto bad; }
             uint16_t t3[3];
-            if (vencp_triple(p, n, t3) != 0) { w = "encryption: padding does not parse"; goto bad; }
+            if (vencp_triple(p, n, t3) != 0) { w = "encryption: invalid padding"; goto bad; }
             if (tok_i % 2 == 0) {
-                if (c->npad_lens >= VENC_MAX_PAD) { w = "encryption: padding too long"; goto bad; }
+                if (c->npad_lens >= VENC_MAX_PAD) { w = "encryption: too many padding tokens"; goto bad; }
                 memcpy(c->lens[c->npad_lens++], t3, sizeof t3);
                 if (c->npad_lens == 1 && (t3[0] < 100 || t3[1] < 18 + 17 || t3[2] < 18 + 17)) {
-                    w = "encryption: first padding less than 35"; goto bad;
+                    w = "encryption: first padding is below 100-35-35"; goto bad;
                 }
             } else {
-                if (c->npad_gaps >= VENC_MAX_PAD) { w = "encryption: padding too long"; goto bad; }
+                if (c->npad_gaps >= VENC_MAX_PAD) { w = "encryption: too many padding tokens"; goto bad; }
                 memcpy(c->gaps[c->npad_gaps++], t3, sizeof t3);
             }
             tok_i++;
         } else {
             int bl = vencp_b64url_len(p, n);
-            if (bl != 32 && bl != 1184) { w = "encryption: key not 32 or 1184 bytes"; goto bad; }
+            if (bl != 32 && bl != 1184) { w = "encryption: key is neither 32 nor 1184 bytes"; goto bad; }
             if (c->nkeys >= VENC_MAX_KEYS) { w = "encryption: too many keys"; goto bad; }
             c->key[c->nkeys] = p;
             c->key_len[c->nkeys] = (uint16_t)n;
@@ -119,7 +121,7 @@ static inline int vencp_parse(const char *s, struct venc_cfg *c, const char **wh
         if (!e) break;
         p = e + 1;
     }
-    if (!c->nkeys) { w = "encryption without a key"; goto bad; }
+    if (!c->nkeys) { w = "encryption: no key"; goto bad; }
     return 0;
 bad:
     if (why) *why = w;

@@ -3,7 +3,8 @@
  * VLESS encryption in Xray-core (proxy/vless/encryption) is built on BLAKE3: it derives every
  * AEAD key (blake3.DeriveKey(k, string(ctx), key) in NewAEAD), the xorpub/random keystream key
  * (DeriveKey with the context "VLESS") and the relay key hash (blake3.Sum256). The server needs
- * the very same BLAKE3, and wolfSSL 5.9.4 has none (only BLAKE2).
+ * the very same BLAKE3, and wolfSSL 5.9.4 has none (only BLAKE2). Another library for two
+ * functions is not worth it: the algorithm is forty lines of compression plus the chunk tree.
  *
  * A header of static functions rather than a .c: the public sc_blake3_* are defined in
  * scrypto.c (they belong to the primitives layer), and tests/b3match.c includes this header
@@ -13,8 +14,9 @@
  * ciphertext, public key) is known in full before the call. The input is not limited to one
  * chunk, though: the NewAEAD context is the 1216-byte pfsPublicKey (2 chunks of 1024), and the
  * ML-KEM public key hash (1184 bytes) is 2 chunks as well. So the tree (parent nodes, the stack
- * of chaining values) is implemented in full and checked against the BLAKE3 repository vectors
- * at the block, chunk and tree depth boundaries (tests/b3match.c).
+ * of chaining values) is implemented in full. tests/b3match.c checks it against
+ * lukechampine.com/blake3, the library Xray-core uses, at the block, chunk and tree depth
+ * boundaries.
  *
  * Speed does not matter: about ten calls per handshake, none per data record (a record key is
  * derived once per key change, every 2^96 records, see trvenc.c). Hence portable C, no SIMD. */

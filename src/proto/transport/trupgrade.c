@@ -54,14 +54,15 @@
  *     first write, which goes in Sec-WebSocket-Protocol if no longer than Ed (unpadded
  *     base64url, tr_h1_send), otherwise as frames after the 101 (trws.c). httpupgrade, as
  *     ConnRF: the request goes out on open, but the response is not awaited; data follows, and
- *     the first read parses the response (hu_read_wait). sing-box differs (it cuts the first
- *     write at Ed and sends the tail separately); we do not follow it. Unlike Xray, the tunnel
- *     loop cannot wait for the ws response inside a write, so writes made before the 101 are
+ *     the first read parses the response (hu_read_wait); over TLS or Reality only, see
+ *     tr_h1_upgrade for security=none. sing-box differs (it cuts the first write at Ed and
+ *     sends the tail separately); we do not follow it. Unlike Xray, the tunnel loop cannot
+ *     wait for the ws response inside a write, so writes made before the 101 are
  *     queued and sent right after it: the wire order is the same, request, response, frames
  *     (frames must not precede the 101: gorilla on the server drops such a connection, "client
  *     sent data before handshake is complete"). The one cost: the deferred response has no
- *     deadline of its own (Xray: HandshakeTimeout 8 s); a silent server is cut by the stack's
- *     silence timeout.
+ *     deadline of its own (Xray: HandshakeTimeout 8 s); a silent server is left to the stack's
+ *     idle cleanup of the connection (IDLE_EVICT_S in stack.c).
  *
  * ALPN is http/1.1 only, as in Xray (tls.WithNextProto("http/1.1"), and uTLS's
  * WebsocketHandshakeContext rewrites the fingerprint's ALPN extension to http/1.1 alone). With
@@ -118,11 +119,11 @@ static size_t b64_std(const unsigned char *in, size_t n, char *out) {
 
 /* SHA-1 (FIPS 180-4), only for Sec-WebSocket-Accept.
  *
- * Our own, not from the scrypto layer, on purpose. Accept is not protection: it only proves that
- * a server that understood the WebSocket request answered, not a cache or proxy returning someone
- * else's 101 (RFC 6455, 1.3). SHA-1 in the primitives layer would bring an obsolete hash, unfit
- * for signing anything, into the crypto code, and the unit tests, built without the library,
- * could no longer check it. Forty lines for one check per connection are cheaper. */
+ * Our own rather than sc_hash(SC_SHA1) of the scrypto layer, on purpose. Accept is not
+ * protection: it only proves that a server that understood the WebSocket request answered, not
+ * a cache or proxy returning someone else's 101 (RFC 6455, 1.3). And the unit tests of this
+ * transport (wsmatch, xhupmatch) are built without the crypto library, so with the layer's SHA-1
+ * they could no longer check it. Forty lines for one check per connection are cheaper. */
 struct sha1 { uint32_t h[5]; unsigned char b[64]; size_t bn; uint64_t len; };
 
 static uint32_t rol(uint32_t x, int k) { return (x << k) | (x >> (32 - k)); }
@@ -251,9 +252,10 @@ static void hm_set_empty(struct hmap *m, const char *k, const char *v) {
  * word firefox, safari, edge, curl or golang: Xray reads the word as "pose as this client". Xray
  * derives the versions from the date with a CPU-dependent shift (FirefoxVersion, SafariVersion,
  * CurlVersion); here they are fixed by the same rule as UA_CHROME in h2.h: the formula's value
- * for September 2026 at the middle shift. Xray's Edge is ChromeUA followed directly, with no
- * space, by "Edg/...": so in browser.go, so here. Edge's sec-ch-ua is built by the getGreasedChUa
- * rule for version 149 (permutation {2,1,0}, the same fake brand as Chrome). */
+ * for September 2026 at the middle shift. Xray's Edge User-Agent is ChromeUA followed by
+ * "Edg/..." with no space between, as browser.go builds it. Edge's sec-ch-ua is built by the
+ * getGreasedChUa rule for version 149, UA_CHROME_MAJOR (permutation {2,1,0}, the same fake brand
+ * as Chrome). */
 #define UA_FIREFOX \
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0"
 #define UA_SAFARI \
@@ -683,7 +685,8 @@ static int h1_wait(struct transport *t, int ws, int timeout_s) {
  *                       Xray defers even the TCP connect; we open TCP and TLS in advance: the
  *                       bytes on the wire are the same, only the timing is earlier;
  *   httpupgrade, Ed > 0 the request at once, the response read by the first read (Xray's ConnRF,
- *                       H1_WAIT): client data follows the request without waiting for the 101;
+ *                       H1_WAIT): client data follows the request without waiting for the 101.
+ *                       Over TLS or Reality only, see below;
  *   Ed == 0             request and response synchronously. */
 int tr_h1_upgrade(struct transport *t, const struct tr_node *n, int ws, int timeout_s) {
     struct h1_state *s = &t->h1;

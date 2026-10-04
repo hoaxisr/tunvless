@@ -31,7 +31,8 @@ struct flow_key {
     uint8_t ws_seen;
     /* The packet is the FIRST fragment of an incomplete datagram (MF set). ip_parse rejects later
      * fragments outright: they carry no header. This matters for UDP, where an incomplete datagram
-     * would silently reach the server truncated. */
+     * would silently reach the server truncated (stack.c reassembles UDP fragments before
+     * parsing). */
     uint8_t frag;
 };
 
@@ -48,9 +49,9 @@ struct flow_key {
  * thread. */
 #define TUN_MSS 1460
 
-/* Data bytes handed to the client in ONE write when offload is on. The server delivers at most one
- * TLS record (16384 bytes) at a time, so more gains nothing; less costs extra calls where the
- * kernel would take it all. */
+/* Data bytes handed to the client in ONE write when offload is on: one TLS record (16384 bytes),
+ * the usual size of a read from the node. A larger read (in Vision direct copy, up to TUNNEL_BUF)
+ * takes two writes; a smaller limit would cost extra calls where the kernel would take it all. */
 #define TUN_GSO_MAX 16384
 
 /* IP+TCP header without options. The data is not appended to it but goes as a separate writev
@@ -68,10 +69,10 @@ struct flow_key {
 /* The largest datagram we carry.
  *
  * Not 65535: an incomplete datagram needs a buffer PER FLOW (reassembly spans reads), and 64 KB per
- * flow at 320 flows is 20 MB on a router. 4 KB covers real traffic: QUIC and game traffic keep
- * within the MTU, and the largest legitimate case is a DNS answer with EDNS0, where clients
- * advertise a 4096-byte buffer. A larger datagram is skipped whole WITHOUT losing the stream's
- * framing; otherwise one such datagram would break the flow for good. */
+ * flow at 320 flows is 20 MB on a router with 240 MB. 4 KB covers real traffic: QUIC and game
+ * traffic keep within the MTU, and the largest legitimate case is a DNS answer with EDNS0, where
+ * clients advertise a 4096-byte buffer. A larger datagram from the node is skipped whole WITHOUT
+ * losing the stream's framing; otherwise one such datagram would break the flow for good. */
 #define UDP_DGRAM_MAX 4096
 
 /* The largest frame the kernel can hand us with receive offload on: the limit of skb->len, since
@@ -80,12 +81,12 @@ struct flow_key {
 
 struct tun_dev {
     int fd;
-    /* gso: the device takes a virtio header on write (IFF_VNET_HDR). One write then hands the
-     * kernel up to 16 KB as ONE segment marked "split by 1460", and the kernel splits it inside its
-     * stack and completes the checksums (on many LAN cards in hardware). Without it the same 16 KB
-     * take twelve writes and twelve passes over the data for the TCP checksum. sing-box and
-     * wireguard-go work the same way: most of the speed difference comes from the cost of handing
-     * packets to the client, not from crypto. */
+    /* gso: the device carries a virtio header on every read and write (IFF_VNET_HDR). One write
+     * then hands the kernel up to 16 KB as ONE segment marked "split by 1460", and the kernel
+     * splits it inside its stack and completes the checksums (on many LAN cards in hardware).
+     * Without it the same 16 KB take twelve writes and twelve passes over the data for the TCP
+     * checksum. sing-box and wireguard-go work the same way: most of the speed difference comes
+     * from the cost of handing packets to the client, not from crypto. */
     int gso;
     /* gro: whether we coalesce adjacent segments into one write (tun_gro_push). Separate from gso:
      * gso says the device accepts the split mark, gro says we use it to coalesce. STEER_TUN_NOGRO
@@ -93,9 +94,10 @@ struct tun_dev {
      * gso). */
     int gro;
     /* rx_gso: whether WE accept coalesced frames from the kernel (TUNSETOFFLOAD). One read then
-     * returns what would otherwise be some forty-five packets. The buffer for it is one per queue,
-     * inside tun.c: tun_read_packet still hands out one packet at a time, so the data path never
-     * sees coalesced frames. STEER_TUN_NORXGSO turns it off, for the same reason as its neighbours.
+     * returns what would otherwise be some forty-five packets; a Go implementation measured nearly
+     * twice the receive speed with it. The buffer for it is one per queue, inside tun.c:
+     * tun_read_packet still hands out one packet at a time, so the data path never sees coalesced
+     * frames. STEER_TUN_NORXGSO turns it off, for the same reason as its neighbours.
      *
      * Only TUN_F_CSUM and TUN_F_TSO4 are asked for. Not TSO6: parsing here is IPv4 only, and a
      * frame we cannot split would be dropped instead of arriving as ordinary packets. */
@@ -113,9 +115,9 @@ struct tun_dev {
     uint32_t seg_seq;          /* sequence number of the FIRST segment, host order */
     uint16_t seg_id;           /* IP id of the first segment */
     unsigned char seg_flags;   /* TCP flags of the super-frame; FIN and PSH go to the last one */
-    size_t   single;           /* length of a single packet waiting to be handed out; 0 — none */
-    /* Frames that could not be split. Not a failure in itself; if it grows, the kernel hands us
-     * frames we do not handle. */
+    size_t   single;           /* length of a single packet waiting to be handed out, or 0 */
+    /* Frames that could not be split or did not fit. Not a failure, and not always zero on a
+     * healthy system; steady growth means the kernel hands us frames we do not handle. */
     unsigned long long rx_dropped;
 };
 
@@ -133,8 +135,8 @@ int ip_parse(const unsigned char *p, size_t n, struct flow_key *k, size_t *paylo
 /* Read one packet: strips the offload header the device adds and splits coalesced frames. */
 ssize_t tun_read_packet(struct tun_dev *d, unsigned char *buf, size_t cap);
 
-/* Header for a data segment. Checksums are NOT computed here: tun_write_data sets them, since only
- * it knows whether we or the kernel compute them. */
+/* Header for a data segment. The IP checksum is set, the TCP checksum is NOT: tun_write_data sets
+ * it, since only it knows whether we or the kernel compute it. */
 void tcp_hdr_build(unsigned char out[TUN_HDR_LEN],
                    uint32_t src, uint32_t dst, uint16_t sport, uint16_t dport,
                    uint32_t seq, uint32_t ack, unsigned char flags,
@@ -142,16 +144,20 @@ void tcp_hdr_build(unsigned char out[TUN_HDR_LEN],
 
 /* Hand the client a header with its data. The data is NOT copied.
  *
- * When the device queue is full it waits for room and retries: a dropped data segment would stall
- * the connection. Returns 0 or -1. */
+ * When the device queue is full it waits for room and retries (for up to about 200 ms): the queue
+ * drains in microseconds, while a dropped segment would wait for a retransmit timeout. Returns 0
+ * or -1. */
 int tun_write_data(const struct tun_dev *d, unsigned char hdr[TUN_HDR_LEN],
                    const unsigned char *data, size_t data_n);
 
-/* A control packet built by tcp_build, checksums already set. Not retried: the client's own
- * retransmit recovers a lost SYN-ACK or ACK. */
+/* A control packet (tcp_build, icmp_unreach_build) with its checksums already set. Not retried:
+ * the client's own retransmit recovers a lost SYN-ACK or ACK. */
 void tun_write_ctl(const struct tun_dev *d, const unsigned char *pkt, size_t n);
 
 /* ---- COALESCING ADJACENT SEGMENTS INTO ONE WRITE (GRO in reverse) ----------------
+ *
+ * Meant for a protocol that carries whole IP packets. stack.c does not use it (it builds its own
+ * large segments for tun_write_data); tests/tungromatch.c covers it.
  *
  * WHY. A write to TUN is a full pass through the kernel's stack: per write the kernel builds an
  * skb, runs it through ip_rcv and tcp_v4_rcv, queues it on the socket and wakes the reader. A
@@ -176,7 +182,7 @@ void tun_write_ctl(const struct tun_dev *d, const unsigned char *pkt, size_t n);
  * the last piece). Everything else (ICMP, UDP, fragments, SYN, RST, a changed window) goes as its
  * own write. The rules are strict on purpose: coalescing too much hands the client a stream with
  * reordered or corrupted bytes, which only a packet dump reveals. */
-#define TUN_GRO_FRAMES 8      /* frames the sender puts in one record */
+#define TUN_GRO_FRAMES 8      /* most frames coalesced into one write */
 
 struct tun_gro {
     /* vnet_hdr + the whole first packet + payloads of the rest: exactly TUN_GRO_FRAMES frames, as

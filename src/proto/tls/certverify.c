@@ -5,7 +5,7 @@
  * the only proof is the chain to a root plus the CertificateVerify signature over the transcript.
  * Skipping either half checks nothing: a chain without the signature proves only that someone
  * once got a certificate for this name, a signature without the chain only that the peer holds
- * the key we took from it.
+ * the key of the certificate it sent.
  *
  * WHAT IS NOT. No OCSP and no revocation lists: a router has neither the means nor the time to
  * fetch them, and a silent imitation of a check is worse than an honest absence. The library
@@ -28,10 +28,11 @@
 
 /* ---- root store ----------------------------------------------------------------------
  *
- * Parsed ONCE per process. The ca-bundle file is 182 KB and about 150 certificates; parsing it
- * per connection would cost half a second and a third of a megabyte on EVERY node attempt.
- * Hence pthread_once: the connectors run in several threads (stack.c), and two simultaneous
- * first calls would otherwise parse the store twice, the second on top of the first.
+ * Parsed ONCE per process, from the path of the first call; later paths are ignored. The
+ * ca-bundle file is 182 KB and about 150 certificates; parsing it per connection would cost half
+ * a second and a third of a megabyte on EVERY node attempt. Hence pthread_once: connector
+ * threads (stack.c) run in parallel, and two simultaneous first calls would otherwise parse the
+ * store twice, the second on top of the first.
  *
  * Never freed, on purpose: the store lives as long as the process. */
 static struct sc_roots *g_roots;
@@ -127,9 +128,9 @@ static const char CV_LABEL[] = "TLS 1.3, server CertificateVerify";
  * server that picks a scheme outside this list gets its own reason (CERTV_EALG), not "bad
  * signature".
  *
- * secp521r1 (0x0603) is accepted here, but the wolfSSL build has no P-521
- * (build/wolfssl/user_settings.h). We do not offer it, so a server that picks it fails with "bad
- * signature": the certificate's key does not parse. */
+ * ecdsa_secp521r1 (0x0603) and rsa_pss_pss_* (0x0809..0x080B) pass here although we do not offer
+ * them. The wolfSSL build has no P-521 (build/wolfssl/user_settings.h), so a server that picks
+ * 0x0603 still fails: its certificate's key does not parse. */
 static int sig_alg(unsigned code, enum sc_hash *md, enum sc_sig_alg *alg) {
     switch (code) {
         case 0x0403: *md = SC_SHA256; *alg = SC_SIG_ECDSA; return 0;  /* ecdsa_secp256r1 */
@@ -177,10 +178,10 @@ static int check_signature(const unsigned char *leaf, size_t leaf_n,
     unsigned char digest[64];
     if (sc_hash(mdt, content, cn, digest) != 0) return CERTV_ESIG;
 
-    /* PSS salt of ANY length (the layer checks it so). RFC 8446 wants it as long as the hash,
-     * but some servers (and middleboxes that re-sign the stream) use another length; rejecting
-     * them would declare a node broken where the signature is valid. A key of the wrong kind
-     * (an ECDSA signature with an RSA key) is "bad signature" too. */
+    /* The layer accepts a PSS salt of ANY length. RFC 8446 wants it as long as the hash, but
+     * some servers (and middleboxes that re-sign the stream) use another length; rejecting them
+     * would declare a node broken where the signature is valid. A key of the wrong kind (an
+     * ECDSA signature with an RSA key) is "bad signature" too. */
     return sc_cert_verify_sig(leaf, leaf_n, alg, mdt, digest, hn, cv + 4, sig_n) == 0
                ? 0 : CERTV_ESIG;
 }
@@ -495,7 +496,7 @@ const char *cert_verify_strerror(int rc) {
         case CERTV_ENOROOTS: return "no root store (install the ca-bundle package or use --ca)";
         case CERTV_ECHAIN:   return "certificate does not chain to a root or names another host";
         case CERTV_ESIG:     return "bad server signature";
-        case CERTV_EPIN:     return "certificate fingerprint is not pinned (pcs)";
+        case CERTV_EPIN:     return "certificate matches no pinned fingerprint (pcs/pks)";
         case CERTV_EALG:     return "server signed with an algorithm we did not offer";
         /* About the key, not the server: the node is alive and answers, it just did not
          * recognise us. Almost always mismatched pbk/sid or someone else's subscription. */

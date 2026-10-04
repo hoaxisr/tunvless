@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include "scrypto.h"
 
-#define TLS13_MAX_REC   16640          /* RFC record maximum plus room for the tag */
+#define TLS13_MAX_REC   16640          /* 2^14 + 256: RFC 8446 limit for a protected record */
 #define TLS13_MAX_PLAIN 16384
 /* ServerHello bytes kept for the ML-DSA check (about 1200 with the hybrid). */
 #define TLS13_SH_KEEP   2048
@@ -28,11 +28,12 @@
 
 /* The node did not answer in time.
  *
- * Kept apart from TLS13_EIO on purpose. The handshake reads a blocking socket with SO_RCVTIMEO
- * (sock_ready in trdial.c), and when the timeout expires read returns EAGAIN. Silence means OUR
- * packets do not reach the node (SNI filtering, the node is down, packet loss), so the cause is
- * outside, not in the engine. A provider dropping the ClientHello by its SNI looks exactly like
- * this: a healthy TCP connection, a live node, and no answer. */
+ * Kept apart from TLS13_EIO on purpose: the two have different causes and call for different
+ * action. The handshake reads a blocking socket with SO_RCVTIMEO (sock_ready in trdial.c), and
+ * when the timeout expires read returns EAGAIN. Silence means OUR packets do not reach the node
+ * (SNI filtering, the node is down, packet loss), so the cause is outside, not in the record
+ * parser. A provider dropping the ClientHello by its SNI looks exactly like this: a healthy TCP
+ * connection, a live node, and no answer. */
 #define TLS13_ETIMEOUT     (-21)
 /* The server did not prove its identity: chain, name or signature. Unlike EFINISHED (diverged
  * keys), the handshake is mathematically sound but the peer is the wrong one. The exact reason
@@ -78,11 +79,13 @@ struct tls13 {
     unsigned char rbuf[TLS13_MAX_REC + 8];
     size_t rbuf_n;      /* bytes held */
     size_t rbuf_off;    /* bytes of them already parsed */
-    /* The ALPN protocol the server chose, from EncryptedExtensions; "" if it sent none.
+    /* The ALPN protocol the server chose, from EncryptedExtensions; "" if it sent none (as a
+     * Reality server that accepted us does).
      *
-     * grpc and xhttp need HTTP/2. If the server did not agree, everything else works but no
-     * data flows; without this field the symptom is "the node connects and stays silent",
-     * which cannot be told from a closed port. */
+     * transport.c checks it against what the transport needs (h2 for grpc and xhttp, http/1.1
+     * for ws and httpupgrade). With another protocol the handshake works but no data flows;
+     * without this field the symptom is "the node connects and stays silent", which cannot be
+     * told from a closed port. */
     char alpn[16];
     struct tls13_keys rd, wr;
     /* Record counters. NEVER reset: a reset repeats a nonce, which voids AEAD entirely. */
@@ -105,15 +108,16 @@ struct tls13 {
  * its secrets may use it. */
 int tls12_handshake(struct tls13 *t, int fd, const char *sni);
 
-/* client_hello: the bytes ALREADY sent to the server (for the transcript).
+/* client_hello: the record ALREADY sent to the server, 5-byte record header included (for the
+ * transcript).
  * shared_secret: despite the name, our ephemeral X25519 PRIVATE key (reality_state.priv). The
  * TLS secret needs the server's ephemeral key, which only arrives in ServerHello. */
 int tls13_handshake(struct tls13 *t, int fd,
                     const unsigned char *client_hello, size_t hello_n,
                     const unsigned char *shared_secret);
 
-/* How the server proves itself. The fields are not exclusive on paper only: real nodes have
- * exactly one of them.
+/* How the server proves itself. reality_key and host are both optional and could in principle
+ * be combined, but a real node uses exactly one of them.
  *
  * A TLS 1.3 handshake alone does not prove WHO is on the other end: Finished verifies for
  * anyone who ran the key exchange, a man in the middle included. Only the certificate shows
@@ -155,7 +159,8 @@ struct tls13_auth {
     /* Certificate rules when host != NULL (certverify.h): pins, names, insecure. NULL: the
      * default, chain to the roots and the name host. */
     const struct cert_policy *policy;
-    /* The Hello passed to tls13_handshake_auth is the ECH ClientHelloOuter. NULL: no ECH. */
+    /* Set when the Hello passed to tls13_handshake_auth is an ECH ClientHelloOuter; NULL: no
+     * ECH. */
     const struct tls13_ech *ech;
 };
 
@@ -197,13 +202,14 @@ int tls13_read(struct tls13 *t, unsigned char *out, size_t cap, size_t *got);
  * memory per record, which is noticeable on a router's slow memory.
  *
  * The one hard rule for the caller: use the data BEFORE the next read on this connection. The
- * next read moves the buffer contents to its start, and the old pointer then shows other bytes;
- * breaking the rule looks like corrupt data in the middle of a file. */
+ * next read may move the unread bytes to the start of the buffer, and the old pointer then shows
+ * other bytes; breaking the rule looks like corrupt data in the middle of a file. */
 int tls13_read_ref(struct tls13 *t, const unsigned char **body, size_t *body_n);
 
-/* Free the cipher and transcript contexts. Required on every close: thousands of connections
- * pass in an hour, and a key not wiped on close stays in memory until the struct is reused.
- * Calling it twice is harmless. */
+/* Free the cipher and transcript contexts; this wipes the expanded cipher keys (key[] and iv[]
+ * in struct tls13_keys are left as they are). Required on every close: thousands of connections
+ * pass in an hour, and a key schedule not wiped stays in memory until the struct is reused.
+ * Harmless on a zeroed struct and when called twice. */
 void tls13_free(struct tls13 *t);
 
 /* ---- AEAD apart from TLS records --------------------------------------------

@@ -22,7 +22,7 @@ int rtx_grow(struct rtx *r, uint32_t cap) {
     }
     /* Unwrap: the old contents move to the start of the new buffer and head becomes 0. A plain
      * copy would be wrong: data that wrapped past the old end would no longer follow it, and the
-     * next retransmit would send foreign bytes. */
+     * next retransmit would send the wrong bytes. */
     uint32_t first = r->cap - r->head;
     if (first > r->len) first = r->len;
     memcpy(nb, r->buf + r->head, first);
@@ -45,7 +45,8 @@ uint32_t rtx_room(const struct rtx *r) {
 }
 
 void rtx_push(struct rtx *r, const unsigned char *p, uint32_t n) {
-    if (n > rtx_room(r)) return;            /* the caller checks; never corrupt the ring */
+    if (n > rtx_room(r)) return;            /* the caller has checked; refuse rather
+                                             * than corrupt the ring */
     uint32_t tail = r->head + r->len;
     if (tail >= r->cap) tail -= r->cap;     /* no %: cap need not be a power of two, and
                                              * tail is below 2 * cap */

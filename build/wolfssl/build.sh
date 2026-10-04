@@ -82,7 +82,7 @@ failed=
 for f in $(wolfssl_c_files) $ASMFILES; do
     o="$OBJ/$(echo "$f" | tr '/' '_').o"
     extra=
-    # The AES-NI intrinsics in aes.c (AES_set_decrypt_key) need -maes, and only that file gets it:
+    # The AES-NI intrinsics in aes.c (AES_set_decrypt_key_AESNI) need -maes; only that file gets it:
     # the compiler never emits AES instructions on its own, and the whole AES-NI path in aes.c is
     # behind a CPUID check (Check_CPU_support_AES), so the binary still runs without AES-NI.
     # SSE4.1 is withheld on purpose: the compiler DOES emit its instructions when vectorizing
@@ -95,8 +95,8 @@ for f in $(wolfssl_c_files) $ASMFILES; do
         echo "wolfssl: $f failed to compile ($TRIPLE):" >&2
         sed 's/^/    /' "$o.err" >&2
     elif [ -s "$o.err" ]; then
-        # Warnings are not hidden: tunvless builds without them and the library should too, so a
-        # new warning after a wolfSSL update shows here and not in a release.
+        # Warnings are not hidden: tunvless itself builds without any, and the library should
+        # too, so a new warning after a wolfSSL update shows here and not in a release.
         echo "wolfssl: warnings in $f ($TRIPLE):" >&2
         sed 's/^/    /' "$o.err" >&2
     fi

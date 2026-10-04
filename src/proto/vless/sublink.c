@@ -116,9 +116,9 @@ void sl_set_field(char *dst, size_t n, const char *src, size_t len) {
     dst[len] = '\0';
 }
 
-/* Decode first, then cut: a path written entirely in percent form (`%2Fstatic%2Fv1…`, as many
- * panels encode it) is three times longer than the path, and cutting it first sends a wrong path
- * (404 from an xhttp or ws server). */
+/* Decode first, then cut: a path in percent form (`%2Fstatic%2Fv1…`, as many panels encode it)
+ * is up to three times longer than the path, and cutting it first sends a different path: the
+ * xhttp or ws server answers 404 although the node is fine. */
 void sl_set_pct(char *dst, size_t n, const char *src, size_t len) {
     char tmp[512];
     sl_set_field(tmp, sizeof(tmp), src, len);
@@ -192,8 +192,8 @@ void sl_pad_range(struct vless_node *n, const char *v) {
 }
 
 /* Signs that the server uses xhttp obfuscation the client does not have: the key is present with
- * a non-empty value (or true). A false positive costs nothing: such a node would not open anyway,
- * the server expects a different request. */
+ * a non-empty, non-null value (xPaddingObfsMode: true). A node with any of them set would not open
+ * anyway, since the server expects a different request, so rejecting it early loses nothing. */
 static int xh_extra_bad(const char *json) {
     static const char *const keys[] = { "\"downloadSettings\"", "\"sessionIDPlacement\"", "\"seqPlacement\"",
                                         "\"uplinkDataPlacement\"", "\"xPaddingPlacement\"", "\"xPaddingMethod\"" };
@@ -211,10 +211,10 @@ static int xh_extra_bad(const char *json) {
     return 0;
 }
 
-/* The link's `extra` is xhttp settings in JSON. Only the padding length and the obfuscation keys
- * matter here; the rest (xmux, connection reuse) belongs to a multiplexer the client does not
- * have. So keys are searched for by name instead of parsing the object: `extra` is already
- * percent-decoded and has one level of nesting. */
+/* `extra` is xhttp settings in JSON (a link's is percent-decoded first). Only the padding length
+ * and the obfuscation keys matter here; the rest (xmux, connection reuse) belongs to a
+ * multiplexer the client does not have. So the keys are searched for by name instead of parsing
+ * the object. */
 void sl_parse_extra(struct vless_node *n, const char *extra) {
     if (xh_extra_bad(extra)) n->xh_extra = 1;
     const char *k = strstr(extra, "\"xPaddingBytes\"");
@@ -228,11 +228,12 @@ void sl_parse_extra(struct vless_node *n, const char *extra) {
 /* ---- long node values: encryption, pqv, certificate pins ----------------------------------------
  *
  * The values are long (an ML-DSA-65 key is 2603 base64url characters, a VLESS encryption string
- * with an ML-KEM-768 key about 1600) and few nodes have them, so a node holds a pointer into a
- * shared table where equal values are stored once. Strings are never freed: the pointer must
- * outlive the node and its copies (nodes are copied by value), and parsing the same subscription
- * again finds them already there. The table is bounded: when it is full the node is unusable with
- * a named reason, so a hostile subscription with random keys cannot keep growing memory. */
+ * with an ML-KEM-768 key about 1600), and a field for them would add kilobytes to every node for
+ * what few nodes have. So a node holds a pointer into a shared table where equal values are
+ * stored once. Strings are never freed: the pointer must outlive the node and its copies (nodes
+ * are copied by value), and parsing the same subscription again finds them already there. The
+ * table is bounded: when it is full the node is unusable with a named reason, so a hostile
+ * subscription with random keys cannot keep growing memory. */
 #define SUB_INTERN_MAX 256
 static const char *g_intern[SUB_INTERN_MAX];
 static volatile int g_intern_lock;
@@ -391,8 +392,8 @@ static volatile int g_insecure;
 void vless_set_insecure(int on) { g_insecure = on ? 1 : 0; }
 int vless_insecure(void) { return g_insecure; }
 
-/* On the heap: long values (pqv, encryption) do not fit in the node, and worker thread stacks are
- * small. */
+/* On the heap, at the value's full length: pqv and encryption values run to thousands of
+ * characters, and a fixed buffer would cut them. */
 char *sl_param_dup(const char *v, size_t vlen) {
     char *c = malloc(vlen + 1);
     if (!c) return NULL;
@@ -434,8 +435,8 @@ uint16_t sl_port_of(const char *s) {
  * 1 — unusable (reason in skip_reason).
  *
  *   - no Vision (flow xtls-rprx-vision) over them: Xray needs bare TLS or REALITY for Vision and
- *     refuses ("failed to use xtls-rprx-vision, maybe "security" is not "tls"…"), and our Vision
- *     direct copy would read the socket past the frames;
+ *     refuses ("failed to use xtls-rprx-vision, maybe "security" is not "tls"…"), and this
+ *     client's Vision direct copy would read the raw socket, bypassing the ws framing;
  *   - a path Xray would not parse unambiguously, or ws would not open at all (trpath.h): the same
  *     rule as the transport, so "usable" here means "opens" there;
  *   - host is the Host header: no blanks or control characters, or the request line breaks;
@@ -473,8 +474,8 @@ int sl_link_param(struct vless_node *n, const char *k, size_t klen, const char *
     else if (klen == 3 && !strncmp(k, "pbk", 3)) sl_set_field(n->pbk, sizeof(n->pbk), v, vlen);
     else if (klen == 3 && !strncmp(k, "sid", 3)) sl_set_field(n->sid, sizeof(n->sid), v, vlen);
     else if (klen == 10 && !strncmp(k, "headerType", 10)) { if (vlen == 4 && !strncmp(v, "http", 4)) n->tcp_http = 1; }
-    /* pqv: Xray-core's post-quantum check (as of 26.9), an ML-DSA-65 signature over the Reality
-     * certificate. A long value, see sl_intern. */
+    /* pqv: Xray-core's post-quantum check of Reality, an ML-DSA-65 signature in the server's
+     * temporary certificate. A long value, see sl_intern. */
     else if (klen == 3 && !strncmp(k, "pqv", 3)) {
         char *d = sl_param_dup(v, vlen);
         if (d) { sl_set_pqv(n, d); free(d); } else n->pqv = SL_BAD_PQV;
@@ -501,11 +502,12 @@ int sl_link_param(struct vless_node *n, const char *k, size_t klen, const char *
     else if (klen == 11 && !strncmp(k, "serviceName", 11)) { sl_set_field(n->service, sizeof(n->service), v, vlen); sl_pct_decode(n->service); }
     else if (klen == 4 && !strncmp(k, "mode", 4)) sl_set_field(n->mode, sizeof(n->mode), v, vlen);
     /* host: the Host header of ws and httpupgrade. xhttp links carry it too, but xhttp does not
-     * use it: its :authority is the sni. */
+     * use it: its :authority is the sni, else the address. */
     else if (klen == 4 && !strncmp(k, "host", 4)) sl_set_pct(n->http_host, sizeof(n->http_host), v, vlen);
     /* extra: xhttp settings in JSON, read for the padding length (the server checks it and
-     * answers 400 to a wrong one) and obfuscation. The buffer is sized for the percent form,
-     * which is three times longer than the JSON. */
+     * answers 400 to a wrong one) and obfuscation. The buffer is sized for the percent form, up
+     * to three times longer than the JSON: it is cut before decoding, and a buffer sized for the
+     * JSON would silently lose xPaddingBytes further in. */
     else if (klen == 5 && !strncmp(k, "extra", 5)) {
         char ex[2048];
         sl_set_field(ex, sizeof(ex), v, vlen);
@@ -691,15 +693,15 @@ int sl_link_usable_post(struct vless_node *n) {
         return 1;
     }
 
-    /* Supported xhttp modes:
+    /* Supported xhttp modes (empty means auto):
      *
      *   stream-one — one POST, the request body goes up and the response body down. The
      *     cheapest, and Xray picks it for reality with mode=auto, so auto means stream-one;
      *   stream-up  — a GET for the download and a long POST for the upload;
      *   packet-up  — a GET for the download and a series of short POSTs, a chunk in each.
      *
-     * stream-down has no upload at all: it is half of a pair with a separate download server,
-     * which the client does not support. */
+     * Anything else is rejected, stream-down included: it has no upload at all, being half of a
+     * pair with a separate download server, which the client does not support. */
     if (!strcmp(n->type, "xhttp") && n->mode[0] &&
         strcmp(n->mode, "auto") != 0 && strcmp(n->mode, "stream-one") != 0 &&
         strcmp(n->mode, "stream-up") != 0 && strcmp(n->mode, "packet-up") != 0) {

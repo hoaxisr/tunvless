@@ -19,8 +19,9 @@
  * client, which is a signal by itself even with a valid authenticator. So the Hello is built
  * here by hand: a library TLS stack would send its own extension order.
  *
- * And failure looks like success. The server answers no error, it serves the real site. The
- * only test is whether VLESS answers through the tunnel.
+ * And failure looks like success: the server answers no error, it serves the real site, and the
+ * handshake completes. Only the HMAC in the server's temporary certificate (checked by tls13.c,
+ * see certverify.h) or the VLESS answer tells.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -38,7 +39,7 @@
 #include "scrypto.h"
 #include "reality.h"
 
-/* Unpadded base64url, the form pbk takes in a link. */
+/* base64url, unpadded as pbk comes in a link; '=' and line breaks are skipped. */
 static int b64url_decode(const char *in, unsigned char *out, size_t out_n) {
     static const char *A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     size_t o = 0;
@@ -99,10 +100,11 @@ static int fill_random(unsigned char *buf, size_t n) {
  * the same question (EVP_has_aes_hardware) and reorders the same way, so this repeats the
  * browser's behaviour on this hardware.
  *
- * The kernel is asked via AT_HWCAP rather than trying the instruction: a missing instruction
- * raises SIGILL. MIPS has no such instructions at all.
+ * x86 asks CPUID, aarch64 asks the kernel (AT_HWCAP): trying the instruction would raise SIGILL
+ * where it is missing. MIPS has no such instructions at all.
  *
- * STEER_CIPHER=aes|chacha overrides the answer, to check a speed claim on the spot. */
+ * STEER_CIPHER=aes|chacha overrides the answer, to check a speed claim on the spot;
+ * tests/hellofreeze.c pins the order with it. */
 static int cpu_has_aes(void) {
     const char *env = getenv("STEER_CIPHER");
     if (env && !strcmp(env, "aes")) return 1;
@@ -128,9 +130,8 @@ static int cpu_has_aes(void) {
  * The random scalar is drawn HERE through fill_random, not inside the layer: tests/hellofreeze.c
  * replaces os_getrandom with a macro before including this file and compares the Hello byte for
  * byte with a frozen copy; a key generated in another file would escape the substitution.
- * Clamping is here too: the layer does not need it (RFC 7748 X25519 clamps by itself), but
- * st->priv goes on to tls13.c, which computes the secret with the server's ephemeral key, and it
- * must hold exactly the scalar pub was computed from. */
+ * The layer clamps every scalar itself (RFC 7748); clamping here as well keeps st->priv, which
+ * tls13.c later uses with the server's ephemeral key, equal to the scalar actually used. */
 static int x25519_keypair(unsigned char priv[32], unsigned char pub[32]) {
     if (fill_random(priv, 32) != 0) return -1;
     priv[0] &= 248;
@@ -193,9 +194,9 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
         memcpy(st->priv, car->priv, 32);
         memcpy(st->pub, car->pub, 32);
     } else if (x25519_keypair(st->priv, st->pub) != 0) return REALITY_ECRYPTO;
-    /* The secret shared with the server's STATIC key serves only the authenticator. Plain TLS
-     * has none: there is only the ephemeral exchange with the server's key_share, which tls13.c
-     * computes from ServerHello. */
+    /* The secret shared with the server's STATIC key serves only the authenticator (or a
+     * carrier's callbacks). Plain TLS has none: there is only the ephemeral exchange with the
+     * server's key_share, which tls13.c computes from ServerHello. */
     if (!cfg->plain && x25519_shared(st->priv, pbk, st->shared) != 0) return REALITY_ECRYPTO;
 
     /* The authenticator is computed AFTER the Hello is built (below, where it is written in
@@ -208,8 +209,10 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
          * client never leaves the field empty, and a zero one would be a fingerprint. */
         if (fill_random(sess, sizeof(sess)) != 0) return REALITY_ECRYPTO;
     } else {
-        /* Reality client version, from Xray's core.Version_{x,y,z}. The server does not check
-         * it strictly, but it is part of the signed 16 bytes, so it must be plausible. */
+        /* Reality client version, as Xray's core.Version_{x,y,z}; a server checks it only with
+         * minClientVer/maxClientVer set, but it is part of the signed 16 bytes, so it must be
+         * plausible. Bytes 4..7 are Unix time: a server with maxTimeDiff set rejects a client
+         * whose clock is off. */
         sess[0] = 26; sess[1] = 9; sess[2] = 8; sess[3] = 0;
         uint32_t now = (uint32_t)time(NULL);
         sess[4] = (unsigned char)(now >> 24);
@@ -241,8 +244,8 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
     /* The record header is filled in at the end, when the length is known. */
     size_t rec_at = b.len;
     put8(&b, 0x16);            /* handshake */
-    /* Record version 0x0301, as browsers and openssl send it (checked by capture). It is
-     * correct; do not "fix" it to 0x0303. */
+    /* Record version 0x0301, as browsers and openssl send it (checked by capture; RFC 8446
+     * §5.1 allows it for an initial ClientHello). Do not "fix" it to 0x0303. */
     put16(&b, 0x0301);
     size_t rec_len_at = b.len;
     put16(&b, 0);
@@ -296,9 +299,9 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
      * The Reality authenticator signs the WHOLE ClientHello, and Reality's point is to look
      * like a browser. An openssl-like Hello (3 suites, 10 extensions, no GREASE, ECH or ALPN,
      * plus encrypt_then_mac) stopped working on every node at once when servers got pickier,
-     * while sing-box worked with the same keys. The symptom gave no hint: the handshake
-     * completes, the server Finished verifies, only the VLESS answer never comes. Reality has
-     * no negative answer; it silently proxies an unrecognised client to the camouflage site.
+     * while sing-box worked with the same keys. Reality has no negative answer: it silently
+     * proxies an unrecognised client to the camouflage site, so a Hello it rejects looks
+     * exactly like a wrong key (the handshake completes, the certificate check fails).
      *
      * So any change here is verified by a capture next to the browser reference, not by
      * reasoning about what "should work". */
@@ -550,10 +553,10 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
         memcpy(plain, sid_at, 16);
 
         /* The AAD is the Hello with ZEROS in place of session_id: Xray zeroes it before
-         * signing (`copy(hello.Raw[39:], hello.SessionId)` with an empty SessionId), and the
-         * server does the same; 39 = 4+2+32+1 here too. With session_id filled in, the tag
-         * does not match and the server silently answers with its camouflage site, which looks
-         * exactly like a wrong key. Zeroed in a copy: the Hello itself goes out signed.
+         * signing (`copy(hello.Raw[39:], hello.SessionId)` with a freshly zeroed SessionId),
+         * and the server does the same; 39 = 4+2+32+1 here too. With session_id filled in, the
+         * tag does not match and the server silently answers with its camouflage site, which
+         * looks exactly like a wrong key. Zeroed in a copy: the Hello itself goes out signed.
          *
          * __thread, not a shared static: connector threads handshake in parallel, and a shared
          * buffer would let one overwrite another's AAD in the middle of AES-GCM. */

@@ -6,10 +6,10 @@
  *
  * Only the first byte of the VLESS response tells them apart: the server answers with version 0,
  * the real site with anything else (HTTP, HTML, a redirect). So vless_probe() below is the only
- * honest check of a node, and the pool's health check uses it.
+ * honest check of a node; the node choice at startup and the pool's health check use it.
  *
  * Connection setup (TCP to every address, security, transports) lives in proto/transport. This
- * file holds what knows VLESS: the node as transport parameters and the probe by a VLESS request.
+ * file holds what knows VLESS: the node as transport parameters and the probe with a VLESS request.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -125,8 +125,9 @@ static int probe_once(const struct vless_node *node, int timeout_s, char *why, s
      * with the data; the header is not inside the frame. In Xray's XtlsPadding the wrapping
      * applies to data buffers, and "we do a long padding to hide vless header" means the next
      * frame's padding hides the header by sharing its TLS record. With the header inside the
-     * frame the server reads the VLESS version and UUID as the frame's command and lengths and
-     * closes the connection, which looks like a key rejection. */
+     * frame the server matches the frame's UUID, then reads the VLESS version and the start of
+     * the header's UUID as the command and lengths, and closes the connection, which looks
+     * like a key rejection. */
     if (node->flow[0]) {
         struct vision vis;
         vless_uuid_parse(node->uuid, uuid);
@@ -172,8 +173,10 @@ static int probe_once(const struct vless_node *node, int timeout_s, char *why, s
      * work. */
     if (ttfb_ms) *ttfb_ms = (int)(now_ms() - t_sent);
 
-    /* With Vision the answer is framed too, the VLESS response header first. Unwrap before
-     * parsing, or the version byte would be read from the frame header. */
+    /* The VLESS response header comes first and is not wrapped, even with Vision (vl_deliver
+     * in vldial.c parses it the same way). rv is zeroed, so its all-zero UUID does not match
+     * the first 16 bytes and vision_unwrap only hands back the first bytes unchanged: the parse
+     * below reads the raw header either way. */
     const unsigned char *body = buf;
     size_t body_n = got;
     if (node->flow[0]) {

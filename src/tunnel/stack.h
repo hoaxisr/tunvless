@@ -1,5 +1,5 @@
 /* The tunnel stack: packets from the TUN device into flows to a node through a dialer (dialer.h).
- * Its limits are described in stack.c. */
+ * What it does and does not do: see the top of stack.c. */
 #ifndef STEER_STACK_H
 #define STEER_STACK_H
 #include <stdint.h>

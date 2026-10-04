@@ -5,7 +5,8 @@
  * build/wolfssl/user_settings.h, and this file must be compiled with the same ones
  * (-DWOLFSSL_USER_SETTINGS and -I to build/wolfssl, from the .cflags file build.sh writes next to
  * the library), or struct sizes here and in the library disagree. The _Static_assert checks
- * below catch only header storage that is too small, not a library built with other options.
+ * below catch only header storage that is too small; against a library built with other
+ * options the only guard is that build.sh writes the library and its .cflags together.
  *
  * Rule for edits: no function returns wolfSSL codes, only SC_*. Library codes mean nothing to
  * the caller, and replacing the library must not change any branch on the caller's side. */
@@ -629,8 +630,8 @@ int sc_cert_verify_sig(const unsigned char *cert_der, size_t cert_n,
  * The cost is one check at a time: verify_cert adds the intermediates to the store's CertManager
  * as temporary and removes ALL temporary ones when done, so two concurrent checks on one store
  * would interfere (x509_str.c says so). Hence the mutex: one chain check per security=tls
- * handshake takes milliseconds, while a store per thread would cost a hundred KB of roots per
- * connector. */
+ * handshake takes milliseconds, so waiting for it costs nothing, while a store per thread would
+ * cost a hundred KB of roots per connector. */
 struct sc_roots {
     WOLFSSL_X509_STORE *store;
     pthread_mutex_t mu;

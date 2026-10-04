@@ -4,7 +4,8 @@
  * X.509, and one command proves it (`grep -n 'sc_chain\|sc_roots\|sc_cert'
  * src/proto/tls/tls13.c` prints nothing). Reality by design does not check the chain (it belongs
  * to someone else's camouflage site), so the record path must stay free of X.509. tls13.c calls
- * cert_verify_server, which calls the primitives layer (sc_chain_verify, sc_cert_verify_sig).
+ * cert_verify_server_ex and cert_reality_check*, which call the primitives layer
+ * (sc_chain_verify, sc_cert_verify_sig, sc_hmac, sc_mldsa65_verify).
  */
 #ifndef STEER_CERTVERIFY_H
 #define STEER_CERTVERIFY_H
@@ -14,9 +15,10 @@
 #define CERTV_ENOROOTS (-71)   /* the root store could not be read: nothing to check against */
 #define CERTV_ECHAIN   (-72)   /* the chain does not reach a root, or the name does not match */
 #define CERTV_ESIG     (-73)   /* bad CertificateVerify signature */
-#define CERTV_EALG     (-74)   /* the server signed with an algorithm we did not offer */
+#define CERTV_EALG     (-74)   /* a CertificateVerify scheme we do not accept */
 
-/* The root store used when the caller passes NULL or "". trsec.c passes what roots.c picked. */
+/* The root store used when the caller passes NULL or "". The path is a parameter, not
+ * hardcoded: trsec.c passes what roots.c picked (--ca, or the tests' bundle via g_cert_roots). */
 #define CERTV_DEFAULT_ROOTS "/etc/ssl/certs/ca-certificates.crt"
 
 /* Authenticates the server by the TLS 1.3 rules (RFC 8446 §4.4.2 and §4.4.3).
@@ -56,7 +58,8 @@ int cert_verify_server(const unsigned char *cert_body, size_t cert_n,
  *         it the peer does not even prove it holds the key of the certificate it sent. Only
  *         --insecure turns this on; a subscription alone does not.
  *
- * pcs and pks arrive normalized (sub.c): 64 lowercase hex digits each, comma-separated. */
+ * pcs and pks arrive normalized (sl_add_pins in sublink.c): 64 lowercase hex digits each,
+ * comma-separated. */
 struct cert_policy {
     const char *pcs, *pks, *vcn;
     int insecure;

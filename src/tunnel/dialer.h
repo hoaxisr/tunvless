@@ -15,11 +15,12 @@
  * the flow; where one ends and the other begins is the dialer's business (see take).
  *
  * The table has more than VLESS needs: DC_UDP_OWN, DC_ACK_PACED and rcv_wnd_max serve dialers with
- * their own UDP sockets or a bounded send queue, and VLESS sets none of them. The node questions
+ * their own UDP sockets or a bounded send queue, and no dialer here sets them. The node questions
  * (peer_of, match, stale, lost) are answered by the node pool (pool.c), which wraps the dialer.
  *
- * There is no multiplexing (several client flows on one link, XUDP, Mux.Cool): the stack keeps one
- * session per flow (see udp_packet in stack.c).
+ * There is no multiplexing of several client flows on one link: the stack keeps one session per
+ * flow (see udp_packet in stack.c). For a node with Vision the VLESS dialer does frame UDP as
+ * Mux.Cool/XUDP, but still with one flow per link.
  */
 #ifndef STEER_DIALER_H
 #define STEER_DIALER_H
@@ -32,8 +33,8 @@
  *
  * At least a whole TLS record: transports over HTTP/2 return a record's full contents in one read,
  * and a smaller buffer would fail on a perfectly valid frame. Plus room for the request header and
- * Vision padding, which can be 1400 bytes longer than the data. Xray happens to write in 8 KB
- * buffers, but TLS 1.3 lets a server send 16384 at any time.
+ * Vision padding, which adds up to about 1400 bytes to the data. Xray happens to write in 8 KB
+ * buffers, but TLS 1.3 lets a server send 16384-byte records at any time.
  *
  * A number, not an expression of H2_MIN_READ_CAP: the stack knows nothing of HTTP/2, and a dialer
  * that needs more checks it at build time (_Static_assert in vldial.c). The client window reserve
@@ -53,12 +54,11 @@ enum dialer_cap {
      * in the request header with the first data, and until then the link belongs to nobody. Only
      * then does the stack keep spare sessions (spare_* in stack.c). */
     DC_PRECONNECT = 1 << 0,
-    /* A UDP flow goes over the dialer's own UDP socket to the node, not over the link. A spare
-     * session is a TCP stream, so a UDP flow never takes one; a connector thread opens its link
-     * (connect after flow_open with udp). Such a dialer still length-frames datagrams in
-     * dgram_frame: the stack holds datagrams that arrive before the flow is ready as early data and
-     * sends them as one piece (early_flush), and send splits it by the lengths. Without
-     * DC_PRECONNECT the bit changes nothing: there are no spares. */
+    /* A UDP flow's link is the dialer's own UDP socket to the node, not a TCP stream. A spare
+     * session holds a TCP stream, so a UDP flow never takes one; a connector thread opens its link
+     * (connect after flow_open with udp). send gets one datagram framed by dgram_frame per call,
+     * early data included (early_flush sends held datagrams one by one), so each can go out as its
+     * own UDP datagram. Without DC_PRECONNECT the bit changes nothing: there are no spares. */
     DC_UDP_OWN = 1 << 1,
     /* Sending to the node goes through a BOUNDED queue (for example a SOCK_SEQPACKET pair to a
      * multiplexer that encrypts and sends), and its fill level is the only flow control towards
@@ -69,7 +69,8 @@ enum dialer_cap {
      * Without this, the ACK goes out as soon as data is queued, the client sends far faster than
      * the queue drains, and send returns SEND_AGAIN. On SEND_AGAIN the stack neither acknowledges
      * nor advances, so every later segment of that window arrives out of order and is dropped (no
-     * reorder buffer, no SACK), and the client falls back to RTO retransmits, one segment each.
+     * reorder buffer, no SACK, one duplicate ACK per batch), and the client falls back to RTO
+     * retransmits, one segment each.
      * Pacing the ACK by the queue makes the client window the room in the queue, with no loss.
      *
      * The dialer's queue must hold the client window above the low mark (for a unix socket a
@@ -80,8 +81,9 @@ enum dialer_cap {
     DC_ACK_PACED = 1 << 2,
 };
 
-/* Hand the stack payload: a piece of the TCP stream or a whole UDP datagram. 0 — taken; otherwise
- * the connection ends (the device write failed, or the retransmit ring could not be allocated). */
+/* Hand the stack payload: a piece of the TCP stream or a whole UDP datagram. Returns 0 when taken;
+ * otherwise the connection ends (the device write failed, or the retransmit ring could not be
+ * allocated or is full). */
 typedef int (*dialer_emit_fn)(void *arg, const unsigned char *p, size_t n);
 
 struct dialer_ops {
@@ -97,13 +99,15 @@ struct dialer_ops {
     const char *(*strerror)(int rc);
 
     /* ---- the link to the node ---- */
-    /* Connect (in a connector thread: blocks for up to timeout_s). 0 — ready. On failure the
-     * session keeps no descriptor and no keys. */
+    /* Connect (in a connector thread: blocks for up to timeout_s). Returns 0 when ready. On
+     * failure the session keeps no descriptor and no keys. */
     int  (*connect)(const void *ctx, void *sess, int timeout_s);
     /* Move the established link from spare session src into connection session dst: the link in
-     * dst is replaced, the flow state in dst (flow_open) is kept. Afterwards src is empty. */
+     * dst is replaced, the flow state in dst (flow_open) is kept. Afterwards src no longer owns the
+     * link and is not closed. */
     void (*take)(void *dst, void *src);
-    /* Close the link: descriptors and keys. Called only for a connection in use. */
+    /* Close the link: descriptors and keys. Called when a connection is freed and when a spare
+     * session is dropped. */
     void (*close)(void *sess);
     /* Make the session empty for a new connection: no descriptor, no parser counters. Called on
      * every release and when the table is set up, so it must touch only the first bytes of the
@@ -114,24 +118,26 @@ struct dialer_ops {
     int  (*has_data)(const void *sess);
 
     /* ---- the client's flow ---- */
-    /* A new client connection: set up the protocol state for the flow. Non-zero — no flow to this
-     * node is possible (the dialer logs why); the stack closes the connection. */
+    /* A new client connection: set up the protocol state for the flow. Non-zero: no flow to this
+     * node is possible (the dialer logs why), and the stack drops the connection. */
     int  (*flow_open)(const void *ctx, void *sess, const struct flow_key *k, int udp);
-    /* Client bytes to the node; for UDP, datagrams already framed by dgram_frame. SEND_*. */
+    /* Client bytes to the node; for UDP, one datagram framed by dgram_frame per call. Returns
+     * SEND_*. */
     int  (*send)(const void *ctx, void *sess, const struct flow_key *k, int udp,
                  const unsigned char *d, size_t n);
-    /* Frame a client datagram into stream bytes for the node; 0 — it does not fit. */
+    /* Frame a client datagram into stream bytes for the node. Returns the length, or 0 if it does
+     * not fit. */
     size_t (*dgram_frame)(const unsigned char *p, size_t n, unsigned char *out, size_t cap);
-    /* Read from the link. *got is how many bytes came from the node before parsing (the stack
-     * meters its per-pass budget by it); *got 0 with rc 0 is valid (a control frame). Non-zero rc
-     * — the link is over. */
+    /* Read from the link into buf, or point *data at the bytes where they already lie. *got is
+     * their count, before deliver parses them (the stack meters its per-pass budget by it). rc 0
+     * with *got 0 is valid (a control frame); a non-zero rc means the link is over. */
     int  (*read)(void *sess, unsigned char *buf, size_t cap, const unsigned char **data,
                  size_t *got);
-    /* Parse what was read and hand the payload out through emit. Non-zero — the connection ends. */
+    /* Parse what was read and hand the payload out through emit. Non-zero: the connection ends. */
     int  (*deliver)(const void *ctx, void *sess, int udp, const unsigned char *d, size_t n,
                     dialer_emit_fn emit, void *arg);
 
-    /* ---- the client window (OPTIONAL: 0 — the stack advertises its own) ----
+    /* ---- the client window (OPTIONAL: 0 means the stack advertises its own) ----
      *
      * The largest receive window, in bytes, the stack may advertise to the client with this
      * dialer: the window is what the client may send between two ACKs, and a DC_ACK_PACED queue
@@ -139,14 +145,14 @@ struct dialer_ops {
      * (rcv_win_field) is advertised. */
     unsigned rcv_wnd_max;
 
-    /* ---- several nodes (all OPTIONAL: NULL — one node, the one in ctx) ----
+    /* ---- several nodes (all OPTIONAL: NULL means one node, the one in ctx) ----
      *
      * For the node pool: each connection has its own node, known to the session, not to ctx. The
      * stack needs just these four questions, none of them about the protocol. */
     /* The connection's node, for "flow to <node> did not open". */
     const char *(*peer_of)(const void *ctx, const void *sess);
-    /* Whether spare session src suits connection dst: 1 — take it, 0 — leave it spare, -1 — drop
-     * it (its node is no longer active). */
+    /* Whether spare session src suits connection dst: 1 to take it, 0 to leave it spare, -1 to
+     * drop it (its node is no longer active). */
     int  (*match)(const void *ctx, const void *dst, const void *src);
     /* The connection's node is no longer active (declared dead and replaced): the stack resets
      * the connection (RST to the client) after stack_nodes_changed (stack.h). */
@@ -157,12 +163,12 @@ struct dialer_ops {
     void (*lost)(const void *ctx, const void *sess);
 };
 
-/* An instance: the table and the node it connects to.
+/* An instance: the table and its ctx (for the VLESS dialer a node, for the node pool the pool).
  *
  * silence_s is the stall threshold of a node on a live connection (--silence), in seconds. A link
  * whose sent data stays unacknowledged longer, or that is silent longer and does not answer a TCP
  * keepalive probe, is cut by the kernel (TCP_USER_TIMEOUT, SO_KEEPALIVE); the stack then resets the
- * client connection (RST) and calls lost. 0 — no threshold, the kernel's own timeouts (minutes). */
+ * client connection (RST) and calls lost. 0: no threshold, the kernel's own timeouts (minutes). */
 struct dialer {
     const struct dialer_ops *ops;
     const void *ctx;

@@ -4,8 +4,8 @@
  * config, or Clash YAML. Parsing needs no network and no cryptography, so the subscription tests
  * build this file without libraries.
  *
- * Nodes of other protocols are skipped but counted: a subscription is usually shared, and
- * "26 nodes in it, 17 used" must be explained by numbers, not guessed.
+ * Links and Clash proxies of other protocols are skipped but counted (foreign): a subscription is
+ * usually shared, and "26 nodes in it, 17 used" must be explained by numbers, not guessed.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -69,9 +69,10 @@ int vless_parse_url(const char *url, struct vless_node *n) {
 static int node_usable(struct vless_node *n) {
     if (!n->security[0]) snprintf(n->security, sizeof(n->security), "none");
 
-    /* flow=xtls-rprx-vision-udp443 is Vision that also allows UDP/443 (Xray-core). UDP goes here as
-     * a separate command without flow, so the permission changes nothing, and the name becomes
-     * the usual one: Xray also sends the flow without the suffix in the VLESS request. */
+    /* flow=xtls-rprx-vision-udp443 is Vision with UDP to port 443 allowed: without the suffix
+     * Xray's client refuses UDP/443 over Vision ("XTLS rejected UDP/443 traffic") to push QUIC
+     * back to TCP. This client never refuses it, so the suffix changes nothing, and the name
+     * becomes the usual one: Xray also sends the flow without the suffix in the VLESS request. */
     if (!strcmp(n->flow, "xtls-rprx-vision-udp443")) snprintf(n->flow, sizeof(n->flow), "xtls-rprx-vision");
 
     if (n->encryption == SUB_BAD_ENC) {
@@ -240,7 +241,7 @@ static int ci_eq(const char *a, const char *b) {
  *     ("duplicate header not allowed"), so the node would not open with Xray either. httpupgrade
  *     in Xray accepts them (the key as written; the transport sets Connection and Upgrade on top
  *     with its canonical keys), and so does this parser: the request follows Xray (trupgrade.c);
- *   - Host for httpupgrade: Xray rejects the config ("\"headers\" can't contain \"host\""). For
+ *   - Host for httpupgrade: Xray rejects the config (`"headers" can't contain "host"`). For
  *     ws, Xray moves Host from headers into host (if that is empty) and drops it from headers,
  *     and so does this parser;
  *   - more than the node's buffer holds. */
@@ -492,7 +493,7 @@ static void xray_settings(struct sj *j, struct vless_node *n) {
 
 /* ---- sing-box: outbounds with type=vless --------------------------------------------------------
  *
- * Panels that serve a sing-box config (SFI, Hiddify, Karing) put nodes into the same `outbounds`
+ * Panels that serve a sing-box config (to SFI, Hiddify, Karing) put nodes into the same `outbounds`
  * array as Xray, but flat: type/tag/server/server_port/uuid/flow and the tls and transport
  * objects. The differences that need a parser of their own: the kind is in type, not protocol;
  * the port is the number server_port; TLS is an object with nested utls and reality; the Host of
@@ -697,7 +698,7 @@ static int xray_outbound(struct sj *j, struct vless_node *n) {
      * node is not taken. */
     while (sj_obj_key(j, &first, k, sizeof(k)) == 0) {
         if (!strcmp(k, "protocol")) sj_str(j, proto, sizeof(proto));
-        /* tag is cut to the same byte limit as a link's name, and may break a character the
+        /* tag is cut by bytes like a link's name, so an incomplete UTF-8 tail is dropped the
          * same way. */
         else if (!strcmp(k, "tag")) { sj_str(j, n->name, sizeof(n->name)); sl_utf8_trim_tail(n->name); }
         else if (!strcmp(k, "settings")) xray_settings(j, n);
@@ -1120,8 +1121,8 @@ static int looks_clash(const char *t) {
  * certificate, and the client checks that signature when pqv is set (tls13.c →
  * cert_reality_check_pq).
  *
- * The buffer is on the stack: subscriptions are parsed on the main thread, never in the stack's
- * worker threads (128 KB stacks). */
+ * The buffer is on the stack: subscriptions are parsed only on the main thread at startup, never
+ * in the threads with small stacks (the stack's connectors have 128 KB). */
 #define SUB_LINE_MAX 8192
 
 /* A character of a scheme name: `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`
@@ -1148,7 +1149,7 @@ static int scheme_ch(char c) {
  * channel address does not. Schemes without '@' (vmess as base64, the old ss form) are in the
  * splitter's list and never get here.
  *
- * The first occurrence is returned: the earliest glue is where the loss starts. */
+ * The first occurrence is returned: the earliest glued point is where the loss starts. */
 static const char *glued_tail(const char *b, const char *e) {
     for (const char *q = b + 1; q + 3 <= e; q++) {
         if (strncmp(q, "://", 3) != 0) continue;
@@ -1170,9 +1171,9 @@ static const char *glued_tail(const char *b, const char *e) {
     return NULL;
 }
 
-/* Records a glue. The bound is e, not a terminator: the too-long branch does not copy the link,
- * and must report a glue too, or a glued pair and a really long link would read the same ("link
- * longer than 8191 bytes") although they need different fixes. */
+/* Count a glued pair as skipped. Its end is e, not a terminator: the too-long branch does not
+ * copy the link and must report a glued pair too, or a glued pair and a really long link would
+ * read the same ("link longer than 8191 bytes") although they need different fixes. */
 static void glue_note(struct vless_sub_stats *st, const char *glue, const char *e) {
     size_t tail = (size_t)(e - glue);
     size_t show = tail < 32 ? tail : 32;
@@ -1243,8 +1244,8 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
             snprintf(why, sizeof why, "link longer than %zu bytes", sizeof(line) - 1);
             const char *glue = strncmp(p, "vless://", 8) ? NULL : glued_tail(p, e);
             if (glue) {
-                /* A glue is reported before the length: the length is only its consequence,
-                 * and "link longer than 8191 bytes" does not tell what to fix. */
+                /* A glued pair is reported before the length: the length is only its
+                 * consequence, and "link longer than 8191 bytes" does not tell what to fix. */
                 glue_note(st, glue, e);
             } else if (!strncmp(p, "vless://", 8)) {
                 /* The example gives the length and the start of the address, telling a link
@@ -1270,9 +1271,9 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
         } else {
             memcpy(line, p, len);
             line[len] = '\0';
-            /* One reason for every glue; what tells the cases apart goes into the example. A
-             * glued link is not parsed at all: its name is certainly wrong and its address may
-             * be, and a "may be" is worse than a refusal. */
+            /* One reason for every glued pair; what tells the cases apart goes into the
+             * example. A glued link is not parsed at all: its name is certainly wrong and its
+             * address may be, and a "may be" is worse than a refusal. */
             const char *glue = strncmp(line, "vless://", 8)
                                    ? NULL : glued_tail(line, line + len);
             if (glue) {

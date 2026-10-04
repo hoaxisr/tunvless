@@ -7,7 +7,7 @@
 #define H2_EIO      (-50)
 #define H2_EPROTO   (-51)   /* a frame that cannot occur here */
 #define H2_ESTATUS  (-52)   /* the server did not answer 200 */
-#define H2_ERESET   (-53)   /* RST_STREAM or GOAWAY */
+#define H2_ERESET   (-53)   /* RST_STREAM, GOAWAY, end of stream, or a flow-control error */
 #define H2_ETOOBIG  (-54)
 #define H2_EWINDOW  (-55)   /* the send window is closed */
 
@@ -19,10 +19,11 @@ struct h2_io {
     int (*read)(void *ctx, unsigned char *d, size_t cap, size_t *got);
 };
 
-/* Kept SMALL on purpose: one per VLESS connection, up to 64 of them. There is no frame buffer:
- * records are read into a shared buffer, and only what cannot be parsed at once carries over
- * between calls: a split frame header and the count of unread body. 16 KB per connection × 64
- * would be a megabyte. */
+/* Kept SMALL on purpose: one per VLESS connection (two for xhttp with an upload link), and a
+ * loop thread holds hundreds of connections. There is no frame buffer: records are read into a
+ * per-thread buffer, and only what cannot be parsed at once carries over between calls: a split
+ * frame header, a control frame body and the count of unread body. A 16 KB frame buffer per
+ * connection would add up to megabytes. */
 struct h2 {
     struct h2_io io;
     int started;
@@ -86,8 +87,9 @@ struct h2 {
      *
      * Only ONE stream is open at a time. There is no multiplexer: requests go one after
      * another, each closed before the next opens, so windows need no scheduling between
-     * streams. Late frames of a closed stream are recognized by id and dropped; see the frame
-     * header parsing in h2_read. */
+     * streams. Late frames of a closed stream are recognized by id and dropped (their DATA
+     * still counts toward the connection window, a non-200 status still goes to old_status);
+     * see the frame header parsing in h2_read. */
     uint32_t sid;
 
     /* Who we claim to be in the headers: 0 — gRPC (te: trailers and its User-Agent), 1 — a
@@ -102,10 +104,11 @@ struct h2 {
  * for both, so the browser version cannot differ between transports.
  *
  * THE NUMBER IS FIXED, NOT DERIVED FROM THE CLOCK. Xray derives the version from the date
- * (common/utils/browser.go: 144 on 2026-01-13 plus one per 35 days, with a CPU-based offset),
- * but a router with a wrong clock (common without a battery) would then claim a Chrome from the
- * future or from years ago, which stands out more than a slightly old version. Update it with
- * the rest of the fingerprint when the ClientHello is updated. */
+ * (common/utils/browser.go: 144 on 2026-01-13, plus one per 35 days, minus a lag of 35 to 140
+ * days seeded from the CPU), but a router with a wrong clock (common without an RTC battery)
+ * would then claim a Chrome from the future or from years ago, which stands out more than a
+ * slightly old version. Update it with the rest of the fingerprint when the ClientHello is
+ * updated. */
 #define UA_CHROME_MAJOR "149"
 #define UA_CHROME \
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " \
@@ -124,13 +127,14 @@ struct h2 {
 #define H2_POST 0
 #define H2_GET  1
 
-/* Opens a stream: preface, SETTINGS, HEADERS. content_type may be NULL. referer is for xhttp
- * (it carries the padding); gRPC does not send it. */
+/* Opens a stream with the gRPC headers (browser = 0): preface, SETTINGS, WINDOW_UPDATE,
+ * HEADERS. content_type and referer may be NULL; gRPC sends no referer. */
 int h2_start(struct h2 *h, const struct h2_io *io, const char *authority,
              const char *path, const char *content_type, const char *referer);
 
-/* The same with a method and the option to close our half of the stream at once. GET needs
- * end_stream: it has no body, and the server waits for END_STREAM right on HEADERS. */
+/* The same with a method, the option to close our half of the stream at once, and the header
+ * set (browser, see struct h2). GET needs end_stream: it has no body, and the server waits for
+ * END_STREAM right on HEADERS. referer is for xhttp, where it carries the padding. */
 int h2_start_ex(struct h2 *h, const struct h2_io *io, const char *authority,
                 const char *path, const char *content_type, const char *referer,
                 int method, int end_stream, int browser);

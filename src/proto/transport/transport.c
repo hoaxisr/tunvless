@@ -84,8 +84,8 @@ const struct transport_ops tr_tcp = {
     .open = NULL, .write = tcp_write, .read = tcp_read, .moved = NULL, .close = NULL,
 };
 
-/* The transport by the link field. The subscription parser (sub.c) drops unsupported types, so
- * only these five arrive here; anything else is tcp. */
+/* The transport by the link field. The node parser drops unsupported types (sl_link_usable_post
+ * in sublink.c), so only these five arrive here; anything else is tcp. */
 static const struct transport_ops *transport_of(const char *type) {
     if (!strcmp(type, "grpc")) return &tr_grpc;
     if (!strcmp(type, "xhttp")) return &tr_xhttp;
@@ -134,9 +134,9 @@ int transport_open(struct transport *t, const struct tr_node *n, int timeout_s) 
      * Failures AFTER a successful handshake close through transport_close, not close(fd): the
      * keys are expanded by now and the cipher contexts live on the HEAP. Callers do not clean up
      * (the node probe returns at once, the spare pool just marks the slot empty). A grpc/xhttp
-     * node with security=reality that Reality did not accept fails here on EVERY attempt (the
-     * cover site picks http/1.1), and the pool refills on every SYN: a leak here grows RSS until
-     * the OOM killer. */
+     * node with security=reality that Reality did not accept fails here on EVERY attempt (a
+     * cover site without h2 picks http/1.1), and the spare pool refills on every SYN: a leak
+     * here grows RSS until the OOM killer. */
     if (!t->link.plain && t->fr->alpn && t->link.tls.alpn[0] &&
         strcmp(t->link.tls.alpn, t->fr->alpn) != 0) {
         transport_close(t);
@@ -222,27 +222,28 @@ const char *transport_strerror(int rc) {
         case TR_EIO: return "I/O error";
         case TR_ECLOSED: return "server closed the connection";
         case TR_ENOH2: return "server did not agree to HTTP/2 (needed for grpc and xhttp)";
-        case TR_EGRPC: return "gRPC stream in an unexpected shape";
+        case TR_EGRPC: return "unexpected gRPC stream format";
         case TR_ENOH1: return "server did not pick HTTP/1.1 (needed for ws and httpupgrade)";
-        /* The status goes in the text: 404 and 400 almost always mean a wrong path or host (Xray
-         * answers an unknown path so), 403 and 5xx point at a proxy or CDN before the server. */
+        /* The status goes in the text: 404 and 400 almost always mean a wrong path or host (that
+         * is Xray's answer to an unknown path), 403 and 5xx point at a proxy or CDN in front. */
         case TR_EUPSTATUS: {
             static __thread char why[96];
             snprintf(why, sizeof why, "server answered %d instead of 101 (check path and host)",
                      tr_h1_last_status());
             return why;
         }
-        case TR_ENOUPGRADE: return "101 response without Upgrade: websocket";
+        case TR_ENOUPGRADE: return "101 response without Upgrade: websocket or Connection: Upgrade";
         case TR_EWSACCEPT: return "101 response with a wrong Sec-WebSocket-Accept";
         case TR_EUPTIMEOUT: return "server did not answer the Upgrade request (timeout)";
-        case TR_EUPTOOBIG: return "cannot parse the answer to the Upgrade request";
+        case TR_EUPTOOBIG: return "cannot parse the response to the Upgrade request";
         case TR_EWSFRAME: return "WebSocket frame violates RFC 6455";
         case TR_EVENC: {
             static __thread char why[128];
             snprintf(why, sizeof why, "VLESS encryption: %s", tr_venc_reason());
             return why;
         }
-        case TR_EVENCAUTH: return "VLESS encryption: keys mismatch (check the encryption string)";
+        case TR_EVENCAUTH: return "VLESS encryption: keys do not match the server's "
+                                  "(check the encryption string)";
         case TR_EVENC0RTT: return "VLESS encryption: server rejected the 0-RTT ticket";
         case H2_EIO: case H2_EPROTO: case H2_ESTATUS:
         case H2_ERESET: case H2_ETOOBIG: case H2_EWINDOW: return h2_strerror(rc);
@@ -250,13 +251,14 @@ const char *transport_strerror(int rc) {
         case REALITY_ECRYPTO: return "crypto failure";
         case REALITY_ETOOBIG: return "ClientHello does not fit";
         case TLS13_EAUTH: return "AEAD failed (keys out of sync)";
-        case TLS13_EFINISHED: return "Finished mismatch";
+        case TLS13_EFINISHED: return "server Finished did not verify";
         case TLS13_ENOKEYSHARE: return "ServerHello without key_share";
         case TLS13_EBADSUITE: return "server chose an unsupported cipher suite";
         case TLS13_EBADREC: return "corrupt TLS record";
         case TLS13_EECH: return "server rejected ECH (stale or unknown ECH key in the link)";
         case ECH_EPARSE: return "ECH: cannot parse the ECHConfigList from the link";
-        case ECH_ENOCONFIG: return "ECH: no config with X25519, HKDF-SHA256, AES-128-GCM/ChaCha20";
+        case ECH_ENOCONFIG: return "ECH: no usable config in the ECHConfigList (need X25519, "
+                                   "HKDF-SHA256, AES-128-GCM or ChaCha20-Poly1305)";
         case ECH_ECRYPTO: return "ECH: crypto failure";
         case ECH_ETOOBIG: return "ECH: ClientHello does not fit";
         case TLS13_ECLOSED: return "TLS closed by the server";
@@ -264,7 +266,7 @@ const char *transport_strerror(int rc) {
         /* "Did not answer", not "error": TCP is up but ClientHello gets no answer. That is how
          * SNI blocking, a dead node or a lost packet look, so the cause is outside the client,
          * and the text must send the user to look there. */
-        case TLS13_ETIMEOUT: return "node did not answer ClientHello (timeout)";
+        case TLS13_ETIMEOUT: return "node did not answer the ClientHello (timeout)";
         /* One code, different causes: "nothing to verify with" is not "verified and did not
          * match". tls13.c gives the exact text; the general phrase here says what it is about. */
         case TLS13_ECERT: {

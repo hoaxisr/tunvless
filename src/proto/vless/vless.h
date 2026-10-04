@@ -1,18 +1,18 @@
 /* VLESS nodes and subscriptions: the node as parsed from a link or a config, and the parsers.
  *
- * Why an own client and not xray or sing-box: those binaries are a client and a server for two
- * dozen protocols, 27–38 MB. A router with a 6.9 MB overlay cannot hold them, and only one client
- * path is needed.
+ * Why a client of its own rather than xray or sing-box: those binaries are a client and a server
+ * for two dozen protocols, 27–38 MB. A router with a 6.9 MB overlay cannot hold them, and only one
+ * client path is needed.
  */
 #ifndef STEER_VLESS_H
 #define STEER_VLESS_H
 #include <stdint.h>
 #include <stddef.h>
 
-/* A node. Fields are kept as strings, as the link gives them: a conversion there and back would
- * only add room for the two forms to diverge. */
+/* A node. Fields stay strings, as the link gives them, and the transport takes them as they are
+ * (sl_tr_node): there is no second, converted form that could diverge from the first. */
 struct vless_node {
-    char name[128];        /* display name from the #fragment, already percent-decoded */
+    char name[128];        /* display name: the #fragment (decoded), remarks, tag or name */
     char host[128];
     uint16_t port;
     char uuid[64];
@@ -35,7 +35,8 @@ struct vless_node {
     /* ws and httpupgrade: extra request headers, as "Name: value\n" lines. A vless:// link has no
      * such field (Xray's link format does not know it), so only config subscriptions carry them.
      * Xray config headers are checked when parsed: the name is HTTP token characters and the value
-     * has no line break (otherwise one header would become two request lines). */
+     * has no line break (otherwise one header would become two request lines). sing-box and Clash
+     * headers are checked only for size. */
     char headers[192];
     /* A config header did not fit into headers or is invalid: the node is unusable (skip_reason)
      * rather than sent without that header. */
@@ -72,9 +73,10 @@ struct vless_node {
      * does not turn certificate checks off: the node is usable only with vless_set_insecure
      * (--insecure), see sl_link_usable_pre. */
     uint8_t allow_insecure;
-    /* The insecure setting at parse time (sl_link_usable_pre): the client does not verify this
-     * node's certificate. Kept in the node rather than read from the global at connect time, so
-     * the client (client.c) does not depend on the parser: tests build them separately. */
+    /* --insecure as it was at parse time (sl_link_usable_pre): this node's certificate is not
+     * verified. Kept in the node rather than read from the global at connect time, so the
+     * transport (trsec.c, via sl_tr_node) does not depend on the parser: the transport tests are
+     * built without sublink.c. */
     uint8_t insecure;
     char skip_reason[96];  /* why the node is unusable, for display */
 };
@@ -93,8 +95,9 @@ int vless_parse_url(const char *url, struct vless_node *n);
 struct vless_skip {
     /* The same string vless_node.skip_reason would hold, and the same size, so it is not cut. */
     char reason[96];
-    char example[144];     /* name of the FIRST node with this reason, else host:port.
-                            * Longer than name[128] on purpose: the second form fits a whole
+    char example[144];     /* name of the FIRST node with this reason, else host:port;
+                            * for a glued or too long link, its length and first bytes.
+                            * Longer than name[128] on purpose: host:port fits a whole
                             * host plus ":65535", and a cut host in an explanation is worse
                             * than none. */
     size_t count;
@@ -103,8 +106,8 @@ struct vless_skip {
 /* What parsing a subscription found besides the usable nodes (their count is the return value):
  * what was skipped and why. */
 struct vless_sub_stats {
-    size_t skipped;                              /* unusable VLESS nodes */
-    size_t foreign;                              /* nodes of other protocols */
+    size_t skipped;                              /* unusable VLESS nodes and links */
+    size_t foreign;                              /* links and Clash proxies of other protocols */
     size_t reasons_n;                            /* distinct reasons collected */
     size_t reasons_dropped;                      /* nodes whose reason did not fit */
     struct vless_skip reasons[VLESS_SKIP_REASONS];
@@ -125,8 +128,8 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
                        struct vless_sub_stats *st);
 
 /* Subscription file → array of nodes on the heap (the caller frees it), *cnt — usable nodes.
- * NULL — the file did not open or is over 64 MiB. Neither the node count nor the subscription
- * size is limited by a constant. */
+ * NULL — the file did not open, is over 64 MiB, or there is no memory. Below that cap, neither
+ * the node count nor the subscription size is limited. */
 struct vless_node *vless_load_sub(const char *path, size_t *cnt, struct vless_sub_stats *st);
 
 #endif

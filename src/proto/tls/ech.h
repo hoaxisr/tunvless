@@ -15,9 +15,9 @@
  * (tests/hellofreeze.c) do not change.
  *
  * Not supported: compressing Inner with ech_outer_extensions (Inner goes in full: a larger Hello,
- * but simpler and accepted by any server), GREASE ECH without a config, HelloRetryRequest with
- * ECH, fetching the ECHConfigList from DNS (HTTPS record): the list comes from the node's link
- * (`ech=`). */
+ * but simpler and accepted by any server), HelloRetryRequest with ECH, fetching the ECHConfigList
+ * from DNS (HTTPS record): the list comes from the node's link (`ech=`). GREASE ECH needs nothing
+ * here: the Hello builder always sends it, and ech_wrap puts the real extension in its place. */
 #ifndef STEER_ECH_H
 #define STEER_ECH_H
 #include <stddef.h>
@@ -35,11 +35,11 @@
 
 struct ech_cfg {
     uint8_t  config_id;
-    uint16_t kdf_id, aead_id;       /* KDF 0x0001; AEAD 0x0001 or 0x0003 (ChaCha20) */
+    uint16_t kdf_id, aead_id;       /* HKDF-SHA256 (1); AES-128-GCM (1) or ChaCha20-Poly1305 (3) */
     uint8_t  pk[32];                /* the server's X25519 public key */
     uint8_t  max_name;              /* maximum_name_length: Inner is padded to this name length */
     char     public_name[256];      /* SNI of the outer Hello */
-    uint8_t  raw[1024];             /* the whole ECHConfig: part of HPKE info */
+    uint8_t  raw[1024];             /* the whole ECHConfig (version, length, body): in HPKE info */
     size_t   raw_n;
 };
 

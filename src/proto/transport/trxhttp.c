@@ -28,9 +28,9 @@ static void xhttp_path(const struct tr_node *n, char *out, size_t cap) {
              len && p[len - 1] == '/' ? "" : "/");
 }
 
-/* The node's xhttp mode. Empty and "auto" mean stream-one: Xray picks it with reality too, and
- * it is the cheapest. Other modes are named in the link, and the subscription parser (sub.c)
- * has dropped what we do not support, so only these three arrive here. */
+/* The node's xhttp mode. Empty and "auto" mean stream-one: Xray's auto picks it with reality,
+ * and it is the cheapest. Other modes are named in the link, and the node parser has dropped
+ * what we do not support (sl_link_usable_post in sublink.c), so only these three arrive here. */
 static enum xhttp_mode xhttp_mode_of(const struct tr_node *n) {
     if (!strcmp(n->mode, "packet-up")) return XH_PACKET_UP;
     if (!strcmp(n->mode, "stream-up")) return XH_STREAM_UP;
@@ -45,8 +45,8 @@ static void session_id(char *out, size_t cap) {
     unsigned char r[16];
     if (os_getrandom(r, sizeof r, 0) != (ssize_t)sizeof r) {
         /* The random source failed. Zero random bytes would be WORSE than failing: the session
-         * would be predictable while looking valid. Use a clearly invalid string (the nil UUID):
-         * the server accepts it, but such a node does not come up, and that gets noticed. */
+         * would be predictable while looking valid. Use the nil UUID, which no real session
+         * has: the server accepts it, but such a node does not come up, and that gets noticed. */
         snprintf(out, cap, "00000000-0000-0000-0000-000000000000");
         return;
     }
@@ -62,17 +62,16 @@ static void session_id(char *out, size_t cap) {
  *
  * Each request gets its own length, not one per connection: packet-up sends a series of
  * requests, and the same padding length in all of them would turn the padding itself into a
- * signature, the very thing it is there against. The 100..1000 range comes from the Xray server
- * (GetNormalizedXPaddingBytes); going outside it gets the request refused. */
+ * signature, the very thing it is there against. */
 static int xhttp_referer(char *out, size_t cap, const char *authority, const char *path,
                          uint16_t pf, uint16_t pt) {
-    /* THE SERVER SETS THE LENGTH, NOT US. It comes in the link as `xPaddingBytes` (see
+    /* THE SERVER SETS THE RANGE, NOT US. It comes in the link as `xPaddingBytes` (see
      * sl_pad_range in sublink.c), and the server CHECKS it: outside the range means 400. A
      * fixed range that fits Xray's default fails every xhttp node of a provider that announces,
      * say, "50-150": TLS passes, Reality accepts, then 400, and the nodes look dead.
      *
-     * Empty: Xray's default 100..1000 (GetNormalizedXPaddingBytes), to match upstream in both
-     * the bounds and the middle. */
+     * Not announced: Xray's default 100..1000 (GetNormalizedXPaddingBytes), to match upstream in
+     * both the bounds and the middle. */
     size_t lo = pt ? pf : 100;
     size_t hi = pt ? pt : 1000;
     unsigned char r = 0;
@@ -303,8 +302,9 @@ static void xhttp_moved(struct transport *t) {
     t->xh.up.h2.io.ctx = &t->xh.up;
 }
 
-/* The second link exists only in stream-up and packet-up; in stream-one its fd is zero after the
- * memset, hence the check is "greater than zero", not "not -1". */
+/* The second link exists only in stream-up and packet-up. Otherwise (stream-one, or an open that
+ * failed before up_connect) its fd is still 0 from transport_open's memset, hence "> 0", not
+ * "!= -1". */
 static void xhttp_close(struct transport *t) {
     struct xh_up *u = &t->xh.up;
     if (u->link.fd > 0) close(u->link.fd);

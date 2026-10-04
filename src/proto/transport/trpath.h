@@ -10,8 +10,9 @@
  * a 404 and a node that looks dead.
  *
  * The functions are pure (strings only, no network, no libraries): both the transport and the
- * subscription parser (sub.c) call them, so a path Xray would trip over is rejected up front with
- * a stated reason. One rule for both places. */
+ * subscription parser (sublink.c) call them, so a path Xray would trip over is rejected up front,
+ * with a stated reason, instead of failing every connection attempt later. One rule for both
+ * places. */
 #ifndef STEER_TRPATH_H
 #define STEER_TRPATH_H
 #include <stddef.h>
@@ -20,20 +21,20 @@
 /* The request-target for a node's path.
  *
  * ws — 1 for WebSocket, 0 for HTTPUpgrade. Returns 0 with a path starting with a slash in out;
- * otherwise -1 and *why, a short human-readable reason (it ends up in the node's skip_reason).
- * why may be NULL.
+ * otherwise -1 and *why, a short human-readable reason (it ends up in the node's skip_reason,
+ * 96 bytes). why may be NULL.
  *
- * Accepted is what Xray parses unambiguously, and nothing else: no control characters, no `#`
- * (url.Parse would cut it off as a fragment), no leading `//` (read as a host name), and no `:`
- * in the first segment of a path without a leading slash (Go would take it for a scheme). For ws,
- * percent sequences in the path must also be complete, or url.Parse fails and Xray does not
+ * Only what Xray parses unambiguously is accepted: no control characters, no `#` (url.Parse
+ * would cut it off as a fragment), no leading `//` (read as a host name), and no `:` in the first
+ * segment of a path without a leading slash (Go would take it for a scheme). For ws, every `%`
+ * before the `?` must also start a valid %XX sequence, or url.Parse fails and Xray does not
  * connect at all. */
 int tr_upgrade_target(const char *path, int ws, char *out, size_t cap, const char **why);
 
 /* The same, plus Ed — the early data size as Xray's Build computes it
  * (`uint32(strconv.Atoi(ed))`): 0 if `ed=` was not cut out (absent, empty, or the path did not
- * parse) or is not a number. ed_out may be NULL. What Ed changes on the wire: trws.c and
- * trupgrade.c. */
+ * parse) or is not a number. ed_out may be NULL. trws.c and trupgrade.c say what Ed changes on
+ * the wire. */
 int tr_upgrade_target_ed(const char *path, int ws, char *out, size_t cap, const char **why,
                          uint32_t *ed_out);
 

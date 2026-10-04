@@ -1,9 +1,9 @@
-/* The grpc transport: the protocol stream in gRPC messages inside one HTTP/2 stream (the upper
- * layer of transport.h).
+/* The grpc transport: the protocol stream in gRPC messages inside one HTTP/2 stream (the top
+ * layer in transport.h).
  *
- * grpc and xhttp are both HTTP/2, and they differ less than it seems: both open one stream with
- * a POST and carry bytes in its body. They differ in exactly two things: the path, and whether
- * data is wrapped in gRPC messages.
+ * grpc is close to xhttp's stream-one mode: both open one HTTP/2 stream with a POST and carry the
+ * bytes in its body. grpc has its own path (grpc_path) and wraps the data in gRPC messages;
+ * xhttp sends the data bare, with padding in Referer (trxhttp.c).
  *
  * gRPC message format (gRPC over HTTP/2 spec plus Xray's schema from stream.proto):
  *
@@ -63,8 +63,8 @@ static size_t grpc_wrap(const unsigned char *d, size_t n, unsigned char *out, si
     return 5 + msg;
 }
 
-/* Takes chunks of any size: the state lives in struct grpc_de, because message and record
- * boundaries do not coincide. */
+/* Unwraps the data from a stream of gRPC messages, in chunks of any size: the state lives in
+ * struct grpc_de, because message and record boundaries do not coincide. */
 static int grpc_unwrap(struct grpc_de *de, const unsigned char *in, size_t n,
                        unsigned char *out, size_t cap, size_t *out_n) {
     *out_n = 0;
@@ -90,7 +90,8 @@ static int grpc_unwrap(struct grpc_de *de, const unsigned char *in, size_t n,
             while (i < n && de->msg_left > 0) {
                 unsigned char b = in[i++];
                 de->msg_left--;
-                if (de->pb_n >= sizeof(de->pb)) return TR_EGRPC;  /* a varint is at most 5 bytes */
+                /* pb holds the tag and up to 7 varint bytes; a 32-bit length needs at most 5. */
+                if (de->pb_n >= sizeof(de->pb)) return TR_EGRPC;
                 if (de->pb_n == 0 && b != 0x0A) return TR_EGRPC;  /* only field 1 is expected */
                 de->pb[de->pb_n++] = b;
                 if (de->pb_n > 1 && !(b & 0x80)) { complete = 1; break; }
@@ -151,8 +152,8 @@ static int grpc_read(struct transport *t, unsigned char *d, size_t cap, size_t *
     return grpc_unwrap(&t->de, raw, rn, d, cap, got);
 }
 
-/* h2 keeps a pointer to the connection's link (io.ctx); once the struct moves it would point at
- * the old place. */
+/* h2 keeps a pointer to the connection's link (io.ctx); once the struct moves it would point to
+ * the old location. */
 static void grpc_moved(struct transport *t) { t->h2.io.ctx = &t->link; }
 
 const struct transport_ops tr_grpc = {

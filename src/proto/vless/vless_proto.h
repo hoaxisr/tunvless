@@ -13,7 +13,7 @@ enum { VLESS_ADDR_IPV4 = 1, VLESS_ADDR_DOMAIN = 2, VLESS_ADDR_IPV6 = 3 };
 /* Forms of the user id. The rule is Xray's (common/uuid/uuid.go, ParseString) and depends on
  * the string's length, not on whether it looks like hex: Xray derives a UUID from a string of
  * 15 hex digits rather than parsing it. A client that decides otherwise sends the wrong 16
- * bytes, and the server just closes the connection. */
+ * bytes: the server finds no such user and just closes the connection. */
 enum {
     VLESS_UUID_HEX     =  1,   /* 32..36 characters: a hex UUID, hyphens optional */
     VLESS_UUID_DERIVED =  2,   /* 1..30 characters: the UUID is derived (sha1, version 5) */

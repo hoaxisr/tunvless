@@ -59,9 +59,9 @@ static int vl_connect(const void *ctx, void *sess, int timeout_s) {
  * copied: the UUID and Vision state in dst are already set up (flow_open), and overwriting them
  * would lose the flow.
  *
- * h2 keeps a pointer to its own connection (io.ctx), which after the move points into the
- * abandoned pool slot. There are two such self-pointers (see xhttp_moved in trxhttp.c); the
- * transport fixes them in transport_moved, not the dialer. */
+ * h2 keeps a pointer to its own link (io.ctx), which after the move points into the abandoned
+ * spare slot; xhttp has two such self-pointers (xhttp_moved in trxhttp.c). transport_moved
+ * fixes them, not the dialer. */
 static void vl_take(void *dst, void *src) {
     struct vl_sess *d = dst;
     struct vl_sess *s = src;
@@ -106,8 +106,9 @@ static int vl_has_data(const void *sess) {
 
 /* The node's id does not parse, and the connection is closed. Say why: from outside a silent
  * close looks like "no traffic". It cannot happen today (a node with a bad UUID is dropped when
- * the nodes are parsed, and vless_tunnel_run checks it before the device comes up), so the line
- * is rate limited rather than per packet. The UUID is not printed: it is the key to the node. */
+ * the nodes are parsed, and vless_tunnel_run checks the first node's before the device comes
+ * up), so the line is rate limited rather than per packet. The UUID is not printed: it is the
+ * key to the node. */
 static void node_id_refused(const struct vless_node *node, const char *what) {
     static __thread time_t said;
     time_t now = stack_now_s();
@@ -136,9 +137,10 @@ static int vl_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
 
 /* ---- XUDP: UDP over Vision (Mux.Cool, as the Xray client does) ----------------------------
  *
- * Servers refuse a UDP request (command 2) for an account with flow=xtls-rprx-vision: Xray-core
- * answers "doesn't support UDP", and sing-box checks the flow against the account for any
- * command, rejecting both an empty flow and vision. Xray's own client does it differently
+ * A UDP request (command 2) to an account with flow=xtls-rprx-vision does not work everywhere:
+ * Xray-core refuses it with the vision flow ("doesn't support UDP") and accepts it only with an
+ * empty flow, while sing-box checks the flow against the account for any command and rejects
+ * both an empty flow and vision. Xray's own client does it differently
  * (proxy/vless/outbound/outbound.go: with vision the UDP command becomes Mux with the
  * v1.mux.cool:666 service): a Mux.Cool stream of XUDP frames (common/xudp), the whole stream
  * wrapped in Vision as for TCP. So does this code, for nodes with flow. Nodes without flow stay
@@ -388,8 +390,8 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
         /* The HTTP/2 window is closed: the server is not keeping up. This is not a failure,
          * it is what flow control is for. Nothing was sent (h2_write sends all or nothing), so
          * it is enough not to acknowledge the packet: the client retransmits it as after a
-         * loss, by which time the window has opened. Treating it as an error would cut uploads
-         * at a random point. */
+         * loss, and by then the window has usually opened. Treating it as an error would cut
+         * uploads at a random point. */
         s->vis = vis_before;                /* the frame did not leave: undo the wrapping */
         return SEND_AGAIN;
     }
@@ -477,7 +479,7 @@ static int udp_downstream(struct vl_sess *s, const unsigned char *d, size_t n,
                 time_t now = stack_now_s();
                 if (now - said >= 10) {
                     said = now;
-                    fprintf(stderr, LOG_W "tunnel: datagram of %u bytes exceeds the limit %d — "
+                    fprintf(stderr, LOG_W "datagram of %u bytes exceeds the limit %d — "
                             "dropped\n", s->dg_want, UDP_DGRAM_MAX);
                 }
                 s->dg_skip = s->dg_want;

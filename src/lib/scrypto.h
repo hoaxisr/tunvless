@@ -192,9 +192,12 @@ int sc_mldsa65_verify(const unsigned char pk[SC_MLDSA65_PK], const unsigned char
 
 /* ---- BLAKE3 (VLESS encryption) ------------------------------------------------------------ */
 
-/* BLAKE3, needed only by VLESS encryption; wolfSSL has none, so it is our own code
- * (src/lib/blake3.h). Any input length works: the NewAEAD context (a 1216-byte public key) spans
- * more than one chunk. Checked against the BLAKE3 repository vectors (tests/b3match.c). */
+/* BLAKE3, needed only by VLESS encryption: Xray uses it to derive the AEAD keys (DeriveKey with
+ * a string context) and the xorpub/random keystream keys, and to hash the relay keys. wolfSSL has
+ * none, so it is our own port of the reference implementation (src/lib/blake3.h). Any input
+ * length works: the NewAEAD context (a 1216-byte public key) spans more than one chunk and goes
+ * through the tree. tests/b3match.c checks it against lukechampine.com/blake3, the library
+ * Xray-core uses. */
 void sc_blake3_hash(unsigned char out[32], const void *in, size_t n);
 /* blake3.DeriveKey(out, context, material) of lukechampine.com/blake3: the derive_key mode, the
  * context is arbitrary bytes. out_n is at most 64. */

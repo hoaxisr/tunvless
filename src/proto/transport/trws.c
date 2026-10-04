@@ -1,5 +1,5 @@
 /* The ws transport: the protocol stream in WebSocket frames (RFC 6455) after an Upgrade request
- * (the upper layer of transport.h). The Upgrade request and the 101 answer are shared with
+ * (the top layer in transport.h). The Upgrade request and the 101 answer are shared with
  * httpupgrade (trupgrade.c); this file is only the frames.
  *
  * SENDING AS XRAY DOES. The Xray client writes each of its writes to gorilla/websocket as one
@@ -15,7 +15,7 @@
  * Every frame has its own mask from kernel randomness (RFC 6455, 5.3: the client must mask, and
  * the key must be unpredictable, or a caching intermediary can be poisoned with chosen bytes).
  * Keys come in batches, 64 frames per getrandom: a syscall per 4 KB of upload shows on a router,
- * and a per-thread batch is no more predictable.
+ * and a per-thread batch is just as unpredictable.
  *
  * RECEIVING as a stream (tr_ws_parse): the server (Xray: WriteMessage without a buffer) sends a
  * message as one unmasked frame, but the RFC allows fragments, control frames between them, and
@@ -38,7 +38,7 @@
  * request waits for the first write; if that write is no longer than Ed it goes in
  * Sec-WebSocket-Protocol (base64url without padding), otherwise as frames after the 101 answer.
  * Until the answer arrives writes are queued and go right after it (ws_write, ws_read): Xray
- * blocks the write in its own goroutine meanwhile, but the loop thread must not wait. An Xray
+ * blocks the write in its own goroutine meanwhile, but the tunnel loop must not wait. An Xray
  * server always accepts early data, whatever its own Ed (hub.go reads Sec-WebSocket-Protocol
  * unconditionally). */
 #define _GNU_SOURCE
@@ -226,8 +226,9 @@ static int ws_frames(struct transport *t, const unsigned char *d, size_t n) {
     return 0;
 }
 
-/* Queue limit before the 101 answer. Above it a write is refused WHOLE, not in part
- * (H2_EWINDOW: the dialer reads it as "nothing sent, retry", like a closed HTTP/2 window). */
+/* Queue limit before the 101 answer. Above it a write is refused WHOLE, not in part, with
+ * H2_EWINDOW: as with a closed HTTP/2 window, the dialer takes it as "nothing sent" and the
+ * client retransmits. */
 #define WS_QMAX (256 * 1024)
 
 static int q_push(struct h1_state *s, const unsigned char *d, size_t n) {
@@ -351,17 +352,17 @@ static int ws_read(struct transport *t, unsigned char *d, size_t cap, size_t *go
     return 0;
 }
 
-/* Leftover bytes after the 101 and a deferred end of stream: the loop must collect both with a
- * read even though the socket may stay silent. */
+/* Leftover bytes after the 101 and a deferred end of stream: the tunnel loop must collect both
+ * with a read even though the socket may stay silent. */
 static int ws_pending(const struct transport *t) {
     return t->h1.stash != NULL || t->h1.rx.closed;
 }
 
 /* Closing as Xray's connection.Close does: a close with code 1000 and no reason, then the socket.
- * Only after an accepted 101 (no frames before it) and if no close went yet (the answer to the
- * server's close).
+ * Only after an accepted 101 (no frames before it), and only if no close has been sent yet (as
+ * the answer to the server's close).
  *
- * The socket is non-blocking for this write. Closing runs on the loop thread, and the connection
+ * The socket is non-blocking for this write. Closing runs in the tunnel loop, and the connection
  * may already be dead with a full send buffer: a blocking write would hang until the socket
  * timeout (Xray waits up to 5 seconds, but in the connection's own goroutine). An 8-byte frame
  * always goes into a healthy connection; if it does not, nobody was there to receive it. */

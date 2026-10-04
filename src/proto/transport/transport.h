@@ -28,7 +28,7 @@
 #include "h2.h"
 
 /* Transport error codes. They share one number space with the VLESS client's codes: -35 and -36
- * are VLESS_CONN_* (client.h). */
+ * are VLESS_CONN_* (client.h), so a new code must not take them. */
 #define TR_EDNS      (-30)
 #define TR_ESOCK     (-31)
 #define TR_ECONNECT  (-32)
@@ -49,11 +49,12 @@
 #define TR_ENOUPGRADE (-41)  /* 101 without Upgrade: websocket or Connection: upgrade */
 #define TR_EWSACCEPT  (-42)  /* 101 without a valid Sec-WebSocket-Accept */
 #define TR_EUPTIMEOUT (-43)  /* no answer to the Upgrade request within the connect timeout */
-#define TR_EUPTOOBIG  (-44)  /* the Upgrade answer is over the limit or not HTTP */
+#define TR_EUPTOOBIG  (-44)  /* the Upgrade response is over the limit or not HTTP */
 #define TR_EWSFRAME   (-45)  /* a WebSocket frame breaks RFC 6455 */
 #define TR_EVENC      (-46)  /* VLESS encryption: handshake or format (reason: tr_venc_reason) */
 #define TR_EVENCAUTH  (-47)  /* VLESS encryption: AEAD failed, the keys differ from the server's */
-#define TR_EVENC0RTT  (-48)  /* VLESS encryption: 0-RTT ticket rejected, next connect is full */
+#define TR_EVENC0RTT  (-48)  /* VLESS encryption: 0-RTT ticket rejected; the next connection
+                              * does a full handshake */
 
 /* The node as the transport sees it: only what concerns the connection. The pointers point into
  * the parsed node (struct vless_node), no copies: the node outlives every connection to it. */
@@ -62,8 +63,9 @@ struct tr_node {
     uint16_t port;
     const char *type;          /* tcp | grpc | xhttp | ws | httpupgrade */
     const char *security;      /* none | tls | reality */
-    const char *sni;           /* the camouflage domain, also the SNI in ClientHello */
-    const char *fp;            /* browser fingerprint */
+    const char *sni;           /* SNI in the ClientHello; for reality, the camouflage domain */
+    /* Browser fingerprint. Not read: the ClientHello always looks like Chrome (reality.h). */
+    const char *fp;
     const char *pbk;           /* Reality public key, base64url */
     const char *sid;           /* Reality short id, hex */
     const char *path;          /* xhttp, ws, httpupgrade; ws/httpupgrade keep `?ed=` (trpath.h) */
@@ -198,15 +200,16 @@ struct ws_rx {
  * may send data right after the response, and one TLS record (or one socket read) brings both.
  * Dropping them would desync the stream from its first bytes (for httpupgrade the start of the
  * VLESS response, for ws the first frame). On the heap and only when present: this is rare, and
- * a 16 KB buffer in each of the pool's hundreds of connections would add up. The reader frees it
- * (tr_h1_free); transport_close frees what was not read.
+ * a 16 KB buffer in each of the hundreds of connections in the stack's table would add up. The
+ * reader frees it (tr_h1_free); transport_close frees what was not read.
  *
  * EARLY DATA (`?ed=N` in the path, Xray's Ed) changes when the request goes out and when the
  * response is parsed, exactly as in Xray (details in trws.c and trupgrade.c):
  *   ws           the request waits for the first write (H1_DEFER); a write no longer than Ed goes
  *                in Sec-WebSocket-Protocol, a longer one separately, as frames after the 101;
  *   httpupgrade  the request goes out at once but the response is not awaited: data follows, and
- *                the first read parses the response (H1_WAIT).
+ *                the first read parses the response (H1_WAIT). Over TLS or Reality only: with
+ *                security=none the 101 is awaited as without Ed (tr_h1_upgrade says why).
  * Until the 101 arrives (H1_WAIT), ws queues its writes in q. In Xray such a write just waits for
  * the response, but the tunnel loop must not wait; the queue goes out as frames right after the
  * 101. */
@@ -219,8 +222,9 @@ struct h1_state {
     uint8_t phase;             /* H1_OPEN, H1_DEFER, H1_WAIT */
     uint8_t upgraded;          /* 101 accepted: ws sends close 1000 when closing */
     uint32_t ed;               /* Ed from the path (trpath.h) */
-    /* For the deferred ws request: a copy of the node (struct tr_node itself lives on the
-     * opener's stack; its pointers point into the parsed node, which outlives the connection). */
+    /* The node for tr_h1_send, which the deferred ws request calls after open: a copy, because
+     * struct tr_node itself lives on the opener's stack (its pointers point into the parsed
+     * node, which outlives the connection). */
     struct tr_node node;
     struct h1_resp *resp;      /* response parser in H1_WAIT, on the heap while waiting */
     char accept[29];           /* expected Sec-WebSocket-Accept */
@@ -238,10 +242,11 @@ struct transport;
  * transport_write and transport_read. */
 struct transport_ops {
     const char *name;          /* as in the node link: tcp, grpc, xhttp, ws, httpupgrade */
-    /* What to offer in ALPN, or NULL for no ALPN extension at all. A Hello without ALPN is proven
-     * on live nodes, and Reality tells us from an outsider by the Hello's makeup: adding an
-     * extension where it is not needed changes what works for nothing. If the server negotiates
-     * SOMETHING ELSE, the connection fails with TR_ENOH2 (TR_ENOH1 when http/1.1 was asked). */
+    /* The ALPN protocol the transport needs ("h2", "http/1.1"), or NULL: any will do (tcp).
+     * The ClientHello offers "h2, http/1.1" as Chrome does whatever this is, or "http/1.1"
+     * alone when that is what is needed (ws, httpupgrade; trsec.c, reality.c). If the server
+     * negotiates SOMETHING ELSE, transport_open fails with TR_ENOH2 (TR_ENOH1 when http/1.1 was
+     * asked); a server that negotiates nothing is accepted. */
     const char *alpn;
     /* The protocol data sits in the TLS records as is: a read may return a pointer into the
      * decrypted record instead of a copy (transport_read_zc). True for tcp and httpupgrade; grpc
@@ -251,10 +256,11 @@ struct transport_ops {
      * NULL: nothing to open (tcp). On failure nothing needs closing: transport_open closes. */
     int  (*open)(struct transport *t, const struct tr_node *n, int timeout_s);
     int  (*write)(struct transport *t, const unsigned char *d, size_t n);
-    /* 0 bytes with code 0 is valid: an HTTP/2 control frame arrived. End of stream is a code. */
+    /* 0 bytes with code 0 is valid: a record or frame without data arrived (an HTTP/2 control
+     * frame, for one). End of stream is a code. */
     int  (*read)(struct transport *t, unsigned char *d, size_t cap, size_t *got);
-    /* The struct moved in memory (stack spare session -> connection table): fix the pointers to
-     * itself. NULL: the transport has none. */
+    /* The struct moved in memory (a connection takes the link of a spare session, vl_take in
+     * vldial.c): fix the pointers to itself. NULL: the transport has none. */
     void (*moved)(struct transport *t);
     /* Free what the transport holds beyond the main link (the xhttp second link, the rest after
      * the 101). NULL: nothing. */
@@ -339,10 +345,10 @@ void transport_close(struct transport *t);
 const char *transport_strerror(int rc);
 
 /* SO_MARK on sockets to the node, set before connect (--mark): policy routing can then keep them
- * out of the tunnel. 0 — no mark. required — a socket the mark cannot be set on is not used. */
+ * out of the tunnel. 0: no mark. required: a socket the mark cannot be set on is not used. */
 void transport_set_sock_mark(uint32_t mark, int required);
 
-/* SO_BINDTODEVICE on sockets to the node (--bind-dev); NULL or "" — none. */
+/* SO_BINDTODEVICE on sockets to the node (--bind-dev); NULL or "": none. */
 void transport_set_bind_dev(const char *ifname);
 
 /* Resolve host once and use these addresses for every later connection to it, instead of a DNS
@@ -365,8 +371,8 @@ extern const struct security_ops tr_sec_none, tr_sec_tls, tr_sec_reality;
 /* Open ws or httpupgrade over the protected link. Without early data: the Upgrade request and the
  * 101 response synchronously, within timeout_s (opening runs in a connector thread, not in the
  * tunnel loop), and the bytes past the response go to t->h1.stash. With early data, as in Xray
- * (h1_state): ws defers the request to the first write, httpupgrade sends it and does not wait
- * for the response. ws: 1 for WebSocket, 0 for httpupgrade. */
+ * (h1_state): ws defers the request to the first write, httpupgrade over TLS or Reality sends it
+ * and does not wait for the response. ws: 1 for WebSocket, 0 for httpupgrade. */
 int tr_h1_upgrade(struct transport *t, const struct tr_node *n, int ws, int timeout_s);
 
 /* Send the Upgrade request for the node t->h1.node; for ws with a new key (the expected Accept

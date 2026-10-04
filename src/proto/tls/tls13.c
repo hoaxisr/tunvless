@@ -1,14 +1,17 @@
-/* TLS 1.3 handshake and record layer for a ClientHello built by reality.c.
+/* TLS 1.3 handshake and record layer for a ClientHello built by reality.c (plus a minimal TLS 1.2
+ * client at the end).
  *
- * Reality is real TLS 1.3 whose only twist is that the server proves itself with the
- * authenticator in session_id rather than a certificate. The rest is plain RFC 8446: ServerHello
- * brings the server's key_share, traffic keys come from the shared secret, records use AEAD.
+ * Reality is real TLS 1.3 with one twist in authentication: the client proves itself with the
+ * authenticator in session_id, and a server that recognised it sends a temporary certificate
+ * with an HMAC under the authenticator key in the signature field (certverify.h). The rest is
+ * plain RFC 8446: ServerHello brings the server's key_share, traffic keys come from the shared
+ * secret, records use AEAD.
  *
- * The Reality certificate is NOT checked against a chain: it is genuine but belongs to the
- * third-party site the server hides behind, and the proof comes otherwise (the authenticator
- * and the HMAC in the signature field, see certverify.h). That is why there is no library TLS
- * stack here: it would insist on chain checks and build its own ClientHello, while ours must
- * look like a browser's (reality.c). Only primitives are needed, through the scrypto layer.
+ * No chain is checked for Reality: a server that did not recognise us hands the connection to
+ * the third-party site it hides behind, whose genuine certificate proves nothing about the
+ * server. That is why there is no library TLS stack here: it would insist on chain checks and
+ * build its own ClientHello, while ours must look like a browser's (reality.c). Only primitives
+ * are needed, through the scrypto layer.
  *
  * Only the needed part of the handshake exists: parse ServerHello, derive keys, check Finished
  * (plus the certificate check for security=tls). Resumption, client certificates,
@@ -116,13 +119,13 @@ static int read_full(int fd, unsigned char *buf, size_t n) {
  * takes everything pending (up to 16 KB), and records are served from the buffer without new
  * calls.
  *
- * may_wait selects the mode: the handshake WAITS (it is synchronous, nobody can resume it
- * midway); the data stream does not: an incomplete record stays in the buffer and the loop
- * moves on to other connections. */
+ * The data stream passes may_wait = 0: poll first, never block, and leave an incomplete record
+ * in the buffer so the loop moves on to other connections. The handshake, which must wait,
+ * reads the descriptor directly (read_record_fd). */
 /* The remainder moves to the start of the buffer only when the free tail runs short: with
- * medium records (4-8 KB, common with Xray and normal with rx_direct) an unconditional move
- * would memmove kilobytes on every read. The threshold lets one read take a useful chunk
- * rather than a hundred bytes at a time. */
+ * medium records (4-8 KB, common with Xray) an unconditional move would memmove kilobytes on
+ * every read. The threshold lets one read take a useful chunk rather than a hundred bytes at a
+ * time. */
 #define RBUF_MIN_FILL 4096
 
 static int rbuf_fill(struct tls13 *t, int may_wait) {
@@ -152,7 +155,8 @@ static int rbuf_fill(struct tls13 *t, int may_wait) {
     return 0;
 }
 
-/* For the handshake: it has no buffer of its own yet, and it must wait. */
+/* For the handshake: it waits, and it reads exactly one record at a time, so nothing past its
+ * last record leaves the socket before the connection buffer takes over. */
 static int read_record_fd(int fd, unsigned char *type, unsigned char *body, size_t cap,
                           size_t *body_n) {
     unsigned char h[5];
@@ -224,9 +228,9 @@ void tls13_keys_free(struct tls13_keys *k) {
 }
 
 /* Safe on a ZEROED struct and when called twice; this is a contract: tr_link_close calls it on
- * links whose handshake never started. It relies on a zero algorithm or ready flag meaning
- * "empty" for every layer context (sc_hash_free and sc_aead_free then do nothing), and on
- * freeing setting it back to zero. */
+ * every TLS link, including one whose handshake never started. It relies on a zero algorithm or
+ * ready flag meaning "empty" for every layer context (sc_hash_free and sc_aead_free then do
+ * nothing), and on freeing setting it back to zero. */
 void tls13_free(struct tls13 *t) {
     tls13_keys_free(&t->rd);
     tls13_keys_free(&t->wr);
@@ -245,8 +249,8 @@ int tls13_aead_open(struct tls13_keys *k, uint64_t seq,
     size_t ct = n - 16;
     /* The tag is COPIED, not read from the same buffer. Decryption runs in place, and the tag
      * sits right after the ciphertext, where an implementation may write while finishing the
-     * last partial block. tests/scryptomatch.c checks that wolfCrypt does not, at any record
-     * size, but a 16-byte copy is cheaper than depending on library internals. */
+     * last partial block. tests/scryptomatch.c checks that wolfCrypt does not, at record sizes
+     * up to 16401 bytes, but a 16-byte copy is cheaper than depending on library internals. */
     unsigned char tag[16];
     memcpy(tag, buf + ct, 16);
     int rc = sc_aead_open(&k->ctx, nonce, aad, aad_n, buf, ct, tag);
@@ -290,14 +294,15 @@ static int aead_seal_once(const struct tls13_keys *src, uint64_t seq,
 
 /* ---- handshake ------------------------------------------------------------- */
 
-/* The verification failure is kept PER THREAD, not in struct tls13: by the time the caller
- * names the reason, the connection is closed and the struct cleared. The thread outlives the
- * close, and connectors in different threads do not overwrite each other's reasons. */
+/* The verification failure is kept PER THREAD, not in struct tls13: the caller turns it into
+ * text from the error code alone (transport_strerror), after the link is closed. The thread
+ * outlives the close, and connectors in different threads do not overwrite each other's
+ * reasons. */
 static __thread char g_verify_reason[96];
 
 const char *tls13_verify_reason(void) { return g_verify_reason; }
 
-/* Takes the ClientHello already sent (for the transcript) and our ephemeral private key.
+/* Takes the ClientHello record already sent (for the transcript) and our ephemeral private key.
  *
  * auth->host != NULL turns on the certificate check (security=tls); auth->reality_key, the
  * Reality check. Without either, Certificate and CertificateVerify still enter the transcript
@@ -308,8 +313,7 @@ static int handshake(struct tls13 *t, int fd,
                      const unsigned char *client_hello, size_t hello_n,
                      const unsigned char *our_priv,
                      const struct tls13_auth *auth) {
-    /* Computed once: the flag is used in three places of the parsing loop, and three separate
-     * conditions there could drift apart. */
+    /* Computed once, so the checks in the parsing loop cannot drift apart. */
     const char *host = auth ? auth->host : NULL;
     const unsigned char *rkey = auth ? auth->reality_key : NULL;
     const int want_cert = (host != NULL) || (rkey != NULL);
@@ -362,7 +366,7 @@ static int handshake(struct tls13 *t, int fd,
             if (etype == 0x0033 && elen >= 4) {
                 /* group(2) + length(2) + key. The group is read, not guessed from the length
                  * (X25519: 32 bytes, hybrid: 1120): taking a ciphertext for a public key would
-                 * reach Finished with a wrong secret and fail as an AEAD error. */
+                 * go on with a wrong secret and fail as an AEAD error. */
                 unsigned grp = ((unsigned)rec[p] << 8) | rec[p + 1];
                 size_t klen = ((size_t)rec[p + 2] << 8) | rec[p + 3];
                 if (4 + klen > elen) return TLS13_EBADREC;
@@ -450,8 +454,8 @@ static int handshake(struct tls13 *t, int fd,
     if (expand_label(md, early, H, "derived", empty_hash, H, derived, H) != 0) return TLS13_ECRYPTO;
 
     /* The ECDHE input of the schedule is the secret with the server's EPHEMERAL key from
-     * ServerHello, not the one computed in reality.c. Mixing them up gives a handshake that
-     * completes and an AEAD that never verifies:
+     * ServerHello, not the one computed in reality.c. Mixing them up passes ServerHello and then
+     * fails every AEAD (TLS13_EAUTH):
      *
      *   Reality secret = our ephemeral x the server's static key (pbk from the link);
      *                    used ONLY for the authenticator in session_id;
@@ -500,7 +504,7 @@ static int handshake(struct tls13 *t, int fd,
      * valid authenticator.
      *
      * One buffer per thread: a thread runs one handshake at a time, and 40 KB per connection
-     * would be 2.5 MB where 40 KB is enough. */
+     * would be 2.5 MB at 64 connections. */
     static __thread unsigned char hsbuf[40960];
     size_t hs_have = 0;
 
@@ -582,7 +586,7 @@ static int handshake(struct tls13 *t, int fd,
                  * "key not recognised"; compression is beside the point for the user. */
                 snprintf(g_verify_reason, sizeof(g_verify_reason), "%s",
                          rkey ? cert_verify_strerror(CERTV_ENOTREALITY)
-                              : "server compressed its certificate unasked");
+                              : "server sent a compressed certificate without being asked");
                 return TLS13_ECERT;
             }
             if (want_cert && msg == 0x0B && cert_n == 0) {   /* Certificate */
@@ -651,9 +655,9 @@ static int handshake(struct tls13 *t, int fd,
 
     if (host) {
         if (!cert_n || !cv_n) {
-            /* The handshake completed without proof. That is a server expecting a certificate
-             * FROM US (client auth) or resuming a session; we do neither and asked for
-             * neither. Named apart from "the certificate does not verify". */
+            /* The handshake completed without proof. Without a PSK (we offer none) a TLS 1.3
+             * server must send both, so only a broken or hostile server gets here. Named apart
+             * from "the certificate does not verify". */
             snprintf(g_verify_reason, sizeof(g_verify_reason),
                      "server sent no %s", cert_n ? "signature" : "certificate");
             return TLS13_ECERT;
@@ -792,10 +796,10 @@ static int tls12_read_rec(struct tls13 *t, unsigned char type, unsigned char *re
 /* Read EXACTLY ONE record. It may carry no data: then zero bytes with code 0, a success.
  *
  * "Exactly one" matters. Records without data are common here (ChangeCipherSpec,
- * NewSessionTicket, Vision's empty records); looping on to the next read after one would hit
- * SO_RCVTIMEO and return an I/O error on a healthy connection, cutting a download at a random
- * point mid-transfer. Waiting for the socket to become readable is the caller's job: it has
- * poll; this layer has none and must not.
+ * NewSessionTicket, Vision's empty records), and the socket is blocking with SO_RCVTIMEO: waiting
+ * on for data after one stalls a healthy connection until the timeout and then fails it as an
+ * I/O error, cutting a download at a random point. Waiting for the socket to become readable is
+ * the caller's job: it has poll; this layer has none and must not.
  *
  * Shared by both reads: the plaintext stays WHERE IT IS, in the connection buffer. Only
  * tls13_read copies, because its caller wants its own buffer. */
@@ -1028,7 +1032,7 @@ int tls12_handshake(struct tls13 *t, int fd, const char *sni) {
     static const unsigned char sa[] = { 0x08,0x04, 0x08,0x05, 0x08,0x06, 0x04,0x01, 0x05,0x01, 0x06,0x01 };
     put16(p, 0x000d); put16(p + 2, sizeof(sa) + 2); put16(p + 4, sizeof(sa));
     memcpy(p + 6, sa, sizeof(sa)); p += 6 + sizeof(sa);
-    /* ALPN: http/1.1 only, for a WebSocket upgrade over HTTP/1.1 on top */
+    /* ALPN: http/1.1 only */
     put16(p, 0x0010); put16(p + 2, 11); put16(p + 4, 9); p[6] = 8; memcpy(p + 7, "http/1.1", 8); p += 15;
     /* renegotiation_info: empty, as every modern client sends it */
     put16(p, 0xff01); put16(p + 2, 1); p[4] = 0; p += 5;

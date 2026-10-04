@@ -5,7 +5,7 @@
  * shouldEscape for paths and query values, unescape, validEncoded with EscapedPath, and
  * url.Values.Encode. The comments below name the Go functions, for a line-by-line comparison.
  * Only the branches a node's path goes through are repeated: host, user info, fragment and opaque
- * URLs never get here, such a path is rejected earlier (trpath.h).
+ * URLs never get here, because such a path is rejected first (trpath.h).
  *
  * Verified against captured requests of a real Xray 26.3.27 (client in docker, server a listening
  * socket): the path `/p/q?x=1&ed=2048` gives `GET /p/q?x=1` for ws and `GET /p/q%3Fx=1` for
@@ -30,9 +30,10 @@ static int hexval(unsigned char c) {
     return -1;
 }
 
-/* shouldEscape(c, encodePath). Of the reserved characters only `?` is escaped in a path: Go keeps
- * `/ ; ,` for path segments, and RFC 3986 allows `: @ & = + $`. Everything else except letters,
- * digits and `- _ . ~` is escaped (including `! ' ( ) * [ ]` and all non-ASCII). */
+/* shouldEscape(c, encodePath). Of the reserved characters only `?` is escaped in a path: RFC 3986
+ * allows `: @ & = + $` there, and Go also leaves `/ ; ,` alone because it handles the path as a
+ * whole. Everything else except letters, digits and `- _ . ~` is escaped (including
+ * `! ' ( ) * [ ]` and all non-ASCII). */
 static int esc_path(unsigned char c) {
     if (is_alnum(c)) return 0;
     switch (c) {
@@ -133,16 +134,18 @@ static void put_qesc(struct sb *b, const char *s, size_t n) {
  *
  * u.Query() is ParseQuery with the error swallowed: pairs are split on `&`, a pair with `;` or
  * with a bad percent sequence is skipped, key and value are decoded (`+` is a space). Get takes
- * the FIRST `ed` value: `?ed=` without a number leaves the query alone. Encode prints keys sorted
- * bytewise, values of one key in order of appearance, each through QueryEscape. *stripped — whether
- * `ed` was cut; then out holds the new query (possibly empty). */
+ * the FIRST `ed` value, so an empty one (`?ed=`, even followed by `ed=5`) leaves the query alone.
+ * Encode prints keys sorted bytewise, values of one key in order of appearance, each through
+ * QueryEscape. *stripped — whether `ed` was cut; then out holds the new query (possibly empty).
+ * More than QP_MAX pairs fail the call (reported as "path too long"). */
 #define QP_MAX 64
 
 /* Ed as Build computes it: `Ed, _ := strconv.Atoi(q.Get("ed")); ed = uint32(Ed)`. Atoi takes a
- * sign and digits, nothing else; an error (letters, nothing after the sign, int overflow) gives 0.
- * Xray's int is 32-bit on mips and arm and 64-bit on arm64 and x86_64; this follows 64-bit, which
- * differs only for numbers above 2^31 that links never carry. A negative value becomes a huge
- * uint32, as in Xray: `ed=-1` means early data for a first write of any length. */
+ * sign and digits, nothing else; a syntax error (letters, nothing after the sign) gives 0. Out of
+ * range, Atoi clamps to the limits of int, which is 32-bit on mips and arm and 64-bit on arm64 and
+ * x86_64. This code follows a 64-bit int and does not clamp; both differences only touch numbers
+ * beyond ±2^31, which links never carry. A negative value becomes a huge uint32, as in Xray:
+ * `ed=-1` means early data for a first write of any length. */
 static uint32_t go_atoi_u32(const char *s, size_t n) {
     size_t i = 0;
     int neg = 0;
@@ -244,7 +247,7 @@ int tr_upgrade_target_ed(const char *path, int ws, char *out, size_t cap, const 
     if (n && path[0] != '/') {
         const char *sl = memchr(path, '/', pn);
         size_t seg = sl ? (size_t)(sl - path) : pn;
-        if (memchr(path, ':', seg)) { *why = "path with : and no leading /"; return -1; }
+        if (memchr(path, ':', seg)) { *why = "path has : before its first /"; return -1; }
     }
     char tmp[1024];
     int path_ok = unesc(path, pn, tmp, sizeof(tmp), 0) >= 0;

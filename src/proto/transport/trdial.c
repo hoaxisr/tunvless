@@ -1,6 +1,7 @@
 /* The socket to the node: TCP to EVERY address of the name, not just the first, plus the mark
- * and the bound device that keep it out of the tunnel (the lower layer of transport.h). Nothing
- * here depends on the protocol.
+ * and the bound device that keep it out of the tunnel (the bottom layer in transport.h). Nothing
+ * here depends on the protocol. Every connection to a node goes through tr_dial, so all of them
+ * share the address search, the winner cache and the mark.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -27,7 +28,7 @@
  * every query, so "the first address" changes each time. Using only the first one is worse than
  * "sometimes fails to connect":
  *
- *   - a blocking connect to a black hole waits the whole SO_SNDTIMEO, holding the thread;
+ *   - a blocking connect to a black hole waits out the whole SO_SNDTIMEO and holds its thread;
  *   - Linux reports that timeout as EINPROGRESS, not ETIMEDOUT (__inet_stream_connect: when timeo
  *     runs out err stays -EINPROGRESS), so the log shows "Operation in progress" for a blocking
  *     call and hides both the timeout and the dead address;
@@ -74,7 +75,7 @@ static void sock_ready(int fd, int timeout_s) {
     int fl = fcntl(fd, F_GETFL, 0);
     if (fl >= 0) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
     /* Without a read and write timeout a dead node holds a probe until the kernel gives up —
-     * minutes in which the pool cannot get round the other candidates. */
+     * minutes in which the pool cannot check the other candidates. */
     struct timeval tv = { .tv_sec = timeout_s, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -82,8 +83,8 @@ static void sock_ready(int fd, int timeout_s) {
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     /* SO_RCVBUF is deliberately NOT set. Any setsockopt(SO_RCVBUF) DISABLES Linux receive
      * window autotuning and pins the window at that size. Throughput is window / RTT: half a
-     * megabyte at a 60 ms RTT caps it at 68 Mbit/s whatever the link, while autotuning grows to
-     * several megabytes on its own. The limits belong to the system, in net.ipv4.tcp_rmem. */
+     * megabyte at a 60 ms RTT caps it at 68 Mbit/s whatever the bandwidth, while autotuning grows
+     * to several megabytes on its own. The limits belong to the system, in net.ipv4.tcp_rmem. */
 }
 
 /* --mark: SO_MARK on every socket to the node, set before connect — the route, and with it the
@@ -169,16 +170,16 @@ int transport_pinned_addrs(const char *host, uint32_t *out, int max) {
 static int attempt_start(struct in_addr ip, uint16_t port, int *done) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd < 0) return -1;
-    /* Before connect(): the kernel picks the route, and with it the device and the source
-     * address, there — by the mark. */
+    /* Before connect(): connect is where the kernel picks the route by the mark (see --mark
+     * above). */
     if (g_sock_mark &&
         setsockopt(fd, SOL_SOCKET, SO_MARK, &g_sock_mark, sizeof(g_sock_mark)) != 0 &&
         g_sock_mark_req) {
         static int told;
         if (!told) {
             told = 1;
-            fprintf(stderr, "tunvless[warn]: mark 0x%08x not set on a socket to the node (%s) — "
-                            "not connecting: unmarked, it would go into the tunnel\n",
+            fprintf(stderr, "tunvless[warn]: cannot set mark 0x%08x on a socket to the node "
+                            "(%s) — not connecting: unmarked, it would go into the tunnel\n",
                     g_sock_mark, strerror(errno));
         }
         close(fd);
@@ -189,7 +190,7 @@ static int attempt_start(struct in_addr ip, uint16_t port, int *done) {
         static int told;
         if (!told) {
             told = 1;
-            fprintf(stderr, "tunvless[warn]: socket to the node not bound to %s (%s) — not "
+            fprintf(stderr, "tunvless[warn]: cannot bind a socket for the node to %s (%s) — not "
                             "connecting: unbound, it would go into the tunnel\n",
                     g_bind_dev, strerror(errno));
         }
@@ -291,7 +292,7 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_s) {
         return TR_ECONNECT;
     }
     if (dead)
-        fprintf(stderr, "tunvless: %s:%u — connected, skipped %u of %u addresses as dead\n",
+        fprintf(stderr, "tunvless: %s:%u — connected after %u of %u addresses failed\n",
                 host, port, dead, an);
     sock_ready(win, timeout_s);
     return win;

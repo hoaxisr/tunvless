@@ -15,7 +15,8 @@
 #define REALITY_MLKEM_SHARE 1216
 
 struct reality_cfg {
-    const char *sni;   /* camouflage domain, sent as SNI; "" sends no server_name at all */
+    const char *sni;   /* SNI: the camouflage domain (Reality) or the server name (plain);
+                        * "" sends no server_name extension at all */
     const char *pbk;   /* server public key, base64url */
     const char *sid;   /* short id, hex; may be empty */
     const char *fp;    /* browser fingerprint; not read: the Hello always looks like Chrome */
@@ -35,8 +36,8 @@ struct reality_cfg {
      * Reality into plain TLS, a downgrade that looks like a working node. */
     int plain;
 
-    /* A REAL X25519MLKEM768 exchange (as uTLS HelloChrome_131+ and Go 1.24+, which Xray-core
-     * uses).
+    /* A REAL X25519MLKEM768 exchange, like uTLS HelloChrome_131 and later and Go 1.24+ (which
+     * Xray-core uses).
      *
      * Unlike carrier.pq (1216 bytes of random noise, for size only), this is a real ML-KEM-768
      * key (sc_mlkem768_keygen) plus an X25519 half that is the same key as the separate X25519
@@ -44,7 +45,7 @@ struct reality_cfg {
      * carries the ciphertext (1088) and its X25519 half (32), and the key schedule secret is
      * mlkem_ss ‖ x25519_ss (draft-ietf-tls-ecdhe-mlkem: ML-KEM first). The ML-KEM private key
      * goes to reality_state.mlkem_dk and on to tls13_auth.mlkem_dk. Such a server rejects noise
-     * in place of the key (Go validates it). */
+     * in place of the key (Go validates it), so carrier.pq cannot replace this. */
     int pq;
 };
 
@@ -52,12 +53,13 @@ struct reality_state {
     unsigned char priv[32];        /* our ephemeral private key */
     unsigned char pub[32];         /* its public half, sent in key_share */
     unsigned char shared[32];      /* secret shared with the server's static key (pbk) */
-    unsigned char session_id[32];  /* the authenticator, sent as legacy_session_id */
+    unsigned char session_id[32];  /* sent as legacy_session_id: the authenticator, or random
+                                    * bytes when plain */
 
     /* Authenticator key: HKDF-SHA256(ikm = shared secret, salt = Random[0..20),
      * info = "REALITY"). The server SIGNS its temporary certificate with the same key, which is
      * how it proves itself to us (tls13_handshake_auth; reality.go in Xray). So it lives until
-     * the end of the handshake. Zero when plain. */
+     * the end of the handshake. Not set when plain or when a carrier fills session_id. */
     unsigned char authkey[32];
 
     /* ML-KEM-768 private key (FIPS 203, 2400 bytes) to decapsulate the server's answer; set
@@ -89,14 +91,14 @@ struct reality_carrier {
     /* Offer X25519MLKEM768 in key_share, filled with random noise instead of a key.
      *
      * Current Chrome's ClientHello is about 1760 bytes and goes out in TWO segments because of
-     * the 1216-byte post-quantum share. A 537-byte Hello in one segment stands out by size, by
-     * segment count and by supported_groups: "Chrome that offers no post-quantum exchange" is
-     * a Chrome of two years ago.
+     * the 1216-byte post-quantum share. A Hello of about 540 bytes in one segment stands out by
+     * size, by segment count and by supported_groups: "Chrome that offers no post-quantum
+     * exchange" is an outdated Chrome.
      *
-     * Only for a peer that ignores the share; the VLESS client uses reality_cfg.pq instead. */
+     * Only for a peer that never picks the hybrid; the VLESS client uses reality_cfg.pq. */
     int pq;
     /* Offer ONLY http/1.1 in ALPN instead of the usual "h2, http/1.1"; used by ws and
-     * httpupgrade, as Xray does (uTLS WebsocketHandshakeContext).
+     * httpupgrade, as Xray does (its UConn.WebsocketHandshakeContext over uTLS).
      *
      * With h2 offered first, a WebSocket endpoint (e.g. behind Cloudflare) picks h2, and our
      * HTTP/1.1 Upgrade is garbage to it: the node sent an HTTP/2 preface before our request and
@@ -106,10 +108,11 @@ struct reality_carrier {
     /* Do not send application_settings (ALPS, 0x44cd).
      *
      * The extension says the client is ready to send application settings. A server that picks
-     * h2 and accepts ALPS (Google's, e.g. dns.google) then expects the client's ALPS block in
-     * EncryptedExtensions. A browser sends one, this client does not, so a completed handshake
-     * ended in a fatal unexpected_message alert (10) on the first read, before any HTTP/2 frame.
-     * Cloudflare and Quad9 do not accept ALPS. Without the extension the server expects nothing. */
+     * h2 and accepts ALPS (Google's, e.g. dns.google) then expects the client's own
+     * EncryptedExtensions with its ALPS block before the client Finished. A browser sends it,
+     * tls13.c does not, so a completed handshake ended in a fatal unexpected_message alert (10)
+     * on the first read, before any HTTP/2 frame. Cloudflare and Quad9 do not accept ALPS.
+     * Without the extension the server expects nothing. */
     int no_alps;
     /* Fill the ECH padding (176 bytes). NULL leaves random noise, as a browser without an ECH
      * config sends. */
@@ -127,10 +130,11 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
                               const struct reality_carrier *car,
                               unsigned char *out, size_t out_n, size_t *out_len);
 
-/* Primitives of reality.c for tls13.c, ech.c and trvenc.c (VLESS encryption). They are wrappers,
- * not copies; see their definitions in reality.c. */
+/* Primitives of reality.c for tls13.c, ech.c, trsec.c and trvenc.c (VLESS encryption). They are
+ * wrappers, not copies; see their definitions in reality.c. */
 int xc_random(unsigned char *out, size_t n);
-/* base64url (padded or not) to bytes; returns the length or -1. Used for node keys (pqv). */
+/* base64url (padded or not) to bytes; returns the length or -1. For node keys (pqv, VLESS
+ * encryption keys). */
 int xc_b64url_decode(const char *in, unsigned char *out, size_t out_n);
 int xc_cpu_has_aes(void);
 int xc_x25519_keypair(unsigned char priv[32], unsigned char pub[32]);

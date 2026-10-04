@@ -1,8 +1,8 @@
 /* Tunnel stack: packets from the TUN device become flows to the node, and back.
  *
  * The kernel hands us IP packets; the node accepts connections. This file bridges the two: for
- * each TCP connection from the TUN device it opens a flow to the node and carries the bytes,
- * acknowledging them to the client the way a real stack would.
+ * each TCP connection (and UDP flow) from the TUN device it opens a flow to the node and carries
+ * the bytes, acknowledging them to the client the way a real stack would.
  *
  * There is no protocol here. Everything about the node belongs to the dialer (dialer.h): a
  * connection's session is opaque to the stack, and VLESS is the dialer in proto/vless/vldial.c.
@@ -14,7 +14,7 @@
  *
  * Retransmission TOWARDS THE CLIENT is required: without it one lost segment hangs the connection
  * for good (the client keeps acknowledging the old data, we keep sending new). It costs a ring of
- * up to RTX_CAP bytes per connection.
+ * up to RTX_CAP bytes per connection that carries data.
  *
  * There is no REASSEMBLY buffer: an out-of-order segment from the client is dropped, and the
  * client, which has a full stack, retransmits it. Retransmitting is the sender's job and filling
@@ -55,10 +55,10 @@
 #define LOG_W  "tunvless[warn] tunnel: "
 #define LOG_I  "tunvless[info] tunnel: "
 
-/* Connections per loop thread. Browsers keep connections alive between requests, so with a wide
- * set of routes into the tunnel two open sites fill a small table. When the table is full,
- * conn_new evicts an idle connection or refuses the SYN visibly, rather than growing until the
- * OOM killer comes. */
+/* Connections per loop thread. Browsers keep connections alive between requests: with a wide set
+ * of routes into the tunnel, two open sites filled a table of 64. An idle slot costs little (see
+ * the connection table below and RTX_START). When the table is full, conn_new evicts an idle
+ * connection or refuses the SYN and logs it, rather than growing until the OOM killer comes. */
 #define MAX_CONNS 320
 
 /* How long a connection must be silent before it may be evicted (conn_new) or cleaned up as dead
@@ -87,7 +87,7 @@
  * Hence three rules that depend on each other:
  *
  *   1. the bulky half lives in a SEPARATE array (dialer sessions); the loop never touches it, and
- *      its pages become resident only for connections that actually do I/O;
+ *      beyond its first page it becomes resident only for connections that actually do I/O;
  *   2. the hot record is small (checked below), and the fields the loop reads come first;
  *   3. no loop walks the WHOLE table: they walk g_live, which holds only busy slots, and lookup by
  *      flow goes through a hash.
@@ -101,8 +101,8 @@
  * loop thread's heap mapping, next to the hot table (see "loop thread tables" below). */
 
 struct conn {
-    /* The first cache line holds exactly what the loop walk reads. Keep the order: scattered
-     * fields would bring a second line into every walk. */
+    /* The fields the loop walk reads come first, up to `last`. Keep them together: scattered
+     * among the others they would add cache lines to every walk. */
     uint8_t used;
     /* A UDP flow, not a TCP connection. Read by the loop walk: UDP has neither a window nor a
      * retransmission ring, so whether to read more from the server is decided differently. */
@@ -113,7 +113,7 @@ struct conn {
      *
      * pending=1: the job is with a connector, no answer yet. The connection may not be closed,
      * evicted or cleaned up as idle: the connector writes into its session, and freeing the
-     * record under it is a use after free. All three places that remove a conn check it. */
+     * record under it is a use after free. Every place that removes a conn checks it. */
     uint8_t pending;
     /* The server closed the flow, but the client has not acknowledged everything yet. Details
      * at closed_at; the field is here because the loop walk reads it. */
@@ -127,8 +127,8 @@ struct conn {
      * our buffer — so without this flag it would wait for the next data from the server, and the
      * tail of a response could sit until the client's retransmission timeout. */
     uint8_t rx_ready;
-    /* The client is owed an ACK, deferred to the end of the batch of TUN packets: all the
-     * packets of an upload batch are acknowledged by one ACK with the last number. */
+    /* The client is owed an ACK, deferred to the end of the batch of TUN packets: one ACK with
+     * the last number acknowledges the whole batch, instead of a device write per packet. */
     uint8_t ack_due;
     /* The ACK is due but held: a DC_ACK_PACED dialer (dialer.h) cannot take more — its queue to
      * the node is above the low-water mark — and the client, without the ACK, stops at its
@@ -162,8 +162,8 @@ struct conn {
      * unacknowledged bytes live nowhere else, so the two cannot drift apart.
      *
      * Allocated on the first data, not on SYN (emit_to_client), and freed on close or after the
-     * connection idles (conn_deadlines). malloc rather than an array inside struct conn: a block
-     * this large comes from mmap and costs memory only where it is written. */
+     * connection idles (conn_deadlines). A pointer rather than an array inside struct conn: the
+     * hot record must stay small, and only connections that carry data hold a ring. */
     struct rtx rtx;
     /* When the oldest unacknowledged byte was sent (or last resent). 0 — nothing is
      * unacknowledged. */
@@ -172,14 +172,14 @@ struct conn {
     time_t last;
     /* --- below: what the loop walk does NOT read; packet handling and setup only. --- */
     struct flow_key key;
-    int fd;                   /* copy of the session's socket: needed to leave epoll */
+    int fd;                   /* copy of the session's socket, for epoll_ctl and poll */
     int done;                 /* the connector has finished: read only with ACQUIRE */
     int rc;                   /* its result: 0 or the dialer's error code */
     /* When the server closed: the start of the wait for ACKs (CLOSE_DRAIN_MS).
      *
      * The connection must NOT be closed at that moment: that destroys the ring, and the last
      * lost piece can never be resent; the client sits with a hole until its own timeout (121 s
-     * on the test bench, where one flow with twice the loss finished in two). So the server is
+     * on the test bench, where one flow with twice the loss finished in 2 s). So the server is
      * no longer read, but the connection lives and retransmits until the client acknowledges
      * everything; then the FIN goes out. */
     uint64_t closed_at;
@@ -245,8 +245,8 @@ typedef char conn_hot_size_check[sizeof(struct conn) <= 192 ? 1 : -1];
  * connections a browser keeps open with little traffic stay small.
  *
  * Not smaller: it must cover CLIENT_ROOM_RESERVE (room for a whole read) with space to spare.
- * Below that the client could never "take a record", and the connection would never read from
- * the server and so never grow. */
+ * Below that client_can_take_record would never be true, and the connection would never read
+ * from the server and so never grow. */
 #define RTX_START (32 * 1024)
 
 /* Retransmission timeout. Doubles up to a second, in case the client is really gone.
@@ -277,9 +277,10 @@ typedef char conn_hot_size_check[sizeof(struct conn) <= 192 ? 1 : -1];
  * divided by the round trip: the network to the client plus the time until we read its packets
  * and acknowledge them (once per loop pass, flush_acks). A fixed 65535 caps it at 65535/RTT
  * whatever the node and the CPU can do: 175 Mbit/s at 3 ms, 87 at 6, 22 at 24. Measured on an x86
- * bench (network namespaces, Xray 26.3.27 node with Reality and Vision, 6.1 ms to the client),
- * one flow / eight flows in Mbit/s: 64 KB — 83 / 621, 256 KB — 325 / 1340, 1 MiB — 1164 / 1521,
- * 4 MiB — 1286 / 1477. At 0.1 ms the window does not matter: the node is the limit.
+ * bench (network namespaces, Xray 26.3.27 node with Reality and Vision, a 6.1 ms round trip to
+ * the client), upload with one flow / eight flows in Mbit/s: 64 KB — 83 / 621, 256 KB —
+ * 325 / 1340, 1 MiB — 1164 / 1521, 4 MiB — 1286 / 1477. At a 0.1 ms round trip the window does
+ * not matter: the node is the limit.
  *
  * A client that offers window scaling in its SYN (ws_seen) gets our option with shift
  * g_rcv_shift in the SYN-ACK; the SYN-ACK's own window is 65535 unscaled, since a SYN window is
@@ -308,14 +309,16 @@ typedef char conn_hot_size_check[sizeof(struct conn) <= 192 ? 1 : -1];
  * the node accepts, which is not done here.
  *
  * NOT HERE. A window of "free space in the socket's send buffer" (SO_SNDBUF minus SIOCOUTQ)
- * follows the round trip to the NODE, not to the client, and with a fast close node it stuck at
- * 100-200 KB (148-1382 Mbit/s instead of 1286-1349). A brake "65535 while more than 65535 bytes
- * are unsent in the socket" (SIOCOUTQNSD) made the window flap (1079 Mbit/s instead of 1404).
- * Behind a narrow link the single loop blocks in the write to the node (SO_SNDTIMEO) and other
- * connections' ACKs wait in the TUN queue; that happens with any window. There is no reassembly
- * buffer and no SACK (the SYN-ACK offers MSS and window scale only), so the larger the window,
- * the more the client resends after one loss (0.3% loss at 6 ms: 23 -> 24 Mbit/s, TCP
- * retransmits 400 -> 3000-12000). The client's window towards us (client_room) is unaffected.
+ * follows the round trip to the NODE, not to the client (the kernel grows that buffer with the
+ * node's congestion window): with a fast close node it stuck at 100-200 KB (148, 151 and 1382
+ * Mbit/s in three runs instead of 1286-1349). A brake "65535 while more than 65535 bytes are
+ * unsent in the socket" (SIOCOUTQNSD) made the window flap (1079 Mbit/s instead of 1404).
+ * Behind a narrow link the loop, shared by all its connections, blocks in the write to the node
+ * (SO_SNDTIMEO) and other connections' ACKs wait in the TUN queue; that happens with any window.
+ * There is no reassembly buffer and no SACK (the SYN-ACK offers MSS and window scale only), so
+ * the larger the window, the more the client resends after one loss (0.3% loss at 6 ms: 23
+ * Mbit/s and 400 TCP retransmits with 65535, 24 Mbit/s and 3000-12000 with the large window).
+ * The client's window towards us (client_room) is unaffected.
  */
 #define RCV_WND_MIN 65535u        /* what fits in the window field unscaled */
 #define RCV_SHIFT_MAX 14          /* RFC 7323, 2.3: the shift never exceeds 14 */
@@ -336,9 +339,9 @@ static void rcv_window_set(uint32_t wnd) {
 }
 
 /* The window field of a packet to the client: 65535 to a client without scaling, otherwise the
- * ceiling divided by the shift named in the SYN-ACK. Rounded up because the ceiling need not be
- * a multiple of 2^shift (it can be set as a number): rounding down, 65535 at shift 7 would
- * become 65408. */
+ * window divided by the shift named in the SYN-ACK. Rounded up because the window need not be a
+ * multiple of 2^shift (a ceiling set by number, or the dialer's limit): rounding down, a limit
+ * of 65535 at shift 7 would become 65408. */
 static uint16_t rcv_win_field(const struct conn *c) {
     /* The dialer's limit (dialer_ops.rcv_wnd_max): with DC_ACK_PACED the window must fit the
      * queue to the node, and the ceiling, chosen by machine memory, would overflow it. */
@@ -445,7 +448,8 @@ static int client_can_take_record(struct conn *c) {
  * the number of passes. The limit keeps one client's flood from starving the reads from servers. */
 #define TUN_DRAIN_MAX 64
 
-/* ALL mutable state is per loop thread (__thread).
+/* ALL connection state is per loop thread (__thread). Shared are only the spare pool and the
+ * connector queue (each under its mutex) and the node change counter (atomic).
  *
  * A shared table under a mutex would mean a lock per packet, some seven hundred per megabyte.
  * Hence the per-thread table, and hence ONE thread by default, see worker_count.
@@ -501,7 +505,7 @@ static unsigned g_nodes_epoch;
 
 void stack_nodes_changed(void) { __atomic_add_fetch(&g_nodes_epoch, 1, __ATOMIC_RELEASE); }
 
-/* One loop thread (STEER_TUN_THREADS unset): a connection missing from the table does not exist
+/* One loop thread (the device has one queue): a connection missing from the table does not exist
  * at all, and its data can be answered with RST (handle_packet). With several threads half of a
  * connection may be in another queue (see worker_count), and RST would kill a live one. */
 static int g_one_worker = 1;
@@ -688,8 +692,10 @@ static int g_trace;
  * limit is the CPU (X25519 and the handshake's AEAD), not the network wait threads overlap. */
 #define CONNECTORS 4
 #define CONNQ 32
-/* How long a connector waits for the link to the node. The same eight seconds as the node probe
- * at startup: a connection the probe would call alive must not fail here on a shorter limit. */
+/* How long a connector waits for the link to the node; also the link's read and write timeout
+ * (SO_RCVTIMEO, SO_SNDTIMEO). Eight seconds, the default of the startup probe (--timeout): a node
+ * the probe would call alive must not fail here on a shorter limit. --timeout does not change
+ * this value. */
 #define CONNECT_TIMEOUT_S 8
 
 /* ---- spare sessions ---------------------------------------------------------------------
@@ -709,7 +715,8 @@ static int g_trace;
  * request within its handshake timeout, 4 s by default. An older spare is taken as dead without
  * checking: a check costs a round trip, and opening a new session is cheaper.
  *
- * Memory: the live part of a link is ~19 KB of TLS buffers, so four spares cost up to 76 KB. */
+ * Memory: the live part of a link is ~19 KB of TLS buffers, so the default four spares cost up
+ * to 76 KB. */
 #define SPARE_MAX 8
 #define SPARE_TTL_MS 2500
 #define SPARE_EMPTY   0
@@ -962,7 +969,7 @@ static void spare_refill(void) {
  *
  * 0 — all released; -1 — a connector never reported. On -1 the table must NOT be freed: freeing
  * it under a working connector is exactly what this guards against. Leaking is the lesser evil:
- * the process is about to exit anyway. */
+ * the loop leaves only on a fatal epoll error. */
 static int connq_release(struct conn *base) {
     pthread_mutex_lock(&g_cq.mu);
     unsigned kept = 0;
@@ -995,7 +1002,8 @@ static int connq_release(struct conn *base) {
 }
 
 /* This loop thread's eventfd: a connector writes to it when a job is done. Lives from entering
- * worker_loop to leaving it; -1 if the kernel gave no eventfd — then the loop polls every 20 ms. */
+ * worker_loop to leaving it; -1 if the kernel gave no eventfd — then the loop polls every 20 ms
+ * while jobs are pending. */
 static __thread int g_conn_efd = -1;
 
 /* Queue a job for this connection; the result is connq_push's. */
@@ -1135,7 +1143,7 @@ static struct conn *conn_new(const struct tun_dev *tun) {
         static __thread time_t said;
         if (now != said && now - said >= 2) {
             said = now;
-            fprintf(stderr, LOG_W "all %d connections are busy and active, new ones "
+            fprintf(stderr, LOG_W "all %d connection slots hold active connections, new ones "
                             "are refused — too much is routed into the tunnel\n", MAX_CONNS);
         }
         return NULL;
@@ -1436,7 +1444,7 @@ static int emit_stream(void *arg, const unsigned char *p, size_t n) {
  * node per pass (DRAIN_MAX_BYTES) and time spent reading (STEER_TUN_STATS), and those numbers
  * must not depend on what parsing the protocol costs. */
 static int downstream_pump(struct conn *c, const struct tun_dev *tun) {
-    /* Static rather than on the stack: a TLS-record-sized buffer is 16 KB of stack per call. */
+    /* Static rather than on the stack: TUNNEL_BUF would be 18 KB of stack per call. */
     static __thread unsigned char buf[TUNNEL_BUF];
     size_t got = 0;
     void *s = SESS(c);
@@ -1474,7 +1482,7 @@ static int downstream_pump(struct conn *c, const struct tun_dev *tun) {
  *
  * ONE slot per loop thread, not per connection: the fragments of a datagram come back to back —
  * one stack has just cut them — so more than one unfinished reassembly at a time almost never
- * happens.
+ * happens, and a buffer per connection would cost over a megabyte per thread for nothing.
  *
  * Fragments are taken ONLY IN ORDER. Reordering between the client and the router would need
  * different queues on one LAN segment; in exchange there is no map of received pieces, and none
@@ -1578,7 +1586,7 @@ static size_t udp_defrag(const unsigned char *pkt, size_t n, unsigned char *out,
  * wrong.
  *
  * A handshake per flow is cheap: the first datagram waits for it in the early data buffer, and
- * the spare pool hands out a ready flow at once, as for a SYN.
+ * the spare pool hands out a ready link at once, as for a SYN.
  *
  * "A session per flow" is the stack's rule, not only VLESS's: the dialer gets one whole flow, so
  * a multiplexing protocol would need a different model in the stack, not just another dialer
@@ -1593,7 +1601,7 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
 
     if (!c) {
         c = conn_new(tun);
-        if (!c) return;                             /* all flows fresh: the client retries */
+        if (!c) return;                             /* nothing to evict: the datagram is lost */
         memset(c, 0, sizeof(*c));
         c->used = 1;
         c->is_udp = 1;
@@ -1601,7 +1609,7 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
         c->fd = -1;
         conn_link(c);                               /* after the key: the hash uses it */
         c->last = g_now_s;
-        /* The dialer names the refusal itself (for VLESS, an invalid node UUID). */
+        /* On failure the dialer logs the reason itself (for VLESS, an invalid node UUID). */
         if (g_dl->ops->flow_open(g_dl->ctx, SESS(c), k, 1) != 0) {
             conn_drop(c);
             return;
@@ -1619,8 +1627,8 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
             TR("UDP: job queued for a connector\n");
         } else {
             /* The connector queue is full. Say so: from outside it looks like "QUIC does not
-             * work through the tunnel", while the cause is the CPU, not the protocol. Refusal -2
-             * (no connectors) connq_push has already reported. */
+             * work through the tunnel", while the cause is the CPU, not the protocol. connq_push
+             * has already logged -2 (no connector threads). */
             static __thread time_t said_q;
             if (qr == -1 && g_now_s - said_q >= 5) {
                 said_q = g_now_s;
@@ -1803,8 +1811,8 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
          * BEFORE reading from the server: no ring, no read, and nothing is lost because nothing
          * was taken. Browsers keep dozens of connections alive without traffic (HTTP/2
          * keep-alive), and an idle one now costs only its table record. */
-        /* Protocol state on the flow (for VLESS, UUID and Vision). The dialer names the refusal
-         * itself (an invalid node UUID). */
+        /* Protocol state on the flow (for VLESS, UUID and Vision). On failure the dialer logs
+         * the reason itself (an invalid node UUID). */
         if (g_dl->ops->flow_open(g_dl->ctx, SESS(c), &k, 0) != 0) {
             conn_drop(c);
             return;
@@ -1831,7 +1839,7 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         if (qr != 0) {
             /* Queue full: the CPU cannot digest that many handshakes at once. Do not drop the
              * SYN silently: log it and free the record; the client retries the SYN itself.
-             * Refusal -2 (no connectors) connq_push has already reported. */
+             * connq_push has already logged -2 (no connector threads). */
             static __thread time_t said_q;
             time_t nw = g_now_s;
             if (qr == -1 && nw - said_q >= 5) {
@@ -2294,12 +2302,13 @@ static void *worker_loop(void *arg) {
      * returns ONLY what is ready; in exchange the set must be maintained, which is what the armed
      * field is for: epoll_ctl on a state change, not on every turn.
      *
-     * The queue MUST be closed on every exit from here. The kernel spreads flows over queues as
-     * hash % numqueues, and numqueues counts ATTACHED queues, not read ones. A descriptor left
-     * open keeps a share of the traffic going into a queue nobody reads: the connections in it
-     * silently vanish, and the same sites (the hash is stable) never open. close() detaches the
-     * queue (tun_detach in the kernel decrements numqueues), and the flows spread over the live
-     * ones; checked: after closing the second of two queues all 40 flows came to the first. */
+     * The queue MUST be closed on every exit from here. The kernel spreads flows over queues by
+     * a flow hash scaled to numqueues, and numqueues counts ATTACHED queues, not read ones. A
+     * descriptor left open keeps a share of the traffic going into a queue nobody reads: the
+     * connections in it silently vanish, and the same sites (the hash is stable) never open.
+     * close() detaches the queue (tun_detach in the kernel decrements numqueues), and the flows
+     * spread over the live ones; checked: after closing the second of two queues all 40 flows
+     * came to the first. */
     int ep = epoll_create1(0);
     if (ep < 0) {
         fprintf(stderr, LOG_W "epoll unavailable (%s) — thread not started, "
@@ -2354,8 +2363,8 @@ static void *worker_loop(void *arg) {
             else                  g_loop_ms -= (g_loop_ms - busy) / 8;
         }
 
-        /* ONE pass over the live connections per turn (see struct conn for why). It computes
-         * everything needed before the wait: the epoll set, the number of pending jobs, the
+        /* ONE pass over the live connections before the wait (see struct conn for why). It
+         * computes everything the wait needs: the epoll set, the number of pending jobs, the
          * connections with data already read, and the nearest retransmission deadline. */
         int pend = 0, forced = 0;
         /* Wait until the nearest retransmission deadline, not always a second: otherwise a
@@ -2492,9 +2501,11 @@ static void *worker_loop(void *arg) {
         for (int i = 0; i < r; i++) {
             if (evs[i].data.u32 >= (uint32_t)MAX_CONNS) continue;  /* TUN and eventfd */
             struct conn *c = &g_conns[evs[i].data.u32];
-            /* The slot may have been freed in this same turn (a FIN or RST from the client) and
-             * even given to a new connection. A new one is always pending, so these two checks
-             * cover it; otherwise we would reach into a session a connector is filling now. */
+            /* The slot may have been freed in this same turn (an RST from the client, a failed
+             * send, an eviction) and even given to a new connection: conn_new hands out the most
+             * recently freed slot first. These checks skip a free slot and a new connection
+             * waiting for its connector, whose session must not be touched. A new connection
+             * that took a spare session is NOT pending and gets the old connection's event. */
             if (!c->used || c->pending) continue;
             /* The queue to the node has room: the held ACK can go (flush_acks below rechecks
              * readiness itself). Writability alone means nothing to read, so skip the read. */
@@ -2646,8 +2657,8 @@ int stack_run(const struct tun_cfg *tc, const struct dialer *d, stack_ready_fn r
     char desc[512];
     d->ops->describe(d->ctx, desc, sizeof(desc));
     fprintf(stderr, LOG_I "%s -> %s\n", dev, desc);
-    /* Always printed: without offload or a second queue the speed drops several times, and what
-     * we got must be known before measuring, not after. */
+    /* Always printed: without offload the speed drops several times, and what we got (offload,
+     * threads) must be known before measuring, not after. */
     fprintf(stderr, LOG_I "write offload on %s %s; threads %d of %d requested\n",
             dev, queues[0].gso ? "enabled (segments up to 16 KB, checksums by the kernel)"
                                : "UNAVAILABLE — 1460-byte segments, checksums computed here",
@@ -2655,7 +2666,7 @@ int stack_run(const struct tun_cfg *tc, const struct dialer *d, stack_ready_fn r
     fprintf(stderr, LOG_I "spare sessions to the node: %d (STEER_TUN_SPARES)\n", g_spare_want);
     if (n < want)
         fprintf(stderr, LOG_W "fewer queues than requested — the kernel lacks "
-                        "IFF_MULTI_QUEUE, running one thread\n");
+                        "IFF_MULTI_QUEUE or gave no more; one thread per queue\n");
 
     /* Threads two to last are separate; the first runs in this one. So the process stays what it
      * is for its supervisor: when the loop ends, the process ends. */

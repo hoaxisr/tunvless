@@ -4,8 +4,8 @@
  * The kernel hands us whole IP packets, not connections; stack.c rebuilds the connections and
  * carries each over its own VLESS flow. What is carried:
  *   TCP  — a VLESS flow per connection, with its state tracked;
- *   UDP  — a VLESS flow per address-port pair, datagrams with a 2-byte length (VLESS cmd=2);
- *          QUIC and WireGuard go this way;
+ *   UDP  — a VLESS flow per address-port pair, datagrams with a 2-byte length (VLESS command 2),
+ *          or XUDP frames for a node with Vision (vldial.c); QUIC and WireGuard go this way;
  *   ICMP — not carried: ping through a proxy needs emulation, which only helps diagnostics and
  *          misleads (a ping that answers does not mean the path works).
  */
@@ -188,7 +188,7 @@ int tun_open(struct tun_dev *d, int max_queues, const char *name) {
     }
     if (g_open_stage == 3) {
         fprintf(stderr, "tunvless[warn] tunnel: the kernel created the device under another name: "
-                "asked %s, got %s%s\n", name, g_open_got,
+                "asked for %s, got %s%s\n", name, g_open_got,
                 strlen(name) >= IFNAMSIZ
                     ? " — longer than the kernel's limit (IFNAMSIZ, 15 characters)" : "");
         return TUN_ESETUP;

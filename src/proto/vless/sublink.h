@@ -20,6 +20,7 @@
 int sl_host_leads_nowhere(const char *h);
 /* A name (1) or an IPv4/IPv6 address (0), judged by the string, without resolving. */
 int sl_host_is_name(const char *h);
+/* Percent-decoding in place; "%" not followed by two hex digits stays as it is. */
 void sl_pct_decode(char *s);
 void sl_set_field(char *dst, size_t n, const char *src, size_t len);
 /* A percent-encoded field: decode first, then cut to the field size. */
@@ -31,7 +32,7 @@ void sl_set_name(char *dst, size_t n, const char *src);
 /* Port from a string of digits: 1..65535, else 0. */
 uint16_t sl_port_of(const char *s);
 /* UUID (16 bytes) from 32 hex digits, hyphens optional. 0 — parsed, -1 — not a UUID. Unlike
- * vless_uuid_form, a short string is not hashed into a UUID. */
+ * vless_uuid_parse, a short string is not hashed into a UUID. */
 int sl_uuid_parse(const char *s, unsigned char out[16]);
 /* 1, true, yes — on. */
 int sl_truthy(const char *v);
@@ -42,7 +43,8 @@ char *sl_param_dup(const char *v, size_t vlen);
 
 /* Markers of bad values: compared by address, so there is one of each per process. */
 extern const char SL_BAD_PQV[], SL_FULL[], SL_BAD_PIN[], SL_BAD_ECH[], SL_ECH_DNS[];
-/* Shared table of long strings (pqv, encryption, fingerprints): equal values share one copy. */
+/* Shared table of long strings (pqv, encryption, pins, vcn, ech): equal values share one copy.
+ * Bounded: when it is full (or memory runs out), SL_FULL is returned. */
 const char *sl_intern(const char *v, size_t n);
 void sl_set_pqv(struct vless_node *n, const char *v);
 void sl_add_pins(struct vless_node *n, const char *v, int spki);
@@ -69,10 +71,10 @@ int sl_link_param(struct vless_node *n, const char *k, size_t klen, const char *
 
 /* Whether the node's transport and security are usable, in two halves; between them the protocol
  * checks its own fields (VLESS: the id), which sets the order in which reasons are reported.
- * 0 — usable, 1 — not (reason in skip_reason). pre: values that did not parse (pqv, fingerprints,
- * ech), tcp headerType=http, xhttp obfuscation, certificate checks and allowInsecure. post:
- * security, tls without sni, reality without pbk, the transport and its path, an address with
- * nobody to answer, the xhttp mode. */
+ * 0 — usable, 1 — not (reason in skip_reason). pre: values that did not parse (pqv, pins, ech) or
+ * did not fit the table, tcp headerType=http, xhttp obfuscation, certificate checks and
+ * allowInsecure. post: security, tls without sni, reality without pbk, the transport and its path,
+ * an address with nobody to answer, the xhttp mode. */
 int sl_link_usable_pre(struct vless_node *n);
 int sl_link_usable_post(struct vless_node *n);
 
@@ -83,9 +85,8 @@ void sl_skip_note(struct vless_sub_stats *st, const struct vless_node *n, const 
 
 /* ---- the node as the transport sees it ------------------------------------------------------- */
 
-/* Pointers into the node, no copies. Certificate checks apply only to security=tls: for reality
- * these fields mean nothing. Inline here, not in sublink.c, so that the subscription parser (tests
- * without the transport) does not pull in transport.c. */
+/* Pointers into the node, no copies: the node must outlive t. Certificate checks apply only to
+ * security=tls: for reality these fields mean nothing. */
 static inline void sl_tr_node(const struct vless_node *n, struct tr_node *t) {
     t->host = n->host;
     t->port = n->port;
