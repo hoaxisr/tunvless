@@ -44,13 +44,16 @@ jobs:
       matrix:
         include:
           - arch: aarch64
+            libc: arm64
             skip: ""
           - arch: mipsel
+            libc: mipsel
             skip: ""
           # Big-endian, like Entware's mips-3.4. qemu-user truncates TCP_INFO to an int and
           # byte-swaps it on big-endian guests, so tunnelmatch's node-abort checks (which read
           # tcpi_state) cannot pass under qemu-mips; on a real kernel they do.
           - arch: mips
+            libc: mips
             skip: tunnelmatch
     steps:
       - uses: actions/checkout@v5
@@ -58,7 +61,8 @@ jobs:
       - name: Install the cross toolchain and qemu
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-${{ matrix.arch }}-linux-gnu qemu-user
+          sudo apt-get install -y --no-install-recommends gcc-${{ matrix.arch }}-linux-gnu \
+            libc6-dev-${{ matrix.libc }}-cross qemu-user
 
       - name: Fetch wolfSSL
         run: make fetch
@@ -76,6 +80,7 @@ jobs:
         run: |
           set -eu
           tests="h2match xhupmatch wsmatch b3match visionmatch submatch subpq tungromatch tunnelmatch \
+                 rtxmatch grpcmatch \
                  scryptomatch hellofreeze echmatch vlessmatch takematch"
           run=""
           for t in $tests; do
