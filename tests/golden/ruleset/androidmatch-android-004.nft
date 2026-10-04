@@ -1,3 +1,0 @@
-# args: apply --dry-run --spec TMP/zf.json --state-dir TMP/state
-# exit: 2
-# stderr: steer: outputs.vpn: on_fail zapret — на телефоне zapret нет (want drop or direct)

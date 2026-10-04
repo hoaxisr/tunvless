@@ -1,19 +1,20 @@
 #!/bin/sh
-# Выпустить тестовую PKI для tests/scryptomatch.c и напечатать tests/scrypto-pki.h.
+# Issue the test PKI for tests/scryptomatch.c and print tests/scrypto-pki.h.
 #
 #     sh tests/scrypto-pki.sh > tests/scrypto-pki.h
 #
-# Сертификаты и подписи выпускает OpenSSL, а проверяет их wolfSSL за слоем scrypto: так стенд
-# ловит ошибку и в нашем вызове библиотеки, и в самой библиотеке, а не сверяет её с собой же.
-# Ключи новые на каждый запуск — поэтому перевыпуск только целиком, скриптом, а не руками.
+# OpenSSL issues the certificates and signatures, and wolfSSL behind the scrypto layer checks them:
+# the test catches a mistake both in our use of the library and in the library itself, instead of
+# checking the library against itself. Keys are new on every run, so the file is only ever
+# regenerated whole by this script, never edited by hand.
 #
-# Состав: корень (EC P-256) → промежуточный (RSA 2048, pathlen 0) → листья: EC P-256 с SAN
-# good.example, *.wild.example и IP 192.0.2.7; RSA 2048 с SAN rsa.example (подписи PKCS#1 v1.5 и
-# PSS с солью 32, 20 и 0); P-384 прямо под корнем; «поддельный CA» — лист без признака CA, которым
-# подписан ещё один лист (цепочка через него обязана не сойтись); истёкший лист (2020-2021);
-# посторонний корень. Срок остальных — 30 лет от выпуска.
+# Contents: root (EC P-256) -> intermediate (RSA 2048, pathlen 0) -> leaves: EC P-256 with SAN
+# good.example, *.wild.example and IP 192.0.2.7; RSA 2048 with SAN rsa.example (PKCS#1 v1.5
+# signature and PSS with salt 32, 20 and 0); P-384 directly under the root; a "fake CA", a leaf
+# without the CA flag that signs another leaf (a chain through it must fail); an expired leaf
+# (2020-2021); an unrelated root. The rest are valid for 30 years from issue.
 set -eu
-command -v openssl >/dev/null || { echo "нужен openssl" >&2; exit 2; }
+command -v openssl >/dev/null || { echo "scrypto-pki: needs openssl" >&2; exit 2; }
 W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 cd "$W"
@@ -45,7 +46,7 @@ q openssl req -x509 -new -key other.key -sha256 -days $D -subj "/CN=steer other 
 q openssl genrsa -out inter.key 2048
 q openssl req -new -key inter.key -subj "/CN=steer test intermediate" -config ext.cnf -out inter.csr
 q openssl x509 -req -in inter.csr -CA root.pem -CAkey root.key -set_serial 2 -sha256 -days $D -extfile ext.cnf -extensions inter -out inter.pem
-leaf() { # имя секция издатель серийный
+leaf() { # name extension-section issuer serial
     q openssl req -new -key "$1.key" -subj "/CN=$1" -config ext.cnf -out "$1.csr"
     q openssl x509 -req -in "$1.csr" -CA "$3.pem" -CAkey "$3.key" -set_serial "$4" -sha256 -days $D \
         -extfile ext.cnf -extensions "$2" -out "$1.pem"
@@ -70,8 +71,8 @@ q openssl dgst -sha256 -sign rsaleaf.key -sigopt rsa_padding_mode:pss -sigopt rs
 q openssl dgst -sha384 -sign rsaleaf.key -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:20 -out s.pss384s20 msg
 q openssl dgst -sha256 -sign rsaleaf.key -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:0 -out s.pss256s0 msg
 
-echo "/* Тестовая PKI для tests/scryptomatch.c. СГЕНЕРИРОВАН: sh tests/scrypto-pki.sh > tests/scrypto-pki.h"
-echo " * ($(openssl version | cut -d' ' -f1-2), $(date -u +%Y-%m-%d)). Руками не править — только перевыпуск целиком. */"
+echo "/* Test PKI for tests/scryptomatch.c: sh tests/scrypto-pki.sh > tests/scrypto-pki.h"
+echo " * ($(openssl version | cut -d' ' -f1-2), $(date -u +%Y-%m-%d)). Generated; do not edit by hand, regenerate it whole. */"
 echo "#ifndef STEER_TESTS_SCRYPTO_PKI_H"
 echo "#define STEER_TESTS_SCRYPTO_PKI_H"
 for c in root inter leaf rsaleaf p384 fakeca fakeleaf expired other; do

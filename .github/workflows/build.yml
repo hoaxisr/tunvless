@@ -1,0 +1,179 @@
+name: Build Entware packages
+
+# Packages are built the way hoaxisr/firc builds its own: the prebuilt Entware SDK
+# (GCC 8.4, glibc 2.27) selected by ownik/gh-action-entware-sdk compiles a temporary feed package
+# (entware/Makefile) from a source tarball made here. The tarball carries the wolfSSL sources,
+# fetched and checksum-verified by build/wolfssl/fetch.sh, so the SDK build needs no network.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: >-
+          Existing release tag to rebuild and attach the packages to. Leave empty to attach
+          them to the run as artifacts instead.
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build package (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Entware package architectures: opkg on the router names its own in /opt/etc/opkg.conf.
+        arch: [aarch64-3.10, mipsel-3.4, mips-3.4]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Prepare the feed
+        id: feed
+        run: |
+          set -eu
+          version=$(cat VERSION)
+          release=1
+          make fetch WOLFSSL_SRC=third_party/wolfssl
+
+          feed_dir="${RUNNER_TEMP}/tunvless-feed-${{ matrix.arch }}"
+          artifacts_dir="${RUNNER_TEMP}/tunvless-artifacts-${{ matrix.arch }}"
+          mkdir -p "$feed_dir/tunvless" "$artifacts_dir"
+          cp entware/Makefile "$feed_dir/tunvless/Makefile"
+          {
+            printf 'TUNVLESS_VERSION:=%s\n' "$version"
+            printf 'TUNVLESS_RELEASE:=%s\n' "$release"
+            printf 'TUNVLESS_TARGET:=%s\n' "${{ matrix.arch }}"
+          } > "$feed_dir/tunvless/version.mk"
+          tar -czf "$feed_dir/tunvless/tunvless-source.tar.gz" \
+            --transform "s,^,tunvless-${version}/," \
+            LICENSE VERSION Makefile build src entware third_party/wolfssl
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "feed_dir=$feed_dir" >> "$GITHUB_OUTPUT"
+          echo "artifacts_dir=$artifacts_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Build with the Entware SDK
+        id: sdk
+        continue-on-error: true
+        # v1, pinned to the commit hoaxisr/firc verified, not to a mutable tag.
+        uses: ownik/gh-action-entware-sdk@003ddc33bb3b12a2f96e0c4689c56351614cf01a
+        env:
+          ARCH: ${{ matrix.arch }}
+          ARTIFACTS_DIR: ${{ steps.feed.outputs.artifacts_dir }}
+          BUILD_LOG: 1
+          FEED_DIR: ${{ steps.feed.outputs.feed_dir }}
+          PACKAGES: tunvless
+          V: s
+
+      - name: Report an SDK build failure
+        if: steps.sdk.outcome == 'failure'
+        run: |
+          log_root="${{ steps.feed.outputs.artifacts_dir }}/logs"
+          if [ -d "$log_root" ]; then
+            find "$log_root" -type f -print0 | sort -z | while IFS= read -r -d '' log; do
+              if grep -qE 'make\[[0-9]+\]: \*\*\*|(^|: )(fatal )?error:|undefined reference|No rule to make target' "$log"; then
+                echo "==> $log <=="
+                tail -n 60 "$log"
+              fi
+            done
+          else
+            echo "The SDK build failed and left no logs."
+          fi
+          exit 1
+
+      - name: Collect and verify the package
+        id: package
+        run: |
+          set -eu
+          mapfile -t found < <(find "${{ steps.feed.outputs.artifacts_dir }}" -type f -name 'tunvless_*.ipk' | sort)
+          if [ "${#found[@]}" -ne 1 ]; then
+            echo "Expected exactly one tunvless IPK, found ${#found[@]}" >&2
+            printf '%s\n' "${found[@]}" >&2
+            exit 1
+          fi
+          mkdir -p .build
+          package=".build/tunvless_${{ steps.feed.outputs.version }}-${{ steps.feed.outputs.release }}_entware_${{ matrix.arch }}.ipk"
+          cp "${found[0]}" "$package"
+
+          # An ipk is an ar archive or (ipkg-build) a tar.gz; one extractor for both.
+          ipk_member() {
+            if ar t "$1" >/dev/null 2>&1; then
+              ar p "$1" "$2"
+            else
+              member=$(tar -tf "$1" | awk -v m="$2" '$0 == m || $0 == "./" m { print; exit }')
+              [ -n "$member" ] || { echo "No $2 in $1" >&2; return 1; }
+              tar -xOf "$1" "$member"
+            fi
+          }
+          data=$(mktemp)
+          binary=$(mktemp)
+          ipk_member "$package" data.tar.gz > "$data"
+          payload=$(tar -tzf "$data")
+          for f in opt/bin/tunvless opt/etc/init.d/S99tunvless opt/etc/tunvless/tunvless.conf; do
+            echo "$payload" | grep -Eq "^(\./)?$f\$" || { echo "data.tar.gz has no $f" >&2; exit 1; }
+          done
+          member=$(echo "$payload" | grep -E '^(\./)?opt/bin/tunvless$')
+          tar -xzOf "$data" "$member" > "$binary"
+
+          readelf -h "$binary"
+          readelf -l "$binary" | grep -i interpreter
+          case "${{ matrix.arch }}" in
+            aarch64-*)
+              readelf -h "$binary" | grep -Eq 'Machine:.*AArch64'
+              readelf -h "$binary" | grep -Eq 'Data:.*little endian'
+              readelf -l "$binary" | grep -F '/opt/lib/ld-linux-aarch64.so.1'
+              ;;
+            mipsel-*)
+              readelf -h "$binary" | grep -Eq 'Machine:.*MIPS'
+              readelf -h "$binary" | grep -Eq 'Data:.*little endian'
+              readelf -l "$binary" | grep -F '/opt/lib/ld.so.1'
+              ;;
+            mips-*)
+              readelf -h "$binary" | grep -Eq 'Machine:.*MIPS'
+              readelf -h "$binary" | grep -Eq 'Data:.*big endian'
+              readelf -l "$binary" | grep -F '/opt/lib/ld.so.1'
+              ;;
+            *)
+              echo "no ELF check for ${{ matrix.arch }}: add one before adding the target" >&2
+              exit 1
+              ;;
+          esac
+          strings "$binary" | grep -qx "${{ steps.feed.outputs.version }}" \
+            || { echo "the binary does not carry version ${{ steps.feed.outputs.version }}" >&2; exit 1; }
+
+          echo "path=$package" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$package")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the package as an artifact
+        if: ${{ github.event.release.tag_name == '' && inputs.release_tag == '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Attach the package to the release
+        if: ${{ github.event.release.tag_name != '' || inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          gh release upload "$RELEASE_TAG" "${{ steps.package.outputs.path }}" \
+            --repo "$GITHUB_REPOSITORY" --clobber

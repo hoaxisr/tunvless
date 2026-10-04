@@ -1,74 +1,69 @@
-/* Рукопожатие Reality: ClientHello, неотличимый от браузерного, с аутентификатором в
- * session_id. Подробное объяснение механики — в reality.c. */
+/* Reality handshake: a ClientHello indistinguishable from a browser's, with an authenticator in
+ * session_id. The mechanics are explained in reality.c. */
 #ifndef STEER_REALITY_H
 #define STEER_REALITY_H
 #include <stdint.h>
 #include <stddef.h>
 
-#define REALITY_EBADKEY (-2)   /* pbk или sid не разобрались */
-#define REALITY_ECRYPTO (-3)   /* сбой примитива или источника случайности */
-#define REALITY_ETOOBIG (-4)   /* Hello не влез в буфер */
+#define REALITY_EBADKEY (-2)   /* pbk or sid does not parse */
+#define REALITY_ECRYPTO (-3)   /* a primitive or the random source failed */
+#define REALITY_ETOOBIG (-4)   /* the Hello does not fit the buffer */
 
-/* X25519MLKEM768 — постквантовый обмен, который современный Chrome предлагает ПЕРВЫМ. Его ключ на
- * проводе занимает 1184 байта ML-KEM плюс 32 байта X25519. */
+/* X25519MLKEM768: the post-quantum exchange current Chrome offers FIRST. Its share on the wire is
+ * 1184 bytes of ML-KEM plus 32 bytes of X25519. */
 #define REALITY_GROUP_MLKEM 0x11EC
 #define REALITY_MLKEM_SHARE 1216
 
 struct reality_cfg {
-    const char *sni;   /* маскировочный домен: он же SNI, он же соль для authkey */
-    const char *pbk;   /* публичный ключ сервера, base64url */
-    const char *sid;   /* short id, hex; может быть пустым */
-    const char *fp;    /* отпечаток браузера — пока влияет только на набор расширений */
-    /* Протокол для ALPN, или NULL — тогда расширения нет вовсе.
-     *
-     * NULL по умолчанию не из лени: Hello без ALPN проверен на живых узлах и работает, а
-     * состав Hello — это то, по чему Reality отличает нас от постороннего. Добавлять
-     * расширение туда, где оно не нужно, значит менять проверенное ради ничего. Оно нужно
-     * ровно транспортам grpc и xhttp: они говорят по HTTP/2, и согласовать его можно
-     * только здесь. */
+    const char *sni;   /* SNI: the camouflage domain (Reality) or the server name (plain);
+                        * "" sends no server_name extension at all */
+    const char *pbk;   /* server public key, base64url */
+    const char *sid;   /* short id, hex; may be empty */
+    const char *fp;    /* browser fingerprint; not read: the Hello always looks like Chrome */
+    /* The ALPN protocol the transport needs, or NULL. Not read by the builder: the Hello always
+     * offers "h2, http/1.1" like Chrome, or http/1.1 alone via reality_carrier.alpn_http11. */
     const char *alpn;
 
-    /* ОБЫЧНЫЙ TLS, БЕЗ REALITY (security=tls).
+    /* PLAIN TLS, NO REALITY (security=tls).
      *
-     * Тот же самый ClientHello — с обликом Chrome, с GREASE, с постквантовым ключом, — но
-     * без аутентификатора: session_id заполняется случайными байтами, как у браузера, и pbk
-     * не нужен вовсе. Отдельным сборщиком это делать нельзя по той же причине, по которой
-     * его не завели для xsteer: облик браузера обязан жить в ОДНОМ месте, иначе две копии
-     * однажды разойдутся, а симптомом будет не ошибка сборки, а узел, который перестал
-     * работать без видимой причины.
+     * The same ClientHello (Chrome's look, GREASE, the post-quantum share) without the
+     * authenticator: session_id is random bytes, as a browser's, and pbk is not needed. There is
+     * no separate builder because the browser look must live in ONE place: two copies drift
+     * apart, and the symptom is not a build error but a node that stops working for no visible
+     * reason.
      *
-     * Признак явный, а не «pbk пуст»: опечатка в ключе не должна молча превращать Reality в
-     * обычный TLS — это тихое понижение защиты, которое снаружи выглядит как рабочий узел. */
+     * An explicit flag rather than "pbk is empty": a typo in the key must not silently turn
+     * Reality into plain TLS, a downgrade that looks like a working node. */
     int plain;
 
-    /* НАСТОЯЩИЙ постквантовый обмен X25519MLKEM768 (паритет с uTLS HelloChrome_131+ и Go 1.24+, которыми
-     * пользуется Xray-core).
+    /* A REAL X25519MLKEM768 exchange, like uTLS HelloChrome_131 and later and Go 1.24+ (which
+     * Xray-core uses).
      *
-     * Отличие от carrier.pq: там 1216 байт случайного шума, «для размера», а здесь — ключ ML-KEM-768,
-     * сделанный по-настоящему (sc_mlkem768_keygen), и X25519-половина того же общего ключа, что и отдельный
-     * X25519-share. Сервер Reality на Go ≥ 1.24 выбирает гибрид сам, если клиент его предложил, и тогда в
-     * ServerHello приезжает шифротекст (1088) и его X25519-половина (32), а секрет расписания ключей —
-     * mlkem_ss ‖ x25519_ss (draft-ietf-tls-ecdhe-mlkem: ML-KEM первым). Приватная половина ML-KEM лежит в
-     * reality_state.mlkem_dk и уезжает в tls13_auth.mlkem_dk. С шумом вместо ключа такой сервер отвечал
-     * бы отказом (Go проверяет ключ) — поэтому шум остаётся только у xsteer, чей хаб гибрид не выбирает. */
+     * Unlike carrier.pq (1216 bytes of random noise, for size only), this is a real ML-KEM-768
+     * key (sc_mlkem768_keygen) plus an X25519 half that is the same key as the separate X25519
+     * share. A Reality server on Go >= 1.24 picks the hybrid when offered; ServerHello then
+     * carries the ciphertext (1088) and its X25519 half (32), and the key schedule secret is
+     * mlkem_ss ‖ x25519_ss (draft-ietf-tls-ecdhe-mlkem: ML-KEM first). The ML-KEM private key
+     * goes to reality_state.mlkem_dk and on to tls13_auth.mlkem_dk. Such a server rejects noise
+     * in place of the key (Go validates it), so carrier.pq cannot replace this. */
     int pq;
 };
 
 struct reality_state {
-    unsigned char priv[32];        /* наш эфемерный приватный */
-    unsigned char pub[32];         /* он же публичный — уезжает в key_share */
-    unsigned char shared[32];      /* общий секрет с сервером */
-    unsigned char session_id[32];  /* аутентификатор, он же legacy_session_id */
+    unsigned char priv[32];        /* our ephemeral private key */
+    unsigned char pub[32];         /* its public half, sent in key_share */
+    unsigned char shared[32];      /* secret shared with the server's static key (pbk) */
+    unsigned char session_id[32];  /* sent as legacy_session_id: the authenticator, or random
+                                    * bytes when plain */
 
-    /* Ключ аутентификатора: HKDF-SHA256(ikm = общий секрет, salt = Random[0..20),
-     * info = "REALITY"). Тем же ключом сервер ПОДПИСЫВАЕТ свой временный сертификат, и
-     * этим доказывает подлинность НАМ — см. tls13_handshake_auth и reality.go в Xray.
-     * Поэтому он не остаётся внутри сборщика Hello, как раньше, а живёт до конца
-     * рукопожатия. Нулевой при plain: у обычного TLS его не существует. */
+    /* Authenticator key: HKDF-SHA256(ikm = shared secret, salt = Random[0..20),
+     * info = "REALITY"). The server SIGNS its temporary certificate with the same key, which is
+     * how it proves itself to us (tls13_handshake_auth; reality.go in Xray). So it lives until
+     * the end of the handshake. Not set when plain or when a carrier fills session_id. */
     unsigned char authkey[32];
 
-    /* Закрытый ключ ML-KEM-768 (FIPS 203, 2400 байт) для декапсуляции ответа сервера; заполнен, только
-     * если cfg.pq. Живёт на стеке соединителя, как и priv, и нужен до конца рукопожатия. */
+    /* ML-KEM-768 private key (FIPS 203, 2400 bytes) to decapsulate the server's answer; set
+     * only with cfg.pq. Like priv, it lives on the caller's stack until the handshake ends. */
     unsigned char mlkem_dk[2400];
     int pq;
 };
@@ -76,70 +71,55 @@ struct reality_state {
 int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
                         unsigned char *out, size_t out_n, size_t *out_len);
 
-/* Носитель чужого рукопожатия внутри того же ClientHello.
+/* Variations of the same ClientHello for callers that need a different payload or ALPN.
  *
- * ЗАЧЕМ ЭТО ЗДЕСЬ, А НЕ ОТДЕЛЬНЫМ СБОРЩИКОМ. Протоколу xsteer (см. xshake.c) нужен Hello
- * с обликом Chrome, но со своей полезной нагрузкой в двух полях: свой эфемерный ключ в
- * key_share, свой аутентификатор в session_id и запечатанный статический ключ в набивке
- * фальшивого ECH. Скопировать для этого сборщик Hello значило бы завести ВТОРОЕ место, где
- * живёт отпечаток браузера, — и однажды они разъедутся, причём симптомом будет не ошибка, а
- * сервер Reality, молча отвечающий маскировочным сайтом. Поэтому сборщик один, а различия
- * выражены тремя необязательными полями.
+ * They are optional fields of the one builder, not a second builder: the browser fingerprint
+ * must live in ONE place, or two copies drift apart, and the symptom is not an error but a
+ * Reality server silently answering with its camouflage site.
  *
- * Байты Hello при car == NULL не меняются ни на бит: это закреплено стендом
- * tests/hellofreeze.c, который сверяет их с заморозкой, снятой ДО появления носителя.
+ * The Hello with car == NULL is pinned byte for byte by tests/hellofreeze.c; a field left at
+ * zero does not change it.
  *
- * Порядок вызова обратных функций не случаен и важен для обеих сторон: сначала fill_ech
- * (набивка входит в подписываемые байты), потом fill_sid (подписывает весь Hello с
- * обнулённым session_id). Тот же порядок повторяет хаб, разбирая полученное. */
+ * Callback order matters to both sides: fill_ech first (the padding is part of the signed
+ * bytes), then fill_sid (it signs the whole Hello with session_id zeroed). The peer checks in
+ * the same order. */
 struct reality_carrier {
-    /* Готовая эфемерная пара вместо сгенерированной. Нужна потому, что xsteer выводит из
-     * неё общий секрет ЕЩЁ ДО сборки Hello — чтобы было чем запечатать статический ключ. */
-    const unsigned char *priv;      /* 32 байта, или NULL */
-    const unsigned char *pub;       /* 32 байта, обязателен вместе с priv */
-    /* Предлагать ли постквантовый обмен X25519MLKEM768 в key_share.
+    /* A ready ephemeral pair instead of a generated one, for a caller that needs the shared
+     * secret BEFORE the Hello is built (to seal data into the ECH padding). */
+    const unsigned char *priv;      /* 32 bytes, or NULL */
+    const unsigned char *pub;       /* 32 bytes, required with priv */
+    /* Offer X25519MLKEM768 in key_share, filled with random noise instead of a key.
      *
-     * Нужно xsteer и только ему. Сравнение с настоящим трафиком (стенд tests/xhttp-compare.sh в
-     * репозитории xsteer) показало: у современного Chrome ClientHello занимает около 1760 байт и
-     * уезжает ДВУМЯ сегментами — именно из-за постквантового ключа, который занимает 1216 байт. Наши
-     * 537 байт в одном сегменте опознаются и по размеру, и по числу сегментов, и по составу
-     * supported_groups: «Chrome, который не предлагает постквантовый обмен» — это Chrome позапрошлого
-     * года.
+     * Current Chrome's ClientHello is about 1760 bytes and goes out in TWO segments because of
+     * the 1216-byte post-quantum share. A Hello of about 540 bytes in one segment stands out by
+     * size, by segment count and by supported_groups: "Chrome that offers no post-quantum
+     * exchange" is an outdated Chrome.
      *
-     * Клиент VLESS этого НЕ включает, и не по забывчивости: его Hello заморожен побайтово
-     * (tests/hellofreeze.c) и сверен с живыми узлами Reality, а менять проверенное ради ничего в этом
-     * файле запрещено его же шапкой. Байты при pq == 0 не меняются ни на бит. */
+     * Only for a peer that never picks the hybrid; the VLESS client uses reality_cfg.pq. */
     int pq;
-    /* Предлагать в ALPN ТОЛЬКО http/1.1 вместо обычной пары «h2, http/1.1».
+    /* Offer ONLY http/1.1 in ALPN instead of the usual "h2, http/1.1"; used by ws and
+     * httpupgrade, as Xray does (its UConn.WebsocketHandshakeContext over uTLS).
      *
-     * Нужно мосту Telegram (tgws) и только ему. Пара с h2 впереди — это то, что шлёт
-     * браузер, и менять её по умолчанию нельзя; но точка веб-сокета за Cloudflare, увидев
-     * h2, его и выбирает, а дальше наш апгрейд по HTTP/1.1 для неё мусор: снято пробой —
-     * узел присылал преамбулу HTTP/2 до нашего запроса и закрывал соединение. Апгрейд
-     * веб-сокета поверх HTTP/2 существует (RFC 8441), но это отдельный протокол ради того
-     * же результата.
-     *
-     * Байты Hello при alpn_http11 == 0 не меняются ни на бит — это закреплено
-     * tests/hellofreeze.c. */
+     * With h2 offered first, a WebSocket endpoint (e.g. behind Cloudflare) picks h2, and our
+     * HTTP/1.1 Upgrade is garbage to it: the node sent an HTTP/2 preface before our request and
+     * closed the connection. WebSocket over HTTP/2 exists (RFC 8441), but it is a separate
+     * protocol for the same result. */
     int alpn_http11;
-    /* Не посылать application_settings (ALPS, 0x44cd).
+    /* Do not send application_settings (ALPS, 0x44cd).
      *
-     * Нужно DoH по HTTP/2 к серверам Google (dns.google) и только ему. Расширение объявляет, что
-     * клиент готов отправить настройки приложения; сервер, выбравший h2, принимает предложение и
-     * ждёт от клиента свой блок ALPS в EncryptedExtensions. Браузер его шлёт, наш клиент — нет, и
-     * рукопожатие, дошедшее до конца, кончалось фатальным оповещением unexpected_message (10) на
-     * первое чтение — без единого кадра HTTP/2. Cloudflare и Quad9 ALPS не принимают и этого не
-     * замечали. Без расширения сервер ничего не ждёт.
-     *
-     * Байты Hello при no_alps == 0 не меняются ни на бит. */
+     * The extension says the client is ready to send application settings. A server that picks
+     * h2 and accepts ALPS (Google's, e.g. dns.google) then expects the client's own
+     * EncryptedExtensions with its ALPS block before the client Finished. A browser sends it,
+     * tls13.c does not, so a completed handshake ended in a fatal unexpected_message alert (10)
+     * on the first read, before any HTTP/2 frame. Cloudflare and Quad9 do not accept ALPS.
+     * Without the extension the server expects nothing. */
     int no_alps;
-    /* Заполнить набивку ECH (176 байт). NULL — оставить случайный шум, как у браузера без
-     * настроенного ECH. */
+    /* Fill the ECH padding (176 bytes). NULL leaves random noise, as a browser without an ECH
+     * config sends. */
     int (*fill_ech)(void *ctx, unsigned char *ech, size_t ech_n,
                     const unsigned char shared[32]);
-    /* Заполнить 32 байта session_id вместо аутентификатора Reality. hs — сообщение
-     * рукопожатия с УЖЕ ОБНУЛЁННЫМ session_id, то есть ровно те байты, которые вторая
-     * сторона сможет восстановить у себя. */
+    /* Fill the 32 bytes of session_id instead of the Reality authenticator. hs is the handshake
+     * message with session_id ALREADY ZEROED: exactly the bytes the peer can rebuild. */
     int (*fill_sid)(void *ctx, unsigned char sid[32],
                     const unsigned char *hs, size_t hs_n,
                     const unsigned char shared[32]);
@@ -150,15 +130,15 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
                               const struct reality_carrier *car,
                               unsigned char *out, size_t out_n, size_t *out_len);
 
-/* Примитивы этого файла наружу — для xsteer (src/proto/xsteer/xshake.c). Объяснение, почему обёртки,
- * а не копии, стоит у их определений в reality.c. */
+/* Primitives of reality.c for tls13.c, ech.c, trsec.c and trvenc.c (VLESS encryption). They are
+ * wrappers, not copies; see their definitions in reality.c. */
 int xc_random(unsigned char *out, size_t n);
-/* base64url (с выравниванием или без) в байты; длина результата либо -1. Для ключей узла (pqv). */
+/* base64url (padded or not) to bytes; returns the length or -1. For node keys (pqv, VLESS
+ * encryption keys). */
 int xc_b64url_decode(const char *in, unsigned char *out, size_t out_n);
 int xc_cpu_has_aes(void);
 int xc_x25519_keypair(unsigned char priv[32], unsigned char pub[32]);
 int xc_x25519_public(const unsigned char priv[32], unsigned char pub[32]);
-/* Общий секрет X25519. Живёт здесь же и уже объявлена в tls13.c, но xsteer зовёт её тоже. */
 int x25519_shared_ext(const unsigned char priv[32], const unsigned char peer[32],
                       unsigned char out[32]);
 

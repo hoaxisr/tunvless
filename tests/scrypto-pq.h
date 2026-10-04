@@ -1,11 +1,11 @@
-/* Векторы постквантового слоя (ML-KEM-768 и ML-DSA-65), снятые программой на Go с теми же библиотеками,
- * что у Xray-core: crypto/mlkem (Go 1.27) и github.com/cloudflare/circl v1.6.5 (mldsa65).
+/* Post-quantum vectors (ML-KEM-768 and ML-DSA-65) for tests/scryptomatch.c, taken by a Go program
+ * with the libraries Xray-core uses: crypto/mlkem (Go 1.27) and github.com/cloudflare/circl v1.6.5
+ * (mldsa65).
  *
- * KEM_SEED (d||z) → KEM_EK — детерминированный вывод ключа; KEM_CT/KEM_SS — то, что вернула Go
- * при инкапсуляции к этому ключу (случайность Go не задаётся, поэтому пара сохранена как есть).
- * DSA_*: ключ из seed 01..20, подпись SignTo с пустым контекстом и без случайности (как проверяет
- * Xray: mldsa65.Verify(pk, msg, nil, sig)). Сверка в обратную сторону (наша инкапсуляция → Go
- * декапсулирует) — в tests/scryptomatch.c, значение хешей эталона — там же. */
+ * KEM_SEED (d||z) -> KEM_EK is the deterministic key derivation. KEM_CT/KEM_SS are what Go returned
+ * when encapsulating to that key; Go's randomness cannot be fixed, so the pair is stored as is.
+ * DSA_*: a key from the seed bytes 01..20 (hex), signed by SignTo with an empty context and no
+ * randomness, the way Xray verifies it: mldsa65.Verify(pk, msg, nil, sig). */
 static const unsigned char KEM_SEED[64] = {
     0x03, 0x0a, 0x11, 0x18, 0x1f, 0x26, 0x2d, 0x34, 0x3b, 0x42, 0x49, 0x50, 0x57, 0x5e, 0x65, 0x6c,
     0x73, 0x7a, 0x81, 0x88, 0x8f, 0x96, 0x9d, 0xa4, 0xab, 0xb2, 0xb9, 0xc0, 0xc7, 0xce, 0xd5, 0xdc,

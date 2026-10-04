@@ -1,113 +1,124 @@
-/* Минимальный клиент HTTP/2 на один поток. Зачем и с какими границами — в h2.c. */
+/* A minimal HTTP/2 client, one stream at a time. Why it exists and its limits: h2.c. */
 #ifndef STEER_H2_H
 #define STEER_H2_H
 #include <stdint.h>
 #include <stddef.h>
 
 #define H2_EIO      (-50)
-#define H2_EPROTO   (-51)   /* кадр, которого здесь быть не может */
-#define H2_ESTATUS  (-52)   /* сервер ответил не 200 */
-#define H2_ERESET   (-53)   /* RST_STREAM или GOAWAY */
+#define H2_EPROTO   (-51)   /* a frame that cannot occur here */
+#define H2_ESTATUS  (-52)   /* the server did not answer 200 */
+#define H2_ERESET   (-53)   /* RST_STREAM, GOAWAY, end of stream, or a flow-control error */
 #define H2_ETOOBIG  (-54)
-#define H2_EWINDOW  (-55)   /* окно закрыто, а отдать данные некуда */
+#define H2_EWINDOW  (-55)   /* the send window is closed */
 
-/* Ввод-вывод под нами. Абстракция, а не прямой вызов tls13_*, потому что транспорт
- * бывает и без TLS (security=none), а HTTP/2 к этому безразличен. */
+/* The I/O below us. Not direct tls13_* calls: the transport may run without TLS
+ * (security=none), and HTTP/2 does not care. */
 struct h2_io {
     void *ctx;
     int (*write)(void *ctx, const unsigned char *d, size_t n);
     int (*read)(void *ctx, unsigned char *d, size_t cap, size_t *got);
 };
 
-/* Состояние держится МАЛЕНЬКИМ сознательно: по одному такому на соединение VLESS, а их
- * до 64. Буфера на кадр здесь нет — записи читаются в общий буфер, а через вызовы
- * переносится только то, что нельзя разобрать сразу: обрывок заголовка кадра и счётчик
- * непрочитанного тела. 16 КБ на соединение × 64 — это мегабайт на коробке с 15. */
+/* Kept SMALL on purpose: one per VLESS connection (two for xhttp with an upload link), and a
+ * loop thread holds hundreds of connections. There is no frame buffer: records are read into a
+ * per-thread buffer, and only what cannot be parsed at once carries over between calls: a split
+ * frame header, a control frame body and the count of unread body. A 16 KB frame buffer per
+ * connection would add up to megabytes. */
 struct h2 {
     struct h2_io io;
     int started;
-    int status;                 /* 200, 0 = ещё не знаем, -1 = не смогли разобрать */
-    int done;                   /* END_STREAM от сервера */
-    /* Отказ сервера на ПРЕЖНЕМ потоке этого соединения: код не-200 из HEADERS потока, который
-     * уже не текущий. Так бывает только у packet-up — ответ на кусок приходит, когда открыт
-     * следующий, — и без этого поля отказ терялся: кадр «не наш» и не разбирался (I-219).
-     * h2_next его НЕ сбрасывает: отказанный кусок уже потерян, и поток VLESS за ним цел
-     * не будет. 0 — отказа не видели. */
+    int status;                 /* 200; 0 — not known yet; -1 — could not parse */
+    int done;                   /* END_STREAM from the server */
+    /* A server refusal on an EARLIER stream of this connection: a non-200 code from the HEADERS
+     * of a stream that is no longer current. Only packet-up does this (the answer to a chunk
+     * arrives when the next one is open); without this field the refusal would be lost with the
+     * frame of a closed stream. h2_next does NOT reset it: the refused chunk is lost, and the
+     * VLESS stream after it cannot be whole. 0 — no refusal seen. */
     int old_status;
-    unsigned char frame_peeked; /* статус из этого кадра HEADERS уже спрошен */
+    unsigned char frame_peeked; /* the status of this HEADERS frame has been looked at */
 
-    /* Обрывок заголовка кадра, не поместившийся в прошлую запись. */
+    /* A frame header cut off by the end of the previous record. */
     unsigned char pend[9];
     size_t pend_n;
 
-    /* Текущий кадр: сколько тела осталось и что это за кадр. */
+    /* The current frame: body bytes left, type and flags. */
     uint32_t frame_left;
     unsigned char frame_type;
     unsigned char frame_flags;
-    int frame_ours;             /* тело этого кадра адресовано нашему потоку */
-    /* Обрамление тела DATA и HEADERS, которое данными не является (RFC 7540 §6.1, §6.2):
-     * pad_wait — впереди ещё байт длины набивки (PADDED), skip_left — сколько байт
-     * приоритета HEADERS осталось пропустить (PRIORITY), pad_left — длина набивки в конце
-     * кадра. Переносятся через вызовы: граница записи TLS может пройти где угодно. */
+    int frame_ours;             /* the frame belongs to the current stream */
+    uint32_t frame_sid;         /* the frame's stream: 0 the connection, sid ours, other closed */
+    /* An end (RST_STREAM, GOAWAY, a parse failure) found by h2_read after it had already
+     * gathered data in the same call. The data is returned (code 0) and this code by the next
+     * call: callers look at the code before got, and Xray sends a response's last data, the
+     * closing HEADERS and RST_STREAM(NO_ERROR) in one TLS record. 0: none. */
+    int pend_err;
+    /* GOAWAY came (RFC 9113 §6.8): no new streams on this connection; the current one, if its
+     * id is within last_stream_id and the code is NO_ERROR, is served to the end. */
+    unsigned char goaway;
+    char why[56];               /* how the server ended the stream: "RST_STREAM CANCEL" ... */
+    /* Framing inside DATA and HEADERS bodies that is not data (RFC 7540 §6.1, §6.2):
+     * pad_wait — the pad length byte is still ahead (PADDED); skip_left — HEADERS priority
+     * bytes left to skip (PRIORITY); pad_left — padding length at the end of the frame. They
+     * carry over between calls: a TLS record boundary can fall anywhere. */
     unsigned char pad_wait;
     unsigned char pad_left;
     unsigned char skip_left;
 
-    /* Тело служебного кадра собирается здесь: WINDOW_UPDATE, SETTINGS, PING и RST надо
-     * увидеть ЦЕЛИКОМ, чтобы на них ответить, а границы записи TLS и кадра HTTP/2 не
-     * совпадают. Все они короткие — 64 байта хватает на десяток настроек. */
+    /* The body of a control frame is collected here: WINDOW_UPDATE, SETTINGS, PING and RST
+     * must be seen WHOLE to act on them, and TLS record and HTTP/2 frame boundaries do not line
+     * up. They are all short: 64 bytes hold ten settings. */
     unsigned char ctl[64];
     unsigned char ctl_n;
 
-    /* Управление потоком. Наше окно приёма пополняется по мере чтения; окно ОТПРАВКИ
-     * принадлежит серверу, и переполнить его — значит получить RST_STREAM. */
-    /* Сколько прочитано с последнего WINDOW_UPDATE. Счётчиков ДВА, потому что окон приёма
-     * два: у потока и у соединения (RFC 7540 §6.9.1). Общий на оба врал в обе стороны.
+    /* Flow control. Our receive window is refilled as we read; the SEND window belongs to the
+     * server, and overrunning it earns a RST_STREAM.
      *
-     * Потоку зачитывается только то, что пришло по ТЕКУЩЕМУ потоку, и h2_next обнуляет этот
-     * счётчик: прежний поток закрыт, растить его окно незачем.
+     * Bytes read since the last WINDOW_UPDATE. TWO counters, because there are two receive
+     * windows: the stream's and the connection's (RFC 7540 §6.9.1).
      *
-     * Соединению — ВСЁ, включая кадры уже закрытых потоков прежних кусков packet-up: байты
-     * потрачены из общего окна независимо от того, кому они были адресованы, и вернуть их
-     * обязаны мы. Один счётчик на оба уровня терял их дважды: кадр чужого потока не считался
-     * вовсе, а h2_next обнулял и то, что уже накопилось. Окно, объявленное серверу,
-     * монотонно сходилось к нулю — и он замолкал тем позже, чем окно больше. */
+     * The stream counter gets only what came on the CURRENT stream, and h2_next zeroes it:
+     * the old stream is closed, there is no point growing its window.
+     *
+     * The connection counter gets EVERYTHING, including frames of the closed streams of earlier
+     * packet-up chunks: the bytes came out of the shared window whoever they were for, and it
+     * is on us to return them. Otherwise the window announced to the server shrinks toward zero
+     * and the server eventually goes silent. */
     int32_t recv_credit;
     int32_t recv_credit_conn;
-    int32_t send_win;           /* окно потока, которое дал сервер */
-    int32_t send_win_conn;      /* окно соединения */
-    /* Прошлое значение SETTINGS_INITIAL_WINDOW_SIZE. Нужно, потому что по RFC 7540 §6.9.2
-     * окно сдвигается на разницу с ПРЕДЫДУЩИМ значением, а не с 65535: сервер, приславший
-     * одинаковые SETTINGS дважды, иначе получал бы сдвиг дважды. Стартовое значение —
-     * 65535, его ставит h2_open вместе с окнами. */
+    int32_t send_win;           /* the stream window the server gave */
+    int32_t send_win_conn;      /* the connection window */
+    /* The previous SETTINGS_INITIAL_WINDOW_SIZE. RFC 7540 §6.9.2 shifts the window by the
+     * difference from the PREVIOUS value, not from 65535; otherwise a server sending the same
+     * SETTINGS twice would shift it twice. Starts at 65535, set by h2_start_ex. */
     int32_t peer_init_win;
 
-    /* Номер ТЕКУЩЕГО потока. Раньше он был единицей на всё время жизни соединения, и это
-     * было правдой ровно до packet-up: там выгрузка идёт чередой коротких запросов, а номер
-     * потока HTTP/2 переиспользовать нельзя — он растёт на два (RFC 7540 §5.1.1).
+    /* The CURRENT stream id. packet-up uploads as a series of short requests, and an HTTP/2
+     * stream id cannot be reused: it grows by two (RFC 7540 §5.1.1).
      *
-     * Одновременно открытым поток по-прежнему ОДИН. Мультиплексора здесь нет и не
-     * появилось: запросы идут друг за другом, каждый закрывается прежде, чем откроется
-     * следующий, и планировать окна между потоками не нужно. Кадры, опоздавшие от уже
-     * закрытого потока, узнаются по номеру и отбрасываются — см. разбор заголовка кадра. */
+     * Only ONE stream is open at a time. There is no multiplexer: requests go one after
+     * another, each closed before the next opens, so windows need no scheduling between
+     * streams. Late frames of a closed stream are recognized by id and dropped (their DATA
+     * still counts toward the connection window, a non-200 status still goes to old_status);
+     * see the frame header parsing in h2_read. */
     uint32_t sid;
 
-    /* Каким клиентом представляться в заголовках: 0 — gRPC (te: trailers и его User-Agent),
-     * 1 — браузер (облик Chrome для xhttp, см. put_headers в h2.c). Живёт в СОСТОЯНИИ, а не
-     * в аргументах: у packet-up запросов череда, и передавать признак в каждый значило бы
-     * место, где однажды забудут. Ставится один раз при открытии соединения. */
+    /* Who we claim to be in the headers: 0 — gRPC (te: trailers and its User-Agent), 1 — a
+     * browser (Chrome for xhttp, see put_headers in h2.c). Kept in the STATE, not passed as an
+     * argument: packet-up sends a series of requests, and a flag passed to each is a flag
+     * someone forgets once. Set once when the connection opens. */
     int browser;
 };
 
-/* Облик Chrome в заголовках запроса: xhttp (put_headers в h2.c — там же, откуда набор) и
- * запрос Upgrade у ws и httpupgrade (proto/transport/trupgrade.c). Одно место на оба, чтобы
- * версия браузера у разных транспортов не разошлась.
+/* Chrome's look in request headers: xhttp (put_headers in h2.c, which says where the set comes
+ * from) and the Upgrade request of ws and httpupgrade (proto/transport/trupgrade.c). One place
+ * for both, so the browser version cannot differ between transports.
  *
- * ЧИСЛО ЗАШИТО, А НЕ СЧИТАЕТСЯ ОТ ЧАСОВ. Xray считает версию от даты (common/utils/browser.go:
- * 144 на 13.01.2026 плюс единица за 35 дней, со сдвигом от процессора), но роутер с уехавшими
- * часами (а на роутере без батарейки это обычное дело) представлялся бы тогда Chrome из будущего
- * или из позапрошлого года — приметнее, чем слегка отставшая версия. Обновляется вместе с
- * остальными приметами облика, когда обновляют ClientHello. */
+ * THE NUMBER IS FIXED, NOT DERIVED FROM THE CLOCK. Xray derives the version from the date
+ * (common/utils/browser.go: 144 on 2026-01-13, plus one per 35 days, minus a lag of 35 to 140
+ * days seeded from the CPU), but a router with a wrong clock (common without an RTC battery)
+ * would then claim a Chrome from the future or from years ago, which stands out more than a
+ * slightly old version. Update it with the rest of the fingerprint when the ClientHello is
+ * updated. */
 #define UA_CHROME_MAJOR "149"
 #define UA_CHROME \
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " \
@@ -116,42 +127,44 @@ struct h2 {
     "\"Google Chrome\";v=\"" UA_CHROME_MAJOR "\", \"Chromium\";v=\"" UA_CHROME_MAJOR \
     "\", \"Not)A;Brand\";v=\"24\""
 
-/* Сколько места обязан дать вызывающий h2_read. В одной записи TLS приезжает до 16384
- * байт, и все они могут оказаться телом DATA — плюс перенесённый обрывок заголовка.
- * Меньший буфер означал бы H2_ETOOBIG на совершенно законном кадре. */
+/* The room a h2_read caller must give. A TLS record carries up to 16384 bytes, all of which
+ * may be DATA body, plus a carried-over header fragment. A smaller buffer would mean
+ * H2_ETOOBIG on a perfectly legal frame. */
 #define H2_MIN_READ_CAP (16384 + 16)
 
-/* Метод запроса. GET — только для скачивающего потока xhttp (stream-down): у него нет тела,
- * и сервер отличает выгрузку от загрузки именно методом (hub.go в Xray). */
+/* Request method. GET is only for the xhttp download stream (stream-down): it has no body, and
+ * the server tells download from upload by the method (hub.go in Xray). */
 #define H2_POST 0
 #define H2_GET  1
 
-/* Открыть поток: преамбула, SETTINGS, HEADERS. content_type может быть NULL.
- * referer нужен xhttp (в нём едет набивка), gRPC его не посылает. */
+/* Opens a stream with the gRPC headers (browser = 0): preface, SETTINGS, WINDOW_UPDATE,
+ * HEADERS. content_type and referer may be NULL; gRPC sends no referer. */
 int h2_start(struct h2 *h, const struct h2_io *io, const char *authority,
              const char *path, const char *content_type, const char *referer);
 
-/* То же, но с выбором метода и с возможностью сразу закрыть свою половину потока.
- * end_stream нужен GET: у него нет тела, и сервер ждёт END_STREAM прямо на HEADERS. */
+/* The same with a method, the option to close our half of the stream at once, and the header
+ * set (browser, see struct h2). GET needs end_stream: it has no body, and the server waits for
+ * END_STREAM right on HEADERS. referer is for xhttp, where it carries the padding. */
 int h2_start_ex(struct h2 *h, const struct h2_io *io, const char *authority,
                 const char *path, const char *content_type, const char *referer,
                 int method, int end_stream, int browser);
 
-/* СЛЕДУЮЩИЙ запрос на том же соединении: новый номер потока, свежее состояние потока,
- * настройки и окно соединения не пересылаются. Нужен packet-up, где каждый кусок выгрузки —
- * отдельный запрос POST. Предыдущий поток к этому моменту обязан быть закрыт с нашей
- * стороны (h2_end_stream), иначе сервер увидит два открытых и это будет уже не «череда». */
+/* The NEXT request on the same connection: a new stream id and fresh stream state; settings
+ * and the connection window are not sent again. For packet-up, where each upload chunk is a
+ * separate POST. The previous stream must already be closed on our side (h2_end_stream), or
+ * the server sees two open streams. */
 int h2_next(struct h2 *h, const char *authority, const char *path,
             const char *content_type, const char *referer, int method);
 
-/* Закрыть свою половину текущего потока: пустой DATA с END_STREAM. */
+/* Closes our half of the current stream: an empty DATA with END_STREAM. */
 int h2_end_stream(struct h2 *h);
 
-/* Отдать данные одним DATA-кадром (при необходимости несколькими). */
+/* Sends the data in DATA frames, all or nothing (H2_EWINDOW); see h2.c. */
 int h2_write(struct h2 *h, const unsigned char *d, size_t n);
 
-/* Прочитать тело ответа. cap должен быть не меньше максимальной записи TLS: кадр целиком
- * влезает в запись, и тогда за один вызов отдаётся всё, что пришло. */
+/* Reads the response body. cap must be at least H2_MIN_READ_CAP, so that one call returns
+ * everything a record brought. 0 with *got == 0 is legal: the record held only control
+ * frames. */
 int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got);
 
 const char *h2_strerror(int rc);

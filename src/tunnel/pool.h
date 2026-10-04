@@ -1,55 +1,50 @@
-/* Пул узлов выхода: N активных узлов подписки сразу, раздача новых соединений между ними и слежка
- * за каждым. Подробности — в pool.c. */
-#ifndef STEER_POOL_H
-#define STEER_POOL_H
+/* Node pool: several nodes active at once, new connections spread over them, each one health
+ * checked and replaced from the candidates when it dies. Details in pool.c. */
+#ifndef TUNVLESS_POOL_H
+#define TUNVLESS_POOL_H
 #include <stddef.h>
 #include "dialer.h"
 #include "stack.h"
 
-/* Как раздаются новые соединения — ключ `by` выхода, enum group_by (spec.h), те же значения и имена,
- * что у `by` группы balance (group_by_name):
- *   BY_CONNECTION  — каждое новое соединение на случайный живой узел (поровну);
- *   BY_SITE        — по адресу назначения: сайт на одном узле;
- *   BY_SITE_CLIENT — по паре «клиент, адрес назначения»: сайт одного клиента на одном узле. */
-
-/* Что пул спрашивает у протокола. ops — дайлер протокола, у которого ctx — узел подписки. */
-struct pool_proto {
-    const struct dialer_ops *ops;
-    /* Проверка узла — та же мера, по которой он выбран при подъёме (у VLESS — vless_probe):
-     * 0 — жив, иначе why — причина для человека. */
-    int (*probe)(const void *node, int timeout_s, char *why, size_t why_n);
-    const char *(*name)(const void *node);
-    /* Приставка файла состояния: <каталог состояния>/<tag>-<выход> (status, diag). */
-    const char *tag;
-    /* Поля протокола в файл состояния — готовым куском JSON (`"protocol":"trojan"`); NULL — нет. */
-    const char *extra;
+/* How new connections are spread over the active nodes. A connection stays on its node until it
+ * ends. */
+enum pool_by {
+    POOL_BY_CONNECTION,     /* each new connection: a random live node */
+    POOL_BY_SITE,           /* by destination address: a site stays on one node */
+    POOL_BY_SITE_CLIENT,    /* by client and destination address */
 };
 
-/* Умолчания ключей выхода (docs/spec-v2.md): период проверки узла и порог молчания, секунды. */
+/* "connection", "site", "site-client" (or "site_client"): the enum value, or -1. */
+int pool_by_parse(const char *s);
+const char *pool_by_name(int by);
+
+/* What the pool needs from the protocol. The dialer's ctx is a node. */
+struct pool_proto {
+    const struct dialer_ops *ops;
+    /* The same check that chose the node at startup: 0 — alive, otherwise why says what failed. */
+    int (*probe)(const void *node, int timeout_s, char *why, size_t why_n);
+    const char *(*name)(const void *node);
+};
+
 #define POOL_INTERVAL_S 60
 #define POOL_SILENCE_S  20
 
 struct pool_cfg {
     const struct pool_proto *proto;
-    /* Узлы подписки: узел i — nodes + i * stride; живут до конца процесса. */
-    const void *nodes;
+    const void *nodes;      /* node i is nodes + i * stride; lives as long as the process */
     size_t stride;
-    /* Кандидаты в порядке предпочтения (индексы узлов, out_node_list и фильтры модуля) — живут до
-     * конца процесса. */
-    const int *sel;
+    const int *sel;         /* candidates (node indexes) in order of preference */
     size_t sel_n;
-    int first;          /* узел, выбранный при подъёме (индекс) */
-    int checked;        /* first проверен при подъёме (перебор), а не назван человеком */
-    int active;         /* сколько узлов держать активными (ключ `active`, 1 — прежнее поведение) */
-    int by;             /* enum group_by */
-    int interval_s;     /* период проверки каждого узла */
-    int silence_s;      /* порог молчания узла на живом соединении (struct dialer), 0 — нет */
-    const char *out;    /* имя выхода: файл состояния */
+    int first;              /* the node chosen at startup */
+    int checked;            /* first was probed at startup; otherwise it is probed at once */
+    int active;             /* how many nodes to keep active, at least 1 */
+    int by;                 /* enum pool_by */
+    int interval_s;         /* health check period of each active node */
+    int silence_s;          /* stall threshold on live connections (struct dialer), 0 — none */
 };
 
-/* Поднять туннель выхода o на пуле узлов: стек с дайлером пула (stack_run), слежка за узлами, когда
- * устройство поднято, и ready модуля после неё (может быть NULL). Код выхода процесса — как у
- * stack_run. */
-int pool_run(struct output *o, const struct pool_cfg *pc, stack_ready_fn ready, void *arg);
+/* Run the tunnel tc over the pool: the stack with the pool's dialer, health checks once the device
+ * is up, then ready (may be NULL). Returns the process exit code, as stack_run does. */
+int pool_run(const struct tun_cfg *tc, const struct pool_cfg *pc, stack_ready_fn ready, void *arg);
 
 #endif

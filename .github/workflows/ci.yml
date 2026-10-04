@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    name: Build and test (x86_64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends iproute2 nftables wget python3 openssl
+
+      - name: Fetch wolfSSL
+        run: make fetch
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Unit and crypto tests
+        run: make -j"$(nproc)" test
+
+      - name: Unit and crypto tests under AddressSanitizer
+        run: make -j"$(nproc)" O=out-asan SANITIZE=address test
+
+      - name: Tunnel tests in network namespaces
+        run: sudo make e2e
+
+  cross:
+    name: Cross build and tests under qemu (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            libc: arm64
+            skip: ""
+          - arch: mipsel
+            libc: mipsel
+            skip: ""
+          # Big-endian, like Entware's mips-3.4. qemu-user truncates TCP_INFO to an int and
+          # byte-swaps it on big-endian guests, so tunnelmatch's node-abort checks (which read
+          # tcpi_state) cannot pass under qemu-mips; on a real kernel they do.
+          - arch: mips
+            libc: mips
+            skip: tunnelmatch
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the cross toolchain and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-${{ matrix.arch }}-linux-gnu \
+            libc6-dev-${{ matrix.libc }}-cross qemu-user
+
+      - name: Fetch wolfSSL
+        run: make fetch
+
+      - name: Build
+        run: |
+          make -j"$(nproc)" O=out-${{ matrix.arch }} \
+            CC=${{ matrix.arch }}-linux-gnu-gcc AR=${{ matrix.arch }}-linux-gnu-ar
+          file out-${{ matrix.arch }}/tunvless
+
+      - name: Tests under qemu
+        env:
+          ARCH: ${{ matrix.arch }}
+          SKIP: ${{ matrix.skip }}
+        run: |
+          set -eu
+          tests="h2match xhupmatch wsmatch b3match visionmatch submatch subpq tungromatch tunnelmatch \
+                 rtxmatch grpcmatch \
+                 scryptomatch hellofreeze echmatch vlessmatch takematch"
+          run=""
+          for t in $tests; do
+            case " $SKIP " in *" $t "*) echo "skipped under qemu: $t"; continue ;; esac
+            run="$run $t"
+          done
+          make -j"$(nproc)" O=out-$ARCH CC=$ARCH-linux-gnu-gcc AR=$ARCH-linux-gnu-ar \
+            $(for t in $run; do printf ' out-%s/tests/%s' "$ARCH" "$t"; done)
+          qemu-$ARCH -L /usr/$ARCH-linux-gnu out-$ARCH/tunvless --version
+          for t in $run; do
+            echo "== $t"
+            qemu-$ARCH -L /usr/$ARCH-linux-gnu out-$ARCH/tests/$t
+          done

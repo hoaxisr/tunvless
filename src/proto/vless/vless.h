@@ -1,141 +1,135 @@
-/* Клиент VLESS/Reality для steer-extended.
+/* VLESS nodes and subscriptions: the node as parsed from a link or a config, and the parsers.
  *
- * Отдельный пакет по той же логике, по которой в OpenWrt есть dnsmasq и dnsmasq-full:
- * базовому движку VLESS не нужен, а весит он вместе с TLS-стеком заметно больше самого
- * движка. Кто хочет — ставит extended, у кого туннели wireguard — не платит за это.
- *
- * Почему свой клиент, а не xray/sing-box: те бинарники — это клиент И сервер И два
- * десятка протоколов, 27–38 МБ. На роутере с 6.9 МБ overlay они не помещаются вовсе, а
- * нужен из них один клиентский путь.
+ * Why a client of its own rather than xray or sing-box: those binaries are a client and a server
+ * for two dozen protocols, 27–38 MB. A router with a 6.9 MB overlay cannot hold them, and only one
+ * client path is needed.
  */
 #ifndef STEER_VLESS_H
 #define STEER_VLESS_H
 #include <stdint.h>
 #include <stddef.h>
 
-/* Узел подписки. Строки, а не разобранные структуры: всё это едет в конфиг как есть, и
- * лишнее преобразование туда-обратно только добавило бы место для расхождения. */
+/* A node. Fields stay strings, as the link gives them, and the transport takes them as they are
+ * (sl_tr_node): there is no second, converted form that could diverge from the first. */
 struct vless_node {
-    char name[128];        /* человеческое имя из #фрагмента, уже раскодированное */
+    char name[128];        /* display name: the #fragment (decoded), remarks, tag or name */
     char host[128];
     uint16_t port;
     char uuid[64];
     char type[16];         /* tcp | grpc | xhttp | ws | httpupgrade */
     char security[16];     /* none | tls | reality */
-    char sni[128];         /* маскировочный домен — он же SNI в ClientHello */
-    char fp[16];           /* отпечаток браузера: chrome, firefox, qq… */
-    char pbk[64];          /* публичный ключ сервера, base64url */
+    char sni[128];         /* SNI of the ClientHello; for reality, the camouflage domain */
+    char fp[16];           /* browser fingerprint: chrome, firefox, qq… */
+    char pbk[64];          /* server public key, base64url */
     char sid[32];          /* short id, hex */
-    char flow[32];         /* xtls-rprx-vision или пусто */
-    /* xhttp, ws, httpupgrade. У ws и httpupgrade — как в ссылке, вместе с `?ed=N`: ранние данные
-     * вырезаются из пути при запросе, ровно как у Xray (src/proto/transport/trpath.h). */
+    char flow[32];         /* xtls-rprx-vision or empty */
+    /* xhttp, ws, httpupgrade. For ws and httpupgrade it is kept as in the link, with `?ed=N`: the
+     * early data parameter is cut from the path when the request is built, as Xray does
+     * (src/proto/transport/trpath.h). */
     char path[128];
     char service[64];      /* grpc serviceName */
     char mode[16];         /* grpc: multi/gun; xhttp: auto/packet-up… */
-    /* ws и httpupgrade: заголовок Host — параметр `host` ссылки, `host` в wsSettings или
-     * httpupgradeSettings конфига Xray. Пусто — sni, затем адрес узла (правило Xray). */
+    /* ws and httpupgrade: the Host header — the link's `host` parameter, or `host` in wsSettings or
+     * httpupgradeSettings of an Xray config. Empty — sni, then the node address (Xray's rule). */
     char http_host[128];
-    /* ws и httpupgrade: свои заголовки запроса — `headers` конфига Xray, строками «Имя: значение\n».
-     * У ссылки vless:// такого поля нет вовсе (формат Xray его не знает), поэтому заголовки бывают
-     * только у подписки в виде конфига. Проверены при разборе: имя — знаки токена HTTP, в значении
-     * нет перевода строки (иначе один заголовок узла становился бы двумя строками запроса). */
+    /* ws and httpupgrade: extra request headers, as "Name: value\n" lines. A vless:// link has no
+     * such field (Xray's link format does not know it), so only config subscriptions carry them.
+     * Xray config headers are checked when parsed: the name is HTTP token characters and the value
+     * has no line break (otherwise one header would become two request lines). sing-box and Clash
+     * headers are checked only for size. */
     char headers[192];
-    /* Заголовок из конфига не влез в headers или негоден — узел непригоден (skip_reason), а не
-     * уходит с молча выброшенным заголовком. */
+    /* A config header did not fit into headers or is invalid: the node is unusable (skip_reason)
+     * rather than sent without that header. */
     uint8_t headers_bad;
 
-    /* Длина набивки xhttp, в знаках: сколько сервер согласен принять в x_padding.
+    /* xhttp padding length, in characters: what the server accepts in x_padding. This is a
+     * requirement: an xhttp server checks the length and answers 400 on a mismatch, so a node
+     * with the wrong padding looks broken while everything else is right.
      *
-     * ЭТО НЕ УКРАШЕНИЕ, А УСЛОВИЕ. Сервер xhttp ПРОВЕРЯЕТ длину и на несовпадение отвечает
-     * 400 — то есть узел с чужой набивкой выглядит неисправным, притом что исправно всё.
-     * Снято на живой подписке: продавец объявил «50-150», мы слали 150…660, и все четыре
-     * его узла xhttp отвечали отказом.
-     *
-     * Ноль в pad_to означает «не объявлено» — тогда берётся умолчание Xray, 100…1000
+     * pad_to == 0 — not announced: Xray's default 100..1000 applies
      * (GetNormalizedXPaddingBytes). */
     uint16_t pad_from, pad_to;
-    /* Постквантовые поля Xray-core. Длинные (ключ ML-DSA-65 — 2603 знака base64url, реле VLESS
-     * encryption с ключом ML-KEM-768 — около 1600), поэтому строки лежат не в узле, а в общей
-     * таблице sub.c (sub_intern): одинаковые значения — один экземпляр, память не освобождается и не
-     * растёт от повторных разборов. NULL — поля нет. Указатель переживает узел и его копии. */
+    /* Post-quantum fields of Xray-core. They are long (an ML-DSA-65 key is 2603 base64url
+     * characters, a VLESS encryption string with an ML-KEM-768 key about 1600), so the strings live
+     * in a shared table (sl_intern, sublink.c), not in the node: equal values share one copy, which
+     * is never freed and does not grow on repeated parsing. NULL — no such field. The pointer
+     * outlives the node and its copies. */
     const char *pqv;         /* reality: mldsa65Verify / pqv */
-    const char *encryption;  /* vless: encryption=mlkem768x25519plus.… (none не хранится) */
-    /* Настройки, которых клиент не умеет и которые сервер ТРЕБУЕТ (иначе соединение не откроется): узел
-     * объявляется непригодным сразу, с названной причиной, а не тратит попытки сторожа. tcp_http —
-     * заголовок HTTP-маскировки tcp (headerType=http); xh_extra — обфускация запросов xhttp
-     * (xPaddingObfsMode, размещения sessionID/seq/данных, downloadSettings). */
+    const char *encryption;  /* vless: encryption=mlkem768x25519plus.… (none is not stored) */
+    /* Settings the client does not support and the server requires (the connection would not
+     * open): the node is unusable at once, with a named reason, instead of failing every connect.
+     * tcp_http — tcp HTTP camouflage header (headerType=http); xh_extra — xhttp request
+     * obfuscation (xPaddingObfsMode, sessionID/seq/data placements, downloadSettings). */
     uint8_t tcp_http, xh_extra;
-    /* Клиентская проверка сертификата узла security=tls (Xray-core: pinnedPeerCertSha256 / `pcs`,
-     * verifyPeerCertByName / `vcn`; sing-box: certificate_public_key_sha256). Строки из общей таблицы
-     * sub_intern, NULL — поля нет. pcs и pks — SHA-256 в hex строчными, через запятую: pcs от всего
-     * сертификата (DER), pks от его SubjectPublicKeyInfo; vcn — имена через запятую. */
+    /* Certificate check of a security=tls node (Xray-core: pinnedPeerCertSha256 / `pcs`,
+     * verifyPeerCertByName / `vcn`; sing-box: certificate_public_key_sha256). Interned strings
+     * (sl_intern), NULL — no such field. pcs and pks — lowercase hex SHA-256, comma separated:
+     * pcs of the whole certificate (DER), pks of its SubjectPublicKeyInfo; vcn — comma separated
+     * names. */
     const char *pcs, *pks, *vcn;
-    /* security=tls: ECHConfigList в base64 (Encrypted Client Hello), интернирован; NULL — без ECH. */
+    /* security=tls: ECHConfigList in base64 (Encrypted Client Hello), interned; NULL — no ECH. */
     const char *ech;
-    /* allowInsecure=1 (skip-cert-verify, insecure) в подписке. Подписка сама проверку сертификата НЕ
-     * выключает: узел пригоден, только если у выхода явно стоит `insecure` (sub.c, node_usable). */
+    /* allowInsecure=1 (skip-cert-verify, insecure) in the subscription. The subscription alone
+     * does not turn certificate checks off: the node is usable only with vless_set_insecure
+     * (--insecure), see sl_link_usable_pre. */
     uint8_t allow_insecure;
-    /* Ключ `insecure` выхода на момент разбора (node_usable): клиент не проверяет сертификат этого
-     * узла. Живёт в узле, а не читается из глобала при подключении, чтобы клиент (client.c) не зависел
-     * от разбора подписки: стенды собирают их порознь. */
+    /* --insecure as it was at parse time (sl_link_usable_pre): this node's certificate is not
+     * verified. Kept in the node rather than read from the global at connect time, so the
+     * transport (trsec.c, via sl_tr_node) does not depend on the parser: the transport tests are
+     * built without sublink.c. */
     uint8_t insecure;
-    char skip_reason[96];  /* почему узел непригоден — чтобы это можно было показать */
+    char skip_reason[96];  /* why the node is unusable, for display */
 };
 
 size_t b64_decode(const char *in, size_t n, char *out, size_t out_n);
 
-/* 0 — узел пригоден, 1 — пропущен (причина в skip_reason), -1 — не vless-ссылка. */
+/* 0 — usable node, 1 — skipped (reason in skip_reason), -1 — not a vless link. */
 int vless_parse_url(const char *url, struct vless_node *n);
 
-/* Причины непригодности, сгруппированные по тексту причины.
- *
- * Группировка здесь, а не в интерфейсе: подписка, целиком собранная из узлов с
- * неподдержанным security, даёт 26 одинаковых строк, и гонять их по ubus ради того,
- * чтобы свернуть на экране, незачем. Отдельного кода причины нет намеренно — текст уже
- * содержит и класс («транспорт X не поддержан»), и само значение, а код был бы вторым
- * способом сказать то же самое, который со временем разойдётся с первым. */
+/* Skip reasons, grouped by their text: a subscription of 26 nodes with the same unsupported
+ * security gives one line, not 26. There is no reason code on purpose: the text already names the
+ * class and the value ("transport X is not supported"), and a code would be a second way to say
+ * the same thing that drifts away from the first. */
 #define VLESS_SKIP_REASONS 8
 
 struct vless_skip {
-    /* та же строка, что легла бы в vless_node.skip_reason, и того же размера: при 64 байтах против 96
-     * у узла причина в skipped_reasons обрезалась («…включите insecure у выхода явн»). */
+    /* The same string vless_node.skip_reason would hold, and the same size, so it is not cut. */
     char reason[96];
-    char example[144];     /* имя ПЕРВОГО узла с этой причиной, иначе host:port.
-                            * Длиннее name[128] намеренно: во второй форме сюда влезает
-                            * host целиком плюс ":65535", а обрезанный хост в объяснении
-                            * хуже, чем его отсутствие. */
+    char example[144];     /* name of the FIRST node with this reason, else host:port;
+                            * for a glued or too long link, its length and first bytes.
+                            * Longer than name[128] on purpose: host:port fits a whole
+                            * host plus ":65535", and a cut host in an explanation is worse
+                            * than none. */
     size_t count;
 };
 
-/* Итог разбора подписки: сколько узлов пригодно — возвращаемое значение, всё остальное
- * здесь, с объяснением. До запуска 45 отсюда наружу шли только два числа, и человек с
- * подпиской из одних tls-узлов видел «пригодно 0, пропущено 26» без причины, хотя
- * причина у движка была в руках (splicicd#16, вариант А). */
+/* What parsing a subscription found besides the usable nodes (their count is the return value):
+ * what was skipped and why. */
 struct vless_sub_stats {
-    size_t skipped;                              /* непригодных ссылок vless:// */
-    size_t foreign;                              /* ссылок чужих протоколов */
-    size_t reasons_n;                            /* сколько РАЗНЫХ причин собрано */
-    size_t reasons_dropped;                      /* узлов, чья причина не влезла */
+    size_t skipped;                              /* unusable VLESS nodes and links */
+    size_t foreign;                              /* links and Clash proxies of other protocols */
+    size_t reasons_n;                            /* distinct reasons collected */
+    size_t reasons_dropped;                      /* nodes whose reason did not fit */
     struct vless_skip reasons[VLESS_SKIP_REASONS];
 };
 
-/* Ключ `insecure` выхода: подписке разрешено нести узлы с allowInsecure, а клиент не проверяет
- * сертификат узлов security=tls. Ставится процессом выхода ДО разбора подписки; по умолчанию — 0.
- * Глобальная настройка, а не поле узла, потому что процесс клиента обслуживает ровно один выход,
- * а решение «пригоден ли узел» принимает разбор, которому выхода не передают. */
+/* --insecure: nodes with allowInsecure are usable, and the client does not verify certificates of
+ * security=tls nodes. Set BEFORE the nodes are parsed; off by default. A global, because the
+ * parsers decide whether a node is usable and take no such argument. */
 void vless_set_insecure(int on);
 int vless_insecure(void);
 
-/* st допускает NULL: подъёму туннеля счётчики не нужны. */
-/* Привести прочитанный файл подписки к тексту для vless_parse_sub: конфиг Xray и список
- * ссылок отдаются как есть, base64 раскодируется в dec. Подробности — в sub.c. */
+/* Turn a subscription file as read into text for vless_parse_sub: a JSON or YAML config and a
+ * list of links are returned as is, base64 is decoded into dec. Details in sub.c. */
 const char *vless_sub_text(const char *raw, size_t raw_n, char *dec, size_t dec_n);
 
+/* st may be NULL. */
 size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
                        struct vless_sub_stats *st);
 
-/* Файл подписки → массив узлов в куче (free вызывающему), *cnt — сколько пригодных. NULL — файл
- * не открылся или больше 64 МиБ. Ни число узлов, ни размер подписки константой не ограничены. */
+/* Subscription file → array of nodes on the heap (the caller frees it), *cnt — usable nodes.
+ * NULL — the file did not open, is over 64 MiB, or there is no memory. Below that cap, neither
+ * the node count nor the subscription size is limited. */
 struct vless_node *vless_load_sub(const char *path, size_t *cnt, struct vless_sub_stats *st);
 
 #endif

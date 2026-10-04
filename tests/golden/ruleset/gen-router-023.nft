@@ -1,4 +1,0 @@
-# args: apply --dry-run --spec TMP/emptyspec.json --state-dir TMP/state-dev4
-# exit: 2
-# env: STEER_NFT_INGRESS=0
-# stderr: steer: канал nohost объявлен правилом на устройство, но в нём нет ни одного хозяина: добавьте адрес или MAC в "from"

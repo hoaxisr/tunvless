@@ -1,68 +1,72 @@
-/* Encrypted Client Hello (RFC 9849, прежний draft-ietf-tls-esni) — клиентская половина для security=tls.
+/* Encrypted Client Hello (RFC 9849, formerly draft-ietf-tls-esni), client side, for security=tls.
  *
- * ЧТО ЭТО. ClientHello с настоящим именем сервера (SNI) виден любому на пути. ECH прячет его: по проводу
- * идёт ClientHelloOuter с безобидным именем (public_name из ECHConfig, обычно имя провайдера ECH),
- * а настоящий ClientHelloInner лежит в его расширении зашифрованным открытым ключом сервера (HPKE).
- * Сервер, у которого есть закрытый ключ, расшифровывает Inner и проводит рукопожатие по нему; кто ключа не
- * имеет, видит только Outer. Принял ли сервер ECH, клиент узнаёт по восьми последним байтам
- * ServerHello.random (подтверждение принятия) — сверка лежит в tls13.c, здесь только построение Hello.
+ * The ClientHello carries the real server name (SNI) in the clear. With ECH the wire carries a
+ * ClientHelloOuter with a harmless name (public_name of the ECHConfig, usually the ECH provider's),
+ * and the real ClientHelloInner sits in one of its extensions, encrypted to the server's public key
+ * (HPKE). A server with the private key decrypts Inner and runs the handshake on it; anyone else
+ * sees only Outer. The client learns that the server accepted ECH from the last eight bytes of
+ * ServerHello.random; that check is in tls13.c, this file only builds the Hello.
  *
- * ЧТО ЗДЕСЬ. Разбор ECHConfigList (ech_pick), HPKE (ech_hpke_seal: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256,
- * AES-128-GCM или ChaCha20-Poly1305 — ровно то, что предлагают серверы ECH на практике: Cloudflare, Go
- * crypto/tls, BoringSSL) и сборка пары Outer/Inner из уже построенного ClientHello (ech_wrap). Hello строит
- * прежний сборщик (reality.c) с настоящим SNI — он и становится Inner; ECH лишь заворачивает готовые байты,
- * поэтому облик Hello не зависит от ECH, а замороженные отпечатки (tests/hellofreeze.c) остаются прежними.
+ * Here: parsing the ECHConfigList (ech_pick), HPKE (ech_hpke_seal: DHKEM(X25519, HKDF-SHA256),
+ * HKDF-SHA256, AES-128-GCM or ChaCha20-Poly1305 — what ECH servers offer in practice: Cloudflare,
+ * Go crypto/tls, BoringSSL) and building the Outer/Inner pair from a finished ClientHello
+ * (ech_wrap). reality.c builds the Hello with the real SNI and that Hello becomes Inner; ECH only
+ * wraps the finished bytes, so the Hello's shape does not depend on ECH and the frozen fingerprints
+ * (tests/hellofreeze.c) do not change.
  *
- * ЧЕГО НЕТ: сжатия Inner через ech_outer_extensions (Inner идёт полностью — Hello выходит больше, зато проще и
- * принимается любым сервером), GREASE-ECH без конфигурации, HelloRetryRequest с ECH, получения ECHConfigList
- * из DNS (HTTPS-запись): список берётся из ссылки узла (`ech=`). */
+ * Not supported: compressing Inner with ech_outer_extensions (Inner goes in full: a larger Hello,
+ * but simpler and accepted by any server), HelloRetryRequest with ECH, fetching the ECHConfigList
+ * from DNS (HTTPS record): the list comes from the node's link (`ech=`). GREASE ECH needs nothing
+ * here: the Hello builder always sends it, and ech_wrap puts the real extension in its place. */
 #ifndef STEER_ECH_H
 #define STEER_ECH_H
 #include <stddef.h>
 #include <stdint.h>
 
-#define ECH_EPARSE    (-90)   /* ECHConfigList или ClientHello не разобрался */
-#define ECH_ENOCONFIG (-91)   /* в списке нет записи, которую мы умеем (версия, KEM, набор шифров, расширения) */
+#define ECH_EPARSE    (-90)   /* malformed ECHConfigList or ClientHello */
+#define ECH_ENOCONFIG (-91)   /* no usable entry (version, KEM, cipher suite, extensions) */
 #define ECH_ECRYPTO   (-92)
-#define ECH_ETOOBIG   (-93)   /* результат не влез в буфер */
+#define ECH_ETOOBIG   (-93)   /* the result does not fit the buffer */
 
-/* Полное handshake-сообщение ClientHelloInner (с четырьмя байтами заголовка) — для транскрипта, когда
- * сервер принял ECH. Hello с ML-KEM в key_share — около 1,8 КБ; запас на расширение и имя. */
+/* The full ClientHelloInner handshake message (with its 4-byte header), for the transcript when
+ * the server accepts ECH. A Hello with ML-KEM in key_share is about 1.8 KB; the rest is headroom
+ * for the extension and the name. */
 #define ECH_INNER_MAX 3072
 
-/* Выбранная запись ECHConfig. */
 struct ech_cfg {
     uint8_t  config_id;
-    uint16_t kdf_id, aead_id;       /* выбранный набор: HKDF-SHA256 (0x0001), AES-128-GCM (0x0001) или ChaCha20 (0x0003) */
-    uint8_t  pk[32];                /* открытый ключ X25519 сервера */
-    uint8_t  max_name;              /* maximum_name_length: Inner дополняется до этой длины имени */
-    char     public_name[256];      /* имя в SNI внешнего Hello */
-    uint8_t  raw[1024];             /* ECHConfig целиком (версия, длина, содержимое): входит в info HPKE */
+    uint16_t kdf_id, aead_id;       /* HKDF-SHA256 (1); AES-128-GCM (1) or ChaCha20-Poly1305 (3) */
+    uint8_t  pk[32];                /* the server's X25519 public key */
+    uint8_t  max_name;              /* maximum_name_length: Inner is padded to this name length */
+    char     public_name[256];      /* SNI of the outer Hello */
+    uint8_t  raw[1024];             /* the whole ECHConfig (version, length, body): in HPKE info */
     size_t   raw_n;
 };
 
 struct ech_state {
-    uint8_t random[32];             /* random Inner: на нём считается подтверждение принятия */
+    uint8_t random[32];             /* Inner's random: input of the acceptance check */
     size_t  inner_n;
     uint8_t inner[ECH_INNER_MAX];
 };
 
-/* base64 (стандартный алфавит, `=` и переводы строк допустимы) в байты; длина или -1. */
+/* base64 (standard or URL-safe alphabet; `=`, spaces and line breaks are skipped) to bytes;
+ * returns the length or -1. */
 int ech_b64_decode(const char *in, uint8_t *out, size_t cap);
 
-/* Выбрать запись из ECHConfigList: первая версии 0xfe0d с KEM X25519, набором HKDF-SHA256 и AES-128-GCM либо
- * ChaCha20-Poly1305, допустимым public_name и без обязательных расширений (старший бит типа). 0 — выбрана. */
+/* Picks the first ECHConfig of version 0xfe0d with KEM X25519, a suite of HKDF-SHA256 and
+ * AES-128-GCM or ChaCha20-Poly1305, a valid public_name and no mandatory extensions (high bit of
+ * the type). 0 — picked. */
 int ech_pick(const uint8_t *list, size_t n, struct ech_cfg *out);
 
-/* HPKE, режим base: зашифровать pt под ключом cfg->pk. info = "tls ech\0" ‖ ECHConfig (RFC 9849, 6.1).
- * eph — закрытый эфемерный ключ (для тестов с известным ответом) или NULL — тогда случайный.
- * enc получает 32 байта (инкапсулированный ключ), ct — pt_n + 16 байт. */
+/* HPKE base mode: encrypts pt to cfg->pk. info = "tls ech\0" ‖ ECHConfig (RFC 9849, 6.1).
+ * eph is the ephemeral private key (for known-answer tests) or NULL for a random one.
+ * enc gets 32 bytes (the encapsulated key), ct gets pt_n + 16 bytes. */
 int ech_hpke_seal(const struct ech_cfg *cfg, const uint8_t *eph,
                   const uint8_t *aad, size_t aad_n, const uint8_t *pt, size_t pt_n,
                   uint8_t enc[32], uint8_t *ct);
 
-/* Из готового ClientHello (запись TLS целиком, с заголовком из пяти байт) с настоящим SNI собрать внешний
- * ClientHelloOuter в out (тоже запись целиком) и запомнить Inner в st. 0 — готово. */
+/* From a finished ClientHello with the real SNI (a whole TLS record, with its 5-byte header) builds
+ * the ClientHelloOuter record in out and keeps Inner in st. 0 — done. */
 int ech_wrap(const struct ech_cfg *cfg, const uint8_t *hello, size_t hello_n,
              uint8_t *out, size_t cap, size_t *out_n, struct ech_state *st);
 

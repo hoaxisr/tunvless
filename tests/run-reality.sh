@@ -1,36 +1,34 @@
 #!/bin/sh
-# Прогон туннеля через НАСТОЯЩИЙ Reality-сервер — свой, с известными ключами.
+# The tunnel through a REAL Reality server: our own, with known keys.
 #
-# Зачем, если уже есть tests/run-tunnel.sh. Тот стенд поднимает поддельный сервер без TLS и
-# проверяет цикл туннеля: синтез TCP, повторную передачу, потоки. Reality, Vision и VLESS он
-# не проверяет вовсе — а именно там ломалось так, что снаружи выглядело как «узел умер».
+# tests/run-tunnel.sh uses a fake server without TLS and tests the tunnel loop (TCP synthesis,
+# retransmission, threads). It does not test Reality, Vision or VLESS at all, and failures there
+# look from outside like "the node died".
 #
-# Здесь другая половина: сервер настоящий (sing-box), с настоящим Reality и Vision, и он
-# ПИШЕТ В ЛОГ, что именно ему не понравилось. Это оказалось единственным способом отличить
-# «нас не признали» от «признали, но мы не поняли ответ»: у Reality нет отрицательного
-# ответа, непризнанного клиента он молча проксирует на маскировочный сайт, и оба случая
-# снаружи одинаковы.
+# Here the server is real (sing-box), with real Reality and Vision, and it LOGS what it did not
+# like. That is the only way to tell "we were not recognized" from "recognized, but we did not
+# understand the answer": Reality has no negative answer, it silently proxies an unrecognized
+# client to the cover site, and both cases look the same from outside.
 #
-# Стороны РАЗВЕДЕНЫ по сетевым пространствам, и это обязательно. Первая версия держала всё на
-# хосте, маршрут до цели через туннель применялся и к самому серверу, и его исходящее
-# соединение уходило обратно в туннель — стенд ловил свою же петлю и выглядел как отказ
-# Reality.
+# The two sides MUST be in separate network namespaces: on one host the route to the target
+# through the tunnel also applies to the server, its outgoing connection goes back into the
+# tunnel, and the test catches its own loop, which looks like a Reality refusal.
 #
-# Нужен sing-box. Путь задаётся переменной SINGBOX, по умолчанию ./build/sing-box.
+# Needs sing-box: SINGBOX, default ./build/sing-box.
 set -eu
 cd "$(dirname "$0")/.."
 
 SB="${SINGBOX:-./build/sing-box}"
-BIN="${STEER:-./build/steer-ext-check}"
-MASK="${MASK:-prod.vkimages.io}"          # маскировочный домен: обязан уметь TLS 1.3 и h2
-TARGET="${TARGET:-205.234.175.175}"       # куда просим сходить через туннель
+BIN="${TUNVLESS:-./out/tunvless}"
+MASK="${MASK:-prod.vkimages.io}"          # cover domain: must support TLS 1.3 and h2
+TARGET="${TARGET:-205.234.175.175}"       # what to fetch through the tunnel
 TPATH="${TPATH:-/1mb.test}"
 THOST="${THOST:-cachefly.cachefly.net}"
 
-[ -x "$SB" ] || { echo "нет sing-box: $SB (SINGBOX=путь)"; exit 2; }
-[ -x "$BIN" ] || { echo "нет бинарника: $BIN"; exit 2; }
+[ -x "$SB" ] || { echo "no sing-box: $SB (SINGBOX=path)"; exit 2; }
+[ -x "$BIN" ] || { echo "no binary: $BIN"; exit 2; }
 
-NS=steer-reality
+NS=tunvless-reality
 W="$(mktemp -d)"
 cleanup() {
     [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null || true
@@ -68,32 +66,26 @@ cat > "$W/server.json" <<CFG
  "outbounds":[{"type":"direct","tag":"out"}]}
 CFG
 
-printf '%s\n' "vless://$UUID@10.90.0.1:18443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=$MASK&pbk=$PUB&sid=$SID&fp=chrome#local" > "$W/sub.txt"
-cat > "$W/spec.json" <<SPEC
-{"schema":1,
- "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$W/sub.txt","node":0}},
- "channels":[]}
-SPEC
+LINK="vless://$UUID@10.90.0.1:18443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=$MASK&pbk=$PUB&sid=$SID&fp=chrome#local"
 
 "$SB" run -c "$W/server.json" > "$W/srv.log" 2>&1 &
 SRV=$!
 sleep 2
-grep -q "tcp server started" "$W/srv.log" || { echo "сервер не поднялся:"; tail -5 "$W/srv.log"; exit 1; }
+grep -q "tcp server started" "$W/srv.log" || { echo "server did not start:"; tail -5 "$W/srv.log"; exit 1; }
 
-ip netns exec "$NS" env STEER_TUN_STATS=1 "$BIN" vless vl \
-    --spec "$W/spec.json" --state-dir "$W/state" > "$W/tun.log" 2>&1 &
+ip netns exec "$NS" env STEER_TUN_STATS=1 "$BIN" "$LINK" -d vl -r "$TARGET/32" > "$W/tun.log" 2>&1 &
 for _ in $(seq 40); do
-    ip netns exec "$NS" ip link show vl >/dev/null 2>&1 && break
+    ip netns exec "$NS" ip route show "$TARGET/32" 2>/dev/null | grep -q 'dev vl' && break
     sleep 0.2
 done
-ip netns exec "$NS" ip link show vl >/dev/null 2>&1 || { echo "vl не поднялся:"; tail -5 "$W/tun.log"; exit 1; }
-ip netns exec "$NS" ip route replace "$TARGET/32" dev vl
+ip netns exec "$NS" ip route show "$TARGET/32" 2>/dev/null | grep -q 'dev vl' ||
+    { echo "vl did not come up:"; tail -5 "$W/tun.log"; exit 1; }
 
-echo "  маскировка $MASK, цель $TARGET"
+echo "  cover $MASK, target $TARGET"
 ip netns exec "$NS" curl -s -o "$W/dl.bin" \
-    -w "  через туннель: код %{http_code}, %{size_download} байт, %{speed_download} Б/с\n" \
-    --max-time 30 -H "Host: $THOST" "http://$TARGET$TPATH" || echo "  через туннель: НЕ ВЫШЛО"
+    -w "  through the tunnel: code %{http_code}, %{size_download} bytes, %{speed_download} B/s\n" \
+    --max-time 30 -H "Host: $THOST" "http://$TARGET$TPATH" || echo "  through the tunnel: FAILED"
 
-echo "  сервер:"
+echo "  server:"
 grep -iE "inbound connection to|Xtls|ERROR|isHandshakeComplete" "$W/srv.log" |
     tail -5 | sed 's/.*\] //; s/^/    /' | cut -c1-150

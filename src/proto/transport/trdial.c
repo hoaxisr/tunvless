@@ -1,9 +1,7 @@
-/* Сокет до узла: TCP по ВСЕМ адресам имени, а не по первому, и метка выхода-подложки.
- *
- * Нижний ярус транспорта (transport.h). Переехал сюда из клиента VLESS (client.c) без
- * изменений: от протокола здесь не зависит ничего, а любой следующий дайлер поверх тех же
- * транспортов обязан соединяться тем же путём — с тем же перебором адресов, тем же кэшем
- * победителя и той же меткой, иначе `over` у него значил бы другое.
+/* The socket to the node: TCP to EVERY address of the name, not just the first, plus the mark
+ * and the bound device that keep it out of the tunnel (the bottom layer in transport.h). Nothing
+ * here depends on the protocol. Every connection to a node goes through tr_dial, so all of them
+ * share the address search, the winner cache and the mark.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -19,39 +17,33 @@
 #include <fcntl.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <net/if.h>
 
 #include "transport.h"
 
-/* ---- установление TCP: ВСЕ адреса узла, а не первый ---------------------------
+/* ---- TCP connect: EVERY address of the node, not the first ----------------------------
  *
- * Одно имя узла — это, как правило, не один адрес. Живой пример, на котором это нашлось:
- * pl.riotvpn.eu отдаёт ПЯТНАДЦАТЬ записей A, и шесть из них — чёрные дыры: SYN уходит, в
- * ответ тишина. DNS перемешивает список при каждом запросе, поэтому «первый адрес» каждый
- * раз другой, и в сорока процентах случаев он мёртвый.
+ * A node name is often several addresses, and some may be black holes: a SYN goes out and nothing
+ * comes back (one real node had fifteen A records, six of them dead). DNS shuffles the list on
+ * every query, so "the first address" changes each time. Using only the first one is worse than
+ * "sometimes fails to connect":
  *
- * Прежний код брал res->ai_next == первый и на этом останавливался. Последствия оказались
- * куда хуже, чем «иногда не соединяется»:
+ *   - a blocking connect to a black hole waits out the whole SO_SNDTIMEO and holds its thread;
+ *   - Linux reports that timeout as EINPROGRESS, not ETIMEDOUT (__inet_stream_connect: when timeo
+ *     runs out err stays -EINPROGRESS), so the log shows "Operation in progress" for a blocking
+ *     call and hides both the timeout and the dead address;
+ *   - a health check of the node becomes a coin toss.
  *
- *   - блокирующий connect к чёрной дыре ждёт SO_SNDTIMEO целиком — восемь секунд, — и
- *     всё это время событийный цикл СТОИТ. Не тормозит, а стоит: ни один другой поток не
- *     двигается. На роутере это выглядело как «сайты еле открываются» при простое
- *     процессора 80% и нулевых счётчиках ошибок;
- *   - Linux сообщает об этом таймауте кодом EINPROGRESS (см. __inet_stream_connect:
- *     истёк timeo — err остаётся -EINPROGRESS), а не ETIMEDOUT. То есть в логе стояло
- *     «Operation in progress» у блокирующего вызова — вид сообщения, за которым не видно
- *     ни таймаута, ни мёртвого адреса;
- *   - сторож считал узел живым или мёртвым по одной пробе, то есть по жребию.
- *
- * Поэтому здесь: неблокирующий connect, свой таймаут вместо SO_SNDTIMEO, несколько
- * попыток одновременно с задержкой между запусками, и адрес-победитель запоминается,
- * чтобы следующее соединение начиналось с него. */
+ * So: a non-blocking connect with its own timeout instead of SO_SNDTIMEO, several staggered
+ * attempts at once, and the winning address is remembered so the next connection starts with
+ * it. */
 
-#define ADDR_MAX      16   /* сколько адресов имени вообще рассматриваем */
-#define ATTEMPT_MAX    4   /* сколько держим в воздухе одновременно */
-#define STAGGER_MS   150   /* пауза перед запуском следующей попытки */
+#define ADDR_MAX      16   /* addresses of a name considered at all */
+#define ATTEMPT_MAX    4   /* attempts in flight at once */
+#define STAGGER_MS   150   /* pause before starting the next attempt */
 
-/* Победивший адрес на имя. Живёт по потоку: работники независимы, блокировка не нужна, а
- * «каждый узнал сам» стоит одного лишнего перебора на работника при старте. */
+/* The winning address per name, per thread: no lock is needed, and each thread learning on its
+ * own costs one extra search per thread at startup. */
 #define GOOD_MAX 8
 static __thread struct { char host[96]; struct in_addr ip; uint16_t port; } g_good[GOOD_MAX];
 static __thread unsigned g_good_n;
@@ -77,34 +69,27 @@ static int64_t now_ms(void) {
     return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 
-/* Готовит установленный сокет к работе остального кода: снимает O_NONBLOCK (чтение и
- * запись дальше блокирующие, с таймаутом через SO_*TIMEO) и ставит опции. */
+/* Clears O_NONBLOCK on a connected socket (reads and writes from here on block, with SO_*TIMEO
+ * timeouts) and sets its options. */
 static void sock_ready(int fd, int timeout_s) {
     int fl = fcntl(fd, F_GETFL, 0);
     if (fl >= 0) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
-    /* Таймаут на чтение и запись. Без него мёртвый узел вешает проверку до таймаута
-     * ядра — минуты, за которые сторож не успеет обойти остальных кандидатов. */
+    /* Without a read and write timeout a dead node holds a probe until the kernel gives up —
+     * minutes in which the pool cannot check the other candidates. */
     struct timeval tv = { .tv_sec = timeout_s, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    /* SO_RCVBUF здесь НЕ ставится, и это отказ от прежней «оптимизации», а не упущение.
-     *
-     * Любой вызов setsockopt(SO_RCVBUF) ОТКЛЮЧАЕТ автоподстройку приёмного окна в Linux и
-     * прибивает его к заданному размеру. А скорость приёма равна «окно, поделённое на круг
-     * до сервера»: при круге 60 мс полмегабайта — это потолок 68 Мбит/с, сколько бы ни
-     * давал канал. Автоподстройка дошла бы до нескольких мегабайт сама.
-     *
-     * То есть «поставил буфер побольше» на деле означало «запретил ядру увеличивать его
-     * дальше». Пределы живут в net.ipv4.tcp_rmem и настраиваются системой, а не нами. */
+    /* SO_RCVBUF is deliberately NOT set. Any setsockopt(SO_RCVBUF) DISABLES Linux receive
+     * window autotuning and pins the window at that size. Throughput is window / RTT: half a
+     * megabyte at a 60 ms RTT caps it at 68 Mbit/s whatever the bandwidth, while autotuning grows
+     * to several megabytes on its own. The limits belong to the system, in net.ipv4.tcp_rmem. */
 }
 
-/* МЕТКА СОКЕТА К УЗЛУ — для `via` (см. «вложенные выходы» в spec.h). Её называет модуль
- * протокола при старте: out_underlay_mark выхода (underlay_setup в proto/vless/vlmain.c).
- * Своя копия того, что в obfs.c делает obfs_mark_sock, а не вызов: этот файл собирают стенды
- * без obfs.c (xhupmatch), а кода здесь три строки. required — задан via: тогда отказ SO_MARK —
- * отказ соединения, иначе оно молча ушло бы мимо выхода-цели напрямую. */
+/* --mark: SO_MARK on every socket to the node, set before connect — the route, and with it the
+ * device and the source address, is chosen there, by the mark. required: a socket the mark cannot
+ * be set on is not used, or it would silently take the unmarked route — into the tunnel. */
 static uint32_t g_sock_mark;
 static int g_sock_mark_req;
 
@@ -113,22 +98,101 @@ void transport_set_sock_mark(uint32_t mark, int required) {
     g_sock_mark_req = mark && required;
 }
 
-/* Запускает неблокирующий connect. Возвращает fd (соединение уже установлено или в
- * процессе) либо -1. */
+/* --bind-dev: sockets to the node leave through this interface (SO_BINDTODEVICE) whatever the
+ * routing table says — the other way, next to SO_MARK, to keep them out of the tunnel when the
+ * default route points into it. A socket that cannot be bound is not used: unbound, it would go
+ * into the tunnel and loop. */
+static char g_bind_dev[IFNAMSIZ];
+
+void transport_set_bind_dev(const char *ifname) {
+    snprintf(g_bind_dev, sizeof(g_bind_dev), "%s", ifname ? ifname : "");
+}
+
+/* Addresses of the nodes resolved once, at startup (transport_pin_host). Once the routes point into
+ * the tunnel, the DNS query for a node's name would itself go into the tunnel and wait for a
+ * connection that is waiting for that query. Filled before the loop threads start and only read
+ * afterwards, so no lock. */
+struct pin { char host[128]; struct in_addr ip[ADDR_MAX]; unsigned n; };
+static struct pin *g_pin;
+static unsigned g_pin_n, g_pin_cap;
+
+static unsigned resolve(const char *host, struct in_addr out[ADDR_MAX]) {
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return 0;
+    unsigned an = 0;
+    for (struct addrinfo *p = res; p && an < ADDR_MAX; p = p->ai_next)
+        if (p->ai_family == AF_INET)
+            out[an++] = ((struct sockaddr_in *)p->ai_addr)->sin_addr;
+    freeaddrinfo(res);
+    return an;
+}
+
+int transport_pin_host(const char *host) {
+    for (unsigned i = 0; i < g_pin_n; i++)
+        if (!strcmp(g_pin[i].host, host)) return (int)g_pin[i].n;
+    if (strlen(host) >= sizeof(g_pin[0].host)) return TR_EDNS;
+    if (g_pin_n == g_pin_cap) {
+        unsigned cap = g_pin_cap ? g_pin_cap * 2 : 8;
+        struct pin *p = realloc(g_pin, cap * sizeof(*p));
+        if (!p) return TR_EDNS;
+        g_pin = p;
+        g_pin_cap = cap;
+    }
+    struct pin *p = &g_pin[g_pin_n];
+    unsigned an = resolve(host, p->ip);
+    if (!an) return TR_EDNS;
+    snprintf(p->host, sizeof(p->host), "%s", host);
+    p->n = an;
+    g_pin_n++;
+    return (int)an;
+}
+
+static unsigned pinned(const char *host, struct in_addr out[ADDR_MAX]) {
+    for (unsigned i = 0; i < g_pin_n; i++)
+        if (!strcmp(g_pin[i].host, host)) {
+            memcpy(out, g_pin[i].ip, g_pin[i].n * sizeof(out[0]));
+            return g_pin[i].n;
+        }
+    return 0;
+}
+
+int transport_pinned_addrs(const char *host, uint32_t *out, int max) {
+    struct in_addr a[ADDR_MAX];
+    unsigned n = pinned(host, a);
+    int k = 0;
+    for (unsigned i = 0; i < n && k < max; i++) out[k++] = a[i].s_addr;
+    return k;
+}
+
+/* Starts a non-blocking connect. Returns the fd (connected, *done = 1, or in progress) or
+ * -1. */
 static int attempt_start(struct in_addr ip, uint16_t port, int *done) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd < 0) return -1;
-    /* До connect(): маршрут, а с ним устройство и адрес источника, ядро выбирает там — по
-     * метке, то есть по таблице выхода-цели. */
+    /* Before connect(): connect is where the kernel picks the route by the mark (see --mark
+     * above). */
     if (g_sock_mark &&
         setsockopt(fd, SOL_SOCKET, SO_MARK, &g_sock_mark, sizeof(g_sock_mark)) != 0 &&
         g_sock_mark_req) {
         static int told;
         if (!told) {
             told = 1;
-            fprintf(stderr, "steer[warn] via: метка 0x%08x на сокет к узлу не встала (%s) — "
-                            "соединение не открываю: без метки оно ушло бы мимо выхода via\n",
+            fprintf(stderr, "tunvless[warn]: cannot set mark 0x%08x on a socket to the node "
+                            "(%s) — not connecting: unmarked, it would go into the tunnel\n",
                     g_sock_mark, strerror(errno));
+        }
+        close(fd);
+        return -1;
+    }
+    if (g_bind_dev[0] &&
+        setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, g_bind_dev, (socklen_t)strlen(g_bind_dev) + 1) != 0) {
+        static int told;
+        if (!told) {
+            told = 1;
+            fprintf(stderr, "tunvless[warn]: cannot bind a socket for the node to %s (%s) — not "
+                            "connecting: unbound, it would go into the tunnel\n",
+                    g_bind_dev, strerror(errno));
         }
         close(fd);
         return -1;
@@ -141,31 +205,22 @@ static int attempt_start(struct in_addr ip, uint16_t port, int *done) {
 }
 
 static int tcp_connect(const char *host, uint16_t port, int timeout_s) {
-    char portstr[8];
-    snprintf(portstr, sizeof(portstr), "%u", port);
-    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
-    struct addrinfo *res = NULL;
-    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return TR_EDNS;
-
     struct in_addr addr[ADDR_MAX];
-    unsigned an = 0;
-    for (struct addrinfo *p = res; p && an < ADDR_MAX; p = p->ai_next)
-        if (p->ai_family == AF_INET)
-            addr[an++] = ((struct sockaddr_in *)p->ai_addr)->sin_addr;
-    freeaddrinfo(res);
+    unsigned an = pinned(host, addr);
+    if (an == 0) an = resolve(host, addr);
     if (an == 0) return TR_EDNS;
 
-    /* Прошлый победитель — вперёд. В устойчивом состоянии это означает одно соединение за
-     * один круг до сервера вместо перебора мёртвых адресов заново каждый раз. */
+    /* The last winner goes first: in steady state one connect takes one round trip instead of
+     * going through the dead addresses again each time. */
     struct in_addr *g = good_get(host, port);
     if (g) for (unsigned i = 1; i < an; i++)
         if (addr[i].s_addr == g->s_addr) { struct in_addr t = addr[0]; addr[0] = addr[i]; addr[i] = t; break; }
 
     int fd[ATTEMPT_MAX];
     struct in_addr fa[ATTEMPT_MAX];
-    unsigned nf = 0;     /* попыток в воздухе */
-    unsigned next = 0;   /* следующий адрес к запуску */
-    unsigned dead = 0;   /* сколько адресов отвалилось */
+    unsigned nf = 0;     /* attempts in flight */
+    unsigned next = 0;   /* next address to start */
+    unsigned dead = 0;   /* addresses that failed */
     int64_t deadline = now_ms() + (long long)timeout_s * 1000;
     int64_t stagger_at = 0;
     int win = -1;
@@ -174,14 +229,14 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_s) {
         int64_t t = now_ms();
         if (t >= deadline) break;
 
-        /* Запуск новых попыток: первая сразу, дальше через STAGGER_MS. Пауза нужна, чтобы
-         * при живом первом адресе (обычный случай) второй сокет вообще не открывался. */
+        /* Start new attempts: the first at once, the next ones STAGGER_MS apart, so that with a
+         * live first address (the usual case) no second socket is opened at all. */
         while (nf < ATTEMPT_MAX && next < an && t >= stagger_at) {
             int d = 0;
             struct in_addr ip = addr[next++];
             int s = attempt_start(ip, port, &d);
             if (s < 0) { dead++; continue; }
-            if (d) {   /* соединилось сразу: обычно это адрес в той же сети */
+            if (d) {   /* connected at once: usually an address on the local network */
                 for (unsigned j = 0; j < nf; j++) close(fd[j]);
                 nf = 0;
                 good_put(host, port, ip);
@@ -193,15 +248,14 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_s) {
             stagger_at = t + STAGGER_MS;
         }
         if (win >= 0) break;
-        if (nf == 0) break;   /* адреса кончились, и ни одна попытка не жива */
+        if (nf == 0) break;   /* no addresses left and no attempt alive */
 
         struct pollfd pv[ATTEMPT_MAX];
         for (unsigned i = 0; i < nf; i++) { pv[i].fd = fd[i]; pv[i].events = POLLOUT; pv[i].revents = 0; }
 
-        /* Ждём до ближайшего из двух событий: пора запускать следующую попытку или вышел
-         * общий срок. Ограничение «только если есть куда запускать» — не мелочь: без него
-         * при четырёх попытках в воздухе и непустом остатке адресов poll получал таймаут 0
-         * и цикл крутился на месте, съедая ядро. */
+        /* Wait until the next attempt is due or the deadline passes. The stagger counts only if
+         * another attempt can start: otherwise, with ATTEMPT_MAX in flight and addresses left,
+         * poll gets a 0 timeout and the loop spins, eating a CPU. */
         int64_t wait = deadline - t;
         if (next < an && nf < ATTEMPT_MAX) {
             int64_t till = stagger_at > t ? stagger_at - t : 0;
@@ -222,7 +276,7 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_s) {
                 nf = 0;
                 break;
             }
-            /* Этот адрес отпал — освобождаем место и сразу пробуем следующий. */
+            /* This address failed: free its place and try the next one at once. */
             close(fd[i]); dead++;
             nf--; fd[i] = fd[nf]; fa[i] = fa[nf]; pv[i] = pv[nf];
             stagger_at = 0;
@@ -231,62 +285,29 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_s) {
 
     if (win < 0) {
         for (unsigned i = 0; i < nf; i++) close(fd[i]);
-        /* Сообщение называет масштаб: «ни один из N адресов» — это про имя узла, а не
-         * про сеть, и лечится сменой узла, а не настройкой роутера. Приставка «steer vless»
-         * — прежняя: по ней журнал читают, а соединяется этим путём пока только VLESS. */
-        fprintf(stderr, "steer vless: %s:%u — ни один адрес не ответил (адресов %u, отпало %u)\n",
+        /* The message gives the scale: when none of N addresses answers, the problem is the
+         * node's name, not the local network. */
+        fprintf(stderr, "tunvless: %s:%u — no address answered (%u addresses, %u failed)\n",
                 host, port, an, dead);
         return TR_ECONNECT;
     }
     if (dead)
-        fprintf(stderr, "steer vless: %s:%u — соединился, пропущено мёртвых адресов: %u из %u\n",
+        fprintf(stderr, "tunvless: %s:%u — connected after %u of %u addresses failed\n",
                 host, port, dead, an);
     sock_ready(win, timeout_s);
     return win;
 }
 
-/* Шов установления TCP — симметрично g_latency_probe в failover.c и по той же причине:
- * стенду нужно провести рукопожатие с собеседником, которого он держит сам, не поднимая
- * ни сокета наружу, ни настоящего узла. В бою указатель NULL, и соединяет tcp_connect.
+/* The TCP connect seam: a test runs the handshake against a peer it holds itself, with no
+ * outside socket and no real node. tests/vlessmatch.c includes this file to reach the seam and
+ * runs the handshake over a socketpair, so the failure branches (freeing keys and the fd) are
+ * checked under AddressSanitizer; fake-vless.py speaks only security=none, and run-reality.sh
+ * needs sing-box, root and network namespaces. NULL in production: tcp_connect connects.
  *
- * Почему шов появился именно здесь. У ветвей отказа установления не было НИ ОДНОГО
- * стенда: tests/fake-vless.py говорит только security=none и до TLS не доходит, а
- * tests/run-reality.sh требует sing-box, root и сетевых пространств и потому не входит ни
- * в `make test`, ни в `make ext-test`. Всё, что охраняло здесь освобождение ключей и
- * дескриптора, — чтение кода глазами, тогда как у xsteer на ту же болезнь (I-067) стенд
- * стоит под AddressSanitizer с запуска 42. Шов дешевле поддельного сервера: адрес узла
- * перестаёт быть обязан быть настоящим, и дальше рукопожатие идёт по socketpair
- * (tests/vlessmatch.c, R-114; стенд включает этот файл, чтобы дотянуться до шва).
- *
- * Возвращает то же, что tcp_connect: дескриптор либо отрицательный код TR_*. */
+ * Returns what tcp_connect does: an fd or a negative TR_* code. */
 static int (*g_tcp_dial)(const char *host, uint16_t port, int timeout_s);
 
 int tr_dial(const char *host, uint16_t port, int timeout_s) {
     if (g_tcp_dial) return g_tcp_dial(host, port, timeout_s);
     return tcp_connect(host, port, timeout_s);
-}
-
-/* Сокет UDP к узлу — для протоколов, у которых датаграммы идут датаграммами (shadowsocks, SOCKS5 UDP
- * ASSOCIATE; src/proto/proxy). Та же метка, что у TCP (`over`/`via`), и тем же правилом: метка
- * обязательна — без неё сокет не открывается. Первый адрес IPv4 имени: перебора, как у TCP, нет —
- * у UDP нет рукопожатия, по которому мёртвый адрес видно сразу. Дескриптор неблокирующий и
- * соединённый (connect), либо отрицательный код TR_*. */
-int tr_dial_udp(const char *host, uint16_t port) {
-    char portstr[8];
-    snprintf(portstr, sizeof(portstr), "%u", port);
-    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM };
-    struct addrinfo *res = NULL;
-    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return TR_EDNS;
-    struct sockaddr_in sa = *(struct sockaddr_in *)res->ai_addr;
-    freeaddrinfo(res);
-    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (fd < 0) return TR_ESOCK;
-    if (g_sock_mark &&
-        setsockopt(fd, SOL_SOCKET, SO_MARK, &g_sock_mark, sizeof(g_sock_mark)) != 0 &&
-        g_sock_mark_req) {
-        close(fd);
-        return TR_ESOCK;
-    }
-    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) { close(fd); return TR_ECONNECT; }
-    return fd;
 }

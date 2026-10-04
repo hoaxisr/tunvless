@@ -1,37 +1,34 @@
-/* Разбор подписки: vless:// ссылки в список узлов.
+/* Subscription parsing: the VLESS nodes of a subscription file.
  *
- * Подписка — это base64 от списка ссылок, по одной на строку. Ничего сложнее здесь нет,
- * и именно поэтому разбор живёт в steer, а не в клиенте: он не требует ни криптографии,
- * ни сети, проверяется текстом, и его результат нужен и интерфейсу (показать узлы), и
- * сторожу (выбрать живой).
+ * A subscription is a list of links (plain or base64, one per line), an Xray or sing-box JSON
+ * config, or Clash YAML. Parsing needs no network and no cryptography, so the subscription tests
+ * build this file without libraries.
  *
- * Чужие протоколы (hy2, ss, trojan) пропускаются молча, но считаются: подписка обычно
- * общая, и «в ней 26 узлов, а steer видит 17» должно объясняться цифрой, а не догадкой.
+ * Links and Clash proxies of other protocols are skipped but counted (foreign): a subscription is
+ * usually shared, and "26 nodes in it, 17 used" must be explained by numbers, not guessed.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include "vless.h"
 #include "sublink.h"
-/* Ради vless_uuid_form: пригодность идентификатора — такая же часть пригодности узла, как
- * транспорт и security, а правило, по которому он превращается в 16 байт, живёт в одном
- * месте — в vless_proto.c. Библиотек это не тянет. */
+/* vless_uuid_form: the rule that turns the id into 16 bytes lives in one place, vless_proto.c
+ * (no libraries). */
 #include "vless_proto.h"
-/* Разбор строки encryption (VLESS encryption): годность узла решается здесь, до подключения. Только строки,
- * без криптографии — сюда же входит стенд подписки, у которого библиотеки нет. */
+/* vencp_parse: a VLESS encryption string is checked here, before connecting. Strings only, no
+ * cryptography. */
 #include "vencp.h"
 
-/* Строки ссылки, поля транспорта и безопасности, длинные значения узла, проверка сертификата и
- * ключ insecure выхода — в sublink.c: их делит с этим файлом модуль steer-proxy (sublink.h). Здесь
- * остались подписки целиком и VLESS-своё: flow, encryption и идентификатор. */
+/* Link strings, transport and security parameters, long values and certificate checks are in
+ * sublink.c. Here: whole subscriptions and the VLESS fields (flow, encryption, the id). */
 
-/* Метка негодного encryption: разбор не удался, причина названа в node_usable. */
+/* Marker of an encryption value that did not parse; node_usable names the reason. */
 static const char SUB_BAD_ENC[] = "!encryption";
 
-/* encryption узла. Пусто и «none» — шифрования нет. Остальное обязано разобраться по правилу Xray
- * (vencp.h): иначе узел помечается меткой и отбраковывается в node_usable. Значение приходит уже
- * раскодированным, с завершающим нулём. */
+/* Empty and "none" mean no encryption. Anything else must parse by Xray's rule (vencp.h), or the
+ * node is marked and node_usable rejects it. v is already percent-decoded. */
 static void set_encryption(struct vless_node *n, const char *v) {
     n->encryption = NULL;
     if (!v[0] || !strcmp(v, "none")) return;
@@ -40,17 +37,10 @@ static void set_encryption(struct vless_node *n, const char *v) {
     n->encryption = sl_intern(v, strlen(v));
 }
 
-/* Пригодность разобранного узла — общее правило для обоих путей разбора; тело ниже. */
 static int node_usable(struct vless_node *n);
 
-/* vless://UUID@host:port?params#name
- *
- * Возвращает 0, если ссылка разобрана и узел ПРИГОДЕН. Непригодный узел — это не ошибка
- * подписки: сервер может предлагать транспорт, которого клиент не умеет, и правильное
- * поведение — пропустить его, а не отказаться от всей подписки. */
-/* Параметры самого VLESS: flow и encryption (постквантовое шифрование Xray-core, паритет 26.9 —
- * значение длинное, см. sl_intern). Остальные параметры ссылки — транспорт и безопасность
- * (sl_link_param). */
+/* The VLESS parameters of a link: flow and encryption (Xray-core's post-quantum encryption, a
+ * long value, see sl_intern). The rest go to sl_link_param. */
 static int vless_own(struct vless_node *n, const char *k, size_t klen, const char *v, size_t vlen) {
     if (klen == 4 && !strncmp(k, "flow", 4)) sl_set_field(n->flow, sizeof(n->flow), v, vlen);
     else if (klen == 10 && !strncmp(k, "encryption", 10)) {
@@ -61,69 +51,54 @@ static int vless_own(struct vless_node *n, const char *k, size_t klen, const cha
     return 1;
 }
 
+/* vless://UUID@host:port?params#name. An unusable node is not an error of the subscription: the
+ * server may offer a transport the client does not support, and only that node is skipped. */
 int vless_parse_url(const char *url, struct vless_node *n) {
-    /* Значения по умолчанию — те, что подразумевает VLESS, когда поле опущено: type=tcp и
-     * security=none встречаются именно так (их ставят sl_link_parse и node_usable).
-     *
-     * security=none — это VLESS БЕЗ TLS, голый протокол по TCP. Он поддержан: шифровать там
-     * нечего, а сам VLESS реализован целиком. Такой узел осмыслен внутри доверенной сети или за
-     * уже защищённым каналом, и отбрасывать его вместе с неподдержанными транспортами было бы
-     * ошибкой — причины у них разные. */
+    /* Omitted fields default to type=tcp and security=none (sl_link_parse, node_usable).
+     * security=none is plain VLESS over TCP, without TLS: supported, and sensible inside a
+     * trusted network or over an already protected channel. */
     int rc = sl_link_parse(url, "vless://", n, vless_own, NULL, NULL);
     if (rc) return rc;
-    /* Пригодность. Проверяется здесь, а не при подключении, чтобы непригодный узел не попал в
-     * список кандидатов и сторож не тратил на него попытки. */
+    /* Checked here, not at connect time, so that an unusable node never becomes a candidate. */
     return node_usable(n);
 }
 
-/* Пригоден ли РАЗОБРАННЫЙ узел. 0 — да, 1 — нет, причина в n->skip_reason.
- *
- * Отдельной функцией, потому что путей разбора теперь два: ссылка vless:// и конфиг Xray в
- * подписке (см. parse_xray ниже). Правило пригодности у них обязано быть одно — иначе узел,
- * непригодный в одном виде, окажется пригодным в другом, и человек получит «узлов два,
- * туннель не работает, сказать нечего» ровно там, где мы этого и добивались избежать.
- *
- * Поля, которых во ссылке не было, к этому моменту уже заполнены умолчаниями: делает это
- * первая же строка. */
+/* Whether a parsed node is usable: 0 — yes, 1 — no, reason in n->skip_reason. Every parser
+ * (links, Xray, sing-box, Clash) goes through it, so a node cannot be usable in one form and
+ * unusable in another. */
 static int node_usable(struct vless_node *n) {
     if (!n->security[0]) snprintf(n->security, sizeof(n->security), "none");
 
-    /* flow=xtls-rprx-vision-udp443 — тот же Vision, но с разрешением UDP/443 в потоке (Xray-core). У нас
-     * UDP идёт отдельной командой и без flow, поэтому разрешение ничего не меняет, а имя приводится к
-     * обычному: в запросе VLESS Xray тоже отправляет flow без суффикса. */
+    /* flow=xtls-rprx-vision-udp443 is Vision with UDP to port 443 allowed: without the suffix
+     * Xray's client refuses UDP/443 over Vision ("XTLS rejected UDP/443 traffic") to push QUIC
+     * back to TCP. This client never refuses it, so the suffix changes nothing, and the name
+     * becomes the usual one: Xray also sends the flow without the suffix in the VLESS request. */
     if (!strcmp(n->flow, "xtls-rprx-vision-udp443")) snprintf(n->flow, sizeof(n->flow), "xtls-rprx-vision");
 
     if (n->encryption == SUB_BAD_ENC) {
-        snprintf(n->skip_reason, sizeof(n->skip_reason), "encryption не поддержан");
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "encryption is not supported");
         return 1;
     }
     if (sl_link_usable_pre(n)) return 1;
 
-    /* Идентификатор пользователя. Проверяется ЗДЕСЬ по той же причине, что и всё
-     * остальное в этом блоке: непригодный узел не должен попасть в кандидаты.
-     *
-     * Пригодность здесь — это правило Xray (см. vless_uuid_form): либо шестнадцатеричный
-     * UUID в 32-36 знаков, либо короткая строка до 30 знаков, из которой UUID выводится
-     * хэшем. Панели выдают и то, и другое, и «TMG_74317ba5f91» — законный узел, а не
-     * ошибка. Непригодны ровно три случая, и стать 16 байтами они не могут никак:
-     * пустая строка, ровно 31 знак (для вывода длинно, для UUID коротко) и длиннее
-     * UUID; отдельно — строка нужной длины с посторонним знаком внутри.
-     *
-     * До этой проверки такой узел считался пригодным, доходил до подключения и молчал:
-     * проба отвечала «UUID неразборчив», а туннель ронял соединение без причины. */
+    /* The user id, by Xray's rule (vless_uuid_form): a hex UUID of 32-36 characters, or a
+     * string of up to 30 characters that is hashed into a UUID. Panels use both, and
+     * "TMG_74317ba5f91" is a valid id. Unusable: an empty string, exactly 31 characters (too
+     * long to hash, too short for a UUID), longer than a UUID, or a UUID-length string with a
+     * character that is not hex. */
     switch (vless_uuid_form(n->uuid)) {
     case VLESS_UUID_EMPTY:
-        snprintf(n->skip_reason, sizeof(n->skip_reason), "идентификатор пуст");
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "id is empty");
         return 1;
     case VLESS_UUID_GAP:
         snprintf(n->skip_reason, sizeof(n->skip_reason),
-                 "идентификатор: 31 знак, нужен UUID");
+                 "id: 31 characters, need a UUID");
         return 1;
     case VLESS_UUID_TOOLONG:
-        snprintf(n->skip_reason, sizeof(n->skip_reason), "идентификатор длиннее UUID");
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "id longer than a UUID");
         return 1;
     case VLESS_UUID_NOTHEX:
-        snprintf(n->skip_reason, sizeof(n->skip_reason), "UUID с недопустимым знаком");
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "UUID with an invalid character");
         return 1;
     default:
         break;
@@ -132,33 +107,21 @@ static int node_usable(struct vless_node *n) {
     return sl_link_usable_post(n);
 }
 
-/* ---- подписка в виде конфига Xray -------------------------------------------
+/* ---- a subscription as an Xray config -----------------------------------------------------------
  *
- * ЗАЧЕМ ЭТО ВООБЩЕ ЕСТЬ. Панели с привязкой к устройствам выбирают формат ответа по
- * User-Agent, и списка ссылок vless:// среди вариантов может не быть НИ ОДНОГО. Замерено на
- * живой подписке: незнакомому клиенту (steer, curl, sing-box, Nekoray) отдаётся заглушка из
- * ссылок ss:// на localhost:1234 с именами «Неправильный клиент» и «Подключись через Happ»;
- * Happ, v2rayNG и Streisand получают конфиг Xray в JSON; Clash — свой YAML; SFI — конфиг
- * sing-box. То есть подписка, у которой узлы совершенно исправны (проверено пробой: восемь
- * из девяти отвечают), для движка выглядела как «ни одного пригодного узла».
+ * Panels that bind subscriptions to devices pick the format of the answer by User-Agent, and a
+ * list of vless:// links may not be among the formats at all. An unknown client (curl, sing-box,
+ * Nekoray) may get a stub of ss:// links to localhost:1234 named "Wrong client"; Happ, v2rayNG
+ * and Streisand get an Xray config in JSON, Clash its YAML, SFI a sing-box config.
  *
- * Притворяться чужим клиентом — не выход, и не из принципа: JSON приезжает и Happ-у, значит
- * читать его пришлось бы всё равно. Поэтому читаем.
+ * What is read: an array of configs `[{...},{...}]` or one config `{...}`; in each, the
+ * `outbounds` whose `protocol` is `vless`. Everything else (dns, routing, inbounds, freedom,
+ * blackhole) configures the client, not a node, and is skipped.
  *
- * ЧТО ИМЕННО ЧИТАЕТСЯ. Массив конфигов `[{...},{...}]` или один конфиг `{...}`; в каждом
- * берутся `outbounds`, а из них — те, у которых `protocol` равен `vless`. Всё остальное
- * (dns, routing, inbounds, freedom, blackhole) пропускается: это настройки клиента, к
- * которому подписка обращается, а не описание узла.
- *
- * Разборщик свой и намеренно маленький — как и ридер спеки (src/lib/jsonr.c), он не общий
- * парсер JSON, а обход ровно той формы, которую ждём. Ридер спеки теперь общий (jsonr.h), но
- * брать его сюда всё равно незачем, по двум причинам. Он строг там, где подписке нужна
- * терпимость: строку длиннее буфера он отвергает через struct err (для имени выхода или пути
- * так и надо — обрезанное имя устройства ядро не возьмёт), а имя узла из панели здесь молча
- * обрезается — это подпись, и из-за длинной подписи терять узел нельзя. И стенд подписки
- * (tests/submatch.c) включает этот файл исходником и собирается в одиночку, без lib/, модели и
- * криптобиблиотеки, — это его главное свойство: чужой текст из интернета проверяется без сети и без
- * docker.
+ * The parser is small and walks only the expected form; it is not a general JSON parser. It is
+ * lenient where a subscription needs it: a node name longer than its buffer is cut, not
+ * rejected, since a long label must not cost the node. The subscription tests
+ * (tests/submatch.c) build this file without libraries.
  */
 struct sj { const char *p; };
 
@@ -166,10 +129,9 @@ static void sj_ws(struct sj *j) {
     while (*j->p == ' ' || *j->p == '\t' || *j->p == '\n' || *j->p == '\r') j->p++;
 }
 
-/* Строка в buf. Экранирование понимается ровно настолько, чтобы \" не оборвала строку: имена
- * узлов приходят из панели и содержат что угодно, а \uXXXX в них не встречается — панели
- * пишут UTF-8 как есть. Непонятая последовательность попадает в buf буквально, и это лучше,
- * чем отказ: имя — единственное поле, которому позволено быть любым. */
+/* A string into buf, cut to n. Escapes are handled only so that \" does not end the string:
+ * panels write UTF-8 as is, not \uXXXX. An escaped character is taken literally, which beats a
+ * refusal: a name may contain anything. */
 static int sj_str(struct sj *j, char *buf, size_t n) {
     sj_ws(j);
     if (*j->p != '"') return -1;
@@ -186,9 +148,7 @@ static int sj_str(struct sj *j, char *buf, size_t n) {
     return 0;
 }
 
-/* Пропустить одно значение любого типа. Нужен за тем же, за чем js_skip ридеру спеки
- * (src/lib/jsonr.c): чтобы незнакомый ключ
- * не толковался молча, а именно пропускался. */
+/* Skip one value of any type, so that an unknown key is skipped rather than misread. */
 static void sj_skip(struct sj *j) {
     sj_ws(j);
     if (*j->p == '"') { char t[8]; sj_str(j, t, sizeof(t)); return; }
@@ -206,8 +166,8 @@ static void sj_skip(struct sj *j) {
     while (*j->p && *j->p != ',' && *j->p != '}' && *j->p != ']') j->p++;
 }
 
-/* Войти в объект и отдавать его ключи по одному. 0 — ключ в key, 1 — объект кончился,
- * -1 — это не объект. Значение читает вызывающий; не прочитал — обязан позвать sj_skip. */
+/* Enter an object and return its keys one by one: 0 — a key in key, 1 — the object ended,
+ * -1 — not an object. The caller reads the value, or must call sj_skip. */
 static int sj_obj_key(struct sj *j, int *first, char *key, size_t key_n) {
     sj_ws(j);
     if (*first) {
@@ -227,7 +187,7 @@ static int sj_obj_key(struct sj *j, int *first, char *key, size_t key_n) {
     return 0;
 }
 
-/* Тот же приём для массива: 0 — элемент начинается здесь, 1 — массив кончился. */
+/* The same for an array: 0 — an element starts here, 1 — the array ended, -1 — malformed. */
 static int sj_arr_next(struct sj *j, int *first) {
     sj_ws(j);
     if (*first) {
@@ -237,12 +197,9 @@ static int sj_arr_next(struct sj *j, int *first) {
     } else {
         sj_ws(j);
         if (*j->p == ',') j->p++;
-        /* После элемента бывает только запятая или конец массива. Всё прочее — брак, и на
-         * нём разбор обязан ОСТАНОВИТЬСЯ: прежде он отвечал «есть следующий элемент», не
-         * сдвигая указатель, а читатель элемента на не-объекте тоже не сдвигался — и цикл
-         * крутился вечно на `[null]`, `[}`, порте строкой и ещё четырёх формах кривого JSON,
-         * который приходит из интернета (подписка с панели). Висел и процесс туннеля, и
-         * интерфейс. */
+        /* After an element only a comma or the end of the array may follow. Anything else
+         * must stop the parse: neither this nor the element reader would move, and malformed
+         * JSON (`[null]`, `[}`) would loop forever. */
         else if (*j->p != ']') return -1;
     }
     sj_ws(j);
@@ -250,10 +207,10 @@ static int sj_arr_next(struct sj *j, int *first) {
     return 0;
 }
 
-/* Настройки ws или httpupgrade из конфига — до того, как станет известно, какой из двух у узла.
- * Конфиг вправе нести оба объекта (и ещё xhttpSettings) сразу, а решает network — который может
- * стоять и после них, поэтому разобранное складывается сюда и переносится в узел в конце
- * (xray_stream). Иначе путь из wsSettings затирал бы путь xhttp у узла xhttp. */
+/* ws or httpupgrade settings of a config, held until it is known which of the two the node uses.
+ * A config may carry both objects (and xhttpSettings) at once, and network, which decides, may
+ * come after them; so they are collected here and moved into the node at the end (xray_stream).
+ * Otherwise the path from wsSettings would overwrite the path of an xhttp node. */
 struct upg_cfg {
     char path[sizeof(((struct vless_node *)0)->path)];
     char host[sizeof(((struct vless_node *)0)->http_host)];
@@ -271,21 +228,41 @@ static int ci_eq(const char *a, const char *b) {
     return *a == *b;
 }
 
-/* headers конфига Xray (map[string]string) — в строки «Имя: значение\n».
+/* headers of an Xray config (map[string]string) into "Name: value\n" lines.
  *
- * Отбраковка (bad), а не молчаливый пропуск, потому что заголовок узла — часть облика, который
- * продавец выбрал для своего сервера или CDN перед ним: узел, ушедший без него, может
- * отвечать 403 и выглядеть мёртвым. Негодно:
- *   - значение не строкой — Xray такой конфиг не загрузит вовсе;
- *   - имя не из знаков токена HTTP или длиннее 40, значение с управляющим знаком (перевод строки
- *     сделал бы из одного заголовка два) или длиннее 250 — запрос у нас собирается из строк;
- *   - у ws — Upgrade, Connection и Sec-WebSocket-Key/Version/Extensions: gorilla на них отказывает
- *     («duplicate header not allowed»), то есть и у Xray узел не открылся бы. У httpupgrade Xray их
- *     принимает (ключ как написан, Connection и Upgrade транспорт ставит поверх своими
- *     каноническими ключами) — и здесь принимаются, запрос повторяет Xray (trupgrade.c);
- *   - Host у httpupgrade — Xray отвергает конфиг («"headers" can't contain "host"»). У ws Host
- *     из headers Xray переносит в host (если тот пуст) и из заголовков убирает — так и здесь.
- *   - не влезло в буфер узла. */
+ * A bad header marks the node (bad) rather than being dropped: the headers are part of the look
+ * the seller chose for the server or the CDN in front of it, and a node without them may answer
+ * 403 and look dead. Bad:
+ *   - a value that is not a string: Xray does not load such a config;
+ *   - a name not of HTTP token characters or longer than 40, a value with a control character (a
+ *     line break would turn one header into two) or longer than 250: the request is built from
+ *     these strings;
+ *   - for ws, Upgrade, Connection and Sec-WebSocket-Key/Version/Extensions: gorilla refuses them
+ *     ("duplicate header not allowed"), so the node would not open with Xray either. httpupgrade
+ *     in Xray accepts them (the key as written; the transport sets Connection and Upgrade on top
+ *     with its canonical keys), and so does this parser: the request follows Xray (trupgrade.c);
+ *   - Host for httpupgrade: Xray rejects the config (`"headers" can't contain "host"`). For
+ *     ws, Xray moves Host from headers into host (if that is empty) and drops it from headers,
+ *     and so does this parser;
+ *   - more than the node's buffer holds. */
+/* A header the request can carry as it is: a name of HTTP token characters, up to 40, and a value
+ * up to 250 without control characters (a line break would turn one header into two). */
+static int hdr_valid(const char *key, const char *val) {
+    size_t kn = strlen(key), vn = strlen(val);
+    if (!kn || kn > 40 || vn > 250) return 0;
+    for (size_t i = 0; i < kn; i++) {
+        unsigned char c = (unsigned char)key[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              strchr("!#$%&'*+-.^_`|~", c)))
+            return 0;
+    }
+    for (size_t i = 0; i < vn; i++) {
+        unsigned char c = (unsigned char)val[i];
+        if ((c < 0x20 && c != '\t') || c == 0x7f) return 0;
+    }
+    return 1;
+}
+
 static void xray_headers(struct sj *j, struct upg_cfg *u, int hu) {
     int f = 1;
     char key[64], val[256];
@@ -301,17 +278,7 @@ static void xray_headers(struct sj *j, struct upg_cfg *u, int hu) {
             else if (!u->host[0]) sl_set_field(u->host, sizeof(u->host), val, vn);
             continue;
         }
-        int ok = kn > 0 && kn <= 40 && vn <= 250;
-        for (size_t i = 0; ok && i < kn; i++) {
-            unsigned char c = (unsigned char)key[i];
-            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-                  (c && strchr("!#$%&'*+-.^_`|~", c))))
-                ok = 0;
-        }
-        for (size_t i = 0; ok && i < vn; i++) {
-            unsigned char c = (unsigned char)val[i];
-            if ((c < 0x20 && c != '\t') || c == 0x7f) ok = 0;
-        }
+        int ok = hdr_valid(key, val);
         if (!hu && (ci_eq(key, "upgrade") || ci_eq(key, "connection") ||
                     ci_eq(key, "sec-websocket-key") || ci_eq(key, "sec-websocket-version") ||
                     ci_eq(key, "sec-websocket-extensions")))
@@ -321,8 +288,8 @@ static void xray_headers(struct sj *j, struct upg_cfg *u, int hu) {
     }
 }
 
-/* wsSettings и httpupgradeSettings: path, host, headers. Пустой host не затирает Host из
- * headers (у Xray пустой host — «не задан»). */
+/* wsSettings and httpupgradeSettings: path, host, headers. An empty host does not overwrite Host
+ * from headers (in Xray an empty host means "not set"). */
 static void xray_upg(struct sj *j, struct upg_cfg *u, int hu) {
     int f = 1;
     char k[64];
@@ -340,7 +307,7 @@ static void xray_upg(struct sj *j, struct upg_cfg *u, int hu) {
 
 static int sj_bool(struct sj *j);
 
-/* streamSettings: транспорт, security и всё, что зависит от них. */
+/* streamSettings: the transport, security and everything that depends on them. */
 static void xray_stream(struct sj *j, struct vless_node *n) {
     int first = 1;
     char k[64];
@@ -350,9 +317,9 @@ static void xray_stream(struct sj *j, struct vless_node *n) {
     while (sj_obj_key(j, &first, k, sizeof(k)) == 0) {
         if (!strcmp(k, "network")) {
             sj_str(j, n->type, sizeof(n->type));
-            /* raw — каноническое имя tcp у Xray с 24.9.30; панели пишут его всё чаще. */
+            /* raw is Xray's name for tcp since 24.9.30. */
             if (!strcmp(n->type, "raw")) snprintf(n->type, sizeof(n->type), "tcp");
-            /* websocket — второе имя ws у Xray (infra/conf: case "ws", "websocket"). */
+            /* websocket is another name for ws in Xray (infra/conf: case "ws", "websocket"). */
             if (!strcmp(n->type, "websocket")) snprintf(n->type, sizeof(n->type), "ws");
         }
         else if (!strcmp(k, "tcpSettings") || !strcmp(k, "rawSettings")) {
@@ -372,9 +339,9 @@ static void xray_stream(struct sj *j, struct vless_node *n) {
         else if (!strcmp(k, "httpupgradeSettings")) xray_upg(j, &hu, 1);
         else if (!strcmp(k, "security")) sj_str(j, n->security, sizeof(n->security));
         else if (!strcmp(k, "realitySettings") || !strcmp(k, "tlsSettings")) {
-            /* Оба объекта несут serverName и fingerprint; publicKey и shortId бывают только
-             * у reality. Разбирать их одним куском можно потому, что имена полей не спорят:
-             * узел объявляет ровно один из двух. */
+            /* Both carry serverName and fingerprint; only reality has publicKey and shortId.
+             * One parser serves both because the field names do not clash and a node declares
+             * exactly one of the two. */
             int f2 = 1;
             char k2[64];
             while (sj_obj_key(j, &f2, k2, sizeof(k2)) == 0) {
@@ -413,21 +380,21 @@ static void xray_stream(struct sj *j, struct vless_node *n) {
                 else sj_skip(j);
             }
         } else if (!strcmp(k, "xhttpSettings") || !strcmp(k, "splithttpSettings")) {
-            /* splithttpSettings — прежнее имя того же транспорта; панели с ним ещё живут. */
+            /* splithttpSettings is the old name of xhttpSettings; some panels still use it. */
             int f2 = 1;
             char k2[64];
             while (sj_obj_key(j, &f2, k2, sizeof(k2)) == 0) {
                 if (!strcmp(k2, "path")) sj_str(j, n->path, sizeof(n->path));
                 else if (!strcmp(k2, "mode")) sj_str(j, n->mode, sizeof(n->mode));
-                /* В конфигурации это поле лежит прямо здесь, а не в `extra`: `extra` — форма
-                 * ССЫЛКИ, в которую те же настройки заворачивают, когда конфигурации нет. */
+                /* In a config this field is right here, not in `extra`: `extra` is how a
+                 * link wraps the same settings when there is no config. */
                 else if (!strcmp(k2, "xPaddingBytes")) {
                     char pb[32];
                     sj_str(j, pb, sizeof(pb));
                     sl_pad_range(n, pb);
                 }
                 else if (!strcmp(k2, "extra")) {
-                    /* Вложенный extra (форма ссылки внутри конфига): тот же просмотр, что у ссылки. */
+                    /* A nested extra (the link form inside a config): read as in a link. */
                     const char *b = j->p;
                     sj_skip(j);
                     size_t l = (size_t)(j->p - b);
@@ -456,11 +423,6 @@ static void xray_stream(struct sj *j, struct vless_node *n) {
     }
 }
 
-/* settings исходящего vless: vnext[0] — адрес, порт и первый пользователь.
- *
- * Именно первый и только он: подписка описывает узел для ОДНОГО человека, и второго
- * пользователя в ней не бывает. Появится — возьмём первого и не станем притворяться, что
- * умеем больше. */
 static void json_encryption(struct sj *j, struct vless_node *n) {
     char *ev = malloc(4096);
     if (!ev) { sj_skip(j); return; }
@@ -469,12 +431,14 @@ static void json_encryption(struct sj *j, struct vless_node *n) {
     free(ev);
 }
 
+/* settings of a vless outbound: vnext[0] gives the address, the port and the first user. Only
+ * the first: a subscription describes a node for one user. */
 static void xray_settings(struct sj *j, struct vless_node *n) {
     int first = 1;
     char k[64];
     while (sj_obj_key(j, &first, k, sizeof(k)) == 0) {
-        /* Упрощённая форма исходящего (Xray 25+): address, port, id, flow, encryption прямо в settings,
-         * без vnext и users. */
+        /* The short outbound form (Xray 25+): address, port, id, flow and encryption right in
+         * settings, without vnext and users. */
         if (!strcmp(k, "address")) { sj_str(j, n->host, sizeof(n->host)); continue; }
         if (!strcmp(k, "id")) { sj_str(j, n->uuid, sizeof(n->uuid)); continue; }
         if (!strcmp(k, "flow")) { sj_str(j, n->flow, sizeof(n->flow)); continue; }
@@ -504,8 +468,8 @@ static void xray_settings(struct sj *j, struct vless_node *n) {
                 else if (!strcmp(k2, "port")) {
                     sj_ws(j);
                     char num[16];
-                    /* Число или число строкой: панели пишут и так, и так. Прочее — брак,
-                     * пропускается как значение, чтобы разбор не разъехался по объекту. */
+                    /* A number, or a number as a string: panels write both. Anything else is
+                     * skipped as a value, so the parse stays in step with the object. */
                     if (*j->p == '"') sj_str(j, num, sizeof(num));
                     else {
                         size_t i = 0;
@@ -535,21 +499,22 @@ static void xray_settings(struct sj *j, struct vless_node *n) {
     }
 }
 
-/* ---- sing-box: outbounds с type=vless ---------------------------------------------------------
+/* ---- sing-box: outbounds with type=vless --------------------------------------------------------
  *
- * Панели, отдающие конфиг sing-box (клиент SFI, Hiddify, Karing), кладут узлы в тот же массив
- * `outbounds`, что и Xray, но плоско: type/tag/server/server_port/uuid/flow и объекты tls и transport.
- * Отличия от Xray, из-за которых нужен отдельный разбор: имя вида — type, а не protocol; порт — число
- * server_port; TLS — объект с вложенными utls и reality; в transport заголовок Host — строка или
- * массив строк. Ранние данные ws: max_early_data + early_data_header_name; при имени
- * Sec-WebSocket-Protocol это `?ed=N` Xray (наш ws так и умеет), при пустом sing-box кладёт данные в
- * путь — форма, которой у Xray нет, и мы ранние данные тогда не включаем (соединение сработает и без
- * них: сервер sing-box принимает обычный запрос). */
-/* Дописать «Имя: значение\n» в буфер заголовков; -1, если не влезло или имя пусто. Без snprintf: он
- * предупреждает об усечении там, где усечение мы сами исключили проверкой длины. */
+ * Panels that serve a sing-box config (to SFI, Hiddify, Karing) put nodes into the same `outbounds`
+ * array as Xray, but flat: type/tag/server/server_port/uuid/flow and the tls and transport
+ * objects. The differences that need a parser of their own: the kind is in type, not protocol;
+ * the port is the number server_port; TLS is an object with nested utls and reality; the Host of
+ * a transport is a string or an array of strings. ws early data: max_early_data +
+ * early_data_header_name; with the name Sec-WebSocket-Protocol this is Xray's `?ed=N`, which our
+ * ws supports. With an empty name sing-box puts the data into the path, a form Xray does not
+ * have; early data then stays off (a sing-box server accepts a plain request too). */
+/* Append "Name: value\n" to the headers buffer (sing-box and Clash); -1 if it does not fit or the
+ * header is not valid (hdr_valid). No snprintf: it warns about truncation that the length check
+ * already rules out. */
 static int hdr_append(char *dst, size_t cap, const char *k, const char *v) {
     size_t o = strlen(dst), kn = strlen(k), vn = strlen(v);
-    if (!kn || o + kn + vn + 4 >= cap) return -1;
+    if (!hdr_valid(k, v) || o + kn + vn + 4 >= cap) return -1;
     memcpy(dst + o, k, kn);
     dst[o + kn] = ':'; dst[o + kn + 1] = ' ';
     memcpy(dst + o + kn + 2, v, vn);
@@ -567,7 +532,7 @@ static int sj_bool(struct sj *j) {
     return 0;
 }
 
-/* Число: либо 123, либо "123". */
+/* A number: 123 or "123". */
 static long sj_num(struct sj *j) {
     sj_ws(j);
     char b[24] = "";
@@ -586,8 +551,9 @@ static void sb_tls(struct sj *j, struct vless_node *n, int *enabled, int *realit
         else if (!strcmp(k, "server_name")) sj_str(j, n->sni, sizeof n->sni);
         else if (!strcmp(k, "insecure")) { if (sj_bool(j)) n->allow_insecure = 1; }
         else if (!strcmp(k, "ech")) {
-            /* {"enabled": true, "config": ["-----BEGIN ECH CONFIGS-----", "base64…", "-----END ECH CONFIGS-----"]}.
-             * Строки PEM склеиваются без рамки; без config (только query_server_name) — запрос из DNS, не поддержан. */
+            /* {"enabled": true, "config": ["-----BEGIN ECH CONFIGS-----", "base64…",
+             * "-----END ECH CONFIGS-----"]}. The PEM lines are joined without the frame lines.
+             * Without config (only query_server_name) it is a DNS lookup: not supported. */
             int f2 = 1, on = 1, have = 0;
             char k2[64], joined[1400] = "";
             size_t jl = 0;
@@ -596,7 +562,7 @@ static void sb_tls(struct sj *j, struct vless_node *n, int *enabled, int *realit
                 else if (!strcmp(k2, "config")) {
                     int fa = 1;
                     char line[1400];
-                    int r = sj_arr_next(j, &fa);          /* < 0 — не массив, а одна строка */
+                    int r = sj_arr_next(j, &fa);          /* < 0: a single string, not an array */
                     do {
                         line[0] = '\0';
                         if (sj_str(j, line, sizeof line) != 0) break;
@@ -610,7 +576,7 @@ static void sb_tls(struct sj *j, struct vless_node *n, int *enabled, int *realit
             else if (on) n->ech = SL_ECH_DNS;
         }
         else if (!strcmp(k, "certificate_public_key_sha256")) {
-            /* Массив строк base64: SHA-256 от SubjectPublicKeyInfo. Строка вместо массива — тоже. */
+            /* Base64 SHA-256 hashes of the SubjectPublicKeyInfo: an array, or a single string. */
             char pv[80];
             int fa = 1;
             int r = sj_arr_next(j, &fa);
@@ -678,11 +644,9 @@ static void sb_transport(struct sj *j, struct vless_node *n, struct sb_ws *w, st
     }
 }
 
-/* Один outbound sing-box уже прочитан в поля; здесь — свести в узел. Вызывается из xray_outbound,
- * когда встретился ключ type (у Xray его на этом уровне нет). */
+/* A sing-box outbound: it has type where Xray has protocol. xray_outbound calls it after looking
+ * ahead; it reads the whole object. */
 static void sb_outbound_body(struct sj *j, struct vless_node *n, char *proto, size_t proto_n) {
-    /* Возврат сюда после первого ключа невозможен: разбор идёт единым проходом в xray_outbound,
-     * поэтому функция читает остаток объекта сама. */
     int first = 1, tls_on = 0, reality = 0;
     char k[64];
     struct sb_ws w; struct upg_cfg u;
@@ -713,16 +677,16 @@ static void sb_outbound_body(struct sj *j, struct vless_node *n, char *proto, si
     }
 }
 
-/* Один outbound. 1 — это узел vless и он записан в n, 0 — не наш. */
+/* One outbound. 1 — a vless node, written into n; 0 — not ours. */
 static int xray_outbound(struct sj *j, struct vless_node *n) {
     memset(n, 0, sizeof(*n));
-    /* Умолчание транспорта — tcp, как у ссылки: конфиг без streamSettings или без network
-     * законен (так и подразумевает Xray), а пустое слово давало «транспорт  не поддержан». */
+    /* tcp by default, as in a link: a config without streamSettings or network is valid, and
+     * Xray then means tcp. */
     snprintf(n->type, sizeof(n->type), "tcp");
     int first = 1, is_vless = 0;
     char k[64], proto[32] = "";
-    /* Какой это формат — Xray (protocol) или sing-box (type)? Предпросмотр ключей верхнего уровня, как
-     * у remarks: порядок ключей не задан, а разбор идёт единым проходом. */
+    /* Xray (protocol) or sing-box (type)? Look ahead at the top-level keys, as for remarks: the
+     * key order is not defined, and the parse is a single pass. */
     {
         const char *save = j->p;
         int f0 = 1, has_protocol = 0, has_type = 0;
@@ -738,13 +702,13 @@ static int xray_outbound(struct sj *j, struct vless_node *n) {
             return !strcmp(proto, "vless");
         }
     }
-    /* Порядок ключей в JSON не задан, поэтому protocol может оказаться ПОСЛЕ settings.
-     * Значит читаем всё, а решаем в конце: разбор чужого исходящего в свободные поля никому
-     * не вредит, потому что узел всё равно не будет взят. */
+    /* The key order is not defined, so protocol may come after settings: read everything and
+     * decide at the end. Parsing another protocol's outbound into the fields does no harm, the
+     * node is not taken. */
     while (sj_obj_key(j, &first, k, sizeof(k)) == 0) {
         if (!strcmp(k, "protocol")) sj_str(j, proto, sizeof(proto));
-        /* tag из конфигурации Xray обрезается тем же байтовым пределом, что и имя из
-         * фрагмента ссылки, — и рвётся так же. */
+        /* tag is cut by bytes like a link's name, so an incomplete UTF-8 tail is dropped the
+         * same way. */
         else if (!strcmp(k, "tag")) { sj_str(j, n->name, sizeof(n->name)); sl_utf8_trim_tail(n->name); }
         else if (!strcmp(k, "settings")) xray_settings(j, n);
         else if (!strcmp(k, "streamSettings")) xray_stream(j, n);
@@ -754,23 +718,16 @@ static int xray_outbound(struct sj *j, struct vless_node *n) {
     return is_vless;
 }
 
-/* Имя, которое панель показала человеку, лежит в remarks КОНФИГА, а не в tag исходящего.
+/* The name the panel shows lives in the config's remarks, not in the outbound's tag: panels give
+ * many outbounds the same tag ("proxy"), or a tag with a random suffix that changes on every
+ * request ("tl-8-1-43al6bgvgg4"), and only remarks ("Germany", "Finland", …) tells nodes apart.
  *
- * Снято на живой панели (ответ клиенту Happ): семь конфигов, у пяти из них tag исходящего —
- * одно и то же слово «proxy», а различает их только remarks («Германия», «Финляндия», …).
- * У остальных двух tag вида «tl-8-1-43al6bgvgg4» — со СЛУЧАЙНЫМ суффиксом, который панель
- * меняет на каждый запрос. То есть на этом формате имя из tag даёт либо пять одинаковых
- * «proxy», либо имя, которое меняется само по себе при каждом обновлении подписки, — и
- * человек в списке узлов splify2 не может ни отличить их друг от друга, ни узнать вчерашний.
+ * remarks may come after outbounds, so the config object is first scanned for remarks alone
+ * (sj_skip copies nothing) and then parsed from its start. The scan covers one config, not the
+ * whole subscription.
  *
- * ПРЕДПРОСМОТР, А НЕ ЧТЕНИЕ ПО ХОДУ. В ответе панели remarks стоит ПОСЛЕ outbounds: пока
- * поток дойдёт до него, узлы уже записаны и переименовывать было бы нечего — указатель
- * назад не отматывается. Поэтому объект конфига сначала пробегается на один только remarks
- * (sj_skip ничего не копирует), а потом разбирается заново с начала. Второго прохода по
- * всему тексту подписки при этом нет: пробег ограничен одним конфигом.
- *
- * Процентная форма здесь НЕ раскрывается, в отличие от имени из #фрагмента ссылки: remarks —
- * поле JSON, и «%2F» в нём означает ровно эти три знака. Тот же довод, что у tag выше. */
+ * remarks is not percent-decoded, unlike a link's #fragment: in a JSON field "%2F" means exactly
+ * these three characters. */
 static void xray_remarks(struct sj *j, char *out, size_t n) {
     out[0] = '\0';
     const char *save = j->p;
@@ -783,41 +740,40 @@ static void xray_remarks(struct sj *j, char *out, size_t n) {
     j->p = save;
 }
 
-/* Имя узла из remarks конфига. ord — какой это по счёту исходящий vless В ЭТОМ конфиге.
- *
- * Второму и дальше приписывается номер: конфиг с балансировщиком несёт два узла — основной
- * и запасной, — и без номера оба назывались бы одинаково. Номер, а не tag: tag у таких
- * исходящих как раз и есть та случайная строка, от которой имя уводится.
- *
- * Номер в скобках, а не через «#»: панели сами нумеруют узлы решёткой («Мобильная связь #1»),
- * и «Мобильная связь #1 #2» читается как опечатка, а «Мобильная связь #1 (2)» — как второй
- * узел той же строки подписки.
- *
- * Обрезка возможна только у remarks длиной почти в весь буфер имени; тогда номер до имени
- * не доедет и два узла снова совпадут. Это лучше, чем ради номера отрезать человеку имя. */
+/* Node name from the config's remarks; ord counts the vless outbounds of this config. The second
+ * and later get a number, since a config with a balancer has a main and a spare node. The number
+ * is in parentheses ("Mobile #1 (2)") because panels number their nodes with '#' themselves.
+ * When remarks nearly fills the buffer the number is dropped rather than cutting the name. */
 static void xray_name(struct vless_node *nd, const char *remarks, size_t ord) {
-    if (ord == 0) snprintf(nd->name, sizeof(nd->name), "%s", remarks);
-    else snprintf(nd->name, sizeof(nd->name), "%s (%zu)", remarks, ord + 1);
+    char num[24] = "";
+    if (ord) snprintf(num, sizeof(num), " (%zu)", ord + 1);
+    size_t room = sizeof(nd->name) - 1;
+    size_t rl = strnlen(remarks, room);
+    size_t nl = strlen(num);
+    if (nl > room - rl) nl = room - rl;
+    memcpy(nd->name, remarks, rl);
+    memcpy(nd->name + rl, num, nl);
+    nd->name[rl + nl] = '\0';
     sl_utf8_trim_tail(nd->name);
 }
 
-/* Конфиг целиком: массив конфигов или один. Возвращает число ПРИГОДНЫХ узлов. */
+/* A whole config: an array of configs or one config. Returns the number of usable nodes. */
 static size_t parse_xray(const char *text, struct vless_node *out, size_t max,
                          struct vless_sub_stats *st) {
     struct sj j = { text };
     size_t n = 0;
     sj_ws(&j);
-    /* Один конфиг заворачивается в массив из одного: дальше путь общий. */
+    /* A single config is treated as an array of one. */
     int wrapped = (*j.p == '{');
     int fa = 1;
-    if (wrapped) fa = 0;                    /* массива нет — сразу разбираем объект */
+    if (wrapped) fa = 0;                    /* no array: parse the object at once */
     for (;;) {
         if (!wrapped) {
             int r = sj_arr_next(&j, &fa);
             if (r != 0) break;
         }
         const char *cfg_before = j.p;
-        /* Тело одного конфига: узлы — из outbounds, имя им — из remarks (xray_remarks). */
+        /* One config: nodes from outbounds, their names from remarks (xray_remarks). */
         char remarks[sizeof(((struct vless_node *)0)->name)];
         xray_remarks(&j, remarks, sizeof(remarks));
         size_t ord = 0;
@@ -832,17 +788,15 @@ static size_t parse_xray(const char *text, struct vless_node *out, size_t max,
                 struct vless_node node;
                 const char *before = j.p;
                 int ours = xray_outbound(&j, &node);
-                if (j.p == before) break;               /* разбор не двинулся — уходим */
+                if (j.p == before) break;               /* no progress: stop */
                 if (!ours) continue;
-                /* До проверки пригодности: имя уходит и в список узлов, и в объяснение
-                 * пропуска (sl_skip_note берёт его как пример), а человеку в обоих местах
-                 * нужно одно и то же слово — то, которое он видит в панели. */
+                /* Before the usability check: sl_skip_note uses the name as its example, and
+                 * it should be the name the panel shows. */
                 if (remarks[0]) xray_name(&node, remarks, ord);
                 ord++;
                 if (n >= max) {
-                    /* Мест больше нет. Считаем как пропущенный, а не теряем молча: то же
-                     * обещание, что у списка ссылок — арифметика обязана сходиться. */
-                    sl_skip_note(st, &node, "узлов больше, чем помещается");
+                    /* No room left: count the node as skipped, so the numbers add up. */
+                    sl_skip_note(st, &node, "more nodes than fit");
                     continue;
                 }
                 if (node_usable(&node) == 0) out[n++] = node;
@@ -851,24 +805,24 @@ static size_t parse_xray(const char *text, struct vless_node *out, size_t max,
         }
         (void)seen_ob;
         if (wrapped) break;
-        if (j.p == cfg_before) break;                   /* конфиг не разобрался — не крутимся */
+        if (j.p == cfg_before) break;                   /* the config did not parse: do not loop */
     }
     return n;
 }
 
-/* ---- Clash / Mihomo: proxies с type: vless -------------------------------------------------------
+/* ---- Clash / Mihomo: proxies with type: vless ---------------------------------------------------
  *
- * Панели отдают клиентам Clash YAML: список `proxies:`, у каждого узла плоский набор ключей и вложенные
- * *-opts (ws-opts, reality-opts, grpc-opts, xhttp-opts). Записаны бывают двумя способами — блоком
- * (`- name: x` и ключи с отступом) и потоком (`- {name: x, type: vless, reality-opts: {public-key: k}}`,
- * так пишут конвертеры), и разбор обязан уметь оба.
+ * Panels give Clash clients YAML: a `proxies:` list, each node a flat set of keys and nested
+ * *-opts (ws-opts, reality-opts, grpc-opts, xhttp-opts). Nodes come in block form (`- name: x`
+ * and indented keys) and in flow form (`- {name: x, type: vless, reality-opts: {public-key: k}}`,
+ * as converters write), and both must parse.
  *
- * Общий YAML-разбор (src/lib/ynode.c) здесь не берётся: он отказывает на якорях и алиасах целиком, а
- * подписка с якорем в блоке proxy-groups не должна терять узлы; и он тянет libyaml в стенд, который
- * проверяет чужой текст в одиночку. Вместо него — разбор ровно той формы, которую ждём: каждый узел
- * «сплющивается» в пары путь=значение (`reality-opts.public-key`, `ws-opts.headers.Host`, `alpn.0`), а
- * узел строится по путям. Что не разобралось (якорь-алиас `*a`, многострочные скаляры) — значение
- * пропускается, узел получает то, что удалось. Якоря `&a` перед значением отбрасываются. */
+ * No general YAML parser: one that refuses anchors and aliases would lose every node of a
+ * subscription with an anchor in proxy-groups, and the tests build this file without libyaml.
+ * Instead each node is flattened into path=value pairs (`reality-opts.public-key`,
+ * `ws-opts.headers.Host`, `alpn.0`) and built from the paths. A value that does not parse (an
+ * alias `*a`, a multi-line scalar) is skipped, and the node gets the rest. Anchors `&a` before a
+ * value are dropped. */
 #define YF_MAX 96
 struct yflat {
     char buf[12288];
@@ -890,18 +844,18 @@ static const char *yf_get(const struct yflat *f, const char *path) {
     for (size_t i = 0; i < f->n; i++) if (!strcmp(f->kv[i].k, path)) return f->kv[i].v;
     return NULL;
 }
-/* Без учёта регистра: Host/host в headers. */
+/* Case-insensitive: Host or host in headers. */
 static const char *yf_geti(const struct yflat *f, const char *path) {
     for (size_t i = 0; i < f->n; i++) if (ci_eq(f->kv[i].k, path)) return f->kv[i].v;
     return NULL;
 }
 
-/* Скаляр с p: в кавычках или простой. flow != 0 — простой кончается на , } ]. Возвращает указатель за
- * скаляром; значение — в out (раскавыченное), длина в *on. */
+/* The scalar at p, quoted or plain. flow != 0: a plain scalar ends at , } ]. Returns a pointer past
+ * the scalar; the value (unquoted) goes to out, its length to *on. */
 static const char *y_scalar(const char *p, const char *end, int flow, char *out, size_t cap, size_t *on) {
     size_t o = 0;
     while (p < end && (*p == ' ' || *p == '\t')) p++;
-    /* Якорь/тег перед значением. */
+    /* An anchor or a tag before the value. */
     while (p < end && (*p == '&' || *p == '!')) { while (p < end && *p != ' ' && *p != '\t') p++; while (p < end && (*p == ' ' || *p == '\t')) p++; }
     if (p < end && (*p == '"' || *p == '\'')) {
         char q = *p++;
@@ -916,7 +870,7 @@ static const char *y_scalar(const char *p, const char *end, int flow, char *out,
         const char *st0 = p;
         while (p < end && *p != '\n' && *p != '\r') {
             if (flow && (*p == ',' || *p == '}' || *p == ']')) break;
-            /* flow == 2 — ключ: кончается на «:» с пробелом (или концом) следом. */
+            /* flow == 2: a key, which ends at ':' followed by a blank or the end. */
             if (flow == 2 && *p == ':' && (p + 1 >= end || p[1] == ' ' || p[1] == '\n' || p[1] == '\r')) break;
             if (*p == '#' && p > st0 && (p[-1] == ' ' || p[-1] == '\t')) break;
             if (o + 1 < cap) out[o++] = *p;
@@ -931,7 +885,7 @@ static const char *y_scalar(const char *p, const char *end, int flow, char *out,
 
 static const char *y_flow(struct yflat *f, const char *p, const char *end, char *path, size_t pn, int depth);
 
-/* Значение в потоковой записи: {…}, […] или скаляр. */
+/* A value in flow form: {…}, […] or a scalar. */
 static const char *y_flow_val(struct yflat *f, const char *p, const char *end, char *path, size_t pn, int depth) {
     while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
     if (p < end && (*p == '{' || *p == '[')) return y_flow(f, p, end, path, pn, depth + 1);
@@ -967,7 +921,7 @@ static const char *y_flow(struct yflat *f, const char *p, const char *end, char 
     }
 }
 
-/* Строка блока: отступ и текст без него. */
+/* A line of a block: its indent, and the text without it. */
 static const char *y_line(const char *p, const char *end, size_t *ind, const char **e) {
     size_t i = 0;
     while (p + i < end && p[i] == ' ') i++;
@@ -978,7 +932,7 @@ static const char *y_line(const char *p, const char *end, size_t *ind, const cha
     return s;
 }
 
-/* Один узел блока: p — начало строки «- …» (отступ dash); результат — начало строки после узла. */
+/* One node of a block: p starts its "- …" line (indent dash). Returns the line after the node. */
 static const char *y_item(struct yflat *f, const char *p, const char *end, size_t dash) {
     struct lvl { size_t ind; char path[200]; } st[6];
     int sp = 1, first = 1;
@@ -994,7 +948,7 @@ static const char *y_item(struct yflat *f, const char *p, const char *end, size_
         if (s >= e || *s == '#' || (e - s >= 3 && !strncmp(s, "---", 3))) { p = next; continue; }
         if (first) {
             first = 0;
-            s += 1; ind += 1;                                   /* тире */
+            s += 1; ind += 1;                                   /* the dash */
             while (s < e && *s == ' ') { s++; ind++; }
             if (s < e && *s == '{') {
                 char none[1] = "";
@@ -1046,7 +1000,7 @@ static const char *y_item(struct yflat *f, const char *p, const char *end, size_
     return p;
 }
 
-/* Плоский узел → узел vless. 1 — это vless и он записан в n. */
+/* A flattened node into a vless node. 1 — it is vless, written into n. */
 static int clash_node(const struct yflat *f, struct vless_node *n) {
     memset(n, 0, sizeof *n);
     const char *v;
@@ -1059,8 +1013,8 @@ static int clash_node(const struct yflat *f, struct vless_node *n) {
     if ((v = yf_get(f, "flow"))) sl_set_field(n->flow, sizeof n->flow, v, strlen(v));
     if ((v = yf_get(f, "servername")) || (v = yf_get(f, "sni"))) sl_set_field(n->sni, sizeof n->sni, v, strlen(v));
     if ((v = yf_get(f, "client-fingerprint"))) sl_set_field(n->fp, sizeof n->fp, v, strlen(v));
-    /* Clash/mihomo: `fingerprint` — SHA-256 сертификата узла (то же, что pinnedPeerCertSha256 Xray),
-     * `skip-cert-verify` — allowInsecure. */
+    /* Clash/mihomo: `fingerprint` is the SHA-256 of the node's certificate (Xray's
+     * pinnedPeerCertSha256), `skip-cert-verify` is allowInsecure. */
     if ((v = yf_get(f, "fingerprint")) && v[0]) sl_add_pins(n, v, 0);
     if ((v = yf_get(f, "skip-cert-verify")) && sl_truthy(v)) n->allow_insecure = 1;
     if ((v = yf_get(f, "ech-opts.config")) && v[0]) sl_set_ech(n, v);
@@ -1112,7 +1066,7 @@ static int clash_node(const struct yflat *f, struct vless_node *n) {
     return 1;
 }
 
-/* Clash YAML целиком. Возвращает число пригодных узлов; foreign — узлы других протоколов (в st). */
+/* Whole Clash YAML. Returns the number of usable nodes; other protocols count in st->foreign. */
 static size_t parse_clash(const char *text, struct vless_node *out, size_t max, struct vless_sub_stats *st) {
     const char *end = text + strlen(text), *p = text;
     size_t n = 0, dash = 0;
@@ -1128,7 +1082,7 @@ static size_t parse_clash(const char *text, struct vless_node *out, size_t max, 
             if (ind == 0 && (!strncmp(s, "proxies:", 8) || !strncmp(s, "Proxy:", 6))) {
                 const char *c = s + (s[0] == 'p' ? 8 : 6);
                 while (c < e && *c == ' ') c++;
-                if (c < e && *c != '#') break;                 /* «proxies: []» и т.п.: узлов нет */
+                if (c < e && *c != '#') break;                 /* "proxies: []" etc.: no nodes */
                 in_list = 1;
                 dash = (size_t)-1;
             }
@@ -1136,7 +1090,7 @@ static size_t parse_clash(const char *text, struct vless_node *out, size_t max, 
             continue;
         }
         if (s >= e || *s == '#') { p = next; continue; }
-        if (ind == 0 && *s != '-') break;                     /* следующий ключ верхнего уровня */
+        if (ind == 0 && *s != '-') break;                     /* the next top-level key */
         if (*s == '-' && (s + 1 == e || s[1] == ' ')) {
             if (dash == (size_t)-1) dash = ind;
             if (ind != dash) { p = next; continue; }
@@ -1144,7 +1098,7 @@ static size_t parse_clash(const char *text, struct vless_node *out, size_t max, 
             p = y_item(f, p, end, dash);
             struct vless_node node;
             if (!clash_node(f, &node)) { if (st) st->foreign++; continue; }
-            if (n >= max) { sl_skip_note(st, &node, "узлов больше, чем помещается"); continue; }
+            if (n >= max) { sl_skip_note(st, &node, "more nodes than fit"); continue; }
             if (node_usable(&node) == 0) out[n++] = node;
             else sl_skip_note(st, &node, node.skip_reason);
             continue;
@@ -1155,8 +1109,8 @@ static size_t parse_clash(const char *text, struct vless_node *out, size_t max, 
     return n;
 }
 
-/* Это Clash YAML? В любой строке верхнего уровня стоит «proxies:» (или «Proxy:» — прежнее имя). Список
- * ссылок и base64 такой строки не содержат: в base64 нет двоеточия. */
+/* Clash YAML? A line starts with "proxies:" (or "Proxy:", the old name). A list of links or base64
+ * has no such line: base64 has no colon. */
 static int looks_clash(const char *t) {
     for (const char *p = t; *p; ) {
         if (!strncmp(p, "proxies:", 8) || !strncmp(p, "Proxy:", 6)) return 1;
@@ -1167,77 +1121,55 @@ static int looks_clash(const char *t) {
     return 0;
 }
 
-/* Предел длины ОДНОЙ ссылки подписки.
+/* Limit on the length of one link. A Reality link with a post-quantum signature (Xray-core 25.9+)
+ * carries `pqv`, a whole ML-DSA-65 public key: 1952 bytes, 2603 base64url characters, about 2860
+ * bytes for the whole link. 8192 leaves room for ML-DSA-87 (2592 bytes, 3456 characters).
  *
- * Было 2048, и этого перестало хватать. Reality с постквантовой подписью (Xray-core 25.9+)
- * кладёт в ссылку параметр `pqv` — ПУБЛИЧНЫЙ КЛЮЧ ML-DSA-65 целиком, в base64url. Ключ
- * весит 1952 байта, в base64url это ровно 2603 знака, и вся ссылка выходит 2860 байт —
- * столько и снято на живой подписке. Подписка из одной такой ссылки давала «пригодных
- * узлов: 0» и объяснение «ссылка длиннее 2048 байт», то есть выход собрать было не из чего,
- * притом что сама подписка скачивалась и была верна.
+ * pqv is a signature key, not a key exchange: Reality's post-quantum exchange is the
+ * X25519MLKEM768 group in key_share (reality.h). With pqv the server also signs its temporary
+ * certificate, and the client checks that signature when pqv is set (tls13.c →
+ * cert_reality_check_pq).
  *
- * ЭТО ПОДПИСЬ, А НЕ ОБМЕН КЛЮЧАМИ, и путать их дорого: постквантовый обмен у Reality идёт
- * группой X25519MLKEM768 в key_share (см. reality.h), а `pqv` — совсем про другое: им
- * сервер дополнительно подписывает свой временный сертификат, и проверяет эту подпись
- * клиент: reality.c включает проверку, когда параметр задан (tls13.c → cert_reality_check_pq). Ключ
- * хранится в общей таблице (sl_intern).
- *
- * 8192, а не 4096: запас взят на вырост ключа (у ML-DSA-87 он 2592 байта, то есть 3456
- * знаков), а буфер живёт на стеке ОДНОЙ подкоманды CLI, рядом с которой уже стоят два
- * статических буфера по 256 КБ под текст подписки, — восемь килобайт здесь ничего не
- * решают. Разбор в рабочих потоках туннеля (стек 128 КБ) этот путь не проходит. */
+ * The buffer is on the stack: subscriptions are parsed only on the main thread at startup, never
+ * in the threads with small stacks (the stack's connectors have 128 KB). */
 #define SUB_LINE_MAX 8192
 
-/* Знак, из которых состоит имя схемы: `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`
- * (RFC 3986 §3.1), с поправкой на то, что подписки пишут схемы строчными. */
+/* A character of a scheme name: `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`
+ * (RFC 3986 §3.1), lowercase only, as subscriptions write schemes. */
 static int scheme_ch(char c) {
     return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
            c == '+' || c == '.' || c == '-';
 }
 
-/* Приклеенная без разделителя ссылка, схемы которой мы не знаем. Возвращает место самого
- * «://» приклеенной ссылки либо NULL.
+/* A link glued to this one without a separator, with a scheme the splitter does not know.
+ * Returns the "://" of the glued link, or NULL.
  *
- * ЗАЧЕМ ЭТО ОТДЕЛЬНО ОТ РАЗДЕЛИТЕЛЯ ВЫШЕ. Разделитель отступает к началу следующей ссылки
- * по ИМЕНИ схемы из закрытого списка, и там это единственно верный способ: на паре
- * «…#one» + «vless://…» общее правило по форме отступило бы к началу «onevless» — имя,
- * правильное по форме, — и вторая ссылка перестала бы быть ссылкой vless. Список эту
- * двусмысленность решает знанием, и отбирать у него эту работу нельзя.
+ * The splitter in vless_parse_sub steps back by known scheme names on purpose: a rule by form
+ * would read "…#one" + "vless://…" as "onevless://", and the second link would stop being a
+ * vless link. When the list finds nothing the pair is still glued, but the boundary is unknown,
+ * so the node is reported unusable rather than split by a guess.
  *
- * Но когда список не нашёл ничего, пара всё равно склеена — просто мы не знаем, где
- * граница. Тогда единственный честный ответ не «поделим как-нибудь», а «назовём вслух»:
- * узел объявляется непригодным с причиной, в которой стоит схема приклеенной ссылки.
- * Прежде первый узел приезжал в интерфейс с чужим хвостом вместо имени, а второй исчезал,
- * не попав ни в один счётчик, и ни одно число при этом не расходилось — одна ссылка, один
- * узел (I-208, воспроизводит журнал steer#2; владелец согласился на «Б+В» в splicicd#23).
+ * The scheme is not named, for the same reason: stepping back from "://" over scheme characters
+ * in "…#oneanytls://…" gives "oneanytls". The example gives what is known for sure, the tail's
+ * length and first bytes, which locate the glue in the subscription text.
  *
- * СХЕМА ПРИ ЭТОМ НЕ НАЗЫВАЕТСЯ, И ЭТО НЕ СКРОМНОСТЬ. Назвать её по форме нельзя: отступ от
- * «://» по знакам схемы на «…#oneanytls://…» даёт «oneanytls», и сказать человеку «склейка
- * с oneanytls://» значило бы соврать с уверенным видом. Ровно та же двусмысленность, из-за
- * которой список схем и существует. Поэтому наружу идёт то, что известно точно: длина
- * хвоста и его первые байты — по ним место склейки находится в тексте подписки, а имя
- * протокола человек прочтёт там сам.
+ * The glued link must also have '@' before any '#': sellers put their channel into node names
+ * ("#channel https://t.me/shop"), and a proxy link carries credentials before the host while a
+ * channel address does not. Schemes without '@' (vmess as base64, the old ss form) are in the
+ * splitter's list and never get here.
  *
- * ВТОРОЙ ПРИЗНАК — `@` В ПРИКЛЕЕННОЙ ССЫЛКЕ, и без него правило было бы вредным. Продавцы
- * пишут в имя узла адрес своего канала («#канал https://t.me/shop»), и по одной только
- * форме схемы такой узел объявлялся бы непригодным — то есть общее правило отняло бы
- * рабочие узлы у тех, у кого сегодня всё в порядке. Ссылка прокси несёт учётные данные
- * перед хостом, адрес канала — нет; этим они и различаются. Ссылки без `@` (vmess как
- * base64, ss в старой форме) в списке схем есть, значит сюда не доходят.
- *
- * Ищется ПЕРВОЕ вхождение: если склеек больше одной, назвать надо ту, что ближе к началу,
- * — с неё и потерялось. */
+ * The first occurrence is returned: the earliest glued point is where the loss starts. */
 static const char *glued_tail(const char *b, const char *e) {
     for (const char *q = b + 1; q + 3 <= e; q++) {
         if (strncmp(q, "://", 3) != 0) continue;
         const char *sc = q;
         while (sc > b && scheme_ch(sc[-1])) sc--;
-        /* Дошли до начала ссылки — это схема САМОЙ ссылки, делить нечего. */
+        /* Back at the start of the link: this is its own scheme, nothing to split. */
         if (sc == b) continue;
         size_t sl = (size_t)(q - sc);
-        /* Не короче двух знаков и не длиннее пятнадцати: односложное «x://» скорее
-         * случайность в имени узла, чем протокол, а имён схем длиннее пятнадцати у
-         * прокси не бывает. Первый знак — буква, как требует RFC 3986. */
+        /* 2 to 15 characters: a one-letter "x://" is more likely an accident in a node name
+         * than a protocol, and proxy schemes are never longer than 15. The first character
+         * is a letter, as RFC 3986 requires. */
         if (sl < 2 || sl > 15 || sc[0] < 'a' || sc[0] > 'z') continue;
         int creds = 0;
         for (const char *t = q + 3; t < e && *t != '#'; t++)
@@ -1248,64 +1180,51 @@ static const char *glued_tail(const char *b, const char *e) {
     return NULL;
 }
 
-/* Одна запись о склейке. Границей служит e, а не терминатор: в ветке длины ссылка в буфер
- * не копируется, а сказать про склейку надо и там — иначе неразделённая пара и настоящая
- * длинная ссылка дают ОДИН журнал («ссылка длиннее 8191 байт»), то есть один симптом на
- * две разные починки. Ровно это и стоит второй половиной обращения steer#2. */
+/* Count a glued pair as skipped. Its end is e, not a terminator: the too-long branch does not
+ * copy the link and must report a glued pair too, or a glued pair and a really long link would
+ * read the same ("link longer than 8191 bytes") although they need different fixes. */
 static void glue_note(struct vless_sub_stats *st, const char *glue, const char *e) {
     size_t tail = (size_t)(e - glue);
     size_t show = tail < 32 ? tail : 32;
     struct vless_node t;
     memset(&t, 0, sizeof t);
-    snprintf(t.name, sizeof t.name, "хвост %zu байт: %.*s", tail, (int)show, glue);
-    sl_skip_note(st, &t, "ссылки склеены без разделителя");
+    snprintf(t.name, sizeof t.name, "tail of %zu bytes: %.*s", tail, (int)show, glue);
+    sl_skip_note(st, &t, "links glued without a separator");
 }
 
-/* Разобрать текст подписки (уже декодированный из base64) в массив узлов.
- * Возвращает число ПРИГОДНЫХ; остальное — в st (может быть NULL). */
+/* Parse subscription text (already decoded from base64) into nodes. Returns the number of usable
+ * nodes; the rest is counted in st (may be NULL). */
 size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
                        struct vless_sub_stats *st) {
     size_t n = 0;
     if (st) memset(st, 0, sizeof(*st));
     const char *p = text;
-    /* Форма определяется ПЕРВЫМ непробельным знаком, а не поиском подстроки: '[' или '{'
-     * бывает только у JSON, а список ссылок с них не начинается никогда. Прежнее правило в
-     * tunnel.c искало «://» и на конфиге Xray срабатывало случайно — там «https://» лежит
-     * внутри настроек DNS. Случайность в распознавании чужого формата — это отказ, который
-     * появится ровно тогда, когда панель уберёт одну строчку из своего конфига. */
+    /* The form is told by the first non-blank character, not by a substring search: only JSON
+     * starts with '[' or '{'. A search for "://" would match an Xray config only by accident
+     * (an https:// URL in its DNS settings). */
     while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
     if (*p == '[' || *p == '{') return parse_xray(p, out, max, st);
     if (looks_clash(p)) return parse_clash(p, out, max, st);
     while (*p) {
         while (*p == '\n' || *p == '\r' || *p == ' ' || *p == '\t') p++;
         if (!*p) break;
-        /* Конец ссылки — перевод строки ИЛИ начало следующей схемы. Подписки часто
-         * приходят без завершающего перевода, а некоторые панели склеивают ссылки без
-         * разделителя вовсе; при разборе только по переводу последняя ссылка тогда
-         * склеивалась со следующей и терялась молча. */
+        /* A link ends at a line break or where the next link's scheme starts: some panels
+         * glue links without any separator. */
         const char *e = p;
         while (*e && *e != '\n' && *e != '\r') {
             if (e > p && !strncmp(e, "://", 3)) {
-                /* Отступаем к началу схемы — по ИМЕНИ СХЕМЫ, а не по алфавиту.
+                /* Step back to the start of the scheme by its name, not by character
+                 * class: stepping back over letters and digits would take in the tail of
+                 * the node name ("…#onevless://b@…"), and the second link would no longer
+                 * be a vless link.
                  *
-                 * Отступ по алфавиту («пока слева буквы и цифры») съедал хвост имени
-                 * узла: в «...#onevless://b@...» он уходил до самого '#', граница
-                 * ставилась перед «onevless», и вторая ссылка начиналась со лишних
-                 * букв — то есть переставала быть vless-ссылкой и уходила в чужие
-                 * протоколы. На склеенной подписке так терялся КАЖДЫЙ второй узел,
-                 * а первому обнулялось имя. Условие срабатывало почти всегда: имена
-                 * узлов кончаются буквой или цифрой чаще, чем нет.
+                 * The list is sorted longest first and the first match wins: "ss" matches
+                 * the end of "vless", so a shorter name must lose to a longer one. For the
+                 * same reason shorter names are not tried after the longest match: if it
+                 * is the start of this link, there is nothing to split.
                  *
-                 * Список отсортирован по УБЫВАНИЮ длины, и берётся первое совпадение —
-                 * то есть самое длинное. Короткое имя схемы обязано проигрывать
-                 * длинному, иначе граница встаёт внутри чужого слова: «ss» совпадает
-                 * с хвостом самого «vless», и разбор рубил бы каждую ссылку по её же
-                 * собственной схеме. По той же причине после самого длинного совпадения
-                 * к более коротким не переходим: если оно указывает на начало ЭТОЙ
-                 * ссылки, делить нечего.
-                 *
-                 * Имя узла, оканчивающееся именем схемы («...#Express» перед «ss://»),
-                 * разделится верно: сравниваются ровно байты перед «://». */
+                 * A node name that ends like a scheme ("…#Express" before "ss://") still
+                 * splits right: only the bytes before "://" are compared. */
                 static const char *const schemes[] = {
                     "hysteria2", "wireguard", "hysteria", "trojan", "vmess",
                     "vless", "tuic", "hy2", "ssr", "ss"
@@ -1315,7 +1234,7 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
                     size_t sl = strlen(schemes[si]);
                     if ((size_t)(e - p) < sl) continue;
                     if (strncmp(e - sl, schemes[si], sl) != 0) continue;
-                    /* Строго больше: равенство означает схему САМОЙ этой ссылки. */
+                    /* Strictly greater: equal means the scheme of this link itself. */
                     if ((size_t)(e - p) > sl) s2 = e - sl;
                     break;
                 }
@@ -1327,41 +1246,33 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
         char line[SUB_LINE_MAX];
         size_t len = (size_t)(e - p);
         if (len >= sizeof(line)) {
-            /* Ссылка длиннее буфера. Считается непригодной, а не пропадает: см. ниже —
-             * счётчики обязаны сходиться с числом ссылок в тексте.
-             *
-             * Предел назван ЧИСЛОМ ИЗ БУФЕРА, а не переписан в строке: прежде здесь стояло
-             * «длиннее 2048 байт» словами, и предел с сообщением разошлись бы при первой же
-             * правке буфера — человек читал бы про 2048 там, где отказали на 8192. */
+            /* A link longer than the buffer is counted as unusable, not dropped, so the
+             * counters still add up. The limit in the message comes from the buffer size, so
+             * the two cannot drift apart. */
             char why[64];
-            snprintf(why, sizeof why, "ссылка длиннее %zu байт", sizeof(line) - 1);
+            snprintf(why, sizeof why, "link longer than %zu bytes", sizeof(line) - 1);
             const char *glue = strncmp(p, "vless://", 8) ? NULL : glued_tail(p, e);
             if (glue) {
-                /* Склейка называется РАНЬШЕ длины: длина здесь следствие, а не причина, и
-                 * человеку, у которого панель не поставила разделитель, «ссылка длиннее
-                 * 8191 байт» не говорит ничего о том, что делать. */
+                /* A glued pair is reported before the length: the length is only its
+                 * consequence, and "link longer than 8191 bytes" does not tell what to fix. */
                 glue_note(st, glue, e);
             } else if (!strncmp(p, "vless://", 8)) {
-                /* Пример — длина и начало адреса узла (I-209). Одна причина без измерения
-                 * не отличает ссылку чуть длиннее предела (поднимать предел) от блоба на
-                 * десятки килобайт (искать разделитель), а sl_skip_note схлопывает причины по
-                 * тексту, так что измерению место только здесь. Начало — после '@': до
-                 * него идентификатор, которому в журнале, уезжающем в трекер, не место. */
+                /* The example gives the length and the start of the address, telling a link
+                 * just over the limit from a blob of many kilobytes; the reason itself cannot,
+                 * since sl_skip_note groups by it. It starts after '@': the id before it does
+                 * not belong in a log. */
                 const char *at = memchr(p, '@', len);
                 const char *from = at ? at + 1 : p;
                 size_t rest = (size_t)(e - from);
                 struct vless_node t;
                 memset(&t, 0, sizeof t);
-                snprintf(t.name, sizeof t.name, "%zu байт: %s%.*s", len, at ? "…@" : "",
+                snprintf(t.name, sizeof t.name, "%zu bytes: %s%.*s", len, at ? "…@" : "",
                          (int)(rest < 32 ? rest : 32), from);
                 sl_skip_note(st, &t, why);
             }
-            /* ЧУЖОЙ ПРОТОКОЛ ЗДЕСЬ ТОЖЕ СЧИТАЕТСЯ. Короткую ссылку hy2/ss/trojan ветка ниже
-             * учитывает в foreign — именно затем, чтобы расхождение «26 узлов в подписке, 17
-             * у steer» объяснялось числом. Длиннее буфера такая ссылка не считалась нигде, и
-             * арифметика (usable + skipped + foreign) не сходилась ровно на самом неожиданном
-             * тексте подписки. Признак тот же, что у короткой («есть „://“»), только границу
-             * даёт e, а не терминатор: строка здесь не копировалась в буфер. */
+            /* A long link of another protocol is counted in foreign, like a short one, so
+             * that usable + skipped + foreign still adds up. The test is the same ("://"
+             * present), bounded by e since the link was not copied. */
             else if (st) {
                 for (const char *q = p; q + 3 <= e; q++)
                     if (!strncmp(q, "://", 3)) { st->foreign++; break; }
@@ -1369,10 +1280,9 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
         } else {
             memcpy(line, p, len);
             line[len] = '\0';
-            /* Причина одна на все склейки — это один класс поломки подписки, и
-             * группировать его по узлам незачем; всё, что различает случаи, уходит в
-             * пример. Разбирать такую ссылку не пробуем вовсе: имя узла у неё заведомо
-             * чужое, а адрес — может быть, и «может быть» здесь хуже честного отказа. */
+            /* One reason for every glued pair; what tells the cases apart goes into the
+             * example. A glued link is not parsed at all: its name is certainly wrong and its
+             * address may be, and a "may be" is worse than a refusal. */
             const char *glue = strncmp(line, "vless://", 8)
                                    ? NULL : glued_tail(line, line + len);
             if (glue) {
@@ -1380,26 +1290,16 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
             } else if (!strncmp(line, "vless://", 8)) {
                 struct vless_node node;
                 int rc = vless_parse_url(line, &node);
-                /* rc == 0 — узел взят; иначе НЕ ВЗЯТ, и для счётчика это одно и то
-                 * же — узел, которого человек в списке не увидит, — а для объяснения
-                 * разное: у «транспорт не поддержан» (1) причина уже названа разбором,
-                 * у «ссылку не разобрали» (-1) её приходится называть здесь, потому
-                 * что разбор бросил ссылку раньше, чем добрался до пригодности.
-                 * Раньше -1 не считался нигде, и ссылка исчезала бесследно —
-                 * так пропадал, например, узел с IPv6-литералом в host: первое
-                 * двоеточие оказывается внутри скобок, порт читается как 0, разбор
-                 * возвращает -1. Заголовок этого файла обещает обратное: «в ней 26
-                 * узлов, а steer видит 17» должно объясняться цифрой. */
-                /* Мест больше нет — считаем как пропущенный, а не бросаем остаток текста
-                 * непрочитанным: то же обещание, что у конфига Xray, — арифметика
-                 * usable + skipped + foreign обязана сходиться с числом ссылок. */
+                /* rc 1: the parser named the reason. rc -1: the link did not parse at all
+                 * (an IPv6 literal host, for one), so the reason is named here. Both are
+                 * counted, and so is a node that does not fit: usable + skipped + foreign
+                 * must add up to the number of links. */
                 if (rc == 0 && n < max) out[n++] = node;
-                else if (rc == 0) sl_skip_note(st, &node, "узлов больше, чем помещается");
+                else if (rc == 0) sl_skip_note(st, &node, "more nodes than fit");
                 else sl_skip_note(st, &node, rc > 0 ? node.skip_reason
-                                                 : "ссылка не разобрана");
+                                                 : "cannot parse the link");
             } else if (strstr(line, "://") && st) {
-                /* hy2, ss, trojan и прочее. Считаем, но не трогаем: подписка общая, а
-                 * «26 узлов в подписке, 17 у steer» должно объясняться числом. */
+                /* Another protocol: counted, not parsed. */
                 st->foreign++;
             }
         }
@@ -1408,18 +1308,12 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
     return n;
 }
 
-/* Привести прочитанный файл подписки к тексту, который понимает vless_parse_sub.
- *
- * Три вида, и различаются они первым непробельным знаком, а не догадкой:
- *   '[' или '{'  — конфиг Xray в JSON, отдаётся как есть;
- *   есть «://»   — список ссылок, отдаётся как есть;
- *   иначе        — base64, раскодируется в dec.
- *
- * Раньше это решение жило в tunnel.c одной строкой `if (!strstr(raw, "://"))`, и на конфиге
- * Xray оно срабатывало ПО СЛУЧАЙНОСТИ: «://» там есть внутри настроек DNS. Здесь оно потому,
- * что здесь его можно проверить стендом — туннель требует и сети, и TUN, и TLS.
- *
- * Возвращает raw или dec; ни то, ни другое не освобождается — буферы вызывающего. */
+/* Turn a subscription file as read into text that vless_parse_sub understands:
+ *   '[' or '{' first   — a JSON config, returned as is;
+ *   a "proxies:" line  — Clash YAML, returned as is;
+ *   "://" anywhere     — a list of links, returned as is;
+ *   otherwise          — base64, decoded into dec.
+ * Returns raw or dec; both are the caller's buffers. */
 const char *vless_sub_text(const char *raw, size_t raw_n, char *dec, size_t dec_n) {
     const char *p = raw;
     while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
@@ -1430,13 +1324,20 @@ const char *vless_sub_text(const char *raw, size_t raw_n, char *dec, size_t dec_
     return dec;
 }
 
-/* Подписка из файла целиком: буферы и массив узлов — в куче по размеру файла и числу узлов в нём.
- * Раньше буферы были статикой в 256 КиБ, а узлов — 128 (статика в 157 КБ): подписка длиннее
- * теряла хвост, узлов больше — «не помещаются». Мест под узлы столько, сколько в тексте ссылок
- * («://») и объектов Xray («"protocol"») — верхняя граница числа узлов; остаток арифметики
- * (usable + skipped + foreign) сходится, как и прежде. Потолок файла — 64 МиБ: защита от файла-
- * не-подписки под этим именем, а не размер подписки (тысяча узлов — сотни килобайт).
- * NULL — файл не открылся, слишком велик или нет памяти; иначе массив (free), *cnt — узлов. */
+/* How many times "vless" occurs in text, in any case: every VLESS node has it in its own text
+ * (vless://, "protocol": "vless", "type": "vless", type: vless), so this bounds the node count. */
+static size_t count_vless(const char *text) {
+    size_t n = 0;
+    for (const char *q = text; *q; q++)
+        if ((*q == 'v' || *q == 'V') && !strncasecmp(q, "vless", 5)) n++;
+    return n;
+}
+
+/* A whole subscription file. Buffers and the node array are on the heap, sized by the file: one
+ * node slot per "vless" in the text.
+ * The 64 MiB cap guards against a file that is not a subscription (a thousand nodes take hundreds
+ * of kilobytes). NULL — the file did not open, is too large, or no memory; otherwise an array to
+ * free, *cnt — usable nodes. */
 #define VLESS_SUB_FILE_MAX ((size_t)64 << 20)
 struct vless_node *vless_load_sub(const char *path, size_t *cnt, struct vless_sub_stats *st) {
     *cnt = 0;
@@ -1455,9 +1356,7 @@ struct vless_node *vless_load_sub(const char *path, size_t *cnt, struct vless_su
     raw[n] = '\0';
     dec[0] = '\0';
     const char *text = vless_sub_text(raw, n, dec, sz + 16);
-    size_t hint = 1;
-    for (const char *q = text; (q = strstr(q, "://")); q += 3) hint++;
-    for (const char *q = text; (q = strstr(q, "\"protocol\"")); q += 10) hint++;
+    size_t hint = 1 + count_vless(text);
     struct vless_node *nodes = calloc(hint, sizeof(*nodes));
     if (nodes) *cnt = vless_parse_sub(text, nodes, hint, st);
     free(raw);

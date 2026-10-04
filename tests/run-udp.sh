@@ -1,34 +1,38 @@
 #!/bin/sh
-# UDP через туннель на локальном стенде: без узла подписки и без интернета.
+# UDP through the tunnel on a local test bed: no real node and no internet.
 #
-# Зачем отдельно от run-tunnel.sh. Тот проверяет TCP: синтез соединения, повторную передачу,
-# восстановление после потерь. У UDP ничего этого нет — и ровно поэтому ошибки у него другие,
-# а стенд нужен свой. Проверяется здесь то, что может молча испортиться:
+# run-tunnel.sh covers TCP (synthesis, retransmission, recovery after loss). UDP has none of
+# that and fails in other ways. This checks what can break silently:
 #
-#   1. границы датаграмм. VLESS несёт их потоком с двухбайтовой длиной, и запись TLS про эти
-#      границы не знает: датаграмма приезжает двумя записями, а одна запись приносит полторы.
-#      Ошибка в сборке выглядит как «работает, но иногда данные не те» — поэтому сверяется
-#      СОДЕРЖИМОЕ каждого ответа, а не только их число;
-#   2. размеры на границах: 1 байт, ровно в MTU, и больше MTU — последнее уходит клиенту
-#      фрагментами, и собрать их обратно должен его стек;
-#   3. поток на пару адрес-порт: две разные цели одновременно не должны перепутаться;
-#   4. отсутствие ICMP-отказа. Прежде туннель отвечал на UDP «порт недостижим», и если такой
-#      ответ вернётся, клиент будет считать, что порта нет, — то есть QUIC не заработает
-#      даже при исправном переносе датаграмм.
+#   1. datagram boundaries. VLESS carries datagrams in a stream with a two-byte length, and the
+#      TLS record knows nothing of them: one datagram may span two records, and one record may
+#      bring one and a half datagrams. A reassembly bug looks like "works, but sometimes the data is
+#      wrong", so the CONTENT of every answer is compared, not only their count. The server
+#      echoes in pieces cut between the length bytes and inside datagrams (fake-vless.py,
+#      echo_in_pieces), so these records come every time, not by chance;
+#   2. sizes at the edges: 1 byte, exactly the MTU, and above the MTU (that one reaches the
+#      client in fragments, and its stack must reassemble them);
+#   3. one stream per address-port pair: two targets at once must not get mixed up. Every answer
+#      must come from the address and port it was sent to, and the server must have been asked
+#      for exactly one stream to each pair;
+#   4. no ICMP refusal. If the tunnel answered UDP with "port unreachable", the client would
+#      decide the port is closed, and QUIC would fail even with datagrams carried correctly.
 #
-# Стенд: своё сетевое пространство, поддельный сервер VLESS (tests/fake-vless.py) с эхом на
-# команде 2, поднятый steer туннель и питон как клиент UDP.
+# Setup: a network namespace, a fake VLESS server (tests/fake-vless.py) that echoes command 2,
+# the tunnel brought up by tunvless, and Python as the UDP client.
 #
-# Использование: tests/run-udp.sh
+# Usage: tests/run-udp.sh
 set -eu
 cd "$(dirname "$0")/.."
 
-BIN="${STEER:-./build/steer-ext-check}"
-[ -x "$BIN" ] || { echo "нет бинарника: $BIN (собери extended)"; exit 2; }
+BIN="${TUNVLESS:-./out/tunvless}"
+[ -x "$BIN" ] || { echo "no binary: $BIN (make)"; exit 2; }
 
-NS=steer-udp
+NS=tunvless-udp
 UUID=8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124
 PORT=10800
+# Not in 127.0.0.0/8: such a node is rejected as one with no peer (sublink.c).
+NODE=10.66.0.1
 WORK="$(mktemp -d)"
 
 cleanup() {
@@ -40,50 +44,44 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-printf '%s\n' "vless://$UUID@127.0.0.1:$PORT?security=none&type=tcp#local" > "$WORK/sub.txt"
-cat > "$WORK/spec.json" <<SPEC
-{"schema":1,
- "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$WORK/sub.txt","node":0}},
- "channels":[]}
-SPEC
+LINK="vless://$UUID@$NODE:$PORT?security=none&type=tcp#local"
 
 ip netns delete "$NS" 2>/dev/null || true
 ip netns add "$NS"
 ip netns exec "$NS" ip link set lo up
+ip netns exec "$NS" ip addr add "$NODE/32" dev lo
 
-ip netns exec "$NS" python3 tests/fake-vless.py --port "$PORT" --uuid "$UUID" --mb 1 \
+ip netns exec "$NS" python3 tests/fake-vless.py --port "$PORT" --uuid "$UUID" --mb 1 --bind "$NODE" \
     > "$WORK/srv.log" 2>&1 &
 SRV_PID=$!
 sleep 1
 
-ip netns exec "$NS" env STEER_TUN_STATS=1 "$BIN" vless vl \
-    --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/tun.log" 2>&1 &
+# Any address but localhost: the fake server ignores it, it only has to go into the tunnel.
+ip netns exec "$NS" env STEER_TUN_STATS=1 "$BIN" "$LINK" -d vl -r 203.0.113.0/24 \
+    > "$WORK/tun.log" 2>&1 &
 TUN_PID=$!
 
 for _ in $(seq 50); do
-    ip netns exec "$NS" ip link show vl >/dev/null 2>&1 && break
+    ip netns exec "$NS" ip route show 203.0.113.0/24 2>/dev/null | grep -q 'dev vl' && break
     sleep 0.2
 done
-if ! ip netns exec "$NS" ip link show vl >/dev/null 2>&1; then
-    echo "устройство vl не поднялось:"; sed 's/^/  /' "$WORK/tun.log"; exit 1
+if ! ip netns exec "$NS" ip route show 203.0.113.0/24 2>/dev/null | grep -q 'dev vl'; then
+    echo "device vl or the route into it did not come up:"; sed 's/^/  /' "$WORK/tun.log"; exit 1
 fi
 
-# Куда угодно, кроме localhost: поддельному серверу адрес безразличен, важно попасть в туннель.
-ip netns exec "$NS" ip route replace 203.0.113.0/24 dev vl
-
-# Клиент внутри пространства: своим сокетом UDP, потому что ни один готовый инструмент не
-# умеет сказать «пришла ли ответная датаграмма ЦЕЛОЙ и той же». ICMP слушаем сырым сокетом —
-# отказ «порт недостижим» здесь означал бы, что UDP не поддержан, и это надо ЗАМЕТИТЬ, а не
-# получить в виде таймаута.
+# The client is a plain UDP socket: no ready-made tool can tell whether the answer came back
+# WHOLE and the same. ICMP is read on a raw socket: "port unreachable" would mean UDP is not
+# supported, and that must be SEEN, not show up as a timeout.
 rc=0
-ip netns exec "$NS" python3 - > "$WORK/out.txt" 2>&1 <<'PY' || rc=$?
-import socket, struct, sys, time
+ip netns exec "$NS" python3 - "$WORK/srv.log" > "$WORK/out.txt" 2>&1 <<'PY' || rc=$?
+import re, socket, sys, time
 
 TARGET_A, TARGET_B = "203.0.113.7", "203.0.113.9"
+SRV_LOG = sys.argv[1]
 fails = []
 
 def check(name, ok, detail=""):
-    print("%-46s %s%s" % (name, "ok" if ok else "ПРОВАЛ", ("  " + detail) if detail else ""))
+    print("%-46s %s%s" % (name, "ok" if ok else "FAIL", ("  " + detail) if detail else ""))
     if not ok:
         fails.append(name)
 
@@ -91,11 +89,10 @@ icmp = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
 icmp.setblocking(False)
 
 def drain(sock):
-    """Выгрести всё, что уже пришло.
+    """Drain everything that has already arrived.
 
-    Обязательно между проверками: эхо от предыдущей проверки, пришедшее с опозданием, иначе
-    достаётся следующей и она сравнивает не то. Один раз этот стенд уже соврал именно так —
-    «другой порт: свой поток ПРОВАЛ» при исправном туннеле.
+    Needed between checks: a late echo of the previous check would otherwise reach the next
+    one, which would then compare the wrong data and fail on a working tunnel.
     """
     n = 0
     while True:
@@ -106,69 +103,90 @@ def drain(sock):
             return n
 
 
-def echo(sock, host, port, payload, timeout=6.0):
-    """Отправить датаграмму и вернуть ответ (или None по таймауту)."""
-    drain(sock)
-    sock.sendto(payload, (host, port))
+def recv(sock, timeout):
+    """One datagram and where it came from, (None, None) on timeout."""
     end = time.time() + timeout
     while time.time() < end:
         try:
-            data, _ = sock.recvfrom(65535)
-            return data
+            return sock.recvfrom(65535)
         except BlockingIOError:
             time.sleep(0.02)
-    return None
+    return None, None
+
+
+def echo(sock, host, port, payload, timeout=6.0):
+    """Send a datagram and return the answer and its source.
+
+    The source matters as much as the bytes: the echo server answers on whatever stream the
+    datagram came by, so a datagram carried by another flow's stream comes back unchanged, but
+    from that flow's address or port.
+    """
+    drain(sock)
+    sock.sendto(payload, (host, port))
+    return recv(sock, timeout)
+
+
+def verdict(r, src, p, host, port):
+    if r == p and src == (host, port):
+        return True, ""
+    return False, "got %s from %s" % (None if r is None else len(r), src)
 
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.setblocking(False)
 s.bind(("", 0))
 
-# 1. Обычная датаграмма. Первая заодно проверяет весь путь установки: рукопожатие с узлом
-#    идёт уже после того, как датаграмма попала в буфер ранних данных.
+# 1. A plain datagram. Being the first, it also tests setup: the handshake with the node
+#    happens after the datagram is already in the early-data buffer.
 p = b"quic-ish-initial-" + bytes(range(200))
-r = echo(s, TARGET_A, 443, p)
-check("датаграмма 217 байт вернулась той же", r == p,
-      "" if r == p else "получено %r" % (None if r is None else len(r)))
+check("217-byte datagram echoed unchanged", *verdict(*echo(s, TARGET_A, 443, p), p, TARGET_A, 443))
 
-# 2. Размеры на границах. Один байт — минимум; 1472 — ровно MTU (1500 - 20 - 8); 3000 —
-#    больше MTU В ОБЕ СТОРОНЫ: наверх датаграмма приходит от клиента уже фрагментами и
-#    собирается туннелем, обратно она же уходит фрагментами и собирается стеком клиента.
-#    Одна проверка закрывает и сборку, и нарезку — эхо не сойдётся, если сломано любое.
+# 2. Sizes at the edges. One byte is the minimum; 1472 is exactly the MTU (1500 - 20 - 8);
+#    3000 is above the MTU IN BOTH DIRECTIONS: upstream it arrives in fragments the tunnel
+#    reassembles, back it leaves in fragments the client's stack reassembles. If either is
+#    broken the echo does not match.
 for n in (1, 1472, 3000):
     p = bytes((i * 37 + n) % 251 for i in range(n))
-    r = echo(s, TARGET_A, 443, p)
-    check("датаграмма %d байт вернулась той же" % n, r == p,
-          "" if r == p else "получено %s" % (None if r is None else len(r)))
+    check("%d-byte datagram echoed unchanged" % n,
+          *verdict(*echo(s, TARGET_A, 443, p), p, TARGET_A, 443))
 
-# 3. Пачка подряд: границы не должны склеиться. Ответы могут прийти в любом порядке —
-#    сверяем как множество, потому что порядок UDP не обещает никто.
+# 3. A burst: boundaries must not merge. UDP promises no order, so the answers are compared
+#    as a set.
 drain(s)
 sent = [bytes([i]) * (100 + i) for i in range(8)]
 for p in sent:
     s.sendto(p, (TARGET_A, 443))
-got, end = [], time.time() + 8
-while len(got) < len(sent) and time.time() < end:
-    try:
-        got.append(s.recvfrom(65535)[0])
-    except BlockingIOError:
-        time.sleep(0.02)
-check("пачка из 8: все вернулись целыми", sorted(got) == sorted(sent),
-      "получено %d из %d" % (len(got), len(sent)))
+got = []
+while len(got) < len(sent):
+    r, src = recv(s, 8)
+    if r is None:
+        break
+    got.append((r, src))
+check("burst of 8: all echoed unchanged",
+      sorted(got) == sorted((p, (TARGET_A, 443)) for p in sent),
+      "got %d of %d" % (len(got), len(sent)))
 
-# 4. Два адресата одновременно: у каждого свой поток к узлу, и путать их нельзя.
-s2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s2.setblocking(False)
+# 4. Two targets at once, from one socket: each has its own stream to the node, and they must
+#    not mix. Only the source of each answer can show it: a datagram sent into the other
+#    target's stream comes back unchanged, but from that target.
+drain(s)
 pa, pb = b"aaaa-to-A" * 10, b"bbbb-to-B" * 10
-ra = echo(s, TARGET_A, 443, pa)
-rb = echo(s2, TARGET_B, 443, pb)
-check("два адресата не перепутались", ra == pa and rb == pb,
-      "" if ra == pa and rb == pb else "A:%r B:%r" % (ra and len(ra), rb and len(rb)))
+s.sendto(pa, (TARGET_A, 443))
+s.sendto(pb, (TARGET_B, 443))
+got = {}
+for _ in range(2):
+    r, src = recv(s, 6)
+    if r is None:
+        break
+    got[r] = src
+check("two targets did not mix", got == {pa: (TARGET_A, 443), pb: (TARGET_B, 443)},
+      "" if len(got) == 2 else "got %d of 2" % len(got))
 
-# 5. Другой порт того же адреса — тоже отдельный поток.
-r = echo(s, TARGET_A, 51820, b"wireguard-keepalive")
-check("другой порт: свой поток", r == b"wireguard-keepalive")
+# 5. Another port of the same address is a separate stream too.
+p = b"wireguard-keepalive"
+check("another port gets its own stream",
+      *verdict(*echo(s, TARGET_A, 51820, p), p, TARGET_A, 51820))
 
-# 6. ICMP «порт недостижим» приходить НЕ ДОЛЖЕН.
+# 6. No ICMP destination unreachable (type 3) may arrive.
 unreach = 0
 try:
     while True:
@@ -177,40 +195,28 @@ try:
             unreach += 1
 except BlockingIOError:
     pass
-check("ICMP-отказов на UDP нет", unreach == 0, "получено %d" % unreach)
+check("no ICMP unreachable for UDP", unreach == 0, "got %d" % unreach)
 
-print("\nпровалов: %d" % len(fails))
+# 7. What the node saw: one stream per address-port pair, each asking for that address and
+#    port. The server logs a stream as it opens it, before the first echo.
+seen = sorted(re.findall(r"UDP stream to (\S+):(\d+)$", open(SRV_LOG).read(), re.M))
+want = sorted([(TARGET_A, "443"), (TARGET_B, "443"), (TARGET_A, "51820")])
+check("the node got one stream per address and port", seen == want,
+      "" if seen == want else "streams: %s" % seen)
+
+print("\nfailures: %d" % len(fails))
 sys.exit(1 if fails else 0)
 PY
-# `|| rc=$?` вместо прежнего `|| true`, и это не косметика. Раньше следующей строкой стояло
-# `rc=$?` — после `|| true` там всегда был нуль, — и ни одна строка дальше на rc не смотрела:
-# приговор держался только на grep по строке отчёта. С истиной это совпадало, потому что
-# отчёт печатается последним, прямо перед sys.exit. Опасна была форма: любая проверка,
-# добавленная ПОСЛЕ печати отчёта, оказалась бы для стенда невидимой, а мёртвая переменная
-# рядом выглядела так, будто код возврата всё-таки учитывается. Оставить `|| true` было
-# нельзя и убрать тоже: при set -e ненулевой выход оборвал бы стенд ДО печати out.txt, то
-# есть провал остался бы без единственной строки, объясняющей, какая проверка упала.
-#
-# Теперь приговор из двух половин: код возврата отвечает за «упало где угодно», grep — за
-# «отчёт вообще напечатан» (питон мог умереть до него, и тогда провалов в файле нет вовсе).
+# `|| rc=$?` keeps set -e from stopping the script before out.txt is printed, which is the only
+# record of which check failed. The verdict has two halves: the exit code catches a failure
+# anywhere, the grep catches a report that was never printed (Python died before it).
 
 sed 's/^/  /' "$WORK/out.txt"
-if [ "$rc" -ne 0 ] || ! grep -q "^провалов: 0" "$WORK/out.txt"; then
-    echo "  --- журнал туннеля:"
-    grep -iE "warn|датаграмм|udp" "$WORK/tun.log" | tail -10 | sed 's/^/    /' || true
-    echo "  --- журнал сервера:"
+if [ "$rc" -ne 0 ] || ! grep -q "^failures: 0" "$WORK/out.txt"; then
+    echo "  --- tunnel log:"
+    grep -iE "warn|datagram|udp" "$WORK/tun.log" | tail -10 | sed 's/^/    /' || true
+    echo "  --- server log:"
     tail -5 "$WORK/srv.log" | sed 's/^/    /' || true
     exit 1
 fi
-# Сколько потоков к узлу завёл туннель: у каждой пары адрес-порт свой, и это то самое
-# свойство, из-за которого UDP здесь дороже TCP. Сервер пишет об этом, когда поток
-# ЗАКРЫВАЕТСЯ, поэтому сначала останавливаем туннель, а потом считаем.
-kill "$TUN_PID" 2>/dev/null || true
-TUN_PID=""
-sleep 1
-# Не приговор, а справка: сервер печатает строку при ЗАКРЫТИИ потока, и последнюю он может
-# не успеть записать до того, как мы его снимем. Число здесь нужно для другого — увидеть, что
-# потоков несколько (по одному на пару адрес-порт), а не один общий на всё.
-echo "  потоков UDP к узлу: $(grep -c 'UDP-поток закрыт' "$WORK/srv.log" || true) (адресов 2, портов 2 — то есть до 4)"
-echo "  датаграмм принял сервер: $(sed -n 's/.*датаграмм \([0-9]*\)$/\1/p' "$WORK/srv.log" | awk '{s+=$1} END {print s+0}')"
 exit 0

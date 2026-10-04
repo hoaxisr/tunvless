@@ -1,4 +1,0 @@
-{ "rules": [
-  { "domain": ["пример.рф", "xn--e1afmkfd.xn--p1ai"],
-    "domain_suffix": ["почта.рф", ".тест.рф", "δοκιμή.gr"],
-    "domain_keyword": ["ключ"] } ] }

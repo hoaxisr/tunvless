@@ -1,28 +1,25 @@
-/* BLAKE3 для VLESS encryption: хеш и вывод ключа (derive_key), портативным C, без библиотеки.
+/* BLAKE3 for VLESS encryption: the hash and key derivation (derive_key), portable C, no library.
  *
- * ЗАЧЕМ СВОЙ. VLESS encryption в Xray-core (proxy/vless/encryption) стоит на BLAKE3: им выводится
- * каждый ключ AEAD (blake3.DeriveKey(k, string(ctx), key) в NewAEAD), ключ гаммы xorpub/random
- * (DeriveKey с контекстом "VLESS") и хеш ключей реле (blake3.Sum256). Совместимость с сервером — это
- * байт в байт тот же BLAKE3, а в wolfSSL 5.9.4 его нет (есть BLAKE2). Зависимость ради двух функций
- * не оправдана: алгоритм — это сорок строк сжатия и дерево из чанков.
+ * VLESS encryption in Xray-core (proxy/vless/encryption) is built on BLAKE3: it derives every
+ * AEAD key (blake3.DeriveKey(k, string(ctx), key) in NewAEAD), the xorpub/random keystream key
+ * (DeriveKey with the context "VLESS") and the relay key hash (blake3.Sum256). The server needs
+ * the very same BLAKE3, and wolfSSL 5.9.4 has none (only BLAKE2). Another library for two
+ * functions is not worth it: the algorithm is forty lines of compression plus the chunk tree.
  *
- * ПОЧЕМУ ЗАГОЛОВОК СО static, а не отдельный .c. Публичные sc_blake3_* определены в scrypto.c (они часть
- * слоя примитивов), а собирается scrypto.c в шести местах по-разному (ext-test.sh, dnsup.sh, bench.sh,
- * Android.bp, build-ext.sh, sources.mk): ещё один файл значил бы шесть правок и шесть мест, где его
- * можно забыть. Заголовок цепляется одним #include, а стенд `make test` (tests/b3match.c) включает
- * его сам и проверяет BLAKE3 без wolfSSL.
+ * A header of static functions rather than a .c: the public sc_blake3_* are defined in
+ * scrypto.c (they belong to the primitives layer), and tests/b3match.c includes this header
+ * directly to check BLAKE3 without wolfSSL.
  *
- * ПОЧЕМУ ВЕСЬ ВХОД ЗА РАЗ, а не потоковый интерфейс. Все входы у VLESS encryption известны целиком до
- * вызова (ключи, iv, шифротекст, открытый ключ), поэтому потоковое состояние — лишний код и лишние
- * ошибки. Зато вход НЕ ограничен одним чанком: контекст NewAEAD — это pfsPublicKey длиной 1216 байт,
- * то есть 2 чанка по 1024, а хеш открытого ключа ML-KEM (1184 байта) — тоже 2. Поэтому дерево
- * (родительские узлы, стек значений цепочки) реализовано полностью и проверено векторами из
- * репозитория BLAKE3 на длинах 0, 1, 63, 64, 65, 1023, 1024, 1025, 2048, 2049, 3072, 3073, 31744 —
- * это границы блока, чанка и глубины дерева (tests/scryptomatch.c).
+ * The whole input at once, no streaming interface: every VLESS encryption input (keys, iv,
+ * ciphertext, public key) is known in full before the call. The input is not limited to one
+ * chunk, though: the NewAEAD context is the 1216-byte pfsPublicKey (2 chunks of 1024), and the
+ * ML-KEM public key hash (1184 bytes) is 2 chunks as well. So the tree (parent nodes, the stack
+ * of chaining values) is implemented in full. tests/b3match.c checks it against
+ * lukechampine.com/blake3, the library Xray-core uses, at the block, chunk and tree depth
+ * boundaries.
  *
- * Скорость не критична: вызовов на рукопожатие десяток, на запись данных — ни одного (ключ записи
- * выводится один раз на смену ключа, то есть раз в 2^96 записей, см. vlenc.c). Потому — переносимый C
- * без SIMD; подробность о векторных вариантах reference implementation не нужна. */
+ * Speed does not matter: about ten calls per handshake, none per data record (a record key is
+ * derived once per key change, every 2^96 records, see trvenc.c). Hence portable C, no SIMD. */
 #ifndef STEER_BLAKE3_H
 #define STEER_BLAKE3_H
 #include <stdint.h>
@@ -58,8 +55,8 @@ static void round_fn(uint32_t *s, const uint32_t *m) {
     g(s, 2, 7, 8, 13, m[12], m[13]); g(s, 3, 4, 9, 14, m[14], m[15]);
 }
 
-/* Сжатие одного блока. out — все 16 слов состояния после финального XOR: первые 8 — новое значение
- * цепочки, все 16 — расширяемый вывод корня. */
+/* Compresses one block. out gets all 16 state words after the final XOR: the first 8 are the
+ * new chaining value, all 16 are the root's extendable output. */
 static void compress(const uint32_t cv[8], const uint8_t blk[64], uint8_t blen, uint64_t ctr,
                      uint32_t flags, uint32_t out[16]) {
     uint32_t m[16], s[16];
@@ -81,9 +78,9 @@ static void compress(const uint32_t cv[8], const uint8_t blk[64], uint8_t blen, 
     memcpy(out, s, 64);
 }
 
-/* Отложенное сжатие: последний узел (блок последнего чанка либо родитель) сжимается дважды —
- * значением цепочки для вышестоящего узла и с флагом ROOT для вывода, поэтому хранится не результат,
- * а входы. */
+/* A deferred compression: the last node (the last chunk's block or a parent) is compressed
+ * twice, as a chaining value for the node above and with the ROOT flag for the output, so the
+ * inputs are kept rather than the result. */
 struct b3_out { uint32_t cv[8]; uint8_t blk[64]; uint8_t blen; uint64_t ctr; uint32_t flags; };
 
 static void out_cv(const struct b3_out *o, uint32_t cv[8]) {
@@ -112,7 +109,8 @@ static void out_root(const struct b3_out *o, uint8_t *out, size_t n) {
     }
 }
 
-/* Узел, чей вход — один чанк (до 1024 байт), кроме сжатия ПОСЛЕДНЕГО блока: его возвращает как b3_out. */
+/* One chunk (up to 1024 bytes), except the compression of its last block, which is returned as
+ * a b3_out. */
 static struct b3_out chunk_out(const uint32_t key[8], const uint8_t *in, size_t n, uint64_t ctr,
                                uint32_t flags) {
     uint32_t cv[8];
@@ -142,13 +140,13 @@ static struct b3_out parent_out(const uint32_t key[8], const uint32_t l[8], cons
     return o;
 }
 
-/* Хеш всего входа с ключом key и флагами flags (0 либо DERIVE_*), вывод n байт. */
+/* Hashes the whole input with key and flags (0 or B3_DERIVE_*) into out_n bytes. */
 static void b3_run(const uint32_t key[8], uint32_t flags, const uint8_t *in, size_t n,
                    uint8_t *out, size_t out_n) {
     uint32_t stack[54][8];
     int depth = 0;
     uint64_t chunks = 0;
-    /* Все чанки, кроме последнего, сворачиваются в стек; последний остаётся отложенным. */
+    /* Every chunk but the last is folded into the stack; the last one stays deferred. */
     while (n > 1024) {
         struct b3_out c = chunk_out(key, in, 1024, chunks, flags);
         uint32_t cv[8];

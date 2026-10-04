@@ -1,16 +1,15 @@
-/* Слой криптографических примитивов на wolfCrypt. Зачем слой и почему контексты устроены так,
- * как устроены, — в scrypto.h.
+/* The cryptographic primitives layer on wolfCrypt. Why the layer exists and why contexts are
+ * shaped as they are: see scrypto.h.
  *
- * Это ЕДИНСТВЕННЫЙ файл движка, который видит wolfSSL. Опции библиотеки — в
- * build/wolfssl/user_settings.h, и этот файл обязан компилироваться с ними же (ключ
- * -DWOLFSSL_USER_SETTINGS и -I на build/wolfssl), иначе размеры структур здесь и в библиотеке
- * разойдутся. Проверки _Static_assert ниже ловят только то, что хранилище в заголовке мало; то,
- * что библиотека собрана с другими опциями, ловится лишь тем, что сборка у нас одна
- * (build/wolfssl/build.sh, Android.bp — сверяет tests/buildmatch.sh).
+ * This is the only file that sees wolfSSL. The library's options are in
+ * build/wolfssl/user_settings.h, and this file must be compiled with the same ones
+ * (-DWOLFSSL_USER_SETTINGS and -I to build/wolfssl, from the .cflags file build.sh writes next to
+ * the library), or struct sizes here and in the library disagree. The _Static_assert checks
+ * below catch only header storage that is too small; against a library built with other
+ * options the only guard is that build.sh writes the library and its .cflags together.
  *
- * Правило для правок: ни одна функция не возвращает кодов wolfSSL наружу — только SC_*.
- * Код библиотеки ничего не говорит вызывающему, а смена библиотеки не должна менять ни одной
- * ветки у него. */
+ * Rule for edits: no function returns wolfSSL codes, only SC_*. Library codes mean nothing to
+ * the caller, and replacing the library must not change any branch on the caller's side. */
 #define _GNU_SOURCE
 #include <stddef.h>
 #include <stdint.h>
@@ -45,32 +44,31 @@
 #include "scrypto.h"
 #include "blake3.h"
 
-/* ---- хранилища против настоящих размеров --------------------------------------------------
+/* ---- storage against the real sizes -------------------------------------------------------
  *
- * Хранилище в заголовке — массив байт с выравниванием 16; в нём лежит объект wolfSSL. Проверка
- * здесь, а не в рантайме: слишком маленькое хранилище — это не ошибка, которую можно вернуть,
- * а запись за пределы поля, и узнать о ней надо при сборке под ту архитектуру, где она случится. */
-_Static_assert(sizeof(wc_Sha256) <= SC_HASH_CTX_SIZE && _Alignof(wc_Sha256) <= 16, "SC_HASH_CTX_SIZE мал для wc_Sha256");
-_Static_assert(sizeof(wc_Sha512) <= SC_HASH_CTX_SIZE && _Alignof(wc_Sha512) <= 16, "SC_HASH_CTX_SIZE мал для wc_Sha512");
-_Static_assert(sizeof(wc_Sha384) <= SC_HASH_CTX_SIZE && _Alignof(wc_Sha384) <= 16, "SC_HASH_CTX_SIZE мал для wc_Sha384");
-_Static_assert(sizeof(Aes) <= SC_AEAD_CTX_SIZE && _Alignof(Aes) <= 16, "SC_AEAD_CTX_SIZE мал для Aes");
-_Static_assert(sizeof(Aes) <= SC_AESCTR_CTX_SIZE, "SC_AESCTR_CTX_SIZE мал для Aes");
-/* Хеши протоколов steer-proxy (scrypto.h). wc_Sha224 у wolfSSL — тот же тип, что wc_Sha256. */
-_Static_assert(sizeof(wc_Sha) <= SC_HASH_CTX_SIZE && _Alignof(wc_Sha) <= 16, "SC_HASH_CTX_SIZE мал для wc_Sha");
-_Static_assert(sizeof(wc_Sha224) <= SC_HASH_CTX_SIZE && _Alignof(wc_Sha224) <= 16, "SC_HASH_CTX_SIZE мал для wc_Sha224");
-_Static_assert(sizeof(wc_Md5) <= SC_HASH_CTX_SIZE && _Alignof(wc_Md5) <= 16, "SC_HASH_CTX_SIZE мал для wc_Md5");
-_Static_assert(sizeof(wc_Shake) <= SC_SHAKE_CTX_SIZE && _Alignof(wc_Shake) <= 16, "SC_SHAKE_CTX_SIZE мал для wc_Shake");
+ * Header storage is a byte array aligned to 16 that holds a wolfSSL object. Checked at build
+ * time, not at run time: storage that is too small is not an error to return but a write past
+ * the field, and it must show up when building for the architecture where it would happen. */
+_Static_assert(sizeof(wc_Sha256) <= SC_HASH_CTX_SIZE && _Alignof(wc_Sha256) <= 16, "SC_HASH_CTX_SIZE is too small for wc_Sha256");
+_Static_assert(sizeof(wc_Sha512) <= SC_HASH_CTX_SIZE && _Alignof(wc_Sha512) <= 16, "SC_HASH_CTX_SIZE is too small for wc_Sha512");
+_Static_assert(sizeof(wc_Sha384) <= SC_HASH_CTX_SIZE && _Alignof(wc_Sha384) <= 16, "SC_HASH_CTX_SIZE is too small for wc_Sha384");
+_Static_assert(sizeof(Aes) <= SC_AEAD_CTX_SIZE && _Alignof(Aes) <= 16, "SC_AEAD_CTX_SIZE is too small for Aes");
+_Static_assert(sizeof(Aes) <= SC_AESCTR_CTX_SIZE, "SC_AESCTR_CTX_SIZE is too small for Aes");
+/* SHA-1, SHA-224 and MD5 (scrypto.h). In wolfSSL wc_Sha224 is the same type as wc_Sha256. */
+_Static_assert(sizeof(wc_Sha) <= SC_HASH_CTX_SIZE && _Alignof(wc_Sha) <= 16, "SC_HASH_CTX_SIZE is too small for wc_Sha");
+_Static_assert(sizeof(wc_Sha224) <= SC_HASH_CTX_SIZE && _Alignof(wc_Sha224) <= 16, "SC_HASH_CTX_SIZE is too small for wc_Sha224");
+_Static_assert(sizeof(wc_Md5) <= SC_HASH_CTX_SIZE && _Alignof(wc_Md5) <= 16, "SC_HASH_CTX_SIZE is too small for wc_Md5");
 
-/* ChaCha20-Poly1305: развёрнутый ключ ChaCha плюс рабочий Poly1305 (его ключ свой на каждую
- * запись, RFC 8439 §2.6). Лежат рядом в одном хранилище. */
+/* ChaCha20-Poly1305: the ChaCha key plus a working Poly1305 (its key differs for every record,
+ * RFC 8439 §2.6), side by side in one storage. */
 struct chachapoly {
     ChaCha   chacha;
     Poly1305 poly;
 };
 _Static_assert(sizeof(struct chachapoly) <= SC_AEAD_CTX_SIZE && _Alignof(struct chachapoly) <= 16,
-               "SC_AEAD_CTX_SIZE мал для ChaCha+Poly1305");
+               "SC_AEAD_CTX_SIZE is too small for ChaCha+Poly1305");
 
-/* ---- хеши ----------------------------------------------------------------------------------- */
+/* ---- hashes --------------------------------------------------------------------------------- */
 
 size_t sc_hash_len(enum sc_hash h) {
     switch (h) {
@@ -84,7 +82,8 @@ size_t sc_hash_len(enum sc_hash h) {
     return 0;
 }
 
-/* Тип хеша wolfSSL: для HMAC и HKDF это WC_SHA256 и соседи, для PSS и OID — enum wc_HashType. */
+/* wolfSSL hash types: WC_SHA256 and friends for HMAC and HKDF, enum wc_HashType for PSS and
+ * OIDs. */
 static int wc_type(enum sc_hash h) {
     switch (h) {
         case SC_SHA256: return WC_SHA256;
@@ -101,8 +100,8 @@ static enum wc_HashType wc_htype(enum sc_hash h) {
         case SC_SHA256: return WC_HASH_TYPE_SHA256;
         case SC_SHA384: return WC_HASH_TYPE_SHA384;
         case SC_SHA512: return WC_HASH_TYPE_SHA512;
-        /* Хеши протоколов steer-proxy (scrypto.h) подписей не проверяют: цепочке и PSS они не
-         * отдаются, и подпись SHA-1 по-прежнему отвергается. */
+        /* SHA-1, SHA-224 and MD5 never verify signatures: they are not passed to chain or PSS
+         * checks, so a SHA-1 signature is rejected. */
         case SC_SHA1: case SC_SHA224: case SC_MD5: break;
     }
     return WC_HASH_TYPE_NONE;
@@ -154,9 +153,9 @@ int sc_hash_final(struct sc_hash_ctx *c, unsigned char *out) {
     return rc == 0 ? 0 : SC_ECRYPTO;
 }
 
-/* Копия — функцией библиотеки, а не memcpy: у wolfSSL в контексте хеша бывают указатели (кэш
- * расписания при WOLFSSL_SMALL_STACK_CACHE, данные устройства), и побайтовая копия разделила бы
- * их между двумя контекстами, а free обоих освободил бы одно дважды. */
+/* Copy with the library's function, not memcpy: a wolfSSL hash context may hold pointers (the
+ * schedule cache with WOLFSSL_SMALL_STACK_CACHE, device data). A byte copy would share them
+ * between two contexts, and freeing both would free one twice. */
 int sc_hash_clone(struct sc_hash_ctx *dst, const struct sc_hash_ctx *src) {
     int rc;
     dst->alg = 0;
@@ -215,18 +214,18 @@ int sc_hash(enum sc_hash h, const void *d, size_t n, unsigned char *out) {
     return rc;
 }
 
-/* ---- HMAC и HKDF ---------------------------------------------------------------------------- */
+/* ---- HMAC and HKDF -------------------------------------------------------------------------- */
 
 int sc_hmac2(enum sc_hash h, const void *key, size_t key_n,
              const void *msg, size_t n, const void *msg2, size_t n2, unsigned char *out) {
     int t = wc_type(h);
     if (t < 0 || key_n > UINT32_MAX || n > UINT32_MAX || n2 > UINT32_MAX) return SC_EINVAL;
-    /* Hmac у wolfSSL — больше полукилобайта (два состояния хеша и две набивки), поэтому в куче,
-     * а не на стеке: HMAC зовут потоки соединителей, у которых стек скромный. */
+    /* wolfSSL's Hmac is over half a kilobyte (two hash states and two pads), so it goes on the
+     * heap: connector threads, whose stacks are small, call HMAC. */
     Hmac *m = malloc(sizeof(*m));
     if (!m) return SC_ENOMEM;
-    /* Пустой ключ законен (HKDF-Extract без соли в RFC 5869 — это HMAC с ключом из нулей, но
-     * вызывающий вправе передать и пустой), а wolfSSL не принимает NULL даже при нулевой длине. */
+    /* An empty key is legal (HKDF-Extract without salt in RFC 5869 is HMAC with a zero key, but
+     * a caller may pass an empty one), and wolfSSL refuses NULL even with zero length. */
     static const unsigned char nokey[1];
     int rc = wc_HmacInit(m, NULL, INVALID_DEVID);
     if (rc == 0) rc = wc_HmacSetKey(m, t, key_n ? key : nokey, (word32)key_n);
@@ -244,10 +243,10 @@ int sc_hmac(enum sc_hash h, const void *key, size_t key_n,
     return sc_hmac2(h, key, key_n, msg, n, NULL, 0, out);
 }
 
-/* HKDF (RFC 5869) — функциями wolfSSL. Пустая соль и пустой ikm передаются им НЕ нулевым
- * указателем: wolfSSL отказывает на NULL при ненулевой длине, а при нулевой заменяет соль
- * нулями длины хеша — ровно как требует RFC, и HMAC с пустым ключом даёт то же самое. Вывод
- * expand не должен перекрывать prk: библиотека пишет out по блокам, читая prk на каждом. */
+/* HKDF (RFC 5869) with wolfSSL's functions. An empty ikm or info is passed as a non-NULL
+ * pointer, since wolfSSL may refuse NULL. A NULL salt of zero length is replaced with
+ * hash-length zeros, as the RFC requires, and HMAC with an empty key gives the same. expand's
+ * out must not overlap prk: the library writes out block by block, reading prk for each. */
 int sc_hkdf_extract(enum sc_hash h, const void *salt, size_t salt_n,
                     const void *ikm, size_t ikm_n, unsigned char *prk) {
     static const unsigned char empty[1];
@@ -359,7 +358,7 @@ int sc_aesctr_init(struct sc_aesctr *c, const unsigned char key[32], const unsig
     Aes *aes = (Aes *)c->st;
     c->ready = 0;
     if (wc_AesInit(aes, NULL, INVALID_DEVID) != 0) return SC_ECRYPTO;
-    /* Для CTR ключ всегда «на шифрование»: гамма одна и та же в обе стороны. */
+    /* CTR always uses the encryption key: the keystream is the same in both directions. */
     if (wc_AesCtrSetKey(aes, key, 32, iv, AES_ENCRYPTION) != 0) { wc_AesFree(aes); return SC_ECRYPTO; }
     c->ready = 1;
     return 0;
@@ -378,10 +377,10 @@ void sc_aesctr_free(struct sc_aesctr *c) {
     c->ready = 0;
 }
 
-/* ---- AES одним блоком ------------------------------------------------------------------------ */
+/* ---- AES, one block ------------------------------------------------------------------------- */
 
-/* Aes — под килобайт, поэтому в куче: зовут и потоки соединителей стека, у которых стек скромный
- * (довод — у sc_hmac2). Прямой блок (WOLFSSL_AES_DIRECT в user_settings.h) — без режима и IV. */
+/* Aes is nearly a kilobyte, so it goes on the heap (see sc_hmac2). A direct block
+ * (WOLFSSL_AES_DIRECT in user_settings.h) has no mode and no IV. */
 int sc_aes_block(const unsigned char *key, size_t key_n, int decrypt,
                  const unsigned char in[16], unsigned char out[16]) {
     if (key_n != 16 && key_n != 32) return SC_EINVAL;
@@ -398,77 +397,11 @@ int sc_aes_block(const unsigned char *key, size_t key_n, int decrypt,
     return rc == 0 ? 0 : SC_ECRYPTO;
 }
 
-/* ---- XChaCha20-Poly1305 --------------------------------------------------------------------- */
-
-int sc_xchacha_seal(const unsigned char key[32], const unsigned char nonce[24],
-                    const void *aad, size_t aad_n, const unsigned char *in, size_t n,
-                    unsigned char *out) {
-    static const unsigned char empty[1];
-    if (n > UINT32_MAX - 16 || aad_n > UINT32_MAX) return SC_EINVAL;
-    int rc = wc_XChaCha20Poly1305_Encrypt(out, n + 16, n ? in : empty, n, aad_n ? aad : empty,
-                                          aad_n, nonce, 24, key, 32);
-    return rc == 0 ? 0 : SC_ECRYPTO;
-}
-
-int sc_xchacha_open(const unsigned char key[32], const unsigned char nonce[24],
-                    const void *aad, size_t aad_n, const unsigned char *in, size_t n,
-                    unsigned char *out) {
-    static const unsigned char empty[1];
-    if (n < 16 || n > UINT32_MAX || aad_n > UINT32_MAX) return SC_EINVAL;
-    /* Пустая датаграмма: выход нулевой длины, но wolfSSL не берёт NULL и на отказе тега обнуляет
-     * весь переданный ему размер выхода — поэтому ему отдаётся свой байт, а не out вызывающего. */
-    unsigned char none[1];
-    int rc = wc_XChaCha20Poly1305_Decrypt(n > 16 ? out : none, n > 16 ? n - 16 : 1, in, n,
-                                          aad_n ? aad : empty, aad_n, nonce, 24, key, 32);
-    if (rc == WC_NO_ERR_TRACE(MAC_CMP_FAILED_E)) return SC_EAUTH;
-    return rc == 0 ? 0 : SC_ECRYPTO;
-}
-
-/* ---- SHAKE128 потоком ----------------------------------------------------------------------- */
-
-/* Absorb wolfSSL поглощает вход и сразу закрывает его набивкой SHAKE (0x1f), после чего
- * SqueezeBlocks отдаёт блоки по 168 байт подряд — ровно поток вывода XOF. Блок отдаётся
- * вызывающему кусками, остаток лежит в s->blk до следующего чтения. */
-int sc_shake128_init(struct sc_shake *s, const void *in, size_t n) {
-    static const unsigned char empty[1];
-    s->ready = 0;
-    s->pos = SC_SHAKE128_RATE;
-    if (n > UINT32_MAX) return SC_EINVAL;
-    wc_Shake *k = (wc_Shake *)s->st;
-    if (wc_InitShake128(k, NULL, INVALID_DEVID) != 0) return SC_ECRYPTO;
-    if (wc_Shake128_Absorb(k, n ? in : empty, (word32)n) != 0) { wc_Shake128_Free(k); return SC_ECRYPTO; }
-    s->ready = 1;
-    return 0;
-}
-
-int sc_shake128_read(struct sc_shake *s, unsigned char *out, size_t n) {
-    if (!s->ready) return SC_EINVAL;
-    while (n) {
-        if (s->pos >= SC_SHAKE128_RATE) {
-            if (wc_Shake128_SqueezeBlocks((wc_Shake *)s->st, s->blk, 1) != 0) return SC_ECRYPTO;
-            s->pos = 0;
-        }
-        size_t take = SC_SHAKE128_RATE - s->pos;
-        if (take > n) take = n;
-        memcpy(out, s->blk + s->pos, take);
-        s->pos = (uint16_t)(s->pos + take);
-        out += take;
-        n -= take;
-    }
-    return 0;
-}
-
-void sc_shake128_free(struct sc_shake *s) {
-    if (!s->ready) return;
-    wc_Shake128_Free((wc_Shake *)s->st);
-    wc_ForceZero(s, sizeof(*s));
-}
-
 /* ---- X25519 --------------------------------------------------------------------------------- */
 
-/* wolfSSL принимает только ПРИЖАТЫЙ скаляр (и отказывает на любом другом), а функция X25519 из
- * RFC 7748 прижимает его сама — поэтому прижимаем копию. Для ключей, сгенерированных как надо
- * (reality.c прижимает свой, wg genkey и xsteer-key тоже), это ничего не меняет. */
+/* wolfSSL accepts only a clamped scalar (and refuses any other), while the X25519 function of
+ * RFC 7748 clamps it itself, so a copy is clamped. For properly generated keys (reality.c clamps
+ * its own) this changes nothing. */
 static void clamp(unsigned char s[32], const unsigned char in[32]) {
     memcpy(s, in, 32);
     s[0] &= 248;
@@ -488,7 +421,7 @@ int sc_x25519(unsigned char out[32], const unsigned char scalar[32], const unsig
     int rc = wc_curve25519_generic(32, out, 32, s, 32, point);
     wc_ForceZero(s, sizeof(s));
     if (rc != 0) return SC_ECRYPTO;
-    /* Точка малого порядка даёт нулевой секрет, известный кому угодно (RFC 7748 §6.1). */
+    /* A small-order point gives an all-zero secret known to anyone (RFC 7748 §6.1). */
     if (all_zero(out, 32)) return SC_ECRYPTO;
     return 0;
 }
@@ -501,21 +434,21 @@ int sc_x25519_base(unsigned char pub[32], const unsigned char scalar[32]) {
     return rc == 0 ? 0 : SC_ECRYPTO;
 }
 
-/* ---- подписи -------------------------------------------------------------------------------- */
+/* ---- signatures ----------------------------------------------------------------------------- */
 
-/* Сравнение без раннего выхода: подписи и дайджесты здесь не секретны, но привычку сравнивать
- * криптографические значения memcmp'ом в этом файле заводить не стоит. */
+/* Compare without early exit. Signatures and digests here are not secret, but this file should
+ * not get into the habit of comparing cryptographic values with memcmp. */
 static int ct_equal(const unsigned char *a, const unsigned char *b, size_t n) {
     unsigned char d = 0;
     for (size_t i = 0; i < n; i++) d |= (unsigned char)(a[i] ^ b[i]);
     return d == 0;
 }
 
-/* ---- ML-KEM-768 ------------------------------------------------------------------------------ */
+/* ---- ML-KEM-768 ----------------------------------------------------------------------------- */
 
-/* Ключ заводится на время вызова через wc_MlKemKey_New (куча), а не значением в структуре вызывающего:
- * так его размер не входит в ABI между libsteer и libsteer-wolfssl (sc_abi_check) и не раздувает
- * struct tls13. Цена — один malloc на рукопожатие, ничто по сравнению с самим ML-KEM. */
+/* The key lives for the call only, on the heap (wc_MlKemKey_New), not by value in the caller's
+ * struct, so its size does not bloat struct tls13. The cost is one malloc per handshake, nothing
+ * next to ML-KEM itself. */
 static MlKemKey *kem_new(void) {
     return wc_MlKemKey_New(WC_ML_KEM_768, NULL, INVALID_DEVID);
 }
@@ -538,9 +471,9 @@ int sc_mlkem768_ek_check(const unsigned char ek[SC_MLKEM768_EK]) {
     if (!k) return SC_ENOMEM;
     unsigned char back[SC_MLKEM768_EK];
     int rc = SC_EPARSE;
-    /* DecodePublicKey у wolfSSL проверяет коэффициенты (< q), но проверку подтверждаем круговым
-     * кодированием: Go сверяет ровно так (FIPS 203, 7.2), и расхождение здесь означало бы, что
-     * ключ, отвергнутый сервером, мы принимаем. */
+    /* wolfSSL's DecodePublicKey checks the coefficients (< q), but the check is confirmed by a
+     * round trip through encoding: that is exactly how Go checks (FIPS 203, 7.2), and a mismatch
+     * would mean accepting a key the server rejects. */
     if (wc_MlKemKey_DecodePublicKey(k, ek, SC_MLKEM768_EK) == 0 &&
         wc_MlKemKey_EncodePublicKey(k, back, sizeof back) == 0 &&
         ct_equal(ek, back, sizeof back))
@@ -573,7 +506,7 @@ int sc_mlkem768_decaps(unsigned char ss[SC_MLKEM768_SS], const unsigned char dk[
     return rc;
 }
 
-/* ---- ML-DSA-65: только проверка --------------------------------------------------------------- */
+/* ---- ML-DSA-65: verification only ----------------------------------------------------------- */
 
 int sc_mldsa65_verify(const unsigned char pk[SC_MLDSA65_PK], const unsigned char *msg, size_t msg_n,
                       const unsigned char *sig, size_t sig_n) {
@@ -596,6 +529,7 @@ static int mgf_of(enum sc_hash h) {
         case SC_SHA256: return WC_MGF1SHA256;
         case SC_SHA384: return WC_MGF1SHA384;
         case SC_SHA512: return WC_MGF1SHA512;
+        default: break;
     }
     return WC_MGF1NONE;
 }
@@ -604,7 +538,8 @@ static int verify_rsa(const unsigned char *spki, word32 spki_n, enum sc_sig_alg 
                       enum sc_hash h, const unsigned char *digest, size_t dn,
                       const unsigned char *sig, size_t sig_n) {
     RsaKey *key = malloc(sizeof(*key));
-    /* Вывод открытого преобразования — длиной с модуль; 1024 байта — ключ до 8192 бит. */
+    /* The public operation's output is as long as the modulus; 1024 bytes allow keys up to 8192
+     * bits. */
     unsigned char *out = malloc(1024);
     int rc = SC_ENOMEM;
     if (!key || !out) goto done;
@@ -621,8 +556,9 @@ static int verify_rsa(const unsigned char *spki, word32 spki_n, enum sc_sig_alg 
                                                 wc_RsaEncryptSize(key) * 8, NULL) == 0)
             rc = 0;
     } else {
-        /* PKCS#1 v1.5: после открытого преобразования должен выйти ровно DigestInfo с OID
-         * нашего хеша — собираем эталон и сравниваем целиком, а не ищем дайджест в хвосте. */
+        /* PKCS#1 v1.5: the public operation must yield exactly the DigestInfo with our hash's
+         * OID. Build the expected one and compare it whole, rather than look for the digest at
+         * the tail. */
         unsigned char want[SC_HASH_MAX + 32];
         int n = wc_RsaSSL_Verify(sig, (word32)sig_n, out, 1024, key);
         word32 wn = wc_EncodeSignature(want, digest, (word32)dn, wc_HashGetOID(wc_htype(h)));
@@ -662,9 +598,9 @@ int sc_cert_verify_sig(const unsigned char *cert_der, size_t cert_n,
     if (!cert_der || !digest || !sig || cert_n > UINT32_MAX || sig_n > 4096 ||
         digest_n != sc_hash_len(h) || !digest_n)
         return SC_EINVAL;
-    /* Ключ — из SubjectPublicKeyInfo сертификата: разбирать сертификат целиком ради ключа
-     * незачем, а SPKI понимают обе функции разбора ключа. Сертификат с ключом больше
-     * 8192 бит сюда не приходит — такого нет ни у одного узла и ни у одного корня. */
+    /* The key comes from the certificate's SubjectPublicKeyInfo: there is no need to parse the
+     * whole certificate, and both key decoders understand SPKI. Keys over 8192 bits are not
+     * supported: no node or root has one. */
     word32 spki_n = 2048;
     unsigned char *spki = malloc(spki_n);
     if (!spki) return SC_ENOMEM;
@@ -681,59 +617,25 @@ int sc_cert_verify_sig(const unsigned char *cert_der, size_t cert_n,
     return rc;
 }
 
-/* ---- хранилище корней и цепочка ------------------------------------------------------------
+/* ---- root store and chain ----------------------------------------------------------------
  *
- * Цепочку строит и проверяет wolfSSL_X509_verify_cert, а корни держит CertManager внутри
- * WOLFSSL_X509_STORE. Почему не голый CertManager: он проверяет ОДИН сертификат против того, что
- * в нём уже лежит, а промежуточные присланы сервером и доверенными не являются. Положить их туда
- * значило бы либо засорять общее хранилище чужими сертификатами навсегда, либо строить путь
- * самим — со своей проверкой признака CA, keyCertSign, длины пути и ограничений имён, то есть
- * своей реализацией ровно того, что у библиотеки уже есть и уже чинилось (CVE-2026-89133 про
- * ограничения имён — в ней, а не у нас). verify_cert делает всё это сам, включая имя (SAN, IP).
+ * wolfSSL_X509_verify_cert builds and checks the chain; the roots are held by the CertManager
+ * inside WOLFSSL_X509_STORE. A bare CertManager does not do: it checks ONE certificate against
+ * what it already holds, and the intermediates come from the server and are not trusted. Adding
+ * them would either pollute the shared store for good or mean building the path ourselves, with
+ * our own checks of the CA flag, keyCertSign, path length and name constraints: a reimplementation
+ * of what the library has and has already fixed (name constraints in CVE-2026-89133).
+ * verify_cert does all of it, including the name (SAN, IP).
  *
- * Цена — одна проверка за раз: verify_cert кладёт промежуточные в CertManager хранилища как
- * временные и снимает ВСЕ временные по окончании, так что две проверки на одном хранилище
- * одновременно мешали бы друг другу (об этом прямо пишет x509_str.c). Отсюда мьютекс: проверок
- * цепочки — по одной на рукопожатие security=tls, миллисекунды, и очередь за ним ничего не стоит,
- * а хранилище на поток стоило бы по сотне килобайт корней на каждый соединитель. */
+ * The cost is one check at a time: verify_cert adds the intermediates to the store's CertManager
+ * as temporary and removes ALL temporary ones when done, so two concurrent checks on one store
+ * would interfere (x509_str.c says so). Hence the mutex: one chain check per security=tls
+ * handshake takes milliseconds, so waiting for it costs nothing, while a store per thread would
+ * cost a hundred KB of roots per connector. */
 struct sc_roots {
     WOLFSSL_X509_STORE *store;
     pthread_mutex_t mu;
 };
-
-/* ---- сверка с загруженной libsteer-wolfssl.so ---------------------------------------------
- *
- * steer_wolfssl_abi определён в libsteer-wolfssl.so (build/wolfssl/abi.c — порядок полей там тот
- * же, см. комментарий у него). В статической сборке символа нет — слабая ссылка нулевая, и сверять
- * нечего: библиотека там собрана в тот же бинарник теми же опциями. В libsteer.so ссылка обязана
- * быть видна за пределы библиотеки (visibility default), иначе компоновщик разрешил бы её нулём.
- *
- * Расхождение — не ошибка, которую можно вернуть: хранилища контекстов слоя уже расставлены по
- * структурам вызывающих. Поэтому процесс гасится сразу, при загрузке (конструктор), строкой,
- * которая называет причину и лечение, а не падает позже в чужом поле. */
-extern const unsigned long steer_wolfssl_abi[SC_ABI_N] __attribute__((weak, visibility("default")));
-
-struct chachapoly_sz { ChaCha c; Poly1305 p; };
-
-__attribute__((constructor)) static void sc_abi_check(void) {
-    if (!steer_wolfssl_abi) return;
-    const unsigned long want[SC_ABI_N] = {
-        LIBWOLFSSL_VERSION_HEX,
-        sizeof(wc_Sha256), sizeof(wc_Sha512), sizeof(wc_Sha384),
-        sizeof(Aes), sizeof(struct chachapoly_sz),
-        SC_HASH_CTX_SIZE, SC_AEAD_CTX_SIZE, SC_AESCTR_CTX_SIZE,
-        sizeof(WOLFSSL_X509_STORE), offsetof(WOLFSSL_X509_STORE, cm),
-        sizeof(wc_Shake), SC_SHAKE_CTX_SIZE,
-    };
-    for (int i = 0; i < SC_ABI_N; i++) {
-        if (steer_wolfssl_abi[i] == want[i]) continue;
-        static const char msg[] =
-            "steer: libsteer-wolfssl.so другой сборки, чем libsteer.so (версия wolfSSL или размеры "
-            "структур не совпали) — обновите пакеты libsteer и libsteer-wolfssl вместе\n";
-        (void)!write(2, msg, sizeof(msg) - 1);
-        _exit(3);
-    }
-}
 
 static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 static int g_init_rc = -1;
@@ -749,8 +651,8 @@ int sc_roots_load(struct sc_roots **out, const unsigned char *pem, size_t n) {
     r->store = wolfSSL_X509_STORE_new();
     if (!r->store) { free(r); return SC_ENOMEM; }
     pthread_mutex_init(&r->mu, NULL);
-    /* IGNORE_ERR: запись, которая не разобралась, пропускается, остальные грузятся (см. заголовок).
-     * Сколько корней загрузилось, wolfSSL не сообщает; «ни одного» узнаётся по отказу вызова. */
+    /* IGNORE_ERR: an entry that does not parse is skipped, the rest load (see scrypto.h).
+     * wolfSSL does not report how many roots loaded; "none" shows as a failure of the call. */
     int rc = wolfSSL_CertManagerLoadCABuffer_ex(r->store->cm, pem, (long)n, WOLFSSL_FILETYPE_PEM,
                                                 0, WOLFSSL_LOAD_FLAG_IGNORE_ERR);
     if (rc != WOLFSSL_SUCCESS) { sc_roots_free(r); return SC_EPARSE; }
@@ -758,11 +660,11 @@ int sc_roots_load(struct sc_roots **out, const unsigned char *pem, size_t n) {
     return 0;
 }
 
-/* Хранилище из ОДНОГО сертификата в DER — закреплённый отпечатком центр (Xray pinnedPeerCertSha256,
- * когда отпечаток совпал с промежуточным или корнем цепочки). Отличается от sc_roots_load форматом и
- * тем, что запись должна разобраться: сертификат, который не годится в центры (нет признака CA,
- * алгоритма нет в сборке), — отказ SC_EPARSE, и вызывающий трактует его как «отпечаток не нашёл
- * центра», ровно как Xray (в его verifyChain закрепление работает только для cert.IsCA). */
+/* A store of ONE DER certificate: a CA pinned by fingerprint (Xray's pinnedPeerCertSha256, when
+ * the fingerprint matches an intermediate or the root of the chain). Unlike sc_roots_load, the
+ * entry must parse: a certificate that cannot be a CA (no CA flag, an algorithm not in the
+ * build) fails with SC_EPARSE, and the caller treats it as "the fingerprint found no CA", just
+ * as Xray does (its verifyChain pins only when cert.IsCA). */
 int sc_roots_load_der(struct sc_roots **out, const unsigned char *der, size_t n) {
     *out = NULL;
     if (!der || !n || n > INT32_MAX) return SC_EINVAL;
@@ -797,9 +699,9 @@ int sc_chain_verify(struct sc_roots *r, const unsigned char *const *der, const s
     WOLF_STACK_OF(WOLFSSL_X509) *sk = wolfSSL_sk_X509_new_null();
     WOLFSSL_X509_STORE_CTX *ctx = wolfSSL_X509_STORE_CTX_new();
     if (!sk || !ctx) goto out;
-    /* Промежуточный, который не разобрался, пропускается, а не роняет проверку: цепочка нередко
-     * приезжает с запасом, и лишний сертификат с незнакомым алгоритмом ничего не решает. Если он
-     * был нужен — путь до корня не построится, и это будет честный отказ цепочки. */
+    /* An intermediate that does not parse is skipped rather than failing the check: chains often
+     * come with extras, and an extra certificate with an unknown algorithm decides nothing. If it
+     * was needed, no path to a root is built, and the chain fails honestly. */
     for (size_t i = 1; i < count; i++) {
         WOLFSSL_X509 *x = wolfSSL_X509_d2i(NULL, der[i], (int)der_n[i]);
         if (x && wolfSSL_sk_X509_push(sk, x) <= 0) wolfSSL_X509_free(x);
@@ -809,8 +711,8 @@ int sc_chain_verify(struct sc_roots *r, const unsigned char *const *der, const s
     rc = SC_ECHAIN;
     if (wolfSSL_X509_STORE_CTX_init(ctx, r->store, leaf, sk) == WOLFSSL_SUCCESS) {
         WOLFSSL_X509_VERIFY_PARAM *param = wolfSSL_X509_STORE_CTX_get0_param(ctx);
-        /* Имя-адрес сверяется с SAN IP, имя — с SAN DNS (и CN, если SAN нет): так же, как
-         * mbedtls_x509_crt_verify прежде. */
+        /* An address is matched against SAN IP, a name against SAN DNS (and CN when there is
+         * no SAN). */
         unsigned char ip[16];
         int is_ip = inet_pton(AF_INET, host, ip) == 1 || inet_pton(AF_INET6, host, ip) == 1;
         int set = param && (is_ip ? wolfSSL_X509_VERIFY_PARAM_set1_ip_asc(param, host)

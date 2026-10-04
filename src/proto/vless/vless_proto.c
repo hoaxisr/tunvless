@@ -1,14 +1,14 @@
-/* Протокол VLESS: заголовок запроса и разбор ответа.
+/* VLESS: the request header and the response.
  *
- * VLESS намеренно примитивен — в этом его смысл. Никакого своего шифрования и никаких
- * контрольных сумм: всё это уже сделал TLS снизу, и дублировать значило бы добавить
- * отличимый признак в поток, который должен выглядеть обычным HTTPS.
+ * VLESS is deliberately bare: no encryption and no checksums of its own. The TLS below already
+ * does that, and doing it twice would add a distinguishable feature to a stream that must look
+ * like plain HTTPS.
  *
- * Запрос:
- *   версия(1) | UUID(16) | длина_доп(1) | доп | команда(1) | порт(2) | тип_адреса(1) |
- *   адрес | данные...
+ * Request (integers big-endian):
+ *   version(1) | UUID(16) | addons_len(1) | addons | command(1) | port(2) | addr_type(1) |
+ *   address | data...
  *
- * Ответ сервера — два байта (версия, длина_доп) плюс доп, дальше сразу данные.
+ * The server's response is two bytes (version, addons_len) plus the addons, then the data.
  */
 #define _GNU_SOURCE
 #include <string.h>
@@ -17,34 +17,21 @@
 
 #include "vless_proto.h"
 
-/* SHA-1 короткого сообщения — только для ВЫВОДА идентификатора (см. ниже).
+/* SHA-1 of a short message, used only to derive a UUID from a non-UUID id (see below).
  *
- * Почему своя реализация, а не криптобиблиотека, которой линкуется вся расширенная сборка. Две
- * причины:
+ * Own code rather than the crypto library: vless_proto.c needs no library, so the unit tests
+ * (tests/submatch.c) build it without one. SHA-1 is not a protection here but a fixed
+ * derivation the server must reproduce, and any error shows at once as a rejected user. It is
+ * pinned to the NIST "abc" vector in tests/submatch.c.
  *
- *   1. Когда это писалось, SHA-1 в mbedtls этого проекта НЕ СОБИРАЛСЯ (урезанная конфигурация
- *      без MBEDTLS_SHA1_C). У wolfSSL, которая mbedtls сменила (выпуск 1.10), SHA-1 есть — он
- *      нужен разбору сертификатов, — но за слоем src/lib/scrypto.h его нет нарочно: протоколам
- *      он не нужен ни для чего, кроме этого вывода, и вторая причина остаётся в силе.
- *   2. vless_proto.c — арифметика формата, без библиотек, и именно поэтому его вместе с
- *      sub.c проверяет стенд из обычного `make test`, где криптобиблиотеки нет по построению
- *      (R-014). Утащив сюда криптобиблиотеку, мы вынесли бы проверку вывода
- *      идентификатора в релизную сборку, то есть туда, где её никто не гоняет.
- *
- * «Не пиши свою криптографию» здесь не нарушено по существу: SHA-1 работает не как
- * защита, а как ФИКСИРОВАННАЯ функция вывода — те же 16 байт обязан получить сервер, и
- * ошибка не «тихо перестаёт защищать», а сразу отбрасывает пользователя. Реализация
- * прибита к опубликованному вектору NIST («abc») в tests/submatch.c.
- *
- * Сообщение здесь ВСЕГДА короче блока: 16 нулевых байт плюс не больше 30 знаков строки,
- * то есть максимум 46 байт. Поэтому набивка укладывается в один блок 64 байта, и цикла по
- * блокам с накоплением состояния нет вовсе — самой частой ошибки в самодельных хэшах
- * (склейка блоков и перенос длины) здесь просто нет места. На большем — отказ. */
+ * The message is always shorter than a block: 16 zero bytes plus at most 30 characters, 46
+ * bytes at most. The padding fits one 64-byte block, so there is no multi-block loop; longer
+ * input is refused. */
 static int sha1_short(const unsigned char *msg, size_t n, unsigned char out[20]) {
     unsigned char b[64];
     uint32_t w[80], h[5] = { 0x67452301u, 0xEFCDAB89u, 0x98BADCFEu,
                              0x10325476u, 0xC3D2E1F0u };
-    if (n > 55) return -1;              /* 55 = 64 - 1 байт набивки - 8 байт длины */
+    if (n > 55) return -1;              /* 55 = 64 - 1 padding byte - 8 length bytes */
     memset(b, 0, sizeof(b));
     memcpy(b, msg, n);
     b[n] = 0x80;
@@ -86,14 +73,13 @@ static int hexval(char c) {
     return -1;
 }
 
-/* Группы 8-4-4-4-12, как в Xray: перед каждой группой допускается ОДИН дефис, внутри —
- * только шестнадцатеричные знаки. out допускает NULL: тогда идёт одна проверка.
+/* Groups 8-4-4-4-12 as in Xray: at most one hyphen before each group, only hex digits inside.
+ * out may be NULL to only validate.
  *
- * Хвост после последней группы Xray не смотрит вовсе — длину он уже ограничил 36 байтами,
- * и строка вида «32 знака hex плюс 4 любых» у него разбирается по первым 32. Здесь так же,
- * и это осознанно: строгость в эту сторону означала бы, что steer бракует ссылку, с
- * которой любой другой клиент подключается, — а расхождение с сервером она не создаёт,
- * потому что сервер нашу строку не видит. */
+ * Like Xray, the tail after the last group is ignored: the length is already capped at 36, so
+ * "32 hex digits plus 4 arbitrary characters" parses by the first 32. Being stricter would
+ * reject links every other client accepts, and cannot cause a mismatch with the server, which
+ * never sees our string. */
 static int hex_groups(const char *s, size_t n, unsigned char *out) {
     static const size_t groups[5] = { 8, 4, 4, 4, 12 };
     size_t i = 0, o = 0;
@@ -111,12 +97,9 @@ static int hex_groups(const char *s, size_t n, unsigned char *out) {
     return 0;
 }
 
-/* Форма идентификатора — ПО ДЛИНЕ строки, как в Xray (common/uuid/uuid.go, ParseString).
- *
- * Так это и устроено у сервера: id из панели вроде «TMG_74317ba5f91» — законный VLESS, из
- * него UUID выводится хэшем, и оба конца обязаны вывести одинаково. Прежний разбор здесь
- * требовал строгий шестнадцатеричный текст, и такой узел не подключался вовсе: проба
- * отвечала «UUID неразборчив», а туннель ронял соединение без причины. */
+/* The form of the id is decided by the string's length, as in Xray (common/uuid/uuid.go,
+ * ParseString). A panel id such as "TMG_74317ba5f91" is valid VLESS: the UUID is derived from
+ * it by a hash, and both ends must derive the same bytes. */
 int vless_uuid_form(const char *s) {
     size_t n = s ? strlen(s) : 0;
     if (n >= 32 && n <= 36)
@@ -127,17 +110,17 @@ int vless_uuid_form(const char *s) {
     return VLESS_UUID_DERIVED;
 }
 
-/* 16 байт идентификатора. Ветка выбирается ОДНИМ правилом — тем, что выше: два
- * независимых решения о длине разъехались бы, и разъехались бы молча. */
+/* The branch is chosen by the one rule above: two separate decisions on the length could
+ * silently disagree. */
 int vless_uuid_parse(const char *s, unsigned char out[16]) {
     switch (vless_uuid_form(s)) {
     case VLESS_UUID_HEX:
         return hex_groups(s, strlen(s), out);
     case VLESS_UUID_DERIVED: {
-        /* sha1(16 нулевых байт || строка), первые 16 байт; дальше версия 5 в старшей
-         * половине байта 6 и вариант RFC 4122 в байте 8 — ровно как у Xray. Нулевые
-         * байты впереди — это не соль, а пустой UUID, в который Xray хэширует строку
-         * («h.Write(uuid[:])» до записи текста); без них вышли бы другие 16 байт. */
+        /* The first 16 bytes of sha1(16 zero bytes || string), then version 5 in the high
+         * nibble of byte 6 and the RFC 4122 variant in byte 8, exactly as in Xray. The zero
+         * bytes are not a salt: Xray hashes the string into an empty UUID (h.Write(uuid[:])
+         * before the text), and without them the result differs. */
         size_t n = strlen(s);
         unsigned char msg[16 + 30], dg[20];
         memset(msg, 0, 16);
@@ -153,43 +136,43 @@ int vless_uuid_parse(const char *s, unsigned char out[16]) {
     }
 }
 
-/* Заголовок запроса. Адрес передаётся ИМЕНЕМ, когда оно известно: так разрешение имени
- * делает сервер, и запрос не утекает наружу через локальный DNS. Для трафика из TUN имени
- * нет — там уже адрес, и передаётся он как адрес. */
+/* The request header. The address goes as a name when one is known, so the server resolves
+ * it and the lookup does not leak through local DNS. Traffic from TUN has only an address.
+ * Returns the header length, or 0 if it does not fit in cap or the flow or host is too long. */
 size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
                            const char *host, const unsigned char ip4[4],
                            uint16_t port, const char *flow,
                            unsigned char *out, size_t cap) {
     size_t i = 0;
     if (cap < 24) return 0;
-    out[i++] = 0;                       /* версия протокола */
+    out[i++] = 0;                       /* protocol version */
     memcpy(out + i, uuid, 16); i += 16;
 
-    /* Дополнительные данные. Для XTLS-Vision это protobuf-сообщение Addons со строкой
-     * flow в поле 1 — схема из addons.proto Xray:
+    /* Addons. For XTLS-Vision this is the protobuf message Addons with the flow in field 1,
+     * schema from Xray's addons.proto:
      *
      *   message Addons { string Flow = 1; bytes Seed = 2; }
      *
-     * protobuf здесь кодируется вручную, потому что сообщение из одного строкового поля
-     * — это три байта плюс само имя, и тащить генератор ради этого было бы несоразмерно:
-     *   0x0A (поле 1, тип 2) | длина | байты строки
+     * Encoded by hand, since a message of one string field is three bytes plus the name:
+     *   0x0A (field 1, wire type 2) | length | string bytes
      *
-     * Без этого сервер с flow=xtls-rprx-vision не отвечает вовсе: он ждёт Vision, а
-     * получает обычный VLESS. Именно так и выглядела ошибка — «ответ 0 байт». */
+     * Without it a server with flow=xtls-rprx-vision does not answer at all: it expects
+     * Vision and gets plain VLESS. */
     if (flow && flow[0]) {
         size_t fl = strlen(flow);
         if (fl > 120 || i + 3 + fl > cap) return 0;
-        out[i++] = (unsigned char)(2 + fl);   /* длина protobuf-сообщения */
-        out[i++] = 0x0A;                      /* поле 1, wire type 2 (строка) */
+        out[i++] = (unsigned char)(2 + fl);   /* protobuf message length */
+        out[i++] = 0x0A;                      /* field 1, wire type 2 (string) */
         out[i++] = (unsigned char)fl;
         memcpy(out + i, flow, fl); i += fl;
     } else {
-        out[i++] = 0;                         /* дополнительных данных нет */
+        out[i++] = 0;                         /* no addons */
     }
     out[i++] = (unsigned char)cmd;
-    /* У Mux (команда 3) порта и адреса в заголовке НЕТ: служба v1.mux.cool:666 подразумевается самой
-     * командой, и Xray-core (proxy/vless/encoding, EncodeRequestHeader), и sing-box (vless.ReadRequest)
-     * дальше команды заголовок не читают — лишние байты стали бы началом потока Mux. */
+    /* Mux (command 3) has no port and address in the header: the v1.mux.cool:666 service is
+     * implied by the command. Xray-core (proxy/vless/encoding, EncodeRequestHeader) writes
+     * nothing after the command and sing-box (vless.ReadRequest) reads nothing after it, so
+     * extra bytes would become the start of the Mux stream. */
     if (cmd == VLESS_CMD_MUX) return i;
     out[i++] = (unsigned char)(port >> 8);
     out[i++] = (unsigned char)port;
@@ -208,15 +191,15 @@ size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
     return i;
 }
 
-/* Ответ: версия + длина доп. Возвращает число байт, которые надо отбросить перед
- * данными, или отрицательное при неверном ответе.
+/* Response: version and addons length. Returns 0 with the bytes to drop before the data in
+ * *skip, VLESS_EAGAIN if more is needed, VLESS_EPROTO on a bad response.
  *
- * Неверный ответ здесь — важный сигнал: если Reality не признал нас, сервер проксирует
- * на настоящий сайт, и первым, что придёт, будет HTTP или TLS-мусор, а не VLESS. Значит
- * именно эта проверка и отличает «получилось» от «молча не получилось». */
+ * A bad response is the key signal: when Reality does not accept us, the server proxies to the
+ * real site, and the first bytes are HTTP or TLS, not VLESS. This check is what tells success
+ * from silent failure. */
 int vless_parse_response(const unsigned char *buf, size_t n, size_t *skip) {
     if (n < 2) return VLESS_EAGAIN;
-    if (buf[0] != 0) return VLESS_EPROTO;      /* не наша версия — почти наверняка чужой сайт */
+    if (buf[0] != 0) return VLESS_EPROTO;      /* not our version: almost surely the real site */
     size_t extra = buf[1];
     if (n < 2 + extra) return VLESS_EAGAIN;
     *skip = 2 + extra;

@@ -1,30 +1,21 @@
-/* Замороженные байты ClientHello, собранного reality.c при ДЕТЕРМИНИРОВАННОЙ случайности.
+/* Frozen bytes of the ClientHello that reality.c builds with DETERMINISTIC randomness, compared
+ * by tests/hellofreeze.c. The Chrome fingerprint is what lets a Reality server tell us from a
+ * stranger; while the comparison holds, the fingerprint has not moved by a single bit.
  *
- * Зачем. Отпечаток Chrome в reality.c — это то, по чему сервер Reality отличает нас от
- * постороннего, и в самом файле написано, что любая правка здесь проверяется перехватом
- * рядом с браузерным эталоном. Байты ниже сняты ДО того, как в сборщик Hello добавили
- * носителя для рукопожатия xsteer, и стенд hellofreeze сверяет с ними результат ПОСЛЕ:
- * пока сверка сходится, отпечаток не поехал ни на бит.
+ * To regenerate: `make crypto-test` (builds out/tests/hellofreeze), then
+ *     ./out/tests/hellofreeze --emit > tests/chello-frozen.h
+ * and put this header back: --emit prints a short one. Read tests/hellofreeze.c first.
  *
- * Второе применение — стенду chellomatch: разбор Hello проверяется на настоящем Hello, а не
- * на выдуманном, и для этого криптобиблиотека не нужна вовсе.
+ * Bytes 44-75 are the encrypted session_id. It carries the Reality client version, so bumping
+ * the version in reality.c changes them.
  *
- * Как пересобрать: `make ext-test` (собирает build/hellofreeze), затем
- *     ./build/hellofreeze --emit > tests/chello-frozen.h
- * и вернуть эту шапку: --emit печатает короткую.
- *
- * Байты session_id (44-75) переморожены 28 сентября 2026 с кода main до переезда на wolfSSL
- * (mbedtls 3.6.2): прежние остались от версии клиента Reality до 26.9.8 — подробности в шапке
- * tests/hellofreeze.c. Всё остальное — байт в байт августовская заморозка.
- *
- * Порядок шифров зависит от процессора (cpu_has_aes), поэтому заморожены ОБА варианта:
- * иначе «эталон» отличался бы от машины к машине, и стенд падал бы на половине из них.
+ * The cipher order depends on the CPU (cpu_has_aes), so BOTH variants are frozen; otherwise the
+ * reference would differ from machine to machine.
  */
 #ifndef STEER_CHELLO_FROZEN_H
 #define STEER_CHELLO_FROZEN_H
 
-/* STEER_CIPHER=aes — порядок наборов как у браузера на процессоре с AES-NI. */
-/* STEER_CIPHER=aes — порядок наборов как у браузера на процессоре с AES-NI. */
+/* STEER_CIPHER=aes: the browser's cipher suite order on a CPU with AES-NI. */
 static const char FROZEN_AES[] =
     "\x16\x03\x01\x02\x12\x01\x00\x02\x0e\x03\x03\xde\x9e\x33\xdd\x3e"
     "\x00\xdd\x80\x40\xaa\x23\x9f\x84\x92\xb6\xff\x30\xdd\x4c\xd2\x5f"
@@ -61,7 +52,7 @@ static const char FROZEN_AES[] =
     "\xef\x3d\x7f\x94\xe0\x29\x59\xba\x4c\x7c\xdc\xe1\x11\x95\xdc\x79"
     "\xfa\x5d\x5a\x5a\x00\x01\x00";
 
-/* STEER_CIPHER=chacha — порядок наборов как у браузера без ускорения AES (MIPS). */
+/* STEER_CIPHER=chacha: the browser's cipher suite order without AES acceleration (MIPS). */
 static const char FROZEN_CHACHA[] =
     "\x16\x03\x01\x02\x12\x01\x00\x02\x0e\x03\x03\xde\x9e\x33\xdd\x3e"
     "\x00\xdd\x80\x40\xaa\x23\x9f\x84\x92\xb6\xff\x30\xdd\x4c\xd2\x5f"
@@ -98,8 +89,8 @@ static const char FROZEN_CHACHA[] =
     "\xef\x3d\x7f\x94\xe0\x29\x59\xba\x4c\x7c\xdc\xe1\x11\x95\xdc\x79"
     "\xfa\x5d\x5a\x5a\x00\x01\x00";
 
-/* Длина обоих: 535 байт при SNI www.example.com. Строковый литерал несёт нулевой байт
- * в конце, поэтому размер массива на единицу больше — стенды пользуются FROZEN_N. */
+/* Both are 535 bytes with SNI www.example.com. The string literal adds a trailing NUL, so the
+ * arrays are one byte longer: use FROZEN_N. */
 #define FROZEN_N 535
 
 #endif

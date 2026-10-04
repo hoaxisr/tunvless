@@ -1,64 +1,38 @@
-/* Пул узлов выхода: N узлов подписки работают сразу, новые соединения делятся между ними, за каждым
- * узлом — своя слежка, и мёртвый заменяется следующим кандидатом без перезапуска процесса.
+/* Node pool: `active` nodes work at once, new connections are spread over them, each node is
+ * health checked, and a dead one is replaced by the next free candidate without restarting.
  *
- * ОТКУДА. Слежка за узлом жила в модуле VLESS (vlwatch.c) и держала ОДИН узел: потерян — проверить
- * остальных кандидатов и, если ответил другой, ВЫЙТИ, чтобы супервизор поднял процесс заново. Довод
- * был «сменить узел на ходу нельзя, каждое соединение несёт параметры своего узла». Довод верен ровно
- * наоборот: раз параметры узла берутся на КАЖДОЙ отправке, узел можно выбирать на каждое НОВОЕ
- * соединение, и соединения разных узлов живут в одном процессе рядом. Выход же стоил дорого: устройство
- * пропадало, соединения приложений оставались висеть до их таймаута (новый процесс их не знает), а
- * маршрут выхода демон привязывал заново.
+ * The pool wraps the protocol's dialer (dialer.h). The protocol does not know about it: the ctx of
+ * its table is still a node, but each connection has its own node, kept in the pool's session
+ * header. The stack asks the pool the four optional questions of the table (peer_of, match, stale,
+ * lost) and knows nothing about nodes.
  *
- * ГДЕ. Пул — обёртка дайлера (dialer.h), а не часть протокола: протоколу (VLESS, прокси) он не
- * меняет ничего — ctx его таблицы по-прежнему узел, только узел теперь свой у каждого соединения и
- * лежит в шапке сессии пула. Стеку пул отвечает на четыре необязательных вопроса таблицы (peer_of,
- * match, stale, lost), и стек про узлы не знает по-прежнему.
+ * SLOTS. A slot is the place of one active node: the node (or none), whether it is alive, and a
+ * generation. The generation changes when the slot's node is declared dead or replaced, and the
+ * stack resets the connections of older generations (stale: RST to the client) while those of
+ * live slots are left alone. A candidate is taken if it is the node of any slot: two slots never
+ * hold the same node.
  *
- * СЛОТЫ. Активных узлов — `active` (ключ выхода, умолчание 1 — прежнее поведение одного узла).
- * Слот — место активного узла: узел (или пусто), жив ли, поколение. Поколение меняется, когда узел
- * слота признан мёртвым или заменён: соединения прежнего поколения стек сбрасывает (stale, RST
- * клиенту), а соединения живых слотов не трогаются. Кандидат занят, если он узел хоть одного слота —
- * два слота на одном узле не бывают.
+ * SPREADING (`by`). connection — every new connection to a random live slot; site — the slot by a
+ * hash of the destination address (if that slot is dead, the next live one round the circle, so
+ * the sites of live slots do not move); site_client — by a hash of client and destination.
  *
- * РАЗДАЧА (`by`, имена — как у `by` группы balance): connection — каждое новое соединение на
- * случайный живой слот; site — слот по хешу адреса назначения («сайт на одном узле»; слот мёртв —
- * следующий живой по кругу, и сайты живых слотов при этом не переезжают); site_client — по хешу пары
- * «клиент, адрес». Соединение остаётся на своём узле до конца. Адрес — тот, что в пакете: после fake-IP
- * это уже настоящий адрес сайта.
+ * SPARE CONNECTIONS of the stack (DC_PRECONNECT) are opened to live slots in turn. A connection
+ * takes a spare that suits its node (match): with connection, any — the connection moves to the
+ * spare's node; with site, only its own slot's. A spare to a node no longer active is dropped.
  *
- * ЗАПАСНЫЕ СВЯЗИ стека (DC_PRECONNECT) — к своему узлу: запасная наполняется к живым слотам по кругу,
- * а берёт её соединение, которому годится её узел (match): при connection — любое (соединение
- * переезжает на узел запасной, раз выбор был случайным), при site — только того же слота. Связь к узлу,
- * который больше не активен, выбрасывается.
- *
- * СЛЕЖКА — та же мера и тот же ритм, что у прежней слежки vlwatch.c, только на каждый слот. Мера —
- * проверка узла протоколом (у VLESS — vless_probe: соединение, TLS/Reality, запрос через узел и
- * первый байт ответа), та же, по которой узел выбран при подъёме: down и up меряются одной линейкой.
- * Исходы соединений живого трафика приговором НЕ служат, они только зовут проверку раньше срока: пачка
- * SYN при открытии страницы отказывает вся разом на одной потере пакетов, а удачное рукопожатие не
- * говорит, что узел пропускает трафик дальше себя. SYN-ACK клиенту стек отдаёт сам, до рукопожатия с
- * узлом, поэтому проба TCP сторожа через устройство узла не мерит — жив ли узел, знает только клиент:
- *   - живой узел проверяется раз в `interval` (умолчание 60 с); неудача — повтор через 3 с, две
- *     подряд — узел мёртв (после обрыва связи по порогу молчания хватает одной: узел и так молчал
- *     дольше порога);
- *   - раньше срока проверку зовут: три отказа установления связи подряд (как прежде) и ОБРЫВ живого
- *     соединения ядром (lost): порог молчания `silence` (stack.c, node_sock_silence) — отправленное
- *     узлу не подтверждено или узел не ответил на проверку keepalive дольше порога. Это и есть узел,
- *     умерший под длинной закачкой или звонком: новых соединений нет, и прежде его замечала только
- *     плановая проверка — до минуты;
- *   - мёртвый узел: соединения слота — в сброс (поколение), и сразу поиск замены среди свободных
- *     кандидатов по порядку предпочтения. Нашёлся — слот на новом узле. Не нашёлся — круг через 15 с:
- *     сперва свой прежний узел, потом свободные кандидаты, с каждым пустым кругом вдвое дольше, до 5 мин.
- *     Пустой слот (кандидатов при подъёме ответило меньше `active`) ищет узел тем же кругом.
- *
- * ДЕМОНУ — как прежде (evline.h): up с dev и watch, когда устройство поднято; down с причиной, когда
- * живых слотов не осталось (не раньше первой неудачной попытки замены — иначе выход мигал бы на каждой
- * замене, которая удаётся за доли секунды); снова up, когда живой нашёлся. И новое событие `active`
- * — номера активных живых узлов через запятую (поле nodes): демон показывает их в `helper`. Файл
- * состояния <tag>-<выход> (status, diag) — тем же составом, с именами; пишется на перемене, а не по
- * таймеру: флеш телефона.
- *
- * Без демона трубы нет, а слежка всё равно идёт: замена узла и сброс соединений нужны и там.
+ * HEALTH. The measure is the protocol's probe (for VLESS: connect, TLS/Reality, a request through
+ * the node and the first byte of the answer), the same check that chose the node at startup.
+ * Outcomes of live traffic are not a verdict, they only bring the check forward: a burst of SYNs
+ * fails together on one packet loss, and a good handshake does not prove the node passes traffic.
+ *   - a live node is checked every `interval` (60 s); a failure is retried after 3 s, two in a
+ *     row and the node is dead (after a stall the first failure is enough: the node has already
+ *     been silent longer than the threshold);
+ *   - checks come early after three failed connects in a row and after a live connection is cut
+ *     by the kernel for silence (lost: stack.c, node_sock_silence);
+ *   - a dead node: its connections are reset (generation) and a replacement is searched at once
+ *     among the free candidates in order of preference. None answers — another round after 15 s
+ *     (own node first, then the free candidates), doubling up to 5 minutes. An empty slot (fewer
+ *     candidates answered at startup than `active`) searches the same way.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -67,51 +41,51 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <sys/random.h>
 
 #include "pool.h"
-#include "kind.h"
-#include "evline.h"
-#include "jsonw.h"
-#include "platform.h"
 #include "transport.h"
+#include "osrand.h"
 
-#define PL_LOG_W "steer[warn]: "
-#define PL_LOG_I "steer[info]: "
+#ifndef GRND_NONBLOCK
+#define GRND_NONBLOCK 0x0001
+#endif
+
+#define PL_LOG_W "tunvless[warn]: "
+#define PL_LOG_I "tunvless[info]: "
 
 #define PL_CONFIRM_S   3
 #define PL_RETRY_S     15
 #define PL_RETRY_MAX_S 300
 #define PL_STREAK      3
 #define PL_TIMEOUT_S   8
-/* Обрыв соединения зовёт проверку не чаще, чем раз в столько: обрывы приходят пачкой (все соединения
- * умершего узла рвутся по одному сроку), а проверке хватает одной. */
+/* A cut connection brings a check forward at most this often: the connections of a dead node are
+ * cut together, and one check is enough. */
 #define PL_LOST_GAP_MS 5000
 
-/* Шапка сессии пула; за ней, с отступом PL_HDR, — сессия протокола. */
+/* The pool's session header; the protocol's session follows at PL_HDR. */
 struct pl_sess {
-    const void *node;           /* узел соединения; NULL — запасная, ещё ничья */
-    unsigned gen;               /* поколение слота на момент выбора */
-    int slot;                   /* -1 — нет */
-    uint8_t udp, opened;        /* flow_open был, k — его ключ */
+    const void *node;           /* the connection's node; NULL — a spare not yet anybody's */
+    unsigned gen;               /* the slot's generation when the node was chosen */
+    int slot;                   /* -1 — none */
+    uint8_t udp, opened;        /* flow_open was called with k */
     struct flow_key k;
 };
 #define PL_HDR 64
-_Static_assert(sizeof(struct pl_sess) <= PL_HDR, "шапка сессии пула больше отступа");
+_Static_assert(sizeof(struct pl_sess) <= PL_HDR, "pool session header larger than PL_HDR");
 #define INNER(s) ((void *)((unsigned char *)(s) + PL_HDR))
 #define CINNER(s) ((const void *)((const unsigned char *)(s) + PL_HDR))
 
 struct pl_slot {
-    int node;                   /* индекс узла; -1 — пусто */
-    int up;                     /* жив: новые соединения идут сюда */
+    int node;                   /* node index; -1 — empty */
+    int up;                     /* alive: new connections come here */
     unsigned gen;
-    int fails;                  /* неудачных проверок подряд */
-    int streak;                 /* отказов установления подряд */
-    int kick;                   /* проверить сейчас */
-    int lost;                   /* позвал обрыв связи по порогу молчания: одной неудачи хватит */
-    uint64_t due;               /* срок следующей проверки, мс CLOCK_MONOTONIC */
-    uint64_t retry;             /* пауза круга мёртвого или пустого слота, с */
-    uint64_t checked_at;        /* когда проверялся в последний раз */
+    int fails;                  /* failed checks in a row */
+    int streak;                 /* failed connects in a row */
+    int kick;                   /* check now */
+    int lost;                   /* a stall brought the check: one failure is enough */
+    uint64_t due;               /* next check, ms of CLOCK_MONOTONIC */
+    uint64_t retry;             /* pause between rounds of a dead or empty slot, s */
+    uint64_t checked_at;
 };
 
 static struct {
@@ -120,12 +94,11 @@ static struct {
     struct pool_cfg cf;
     const struct dialer_ops *in;
     struct pl_slot *slot;
-    int n;                      /* слотов: active, но не больше кандидатов */
-    unsigned rr;                /* круг запасных связей */
-    int said_up;                /* демону последним сказано up (а не down) */
-    char why[256];              /* причина последней неудачной проверки — для down */
-    char dev[16];
-    char sig[512];              /* последний опубликованный состав — писать только на перемене */
+    int n;                      /* slots: active, but no more than candidates */
+    unsigned rr;                /* round robin of spare connections */
+    int said_up;                /* the last state logged: some node alive */
+    char why[256];              /* reason of the last failed check */
+    char sig[512];              /* the last active set logged */
 } g_pl = { .mu = PTHREAD_MUTEX_INITIALIZER };
 
 static const void *pl_node(int i) {
@@ -138,7 +111,22 @@ static uint64_t pl_now_ms(void) {
     return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
 }
 
-/* ---- раздача ---------------------------------------------------------------------------------- */
+int pool_by_parse(const char *s) {
+    if (!strcmp(s, "connection")) return POOL_BY_CONNECTION;
+    if (!strcmp(s, "site")) return POOL_BY_SITE;
+    if (!strcmp(s, "site-client") || !strcmp(s, "site_client")) return POOL_BY_SITE_CLIENT;
+    return -1;
+}
+
+const char *pool_by_name(int by) {
+    switch (by) {
+    case POOL_BY_SITE: return "site";
+    case POOL_BY_SITE_CLIENT: return "site-client";
+    default: return "connection";
+    }
+}
+
+/* ---- spreading ------------------------------------------------------------------------- */
 
 static uint32_t pl_mix(uint32_t h) {
     h ^= h >> 16;
@@ -149,11 +137,11 @@ static uint32_t pl_mix(uint32_t h) {
     return h;
 }
 
-/* Случайное на поток цикла: равномерность «поровну» не требует криптостойкости. */
+/* Per loop thread; spreading evenly needs no cryptographic strength. */
 static unsigned pl_rand(void) {
     static __thread uint32_t x;
     if (!x) {
-        if (getrandom(&x, sizeof x, GRND_NONBLOCK) != (ssize_t)sizeof x || !x)
+        if (os_getrandom(&x, sizeof x, GRND_NONBLOCK) != (ssize_t)sizeof x || !x)
             x = (uint32_t)pl_now_ms() ^ (uint32_t)getpid() ^ 0x9e3779b9u;
         if (!x) x = 1;
     }
@@ -163,8 +151,8 @@ static unsigned pl_rand(void) {
     return x;
 }
 
-/* Слот нового соединения по раздаче. Под замком. -1 — ни у одного слота нет узла. Живых нет — мёртвый
- * слот с узлом: соединение откажет быстро (RST), а выход к этому времени уже в отказе у демона. */
+/* The slot for a new connection. Under the lock. -1 — no slot has a node. With no live slot, a
+ * dead one that has a node: the connection fails fast (RST). */
 static int pl_pick(const struct flow_key *k) {
     int live[64], nl = 0, any = -1;
     for (int i = 0; i < g_pl.n; i++) {
@@ -173,10 +161,9 @@ static int pl_pick(const struct flow_key *k) {
         if (g_pl.slot[i].up && nl < (int)(sizeof live / sizeof live[0])) live[nl++] = i;
     }
     if (!nl) return any;
-    if (g_pl.cf.by == BY_CONNECTION || !k) return live[pl_rand() % (unsigned)nl];
-    uint32_t h = g_pl.cf.by == BY_SITE_CLIENT ? pl_mix(k->src * 0x9e3779b1u) ^ k->dst : k->dst;
+    if (g_pl.cf.by == POOL_BY_CONNECTION || !k) return live[pl_rand() % (unsigned)nl];
+    uint32_t h = g_pl.cf.by == POOL_BY_SITE_CLIENT ? pl_mix(k->src * 0x9e3779b1u) ^ k->dst : k->dst;
     int at = (int)(pl_mix(h) % (uint32_t)g_pl.n);
-    /* Слот сайта мёртв или пуст — следующий живой по кругу: сайты живых слотов остаются на месте. */
     for (int d = 0; d < g_pl.n; d++) {
         const struct pl_slot *sl = &g_pl.slot[(at + d) % g_pl.n];
         if (sl->node >= 0 && sl->up) return (at + d) % g_pl.n;
@@ -190,118 +177,70 @@ static void pl_bind(struct pl_sess *s, int slot) {
     s->gen = slot >= 0 ? g_pl.slot[slot].gen : 0;
 }
 
-/* ---- слежка: события и файл состояния -------------------------------------------------------- */
+/* ---- health: state in the log ----------------------------------------------------------- */
 
-static void pl_up_event(void) {
-    if (g_pl.dev[0])
-        evline_emit("up", "watch", EVLINE_INT, 1L, "dev", EVLINE_STR, g_pl.dev, (const char *)NULL);
-    else
-        evline_emit("up", "watch", EVLINE_INT, 1L, (const char *)NULL);
-}
-
-/* down с причиной проверки — обрезанной по границе знака UTF-8 так, чтобы запись влезла в
- * EVLINE_WRITE_MAX (EVLINE_WRITE_MAX — 480 байт, evline.c, и каждый байт вне ASCII идёт в ней шестью знаками \u00XX:
- * кириллицы влезает меньше восьмидесяти байт; длиннее — событие потерялось бы целиком). */
-#define PL_WHY_ESC 440
-static void pl_down_event(const char *why) {
-    char w[160];
-    size_t n = 0, esc = 0;
-    for (const unsigned char *s = (const unsigned char *)why; *s && n + 1 < sizeof(w); ) {
-        size_t len = *s >= 0xF0 ? 4 : *s >= 0xE0 ? 3 : *s >= 0xC0 ? 2 : 1;
-        size_t cost = 0, k;
-        for (k = 0; k < len && s[k]; k++)
-            cost += s[k] >= 0x80 || s[k] < 0x20 ? 6 : (s[k] == '"' || s[k] == '\\') ? 2 : 1;
-        if (k < len || n + len + 1 > sizeof(w) || esc + cost > PL_WHY_ESC) break;
-        memcpy(w + n, s, len);
-        n += len;
-        esc += cost;
-        s += len;
-    }
-    w[n] = '\0';
-    evline_emit("down", "why", EVLINE_STR, w[0] ? w : "узел не отвечает", (const char *)NULL);
-}
-
-/* Состав и здоровье выхода — демону и в файл состояния, только на перемене. Не под замком: читает
- * слоты под ним сам. */
+/* Log the pool's state when it changes: the active nodes, and the moment no node answers (with the
+ * reason of the last failed check) or one answers again. Takes the lock itself. */
 static void pl_publish(void) {
-    char nodes[480] = "";
-    size_t nn = 0;
+    char names[480] = "";
+    size_t w = 0;
     int any = 0;
     pthread_mutex_lock(&g_pl.mu);
-    int idx[64], ni = 0;
-    for (int i = 0; i < g_pl.n && ni < 64; i++)
-        if (g_pl.slot[i].node >= 0 && g_pl.slot[i].up) { idx[ni++] = g_pl.slot[i].node; any = 1; }
+    for (int i = 0; i < g_pl.n && w + 2 < sizeof names; i++) {
+        if (g_pl.slot[i].node < 0 || !g_pl.slot[i].up) continue;
+        any = 1;
+        w += (size_t)snprintf(names + w, sizeof names - w, "%s%s (#%d)", w ? ", " : "",
+                              g_pl.cf.proto->name(pl_node(g_pl.slot[i].node)), g_pl.slot[i].node);
+    }
     pthread_mutex_unlock(&g_pl.mu);
-    for (int i = 0; i < ni && nn + 12 < sizeof nodes; i++)
-        nn += (size_t)snprintf(nodes + nn, sizeof nodes - nn, "%s%d", i ? "," : "", idx[i]);
 
     if (any && !g_pl.said_up) {
         g_pl.said_up = 1;
-        pl_up_event();
     } else if (!any && g_pl.said_up) {
         g_pl.said_up = 0;
-        pl_down_event(g_pl.why);
+        fprintf(stderr, PL_LOG_W "no active node answers (%s) — new connections are refused "
+                        "until one does\n", g_pl.why[0] ? g_pl.why : "no answer");
     }
-    char sig[512];
-    snprintf(sig, sizeof sig, "%d|%s", any, nodes);
-    if (!strcmp(sig, g_pl.sig)) return;
-    snprintf(g_pl.sig, sizeof g_pl.sig, "%s", sig);
-    evline_emit("active", "nodes", EVLINE_STR, nodes, (const char *)NULL);
-
-    /* Файл состояния одной строкой: {"pid","up","node","want","slots","by","active":[{"index","name"}]}
-     * и поля протокола (extra). up — есть живой узел; node — имя первого активного (прежнее поле
-     * файла proxy-*: один узел); want — сколько просили (active), slots — сколько держим (не больше
-     * кандидатов). Верен, пока жив pid (как у hy2-*): kill -9 убрать за собой не даст. */
-    if (!g_pl.cf.out || !g_pl.cf.proto->tag) return;
-    char path[320], tmp[340];
-    snprintf(path, sizeof path, "%s/%s-%.32s", steer_state_dir(), g_pl.cf.proto->tag, g_pl.cf.out);
-    snprintf(tmp, sizeof tmp, "%s.tmp", path);
-    FILE *f = fopen(tmp, "w");
-    if (!f) return;
-    fprintf(f, "{\"pid\":%ld,\"up\":%s,\"node\":", (long)getpid(), any ? "true" : "false");
-    jsonw_str(f, ni ? g_pl.cf.proto->name(pl_node(idx[0])) : "");
-    if (g_pl.cf.proto->extra) fprintf(f, ",%s", g_pl.cf.proto->extra);
-    fprintf(f, ",\"want\":%d,\"slots\":%d,\"by\":\"%s\",\"active\":[", g_pl.cf.active, g_pl.n,
-            group_by_name(g_pl.cf.by));
-    for (int i = 0; i < ni; i++) {
-        fprintf(f, "%s{\"index\":%d,\"name\":", i ? "," : "", idx[i]);
-        jsonw_str(f, g_pl.cf.proto->name(pl_node(idx[i])));
-        fputc('}', f);
-    }
-    fputs("]}\n", f);
-    if (fclose(f) != 0 || rename(tmp, path) != 0) unlink(tmp);
+    if (w >= sizeof names - 2) w = sizeof names - 1;
+    if (!strcmp(names, g_pl.sig)) return;
+    snprintf(g_pl.sig, sizeof g_pl.sig, "%s", names);
+    if (any) fprintf(stderr, PL_LOG_I "active: %s\n", names);
 }
 
-/* ---- слежка: проверки ---------------------------------------------------------------------------- */
+/* ---- health: checks --------------------------------------------------------------------- */
 
 static int pl_probe(int node, char *why, size_t n) {
     return g_pl.cf.proto->probe(pl_node(node), PL_TIMEOUT_S, why, n);
 }
 
-/* Занят ли кандидат c другим слотом (живым или мёртвым, который его ещё ждёт). Под замком. */
+/* Whether candidate c is the node of another slot (live, or dead and waiting for it). Under the
+ * lock. */
 static int pl_taken(int c, int except) {
     for (int i = 0; i < g_pl.n; i++)
         if (i != except && g_pl.slot[i].node == c) return 1;
     return 0;
 }
 
-/* Слоту i — живой узел: свой прежний (если own), потом свободные кандидаты по порядку. 1 — нашёлся.
- * Проверки — без замка (до восьми секунд каждая); после каждой неудачной — публикация: если живых
- * не осталось, демон узнаёт об этом сразу, а не после всего круга. */
+static void pl_slot_alive(struct pl_slot *sl) {
+    sl->up = 1;
+    sl->fails = sl->streak = sl->kick = sl->lost = 0;
+    sl->retry = PL_RETRY_S;
+    sl->checked_at = pl_now_ms();
+    sl->due = sl->checked_at + (uint64_t)g_pl.cf.interval_s * 1000ull;
+}
+
+/* Give slot i a live node: its own previous one (if own), then the free candidates in order.
+ * 1 — found. Probes run without the lock (up to eight seconds each); the state is logged after
+ * every failure, so "no node answers" is said at once, not after the whole round. */
 static int pl_refill(int i, int own) {
     char why[256];
     int prev = g_pl.slot[i].node;
     if (own && prev >= 0) {
         if (pl_probe(prev, why, sizeof why) == 0) {
             pthread_mutex_lock(&g_pl.mu);
-            struct pl_slot *sl = &g_pl.slot[i];
-            sl->up = 1;
-            sl->fails = sl->streak = sl->kick = sl->lost = 0;
-            sl->retry = PL_RETRY_S;
-            sl->checked_at = pl_now_ms();
-            sl->due = sl->checked_at + (uint64_t)g_pl.cf.interval_s * 1000ull;
+            pl_slot_alive(&g_pl.slot[i]);
             pthread_mutex_unlock(&g_pl.mu);
-            fprintf(stderr, PL_LOG_I "узел %s снова отвечает\n", g_pl.cf.proto->name(pl_node(prev)));
+            fprintf(stderr, PL_LOG_I "node %s answers again\n", g_pl.cf.proto->name(pl_node(prev)));
             pl_publish();
             return 1;
         }
@@ -323,20 +262,15 @@ static int pl_refill(int i, int own) {
         if (pl_taken(c, i)) { pthread_mutex_unlock(&g_pl.mu); continue; }
         struct pl_slot *sl = &g_pl.slot[i];
         sl->node = c;
-        sl->up = 1;
-        __atomic_add_fetch(&sl->gen, 1, __ATOMIC_RELEASE);  /* pl_stale читает без замка */
-        sl->fails = sl->streak = sl->kick = sl->lost = 0;
-        sl->retry = PL_RETRY_S;
-        sl->checked_at = pl_now_ms();
-        sl->due = sl->checked_at + (uint64_t)g_pl.cf.interval_s * 1000ull;
+        __atomic_add_fetch(&sl->gen, 1, __ATOMIC_RELEASE);  /* pl_stale reads it without the lock */
+        pl_slot_alive(sl);
         pthread_mutex_unlock(&g_pl.mu);
         if (prev >= 0)
-            fprintf(stderr, PL_LOG_W "узел %s не отвечает — вместо него %s\n",
+            fprintf(stderr, PL_LOG_W "node %s does not answer — %s takes its place\n",
                     g_pl.cf.proto->name(pl_node(prev)), g_pl.cf.proto->name(pl_node(c)));
         else
-            fprintf(stderr, PL_LOG_I "активный узел %d из %d: %s\n", i + 1, g_pl.n,
+            fprintf(stderr, PL_LOG_I "active node %d of %d: %s\n", i + 1, g_pl.n,
                     g_pl.cf.proto->name(pl_node(c)));
-        /* Узел слота сменился: соединения прежнего (если они ещё были) — в сброс. */
         stack_nodes_changed();
         pl_publish();
         return 1;
@@ -350,7 +284,7 @@ static int pl_refill(int i, int own) {
     return 0;
 }
 
-/* Одна проверка слота i: живой — обычная проверка, мёртвый или пустой — круг поиска. */
+/* One check of slot i: a live slot gets its regular check, a dead or empty one a search round. */
 static void pl_check(int i) {
     pthread_mutex_lock(&g_pl.mu);
     struct pl_slot *sl = &g_pl.slot[i];
@@ -369,29 +303,30 @@ static void pl_check(int i) {
         pthread_mutex_unlock(&g_pl.mu);
         return;
     }
-    /* Две неудачи подряд — против одной потери на радиоканале. Проверку, которую позвал обрыв связи
-     * ядром, первая неудача уже подтверждает: узел и так молчал дольше порога silence. */
+    /* Two failures in a row, against a single loss on a radio link; one is enough when a stall
+     * brought the check. */
     if (++sl->fails < 2 && !lost) {
         sl->due = sl->checked_at + PL_CONFIRM_S * 1000ull;
         pthread_mutex_unlock(&g_pl.mu);
         return;
     }
-    /* Мёртв: соединения этого узла — в сброс сейчас же (поколение), не дожидаясь замены. */
+    /* Dead: its connections are reset now (generation), without waiting for a replacement. */
     sl->up = 0;
     sl->fails = 0;
     __atomic_add_fetch(&sl->gen, 1, __ATOMIC_RELEASE);
     sl->retry = PL_RETRY_S;
     pthread_mutex_unlock(&g_pl.mu);
     snprintf(g_pl.why, sizeof g_pl.why, "%s", why);
-    fprintf(stderr, PL_LOG_W "узел %s не отвечает: %s — ищу замену\n",
+    fprintf(stderr, PL_LOG_W "node %s does not answer: %s — looking for a replacement\n",
             g_pl.cf.proto->name(pl_node(node)), why);
     stack_nodes_changed();
-    /* Сразу — замена среди свободных; свой только что дважды не ответил, его — в следующем круге. */
+    /* Its own node has just failed twice: only the free candidates now; it waits for the next
+     * round. */
     pl_refill(i, 0);
 }
 
-/* Слот, который пора проверять: с просьбой проверить сейчас — первым, иначе с ближайшим сроком.
- * Под замком; ждёт до срока. */
+/* The slot to check next: one asked to be checked now first, otherwise the earliest due. Under the
+ * lock; waits until it is due. */
 static int pl_next(void) {
     for (;;) {
         uint64_t now = pl_now_ms(), due = UINT64_MAX;
@@ -418,13 +353,13 @@ static void *pl_thread(void *arg) {
     return NULL;
 }
 
-/* Проверить слот сейчас (исход соединения или обрыв). Под замком. */
+/* Under the lock. */
 static void pl_kick(int i) {
     g_pl.slot[i].kick = 1;
     pthread_cond_signal(&g_pl.cv);
 }
 
-/* ---- дайлер пула --------------------------------------------------------------------------------- */
+/* ---- the pool's dialer ------------------------------------------------------------------ */
 
 static const char *pl_peer(const void *ctx) {
     (void)ctx;
@@ -453,12 +388,12 @@ static void pl_describe(const void *ctx, char *out, size_t n) {
     }
     pthread_mutex_unlock(&g_pl.mu);
     if (g_pl.cf.active > 1 && w < n)
-        snprintf(out + w, n - w, " — активных %d, раздача %s", g_pl.cf.active, group_by_name(g_pl.cf.by));
+        snprintf(out + w, n - w, " — %d active, spread by %s", g_pl.cf.active, pool_by_name(g_pl.cf.by));
 }
 
 static const char *pl_strerror(int rc) { return g_pl.in->strerror(rc); }
 
-/* Исход установления — слежке слота: серия отказов зовёт его проверку раньше срока. */
+/* A connect outcome for the slot's health: a streak of failures brings its check forward. */
 static void pl_seen(const struct pl_sess *s, int rc) {
     if (s->slot < 0) return;
     pthread_mutex_lock(&g_pl.mu);
@@ -474,7 +409,7 @@ static int pl_connect(const void *ctx, void *sess, int timeout_s) {
     (void)ctx;
     struct pl_sess *s = sess;
     if (!s->node) {
-        /* Запасная: к живым слотам по кругу. */
+        /* A spare: to the live slots in turn. */
         pthread_mutex_lock(&g_pl.mu);
         int pick = -1;
         for (int d = 0; d < g_pl.n && pick < 0; d++) {
@@ -493,8 +428,9 @@ static int pl_connect(const void *ctx, void *sess, int timeout_s) {
     return rc;
 }
 
-/* Запасная связь — соединению. Узел запасной другой (раздача connection) — соединение переезжает на
- * него: состояние потока заводится заново под новый узел (у VLESS — UUID и Vision), потом связь. */
+/* A spare connection to a client's connection. If the spare's node is another one (by connection),
+ * the connection moves to it: the protocol's flow state is set up again for the new node (VLESS:
+ * UUID and Vision), then the link is moved. */
 static void pl_take(void *dst, void *src) {
     struct pl_sess *d = dst, *s = src;
     if (d->node != s->node) {
@@ -565,7 +501,7 @@ static int pl_match(const void *ctx, const void *dst, const void *src) {
     int live = sl->gen == s->gen && sl->up;
     pthread_mutex_unlock(&g_pl.mu);
     if (!live) return -1;
-    if (g_pl.cf.by == BY_CONNECTION) return 1;
+    if (g_pl.cf.by == POOL_BY_CONNECTION) return 1;
     return d->slot == s->slot;
 }
 
@@ -591,37 +527,33 @@ static void pl_lost(const void *ctx, const void *sess) {
 
 static struct dialer_ops g_pl_ops;
 
-/* ---- подъём -------------------------------------------------------------------------------------- */
+/* ---- start ------------------------------------------------------------------------------ */
 
 struct pl_ready { stack_ready_fn ready; void *arg; };
 
-/* Устройство поднято: up демону и слежка. up — до потока слежки: первая проверка узла, названного
- * человеком (его при подъёме не проверяли), идёт сразу, и её down не должен обогнать up в трубе. */
+/* The device is up: health checks start. A node named on the command line was not probed at
+ * startup, so its first check runs at once. */
 static void pl_ready_cb(void *arg, const char *dev) {
     const struct pl_ready *r = arg;
-    snprintf(g_pl.dev, sizeof g_pl.dev, "%s", dev ? dev : "");
     pl_publish();
     pthread_attr_t a;
     pthread_attr_init(&a);
-    /* Проверка держит соединение (struct transport, ~40 КБ) на своём стеке. */
+    /* A check holds a connection (struct transport, ~40 KB) on its stack. */
     pthread_attr_setstacksize(&a, 512 * 1024);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
     pthread_t t;
     int err = pthread_create(&t, &a, pl_thread, NULL);
     pthread_attr_destroy(&a);
-    if (err) {
-        /* Без слежки up — прежний, без watch: сторож демона тогда пробует устройство сам. */
-        fprintf(stderr, PL_LOG_W "поток слежки за узлами не создался (%s) — потерю узла клиент не "
-                        "заметит\n", strerror(err));
-        evline_emit("up", "dev", EVLINE_STR, g_pl.dev, (const char *)NULL);
-    }
+    if (err)
+        fprintf(stderr, PL_LOG_W "no health check thread (%s) — a dead node will not be noticed\n",
+                strerror(err));
     if (r->ready) r->ready(r->arg, dev);
 }
 
-/* Слоты и таблица пула по настройке pc; дайлер для стека или NULL — нет памяти. Отдельно от pool_run
- * ради стенда (tests/poolmatch.c): он заводит пул без устройства. */
+/* Slots and the pool's dialer for configuration pc, or NULL — out of memory. Separate from pool_run
+ * for the tests, which set the pool up without a device. */
 static const struct dialer *pool_setup(const struct pool_cfg *pc) {
-    /* Сроки слежки — по CLOCK_MONOTONIC: во сне телефона эти часы стоят, и слежка его не будит. */
+    /* CLOCK_MONOTONIC: deadlines must not move with the wall clock (NTP steps it after boot). */
     pthread_condattr_t ca;
     pthread_condattr_init(&ca);
     pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
@@ -631,24 +563,21 @@ static const struct dialer *pool_setup(const struct pool_cfg *pc) {
     g_pl.in = pc->proto->ops;
     if (g_pl.cf.interval_s <= 0) g_pl.cf.interval_s = POOL_INTERVAL_S;
     if (g_pl.cf.active < 1) g_pl.cf.active = 1;
-    /* Слотов — не больше кандидатов: держать активными больше узлов, чем их есть, нечем. */
     g_pl.n = g_pl.cf.active;
     if ((size_t)g_pl.n > pc->sel_n) {
-        fprintf(stderr, PL_LOG_W "активных узлов просили %d, а кандидатов %zu — активны все\n",
+        fprintf(stderr, PL_LOG_W "%d active nodes asked, %zu candidates — all of them are active\n",
                 g_pl.cf.active, pc->sel_n);
         g_pl.n = (int)pc->sel_n;
     }
     if (g_pl.n < 1) g_pl.n = 1;
     g_pl.slot = calloc((size_t)g_pl.n, sizeof *g_pl.slot);
-    if (!g_pl.slot) { fprintf(stderr, PL_LOG_W "нет памяти под слоты узлов\n"); return NULL; }
+    if (!g_pl.slot) { fprintf(stderr, PL_LOG_W "out of memory for node slots\n"); return NULL; }
     uint64_t now = pl_now_ms();
     for (int i = 0; i < g_pl.n; i++) {
         g_pl.slot[i].node = -1;
         g_pl.slot[i].retry = PL_RETRY_S;
-        g_pl.slot[i].due = now;            /* пустой слот ищет узел сразу */
+        g_pl.slot[i].due = now;            /* an empty slot searches at once */
     }
-    /* Первый слот — узел, выбранный при подъёме. Проверен перебором — следующая проверка через
-     * период; назван человеком — сразу. */
     g_pl.slot[0].node = pc->first;
     g_pl.slot[0].up = 1;
     g_pl.slot[0].checked_at = now;
@@ -675,7 +604,7 @@ static const struct dialer *pool_setup(const struct pool_cfg *pc) {
     g_pl_ops.stale = pl_stale;
     g_pl_ops.lost = pl_lost;
 
-    /* Статический: стек держит указатель до конца процесса. */
+    /* The stack keeps the pointer until the process ends. */
     static struct dialer d;
     d.ops = &g_pl_ops;
     d.ctx = &g_pl;
@@ -683,11 +612,11 @@ static const struct dialer *pool_setup(const struct pool_cfg *pc) {
     return &d;
 }
 
-int pool_run(struct output *o, const struct pool_cfg *pc, stack_ready_fn ready, void *arg) {
+int pool_run(const struct tun_cfg *tc, const struct pool_cfg *pc, stack_ready_fn ready, void *arg) {
     const struct dialer *d = pool_setup(pc);
     if (!d) return 1;
     static struct pl_ready r;
     r.ready = ready;
     r.arg = arg;
-    return stack_run(o, d, pl_ready_cb, &r);
+    return stack_run(tc, d, pl_ready_cb, &r);
 }

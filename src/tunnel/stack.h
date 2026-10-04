@@ -1,34 +1,31 @@
-/* Стек туннеля: пакеты из TUN в потоки к узлу через дайлер (dialer.h). Границы — в stack.c. */
+/* The tunnel stack: packets from the TUN device into flows to a node through a dialer (dialer.h).
+ * What it does and does not do: see the top of stack.c. */
 #ifndef STEER_STACK_H
 #define STEER_STACK_H
+#include <stdint.h>
 #include "dialer.h"
-/* Нужен struct output: имя устройства и номер таблицы (из неё — адрес устройства) живут в
- * выходе. Объявления вперёд здесь недостаточно — поля читаются. */
-#include "spec.h"
 
-/* Устройство поднято, у него есть адрес, и оно готово нести трафик: зовётся один раз, из потока
- * stack_run, до запуска потоков цикла. Модуль протокола говорит здесь демону up с именем
- * устройства (evline.h, поле dev), и маршрут выхода к устройству привязывает демон. */
+/* The device the stack creates and brings up. */
+struct tun_cfg {
+    const char *dev;    /* name as asked; the kernel's limit is 15 characters */
+    uint32_t addr;      /* IPv4 address of the device, network order */
+    int prefix;         /* its prefix length */
+};
+
+/* The device is up, has its address and is ready to carry traffic: called once, from the
+ * stack_run thread, before the loop threads start. The caller adds its routes here. */
 typedef void (*stack_ready_fn)(void *arg, const char *dev);
 
-/* Поднять TUN выхода и нести через него трафик дайлером d, пока не кончатся очереди.
+/* Create the TUN device tc, bring it up (ifcfg.c) and carry its traffic through dialer d until
+ * the queues end. ready may be NULL.
  *
- * Выход передаётся целиком, а не именем устройства: туннель сам поднимает устройство и сам даёт
- * ему адрес, а адрес берётся из таблицы выхода (реестр). Маршрут выхода к устройству стек НЕ
- * привязывает (с 1.10, шаг 3): это работа демона, рядом со стражем правил и postrouting_guard, а
- * стек о моменте готовности только сообщает — ready (может быть NULL).
- *
- * Возвращает всегда 1: успешного выхода у цикла нет (см. конец stack_run). */
-int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, void *arg);
+ * Always returns 1: the loop has no successful exit (see the end of stack_run). */
+int stack_run(const struct tun_cfg *tc, const struct dialer *d, stack_ready_fn ready, void *arg);
 
-/* Набор активных узлов изменился (пул узлов, pool.c): соединения, чей узел больше не активен
- * (dialer_ops.stale), стек сбрасывает — RST клиенту, — чтобы приложения переподключались сразу, а не
- * ждали своего таймаута на повисшем соединении. Зовётся из любого потока; поток цикла замечает это на
- * ближайшем витке (не позже секунды). */
+/* The set of active nodes changed: the stack resets (RST to the client) every connection whose node
+ * is no longer active (dialer_ops.stale), so applications reconnect at once instead of waiting for
+ * their own timeout on a hung connection. Callable from any thread; each loop thread notices on its
+ * next pass (within a second). */
 void stack_nodes_changed(void);
-
-/* Поднять устройство и дать ему адрес из таблицы выхода. Каждый отказ `ip` называется в
- * журнале своим тоном (I-114). Отдельно от stack_run — ради стенда devupmatch. */
-void tun_bring_up(const char *dev, int table);
 
 #endif

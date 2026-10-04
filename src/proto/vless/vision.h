@@ -1,4 +1,4 @@
-/* XTLS-Vision: кадры с набивкой поверх VLESS. Подробности формата — в vision.c. */
+/* XTLS-Vision: padded frames over VLESS. The frame format is described in vision.c. */
 #ifndef STEER_VISION_H
 #define STEER_VISION_H
 #include <stddef.h>
@@ -8,50 +8,43 @@
 #define VISION_CMD_END      1
 #define VISION_CMD_DIRECT   2
 
-/* Больше не возвращается: начало потока копится в rx_pre, и нехватка данных перестала
- * быть ошибкой. Значение оставлено, чтобы старый разбор кода возврата не начал считать
- * -1 чем-то другим. */
+/* Never returned: a short read is not an error, the start of the stream is collected in
+ * rx_pre. The value stays reserved so that -1 never gets another meaning. */
 #define VISION_EAGAIN (-1)
 #define VISION_EPROTO (-2)
 
 struct vision {
     unsigned char uuid[16];
-    /* UUID идёт только в первом кадре: он и есть признак начала потока, а повторять его
-     * значило бы отдавать наблюдателю неизменную последовательность байт. */
+    /* The UUID goes only in the first frame: it marks the start of the stream, and repeating
+     * it would hand an observer a fixed byte sequence. */
     int need_uuid;
-    /* Набивка закончилась и на ОТПРАВКУ. После кадра с командой end сервер перестаёт
-     * ждать обёртку, и продолжать её ставить — значит вписывать пять байт заголовка
-     * прямо в поток данных. На одном коротком запросе это незаметно (кадр всего один),
-     * а на любой передаче побольше ломает выгрузку молча. */
+    /* Padding is over in the sending direction. After the end frame the server no longer
+     * expects frames, so a further 5-byte header would land in the data stream: invisible on
+     * a short request (one frame), silent corruption on any longer upload. */
     int sent_end;
-    int recv_uuid_seen;      /* UUID в первом кадре от сервера уже снят */
-    int recv_done;           /* набивка кончилась — дальше поток как есть */
-    /* Сервер прислал команду direct: он переходит на ПРЯМОЕ копирование и дальше пишет в
-     * сокет не свои записи TLS, а поток целевого соединения как есть. Это не оптимизация
-     * поверх того же формата — это конец нашего TLS в направлении «к нам». Читающая
-     * сторона обязана про это узнать, иначе продолжит разбирать чужие записи как свои.
-     *
-     * Xray включает такой режим, когда видит внутри туннеля TLS 1.3 (см. XtlsFilterTls):
-     * то есть на любом https он включается почти сразу. */
+    int recv_uuid_seen;      /* the UUID of the server's first frame is consumed */
+    int recv_done;           /* padding is over: the rest of the stream is passed as is */
+    /* The server sent direct: it switches to direct copy and writes the destination's stream
+     * to the socket as is, not inside its own TLS records. Our TLS ends in the downstream
+     * direction, and the reader must know, or it parses foreign records as its own.
+     * Xray enables this when it sees TLS 1.3 inside the tunnel (XtlsFilterTls), so on almost
+     * any https connection. */
     int recv_direct;
 
-    /* Разбор идёт ПОТОКОМ: кадр может приехать несколькими записями TLS, и требовать его
-     * целиком значило бы либо держать буфер на 128 КБ на каждое соединение, либо терять
-     * данные. Поэтому между вызовами переносятся только счётчики. */
+    /* Parsing is streaming: a frame may arrive in several TLS records, and holding whole
+     * frames would cost a 128 KB buffer per connection. Only counters carry over between
+     * calls. */
     unsigned char rx_hdr[5];
     unsigned char rx_hdr_n;
-    /* Самое начало потока от сервера: 16 байт UUID и 5 байт первого заголовка. Копится
-     * ЗДЕСЬ ровно потому же, почему копится rx_hdr, — запись TLS не обязана содержать их
-     * целиком. Раньше при нехватке возвращался VISION_EAGAIN, и байты пропадали: у
-     * вызывающего для них буфера нет, он их просто отбрасывал. Дальше UUID сравнивался по
-     * сдвинутому смещению, не совпадал, разбор решал, что обёртки нет вовсе, и отдавал
-     * клиенту служебные байты кадров как данные. Проявлялось не обрывом, а порчей
-     * содержимого посреди страницы. */
+    /* The start of the server's stream: the 16-byte UUID and the first 5-byte header. It is
+     * collected here for the same reason as rx_hdr: a TLS record need not hold it whole, and
+     * the caller has no buffer for a partial one. Losing these bytes shifts the UUID compare,
+     * the stream is taken as unwrapped and frame headers reach the client as data. */
     unsigned char rx_pre[21];
     unsigned char rx_pre_n;
-    uint32_t rx_data_left;   /* сколько осталось от данных текущего кадра */
-    uint32_t rx_pad_left;    /* сколько осталось от набивки текущего кадра */
-    int rx_end_after;        /* у текущего кадра команда end или direct */
+    uint32_t rx_data_left;   /* payload bytes left in the current frame */
+    uint32_t rx_pad_left;    /* padding bytes left in the current frame */
+    int rx_end_after;        /* the current frame's command is end or direct */
 
     unsigned long sent_frames;
 };

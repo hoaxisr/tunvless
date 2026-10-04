@@ -1,46 +1,46 @@
-/* Транспорт ws: поток протокола в кадрах WebSocket (RFC 6455) после запроса Upgrade.
+/* The ws transport: the protocol stream in WebSocket frames (RFC 6455) after an Upgrade request
+ * (the top layer in transport.h). The Upgrade request and the 101 answer are shared with
+ * httpupgrade (trupgrade.c); this file is only the frames.
  *
- * Верхний ярус транспорта (transport.h), шаг 5 выпуска 1.10. Запрос Upgrade и ответ 101 — общие с
- * httpupgrade (trupgrade.c); здесь — только кадры.
+ * SENDING AS XRAY DOES. The Xray client writes each of its writes to gorilla/websocket as one
+ * WriteMessage(BinaryMessage); its write buffer is 4096 bytes (websocket/dialer.go:
+ * WriteBufferSize), and gorilla cuts a longer message into 4096-byte frames: the first binary
+ * without FIN, then continuations, the last with FIN (messageWriter.flushFrame in conn.go). A
+ * capture of Xray 26.3.27 uploading 30 KB shows 4096 without FIN, 4096 with FIN, 34 with FIN, ...
+ * Each frame is a separate socket write, so a separate TLS record. This code cuts and writes the
+ * same way, one frame per write, so record sizes on the wire match the Xray client instead of
+ * giving away another implementation. (Go's dynamic record sizing, small TLS records at the
+ * start of a connection, is not repeated: our TLS has its own layout, shared by all transports.)
  *
- * ОТПРАВКА — КАК У XRAY. Клиент Xray пишет в gorilla/websocket одним WriteMessage(BinaryMessage)
- * на каждую свою запись, а буфер записи у него 4096 байт (websocket/dialer.go: WriteBufferSize), и
- * сообщение длиннее буфера gorilla режет на кадры по 4096: первый — binary без FIN, дальше
- * continuation, последний — с FIN (messageWriter.flushFrame в conn.go). Перехват Xray 26.3.27 на
- * выгрузке 30 КБ так и показал: 4096 без FIN, 4096 с FIN, 34 с FIN, … Каждый кадр уходит своей
- * записью в сокет — у TLS это своя запись TLS. Мы режем так же и пишем так же, по кадру на запись:
- * размеры записей на проводе тогда совпадают с клиентом Xray, а не выдают «другую реализацию»
- * одним своим видом. (Правило Go о малых записях TLS в начале соединения — dynamic record
- * sizing — этим не повторено: у нашего TLS своя раскладка, общая для всех транспортов.)
+ * Every frame has its own mask from kernel randomness (RFC 6455, 5.3: the client must mask, and
+ * the key must be unpredictable, or a caching intermediary can be poisoned with chosen bytes).
+ * Keys come in batches, 64 frames per getrandom: a syscall per 4 KB of upload shows on a router,
+ * and a per-thread batch is just as unpredictable.
  *
- * Маска — у каждого кадра своя, из случайности ядра (RFC 6455, 5.3: клиент обязан маскировать,
- * ключ обязан быть непредсказуем, иначе посредник-кеш можно отравить подобранными байтами).
- * Ключи берутся пачкой, по 64 кадра на один getrandom: вызов ядра на каждые 4 КБ выгрузки на
- * роутере заметен, а пачка на поток ничем не хуже по непредсказуемости.
+ * RECEIVING as a stream (tr_ws_parse): the server (Xray: WriteMessage without a buffer) sends a
+ * message as one unmasked frame, but the RFC allows fragments, control frames between them, and
+ * frames up to 2^63 long, so the parser assumes nothing about boundaries and buffers only a frame
+ * header and a control frame's body. RFC violations — a masked server frame, RSV bits without
+ * negotiated extensions, a control frame over 125 bytes or fragmented, a continuation outside a
+ * message or a new message inside an unfinished one, an unknown opcode — break the connection
+ * (TR_EWSFRAME), as in gorilla: the stream after such a frame cannot be followed. Text frames are
+ * read as binary: Xray does the same (connection.go reads NextReader without looking at the
+ * type), and checking VLESS bytes for UTF-8 makes no sense.
  *
- * ПРИЁМ — потоком (tr_ws_parse): сервер (у Xray — WriteMessage без буфера) шлёт сообщение одним
- * незамаскированным кадром, но RFC разрешает и фрагменты, и служебные кадры посреди них, и кадр
- * любой длины до 2^63 — поэтому разбор ничего не предполагает о границах и копит только
- * заголовок кадра и тело служебного. Нарушения RFC — маска от сервера, биты RSV без
- * согласованных расширений, служебный кадр длиннее 125 байт или разрезанный, continuation вне
- * сообщения и новое сообщение внутри неразрезанного, неизвестный опкод — рвут соединение
- * (TR_EWSFRAME), как у gorilla: поток после такого кадра уже не понять. Текстовые кадры
- * читаются как двоичные: Xray сам поступает так же (connection.go читает NextReader, не глядя на
- * тип), а проверять UTF-8 у байтов VLESS бессмысленно.
+ * ping — a pong with the same body; pong — nothing; close — a close with the same code back
+ * (gorilla's default answer) and end of stream. Data that came in the same chunk BEFORE the close
+ * is returned, and end of stream comes with the next read.
  *
- * ping — ответ pong с тем же телом; pong — ничего; close — ответный close с тем же кодом (так
- * отвечает gorilla по умолчанию) и конец потока. Данные, приехавшие в одном куске ДО close,
- * отдаются, а конец потока — следующим чтением.
+ * Closing the connection sends our own close 1000, as Xray does (connection.Close), with a
+ * non-blocking write, see ws_close.
  *
- * При закрытии соединения уходит свой close 1000, как у Xray (connection.Close) — неблокирующей
- * записью, см. ws_close.
- *
- * РАННИЕ ДАННЫЕ (Ed > 0, `?ed=N` в пути) — как у Xray, байт в байт на проводе: запрос Upgrade
- * откладывается до первой записи; она, если не длиннее Ed, уезжает в Sec-WebSocket-Protocol
- * (base64url без выравнивания), иначе — кадрами после ответа 101. Пока ответа нет, записи копятся
- * в очереди и уходят сразу за ним (ws_write, ws_read): у Xray запись в это время ждёт ответа в
- * своей горутине, а цикл туннеля ждать не вправе. Сервер Xray ранние данные принимает всегда,
- * какой бы Ed ни стоял у него самого (hub.go читает Sec-WebSocket-Protocol безусловно). */
+ * EARLY DATA (Ed > 0, `?ed=N` in the path), byte for byte as Xray on the wire: the Upgrade
+ * request waits for the first write; if that write is no longer than Ed it goes in
+ * Sec-WebSocket-Protocol (base64url without padding), otherwise as frames after the 101 answer.
+ * Until the answer arrives writes are queued and go right after it (ws_write, ws_read): Xray
+ * blocks the write in its own goroutine meanwhile, but the tunnel loop must not wait. An Xray
+ * server always accepts early data, whatever its own Ed (hub.go reads Sec-WebSocket-Protocol
+ * unconditionally). */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <string.h>
@@ -51,7 +51,7 @@
 
 #include "transport.h"
 
-#define WS_FRAG 4096               /* кадр отправки: как буфер записи gorilla у Xray */
+#define WS_FRAG 4096               /* send frame size: Xray's gorilla write buffer */
 
 size_t tr_ws_frame(unsigned char *out, size_t cap, int opcode, int fin, const unsigned char key[4],
                    const unsigned char *d, size_t n) {
@@ -74,7 +74,7 @@ size_t tr_ws_frame(unsigned char *out, size_t cap, int opcode, int fin, const un
     return h + 4 + n;
 }
 
-/* Служебный кадр дочитан. */
+/* A control frame has been read in full. */
 static int ws_ctl(struct ws_rx *r) {
     switch (r->op) {
     case 9:                                    /* ping */
@@ -82,10 +82,10 @@ static int ws_ctl(struct ws_rx *r) {
         r->pong_n = r->ctl_n;
         memcpy(r->pong, r->ctl, r->ctl_n);
         return 0;
-    case 10:                                   /* pong — ответ на наш ping; мы их не шлём */
+    case 10:                                   /* pong answers a ping; we send none */
         return 0;
     case 8:                                    /* close */
-        /* Тело close — либо пусто, либо код (2 байта) и причина. Один байт — нарушение
+        /* A close body is empty, or a code (2 bytes) and a reason. One byte is a violation
          * (RFC 6455, 5.5.1). */
         if (r->ctl_n == 1) return TR_EWSFRAME;
         r->closed = 1;
@@ -105,8 +105,8 @@ int tr_ws_parse(struct ws_rx *r, const unsigned char *in, size_t n,
             r->hdr[r->hdr_n++] = in[i++];
             if (r->hdr_n < 2) continue;
             unsigned b0 = r->hdr[0], b1 = r->hdr[1];
-            /* Кадр сервера маскироваться не вправе (RFC 6455, 5.1): клиент обязан закрыть
-             * соединение. Проверяется до длины — дальше этот кадр читать незачем. */
+            /* A server frame must not be masked (RFC 6455, 5.1): the client must close the
+             * connection. Checked before the length: the rest of the frame does not matter. */
             if (b1 & 0x80) return TR_EWSFRAME;
             unsigned l7 = b1 & 0x7f;
             size_t need = 2 + (l7 == 126 ? 2 : l7 == 127 ? 8 : 0);
@@ -117,10 +117,10 @@ int tr_ws_parse(struct ws_rx *r, const unsigned char *in, size_t n,
             } else if (l7 == 127) {
                 len = 0;
                 for (int k = 2; k < 10; k++) len = (len << 8) | r->hdr[k];
-                if (len >> 63) return TR_EWSFRAME;     /* старший бит длины обязан быть 0 */
+                if (len >> 63) return TR_EWSFRAME;     /* the length's top bit must be 0 */
             }
             r->hdr_n = 0;
-            if (b0 & 0x70) return TR_EWSFRAME;         /* RSV: расширений не согласовывали */
+            if (b0 & 0x70) return TR_EWSFRAME;         /* RSV: no extensions negotiated */
             unsigned op = b0 & 0x0f, fin = b0 >> 7;
             if (op & 8) {
                 if (op > 10 || !fin || len > 125) return TR_EWSFRAME;
@@ -167,7 +167,7 @@ int tr_ws_parse(struct ws_rx *r, const unsigned char *in, size_t n,
     return 0;
 }
 
-/* Ключ маски: пачка случайности на поток. */
+/* Mask key from a per-thread batch of randomness. */
 static int mask_key(unsigned char key[4]) {
     static __thread unsigned char pool[256];
     static __thread unsigned left;
@@ -187,7 +187,7 @@ static int ws_control(struct transport *t, int op, const unsigned char *d, size_
     return fl ? tr_link_write(&t->link, f, fl) : TR_EWSFRAME;
 }
 
-/* Ответить на служебное, что накопил разбор: pong на ping, ответный close на close. */
+/* Answer what the parser collected: a pong for a ping, a close for a close. */
 static int ws_answer(struct transport *t) {
     struct ws_rx *r = &t->h1.rx;
     int rc = 0;
@@ -198,7 +198,7 @@ static int ws_answer(struct transport *t) {
     if (r->closed && !r->close_sent) {
         r->close_sent = 1;
         unsigned char c[2] = { (unsigned char)(r->close_code >> 8), (unsigned char)r->close_code };
-        /* Ошибка ответного close не важна: соединение и так кончается. */
+        /* A failed close answer does not matter: the connection is ending anyway. */
         (void)ws_control(t, 8, c, r->close_code == 1005 ? 0 : 2);
     }
     return rc;
@@ -208,11 +208,11 @@ static int ws_open(struct transport *t, const struct tr_node *n, int timeout_s) 
     return tr_h1_upgrade(t, n, 1, timeout_s);
 }
 
-/* Одна запись — одно сообщение, кадрами по WS_FRAG (WriteMessage у gorilla). */
+/* One write is one message, in WS_FRAG frames (gorilla's WriteMessage). */
 static int ws_frames(struct transport *t, const unsigned char *d, size_t n) {
     static __thread unsigned char fb[WS_FRAG + 14];
     size_t off = 0;
-    int op = 2;                                /* binary, дальше — continuation */
+    int op = 2;                                /* binary, then continuation */
     while (off < n) {
         size_t take = n - off > WS_FRAG ? WS_FRAG : n - off;
         unsigned char key[4];
@@ -226,8 +226,9 @@ static int ws_frames(struct transport *t, const unsigned char *d, size_t n) {
     return 0;
 }
 
-/* Предел очереди до ответа 101. Сверх него запись не принимается ЦЕЛИКОМ (H2_EWINDOW: дайлер
- * понимает это как «ничего не ушло, повторить», как закрытое окно HTTP/2), а не частично. */
+/* Queue limit before the 101 answer. Above it a write is refused WHOLE, not in part, with
+ * H2_EWINDOW: as with a closed HTTP/2 window, the dialer takes it as "nothing sent" and the
+ * client retransmits. */
 #define WS_QMAX (256 * 1024)
 
 static int q_push(struct h1_state *s, const unsigned char *d, size_t n) {
@@ -249,7 +250,7 @@ static int q_push(struct h1_state *s, const unsigned char *d, size_t n) {
     return 0;
 }
 
-/* Очередь — кадрами, запись за записью, как их писал бы Xray после ответа 101. */
+/* Send the queue as frames, write by write, as Xray would after the 101 answer. */
 static int q_flush(struct transport *t) {
     struct h1_state *s = &t->h1;
     size_t off = 0;
@@ -266,21 +267,21 @@ static int q_flush(struct transport *t) {
     return rc;
 }
 
-/* Запись по фазе (h1_state):
+/* Writing by phase (h1_state):
  *
- *   H1_DEFER  первая запись при Ed > 0 — у Xray это delayDialConn.Write: запись не длиннее Ed
- *             уезжает ранними данными в самом запросе и считается записанной, длиннее — запрос без
- *             них, а запись — кадрами после ответа 101 (здесь — в очередь);
- *   H1_WAIT   ответа 101 ещё нет: у Xray запись ждёт его внутри dialWebSocket, у нас — в очереди,
- *             которую чтение отправит сразу за принятым ответом. Байты на проводе те же: запрос,
- *             ответ, кадры; отправлять кадры раньше ответа нельзя — gorilla на той стороне
- *             рвёт соединение («client sent data before handshake is complete»);
- *   H1_OPEN   кадры сразу. */
+ *   H1_DEFER  the first write with Ed > 0 — Xray's delayDialConn.Write: a write no longer than Ed
+ *             goes as early data in the request itself and counts as written; a longer one sends
+ *             the request without it, and the write goes as frames after the 101 (here: queued);
+ *   H1_WAIT   no 101 yet: Xray blocks the write inside dialWebSocket, here it is queued, and the
+ *             read side sends the queue right after the answer. The bytes on the wire are the
+ *             same: request, answer, frames. Frames must not go before the answer: gorilla on the
+ *             other side drops the connection ("client sent data before handshake is complete");
+ *   H1_OPEN   frames at once. */
 static int ws_write(struct transport *t, const unsigned char *d, size_t n) {
     struct h1_state *s = &t->h1;
     if (s->phase == H1_OPEN) return ws_frames(t, d, n);
     if (s->phase == H1_WAIT) return q_push(s, d, n);
-    /* H1_DEFER: первая запись. */
+    /* H1_DEFER: the first write. */
     int early = n <= s->ed;
     int rc = early ? 0 : q_push(s, d, n);
     if (rc) return rc;
@@ -292,12 +293,12 @@ static int ws_write(struct transport *t, const unsigned char *d, size_t n) {
     return 0;
 }
 
-/* Кусок входа — целиком в разбор, тела кадров — в d. Выход не длиннее входа (заголовки кадров
- * только убывают), поэтому запись TLS, влезающая в d, влезает и разобранной.
+/* A whole input chunk goes to the parser, frame bodies go to d. The output is never longer than
+ * the input (only frame headers are removed), so a TLS record that fits in d fits parsed too.
  *
- * В H1_WAIT сперва дочитывается ответ 101 (tr_h1_lazy): ответ не тот — отказ его кодом, принят —
- * очередь записей уходит кадрами, а то, что приехало за ответом тем же куском, — уже кадры. В
- * H1_DEFER сервер молчать обязан: запроса ещё не было. */
+ * In H1_WAIT the 101 answer is read first (tr_h1_lazy): a wrong answer fails with its code; once
+ * accepted, the queued writes go out as frames, and whatever came after the answer in the same
+ * chunk is already frames. In H1_DEFER the server must be silent: no request was sent yet. */
 static int ws_read(struct transport *t, unsigned char *d, size_t cap, size_t *got) {
     struct h1_state *s = &t->h1;
     struct ws_rx *r = &s->rx;
@@ -324,7 +325,7 @@ static int ws_read(struct transport *t, unsigned char *d, size_t cap, size_t *go
         if (rc) return rc;
         rc = tr_ws_parse(r, in + used, n - used, d, cap, &on);
     } else if (s->stash) {
-        /* Сначала то, что приехало вместе с ответом 101. */
+        /* First, what came together with the 101 answer. */
         size_t left = s->stash_n - s->stash_off;
         size_t take = left < cap ? left : cap;
         rc = tr_ws_parse(r, s->stash + s->stash_off, take, d, cap, &on);
@@ -338,7 +339,7 @@ static int ws_read(struct transport *t, unsigned char *d, size_t cap, size_t *go
         if (!n) return 0;
         rc = tr_ws_parse(r, in, n, d, cap, &on);
     } else {
-        /* Голый сокет: читаем прямо в d и разбираем на месте. */
+        /* Bare socket: read straight into d and parse in place. */
         ssize_t k = read(t->link.fd, d, cap);
         if (k <= 0) return k == 0 ? TR_ECLOSED : TR_EIO;
         rc = tr_ws_parse(r, d, (size_t)k, d, cap, &on);
@@ -351,19 +352,20 @@ static int ws_read(struct transport *t, unsigned char *d, size_t cap, size_t *go
     return 0;
 }
 
-/* Остаток после 101 и отложенный конец потока: и то, и другое цикл туннеля обязан забрать
- * чтением, хотя сокет может молчать. */
+/* Leftover bytes after the 101 and a deferred end of stream: the tunnel loop must collect both
+ * with a read even though the socket may stay silent. */
 static int ws_pending(const struct transport *t) {
     return t->h1.stash != NULL || t->h1.rx.closed;
 }
 
-/* Закрытие — как connection.Close у Xray: close с кодом 1000 и пустой причиной, затем сокет. Только
- * после принятого 101 (до него кадров не было) и если close ещё не уходил (ответ на close сервера).
+/* Closing as Xray's connection.Close does: a close with code 1000 and no reason, then the socket.
+ * Only after an accepted 101 (no frames before it), and only if no close has been sent yet (as
+ * the answer to the server's close).
  *
- * Сокет на эту запись — неблокирующий. Закрытие идёт из цикла туннеля, и соединение может быть
- * уже мёртвым с полным буфером отправки: блокирующая запись стояла бы там до срока сокета (у Xray
- * — до 5 секунд, но горутина соединения своя). Кадр в 8 байт в исправное соединение уходит всегда;
- * не ушёл — значит и доставлять его было некому. */
+ * The socket is non-blocking for this write. Closing runs in the tunnel loop, and the connection
+ * may already be dead with a full send buffer: a blocking write would hang until the socket
+ * timeout (Xray waits up to 5 seconds, but in the connection's own goroutine). An 8-byte frame
+ * always goes into a healthy connection; if it does not, nobody was there to receive it. */
 static void ws_close(struct transport *t) {
     struct h1_state *s = &t->h1;
     if (s->upgraded && !s->rx.close_sent && t->link.fd >= 0) {

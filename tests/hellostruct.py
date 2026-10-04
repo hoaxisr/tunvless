@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Сверить СОСТАВ двух ClientHello (наш и эталон uTLS): наборы шифров, множество расширений с длинами,
-группы, подписи, key_share. Порядок расширений не сверяется — Chrome и uTLS перемешивают его на каждом
-соединении. Код выхода 1 — расхождение.
+"""Compare the CONTENTS of two ClientHellos (ours and the uTLS reference): cipher suites, the set
+of extensions with their lengths, groups, signature algorithms, key_share. Extension order is not
+compared: Chrome and uTLS shuffle it on every connection. Exit code 1 — a mismatch.
 
-    hellostruct.py эталон.bin наш.bin [--show]
+    hellostruct.py reference.bin ours.bin [--show]
 
-Эталон снимает tests/utls/hello.go; наш Hello — `build/hellofreeze --raw-pq файл`. Длина ECH и padding у
-uTLS случайна в пределах, поэтому сравниваются размеры расширений, но не значения. Сверено 2026-09-30:
-uTLS Chrome 133 (HelloChrome_Auto) и Hello с гибридом — одни и те же 17 расширений одинаковой длины,
-1757 байт."""
+The reference comes from tests/utls/hello.go, our Hello from `out/tests/hellofreeze --raw-pq file`.
+uTLS randomises the ECH and padding lengths within bounds, so extension sizes are compared, not
+values. Checked 2026-09-30: uTLS Chrome 133 (HelloChrome_Auto) and our hybrid Hello have the same
+17 extensions of the same lengths, 1757 bytes."""
 import struct, sys
 
 def grease(x): return (x & 0x0f0f) == 0x0a0a and (x >> 8) == (x & 0xff)
@@ -50,12 +50,12 @@ def describe(exts):
 
 a = parse(open(sys.argv[1], 'rb').read()); b = parse(open(sys.argv[2], 'rb').read())
 bad = 0
-if a[0] != b[0]: print('РАЗНЫЕ наборы шифров:\n ', a[0], '\n ', b[0]); bad = 1
+if a[0] != b[0]: print('cipher suites DIFFER:\n ', a[0], '\n ', b[0]); bad = 1
 da, db = describe(a[1]), describe(b[1])
 for k in sorted(set(da) | set(db)):
     if da.get(k) != db.get(k):
-        print('РАСХОЖДЕНИЕ %s: эталон=%s наш=%s' % (k, da.get(k), db.get(k))); bad = 1
+        print('MISMATCH %s: reference=%s ours=%s' % (k, da.get(k), db.get(k))); bad = 1
 if '--show' in sys.argv:
     for k in sorted(da): print(k, da[k])
-print('состав Hello совпадает с эталоном' if not bad else 'состав Hello РАСХОДИТСЯ')
+print('Hello contents match the reference' if not bad else 'Hello contents DIFFER')
 sys.exit(bad)

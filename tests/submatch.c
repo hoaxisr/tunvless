@@ -1,37 +1,28 @@
-/* Разбор подписки: что именно steer видит в ссылках vless:// и как считает то, чего не взял.
+/* Subscription parsing: what sub.c takes from vless:// links and Xray configs, and how it counts
+ * what it does not take.
  *
- * Зачем отдельным тестом. sub.c — единственное место, где в движок попадает чужой текст
- * из интернета: подписка приходит с панели, формат её никто не гарантирует, а результат
- * разбора расходится сразу двум потребителям — интерфейсу (показать список узлов) и
- * сторожу (выбрать живой). Ошибка здесь не выглядит как сбой: узел просто не появляется
- * в списке, и человек ищет причину в панели, в подписке, в сети — где угодно, кроме
- * парсера, который его молча не понял.
+ * sub.c is where text from the internet comes in: a panel serves the subscription, and nobody
+ * guarantees its format. A parser error does not look like a failure: the node just does not
+ * appear, and the user looks for the cause everywhere but the parser.
  *
- * Поэтому проверяется не «разбирает ли валидную ссылку», а арифметика: заголовок sub.c
- * обещает, что расхождение «26 узлов в подписке, 17 у steer» объясняется ЧИСЛОМ, а не
- * догадкой. Значит usable + skipped + foreign обязано сходиться с числом ссылок в тексте
- * при любом их виде, включая те, которые парсер не осилил.
+ * So the main property checked is the arithmetic: usable + skipped + foreign must equal the
+ * number of links in the text, whatever they look like, including links the parser cannot read.
  *
- * Файл включает исходник (#include "../src/proto/vless/sub.c") — тот же приём, что в dnsmatch.c
- * и specmatch.c: он даёт доступ к статике и не требует ни сети, ни криптобиблиотеки, ни docker,
- * которых у make test нет (см. R-014). */
+ * The file includes the sources it tests, to reach their static functions. They need no network
+ * and no crypto library, so the test builds without them. */
 #include <stdio.h>
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
 
 #include "../src/proto/vless/sub.c"
-#include "nodesel.h"
-/* Вывод UUID живёт в vless_proto.c, а проверка пригодности — в sub.c, и стенду нужны
- * оба: ссылка из панели обязана и пройти проверку пригодности, и дать те самые 16 байт,
- * которые уедут в заголовок запроса. Исходник включается тем же приёмом, что и sub.c —
- * криптобиблиотеки он не требует (см. заголовок vless_proto.c), поэтому стенд остаётся в обычном
- * make test. */
+/* vless_proto.c holds the UUID derivation: a panel link must both pass the usability check in
+ * sub.c and give the 16 bytes that go into the request header. */
 #include "../src/proto/vless/vless_proto.c"
 
 static int g_pass, g_fail;
 
-/* UUID в каноническую запись: сравнивать 16 байт глазами в отчёте стенда нельзя. */
+/* A UUID in canonical form, so that a mismatch is readable in the report. */
 static const char *uuid_str(const unsigned char u[16]) {
     static char s[37];
     snprintf(s, sizeof(s),
@@ -47,7 +38,7 @@ static void check(const char *name, const char *expected, const char *actual) {
         printf("%-56s ok\n", name);
     } else {
         g_fail++;
-        printf("FAIL %s\n  ожидалось: %s\n  получено:  %s\n", name, expected, actual);
+        printf("FAIL %s\n  expected: %s\n  got:      %s\n", name, expected, actual);
     }
 }
 
@@ -58,9 +49,8 @@ static void check_n(const char *name, long expected, long actual) {
     check(name, e, a);
 }
 
-/* Строка целиком в UTF-8: ни одной неполной последовательности. Стенду нужен именно
- * этот ответ, а не «похоже на кириллицу»: оборванный хвост — это байт, который ни один
- * потребитель не может истолковать, и видно его только у последнего символа. */
+/* 1 if the whole string is valid UTF-8. A cut multi-byte sequence leaves a byte no consumer can
+ * read, and it shows only at the end of the string. */
 static int utf8_ok(const char *s) {
     const unsigned char *p = (const unsigned char *)s;
     while (*p) {
@@ -69,7 +59,7 @@ static int utf8_ok(const char *s) {
         else if ((*p & 0xE0) == 0xC0) need = 1;
         else if ((*p & 0xF0) == 0xE0) need = 2;
         else if ((*p & 0xF8) == 0xF0) need = 3;
-        else return 0;                       /* байт продолжения или мусор в начале */
+        else return 0;                       /* a continuation byte or an invalid lead byte */
         p++;
         for (size_t i = 0; i < need; i++) {
             if ((*p & 0xC0) != 0x80) return 0;
@@ -79,249 +69,237 @@ static int utf8_ok(const char *s) {
     return 1;
 }
 
-/* Кривой JSON конфига Xray приходит из интернета, и разбор обязан ВЕРНУТЬСЯ, а не зависнуть:
- * висел и процесс туннеля, и интерфейс. Будильник превращает зависание в провал стенда. */
+/* A malformed Xray config comes from the internet, and parsing must return, not hang. The alarm
+ * turns a hang into a test failure. The output is flushed first: _exit does not, and when stdout
+ * is a pipe or a file (a CI log) the report would end without saying what hung. */
+static size_t g_json_case;
 static void on_alarm(int sig) {
     (void)sig;
-    printf("ЗАВИС: разбор не вернулся за 2 с\n");
+    printf("HANG: parsing malformed JSON %zu did not return within 2 s\n", g_json_case);
+    fflush(stdout);
     _exit(1);
 }
 
 int main(void) {
-    /* ---- исключение узлов (src/model/nodesel.h): страна по флагу, кусок имени ------------- */
-    {
-        char cc[3] = "";
-        /* Флаг — первая пара regional indicator где угодно в имени, как ccFromName в splify2. */
-        check_n("флаг в начале: найден", 1, node_cc("\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1 Амстердам", cc));
-        check("  это NL", "NL", cc);
-        check_n("флаг в середине: найден", 1, node_cc("Узел #3 \xF0\x9F\x87\xA9\xF0\x9F\x87\xAA", cc));
-        check("  это DE", "DE", cc);
-        check_n("одиночный индикатор не флаг", 0, node_cc("x \xF0\x9F\x87\xB3 y", cc));
-        check_n("без флага — нет страны", 0, node_cc("Netherlands", cc));
-        node_cc("\xF0\x9F\x87\xA6\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1", cc);
-        check("три индикатора подряд — первая пара (как регулярное выражение интерфейса)", "AN", cc);
-        check_n("обрубок индикатора на конце не читается за строкой", 0, node_cc("a\xF0\x9F\x87", cc));
-        check_n("кусок имени без регистра: латиница", 1, node_name_has("NL Mobile LTE", "lte"));
-        check_n("кусок имени без регистра: кириллица", 1, node_name_has("Мобильный #6", "МОБИЛЬНЫЙ"));
-        check_n("  Ё и ё", 1, node_name_has("Тёплый стан", "ТЁПЛ"));
-        check_n("кусок, которого нет", 0, node_name_has("Мобильный #6", "лте"));
-        char ru[2][3] = { "RU", "US" };
-        const char *names[1] = { "мобил" };
-        struct node_exclude x = { ru, 2, names, 1 };
-        check_n("исключён по стране", 1, node_excluded(&x, "\xF0\x9F\x87\xB7\xF0\x9F\x87\xBA Москва"));
-        check_n("исключён по куску имени", 1, node_excluded(&x, "\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1 Мобильный"));
-        check_n("не исключён", 0, node_excluded(&x, "\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1 Амстердам"));
-        check_n("узел без флага по стране не исключается", 0, node_excluded(&x, "RU Moscow"));
-        check_n("пустое исключение — ничего", 0, node_excluded(NULL, "x"));
-    }
-
-    /* ---- base64: то, чем подписки реально приходят ------------------------- */
+    /* ---- base64: how subscriptions usually arrive ------------------------------ */
     {
         char out[64];
-        /* Без выравнивающих '=' и с переводом строки посередине: и то, и другое
-         * встречается у панелей, и оба должны раскодироваться, а не обрезаться. */
+        /* No '=' padding and a line break in the middle: panels send both, and both must
+         * decode, not truncate. */
         size_t n = b64_decode("dmxlc3M6\nLy9h", 13, out, sizeof(out));
-        check("base64 без padding и с переводом строки", "vless://a", out);
-        check_n("base64: длина результата", 9, (long)n);
+        check("base64 without padding, with a line break", "vless://a", out);
+        check_n("base64: output length", 9, (long)n);
 
-        /* URL-safe алфавит: '-' вместо '+', '_' вместо '/'. */
+        /* URL-safe alphabet: '-' for '+', '_' for '/'. */
         n = b64_decode("Pz8_", 4, out, sizeof(out));
-        check("base64 URL-safe: _ читается как /", "??\?", out);
-        check_n("base64 URL-safe: длина", 3, (long)n);
+        check("base64 URL-safe: _ decodes as /", "??\?", out);
+        check_n("base64 URL-safe: length", 3, (long)n);
+        n = b64_decode("Pj4-", 4, out, sizeof(out));
+        check("base64 URL-safe: - decodes as +", ">>>", out);
+        check_n("base64 URL-safe: - length", 3, (long)n);
 
-        /* Выравнивание посреди текста: склеенные блоки base64, каждый со своим '='. Недобор
-         * бит перед '=' — остаток блока, и следующий блок начинается с чистого накопителя
-         * (I-326). До правки «QQ==QQ==» давал три байта 41 04 10 вместо «AA». */
+        /* Padding inside the text: concatenated base64 blocks, each with its own '='. The bits
+         * left before '=' end the block, and the next block starts with an empty accumulator;
+         * without that, "QQ==QQ==" decodes to 41 04 10 instead of "AA". */
         n = b64_decode("QQ==QQ==", 8, out, sizeof(out));
-        check("base64: два блока с '=' внутри", "AA", out);
-        check_n("base64: два блока с '=' внутри, длина", 2, (long)n);
+        check("base64: two blocks with '=' inside", "AA", out);
+        check_n("base64: two blocks with '=' inside, length", 2, (long)n);
         n = b64_decode("QUI=Qw==", 8, out, sizeof(out));
-        check("base64: блок с одним '=' и блок с двумя", "ABC", out);
+        check("base64: a block with one '=' then one with two", "ABC", out);
     }
 
-    /* ---- обрезка неполного UTF-8 с конца ------------------------------------ */
+    /* ---- trimming an incomplete UTF-8 tail ------------------------------------- */
     {
-        /* Одинокий байт продолжения после ASCII снимается сам, а буква перед ним остаётся
-         * (I-326): до правки «ab\x80» становилось «a». */
+        /* A lone continuation byte after ASCII goes alone: "ab\x80" must keep its "b". */
         char s1[] = "ab\x80";
         sl_utf8_trim_tail(s1);
-        check("utf8: одинокое продолжение после ASCII", "ab", s1);
+        check("utf8: lone continuation byte after ASCII removed", "ab", s1);
         char s2[] = "ab\xC3";
         sl_utf8_trim_tail(s2);
-        check("utf8: ведущий байт без продолжения", "ab", s2);
+        check("utf8: lead byte without continuation removed", "ab", s2);
         char s3[] = "a\xC3\xA9";
         sl_utf8_trim_tail(s3);
-        check("utf8: целая буква не трогается", "a\xC3\xA9", s3);
+        check("utf8: a complete letter is kept", "a\xC3\xA9", s3);
         char s4[] = "a\xE2\x82";
         sl_utf8_trim_tail(s4);
-        check("utf8: недобитая трёхбайтовая снимается целиком", "a", s4);
+        check("utf8: incomplete 3-byte sequence removed whole", "a", s4);
     }
 
-    /* ---- одна ссылка: поля попадают туда, куда обещано --------------------- */
+    /* ---- one link: every field lands where it should --------------------------- */
     {
         struct vless_node n;
         int rc = vless_parse_url(
             "vless://11111111-2222-3333-4444-555555555555@example.com:8443"
             "?security=reality&sni=www.microsoft.com&pbk=ABCDEF&sid=aa11&fp=chrome"
             "&type=tcp&flow=xtls-rprx-vision#%D0%A3%D0%B7%D0%B5%D0%BB", &n);
-        check_n("reality-ссылка: узел пригоден", 0, rc);
+        check_n("reality link: node is usable", 0, rc);
         check("reality: host", "example.com", n.host);
         check_n("reality: port", 8443, (long)n.port);
         check("reality: uuid", "11111111-2222-3333-4444-555555555555", n.uuid);
         check("reality: sni", "www.microsoft.com", n.sni);
+        check("reality: security", "reality", n.security);
+        check("reality: pbk", "ABCDEF", n.pbk);
+        check("reality: sid", "aa11", n.sid);
+        check("reality: fingerprint", "chrome", n.fp);
         check("reality: flow", "xtls-rprx-vision", n.flow);
-        /* Имя приходит процентно-закодированным: без раскодирования интерфейс
-         * показывает %D0%A3... вместо имени. */
-        check("имя раскодировано из процентной формы", "Узел", n.name);
+        /* The name arrives percent-encoded and must be shown decoded. */
+        check("name is percent-decoded", "Узел", n.name);
     }
 
-    /* ---- непригодные узлы: пропущены с причиной, а не выброшены ------------ */
+    /* ---- unusable nodes: skipped with a reason, not dropped -------------------- */
     {
         struct vless_node n;
-        /* security=tls ПРИГОДЕН: подлинность доказывается сертификатом, и проверка есть
-         * (certverify.c). Раньше он отбраковывался целиком — узел с обычным TLS выглядел
-         * неисправным, хотя неисправен был клиент. */
-        check_n("security=tls по имени: пригоден",
+        /* security=tls is usable: the certificate proves the server, and certverify.c
+         * checks it. */
+        check_n("security=tls to a host name: usable",
                 0, vless_parse_url("vless://u@node.example.org:443?security=tls#x", &n));
-        check("security=tls: security сохранён", "tls", n.security);
+        check("security=tls: security field kept", "tls", n.security);
 
-        /* А вот адрес без sni — непригоден, и по своей причине: сертификат выдают на имя,
-         * и проверять его тут не против чего. Отдельная причина, а не «security не
-         * поддержан»: это разные разговоры с человеком. */
-        check_n("security=tls по адресу без sni: пропущен",
+        /* An IP address without sni is unusable for its own reason: a certificate is issued
+         * for a name, and there is nothing to check it against. The reason differs from "not
+         * supported" because the fix differs. */
+        check_n("security=tls to an IP without sni: skipped",
                 1, vless_parse_url("vless://u@9.9.9.9:443?security=tls#x", &n));
-        check("security=tls по адресу без sni: причина названа",
-              "tls по адресу без sni: нечем сверить", n.skip_reason);
+        check("security=tls to an IP without sni: reason given",
+              "tls to an IP address without sni: nothing to verify", n.skip_reason);
 
-        /* Адрес, но с sni — пригоден: имя есть, проверять против чего. */
-        check_n("security=tls по адресу с sni: пригоден",
+        /* An IP address with sni is usable: there is a name to verify against. */
+        check_n("security=tls to an IP with sni: usable",
                 0, vless_parse_url("vless://u@9.9.9.9:443?security=tls&sni=node.example.org#x", &n));
 
-        /* xtls остаётся непригодным: это не «TLS с проверкой», а свой обмен. */
-        check_n("security=xtls: пропущен",
+        /* xtls stays unusable: it is its own handshake, not TLS with verification. */
+        check_n("security=xtls: skipped",
                 1, vless_parse_url("vless://u@h:443?security=xtls#x", &n));
-        check("security=xtls: причина названа", "security=xtls не поддержан", n.skip_reason);
+        check("security=xtls: reason given", "security=xtls is not supported", n.skip_reason);
 
-        check_n("reality без pbk: пропущен",
+        check_n("reality without pbk: skipped",
                 1, vless_parse_url("vless://u@h:443?security=reality&sni=a.com#x", &n));
-        check("reality без pbk: причина названа", "reality без pbk", n.skip_reason);
+        check("reality without pbk: reason given", "reality without pbk", n.skip_reason);
 
-        /* А ВОТ БЕЗ SNI — ПРИГОДЕН. Reality сверяет имя со списком `serverNames`, и пустая
-         * строка там законна: сервер ждёт ClientHello без расширения server_name, и Xray
-         * его так и шлёт. Живая подписка владельца отдаёт такой узел во всех форматах
-         * разом, а мы объявляли её пустой. */
-        check_n("reality без sni: узел пригоден", 0,
-                vless_parse_url("vless://u@h:443?security=reality&pbk=" 
+        /* Reality without sni is usable. The server checks the name against its
+         * `serverNames`, where an empty string is valid: it then expects a ClientHello
+         * without server_name, and Xray sends one. Such nodes occur in real subscriptions. */
+        check_n("reality without sni: node is usable", 0,
+                vless_parse_url("vless://u@h:443?security=reality&pbk="
                                 "Zm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyMDA&sid=ab12"
                                 "&flow=xtls-rprx-vision#x", &n));
-        check("и имя у него пустое", "", n.sni);
+        check("reality without sni: sni is empty", "", n.sni);
 
-        /* ws и httpupgrade поддержаны с шага 5 выпуска 1.10 (их случаи — ниже, «ws и
-         * httpupgrade»); неподдержанный транспорт теперь kcp. */
-        check_n("транспорт kcp: пропущен",
+        /* ws and httpupgrade are supported (their cases are below); kcp stands for an
+         * unsupported transport. */
+        check_n("transport kcp: skipped",
                 1, vless_parse_url("vless://u@h:443?security=none&type=kcp#x", &n));
-        check("транспорт kcp: причина названа", "транспорт kcp не поддержан", n.skip_reason);
+        check("transport kcp: reason given", "transport kcp is not supported", n.skip_reason);
 
-        /* security опущен вовсе — это VLESS без TLS, он поддержан (см. sub.c). */
-        check_n("security опущен: узел пригоден",
+        /* No security parameter means VLESS without TLS, which is supported. */
+        check_n("security omitted: node is usable",
                 0, vless_parse_url("vless://u@h:443#x", &n));
-        check("security опущен: поле заполнено умолчанием", "none", n.security);
-        check("тип по умолчанию tcp", "tcp", n.type);
+        check("security omitted: defaults to none", "none", n.security);
+        check("type defaults to tcp", "tcp", n.type);
     }
 
-    /* ---- склеенные ссылки: панель может не поставить разделитель (I-028) ----
+    /* ---- glued links: a panel may leave out the separator ----------------------
      *
-     * Отступ к началу следующей ссылки шёл «пока слева буквы и цифры» и съедал хвост
-     * имени: в «#onevless://…» граница вставала перед «onevless», вторая ссылка
-     * переставала начинаться с vless:// и уходила в чужие протоколы. Терялся каждый
-     * второй узел, а первому обнулялось имя. */
+     * The boundary must be found by known scheme names. Stepping back over letters and digits
+     * would put it before "onevless" in "#onevless://…": the second link would no longer
+     * start with vless:// and would count as foreign, and the first node would lose its
+     * name. */
     {
         struct vless_node nodes[8];
         struct vless_sub_stats st;
         size_t n = vless_parse_sub("vless://a@h1:443#one" "vless://b@h2:443#two",
                                    nodes, 8, &st);
-        check_n("две склеенные ссылки разобраны как две", 2, (long)n);
-        check("первая: имя не съело вторую", "one", nodes[0].name);
-        check("вторая: хост свой", "h2", nodes[1].host);
-        check_n("склеенные: чужих протоколов нет", 0, (long)st.foreign);
+        check_n("two glued links parse as two", 2, (long)n);
+        check("glued: first name does not swallow the second link", "one", nodes[0].name);
+        check("glued: second link keeps its own host", "h2", nodes[1].host);
+        check_n("glued: no foreign links counted", 0, (long)st.foreign);
     }
     {
-        /* Имя без '#'-хвоста: граница обязана встать по схеме, не по цифрам порта. */
+        /* Without '#' names: the boundary must follow the scheme, not the port digits. */
         struct vless_node nodes[8];
         struct vless_sub_stats st;
         size_t n = vless_parse_sub("vless://a@h1:443" "vless://b@h2:8443",
                                    nodes, 8, &st);
-        check_n("склейка без имён: две ссылки", 2, (long)n);
-        check_n("первой не откусили порт", 443, (long)nodes[0].port);
-        check_n("второй достался свой порт", 8443, (long)nodes[1].port);
+        check_n("glued without names: two links", 2, (long)n);
+        check_n("glued without names: first port intact", 443, (long)nodes[0].port);
+        check_n("glued without names: second link has its own port", 8443, (long)nodes[1].port);
     }
     {
-        /* Имя, оканчивающееся именем схемы, — граница всё равно по байтам перед '://'. */
+        /* A name that ends like a scheme ("Express" before "ss://"): the boundary is still
+         * taken from the bytes before "://". */
         struct vless_node nodes[8];
         struct vless_sub_stats st;
         size_t n = vless_parse_sub("vless://a@h1:443#Express" "ss://b@h2:443#other",
                                    nodes, 8, &st);
-        check_n("имя кончается на имя схемы: узел один", 1, (long)n);
-        check("имя не обрезано", "Express", nodes[0].name);
-        check_n("следующая ссылка учтена как чужая", 1, (long)st.foreign);
+        check_n("name ends like a scheme: one vless node", 1, (long)n);
+        check("name ends like a scheme: name not cut", "Express", nodes[0].name);
+        check_n("name ends like a scheme: ss link counted as foreign", 1, (long)st.foreign);
     }
 
-    /* ---- склейка с НЕЗНАКОМОЙ схемой: назвать вслух, а не гадать (I-208, R-111) ----
+    /* ---- glue with an unknown scheme: reported, not guessed --------------------
      *
-     * Три предыдущих блока проверяют склейку со схемой, которая есть в списке имён:
-     * граница ставится верно, и оба узла живут. Незнакомая схема границы не получает
-     * вовсе — и вот что из этого выходило. Пара «vless…#one» + «anytls://…» разбиралась
-     * как ОДНА ссылка: первый узел приезжал в интерфейс с чужим хвостом вместо имени
-     * («oneanytls://p@h2:443#two»), а второй исчезал, не попав ни в один счётчик. Ни
-     * одно число при этом не расходилось: одна ссылка, один пригодный узел.
+     * The blocks above glue a scheme from the splitter's list: the boundary is right and both
+     * nodes live. An unknown scheme gets no boundary at all, so "vless…#one" + "anytls://…"
+     * would read as one link: the first node named "oneanytls://p@h2:443#two", the second
+     * gone from every counter, and no number off (one link, one usable node).
      *
-     * Владелец согласился на «Б+В» (splicicd#23). Здесь В: правило границы не меняется,
-     * но склейка называется вслух — узел объявляется непригодным, а в примере стоит длина
-     * хвоста и его первые байты. Схема при этом не называется: отступ по форме на
-     * «…#oneanytls://…» даёт «oneanytls», и назвать это схемой значило бы соврать с
-     * уверенным видом — ровно та двусмысленность, из-за которой список схем и есть. Второй
-     * признак
-     * (`@` в приклеенной ссылке) отделяет склейку от ссылки ВНУТРИ имени узла: продавцы
-     * пишут в имя адрес своего канала, и объявлять такой узел непригодным было бы
-     * регрессией — она проверяется вторым случаем ниже. */
+     * So the boundary rule stays, but the glue is reported: the node is unusable. The second
+     * condition ('@' in the glued link) tells a glue from a link inside a node name, where
+     * sellers put their channel; the second case below checks that this node stays usable. */
     {
         struct vless_node nodes[8];
         struct vless_sub_stats st;
         size_t n = vless_parse_sub("vless://a@h1:443#one" "anytls://p@h2:443#two",
                                    nodes, 8, &st);
-        check_n("незнакомая схема: узел не взят с чужим хвостом", 0, (long)n);
-        check_n("незнакомая схема: ссылка учтена как непригодная", 1, (long)st.skipped);
-        check("незнакомая схема: причина названа",
-              "ссылки склеены без разделителя", st.reasons[0].reason);
-        /* Схема в примере НЕ называется: отступ по форме дал бы «oneanytls», то есть
-         * уверенную неправду. Наружу идёт то, что известно точно, — длина хвоста и его
-         * первые байты; по ним место склейки находится в тексте подписки. */
-        check("незнакомая схема: пример называет длину и байты хвоста",
-              "хвост 15 байт: ://p@h2:443#two", st.reasons[0].example);
-        check_n("незнакомая схема: сумма сходится", 1,
+        check_n("unknown scheme: node with a foreign tail not taken", 0, (long)n);
+        check_n("unknown scheme: link counted as unusable", 1, (long)st.skipped);
+        check("unknown scheme: reason names the glue",
+              "links glued without a separator", st.reasons[0].reason);
+        /* The example names no scheme: stepping back by form would give "oneanytls", a
+         * confident lie. It gives what is known for sure, the tail's length and first bytes,
+         * which locate the glue in the subscription text. */
+        check("unknown scheme: example gives the tail's length and bytes",
+              "tail of 15 bytes: ://p@h2:443#two", st.reasons[0].example);
+        check_n("unknown scheme: counters add up", 1,
                 (long)(n + st.skipped + st.foreign));
     }
-    /* Причина пропуска в skipped_reasons — целиком, как в узле: поле причины у подписки было 64 байта
-     * при 96 у узла, и «allowInsecure: включите insecure у выхода явно» (65 байт) уезжала в интерфейс
-     * как «…у выхода явн». */
+    /* The reason goes into the subscription stats whole: st.reasons[].reason has the size of the
+     * node's skip_reason. The reasons written today are at most 51 bytes, so a stats field cut
+     * anywhere above that would pass with every one of them; a reason that fills skip_reason is
+     * given to sl_skip_note, the one way into the stats, to check the whole size. */
     {
         struct vless_node nodes[4];
         struct vless_sub_stats st;
         vless_set_insecure(0);
         size_t n = vless_parse_sub("vless://11111111-2222-3333-4444-555555555555@b.test:443"
                                    "?security=tls&sni=b.test&allowInsecure=1#B\n", nodes, 4, &st);
-        check_n("allowInsecure без insecure: узел пропущен", 0, (long)n);
-        check("  причина в skipped_reasons — целиком",
-              "allowInsecure: включите insecure у выхода явно", st.reasons[0].reason);
+        check_n("allowInsecure without --insecure: node skipped", 0, (long)n);
+        check("allowInsecure: reason in skipped_reasons",
+              "allowInsecure: needs --insecure", st.reasons[0].reason);
+
+        struct vless_node t;
+        memset(&t, 0, sizeof(t));
+        memset(t.skip_reason, 'r', sizeof(t.skip_reason) - 1);
+        memset(&st, 0, sizeof(st));
+        sl_skip_note(&st, &t, t.skip_reason);
+        check("reason that fills skip_reason: not cut in skipped_reasons",
+              t.skip_reason, st.reasons[0].reason);
+
+        /* A node without a name is reported by host:port; the example field is longer than the
+         * host field so that the longest host fits with the longest port. */
+        char host[sizeof(t.host)], link[256], want[sizeof(t.host) + 8];
+        memset(host, 'h', sizeof(host) - 1);
+        host[sizeof(host) - 1] = '\0';
+        snprintf(link, sizeof(link), "vless://u@%s:65535?type=kcp\n", host);
+        snprintf(want, sizeof(want), "%s:65535", host);
+        vless_parse_sub(link, nodes, 4, &st);
+        check("node without a name: example is the longest host:port, whole", want,
+              st.reasons[0].example);
     }
     {
-        /* И ТА ЖЕ СКЛЕЙКА, НО ДЛИННЕЕ БУФЕРА СТРОКИ — вторая половина обращения steer#2.
-         *
-         * Там человек прислал журнал «ссылка длиннее 2048 байт — узлов 1», и тот же журнал
-         * получается от двух совершенно разных причин: от настоящей длинной ссылки (у неё
-         * лечение — поднять предел, сделано) и от неразделённой пары (у неё лечение —
-         * поправить подписку). Один симптом на две починки — это и есть то, что нужно
-         * развести, поэтому склейка называется раньше длины. */
+        /* The same glue, longer than the line buffer. A really long link and a glued pair
+         * would both read as "link longer than 8191 bytes", but they need different fixes (a
+         * higher limit, a fixed subscription), so the glue is reported before the length. */
         struct vless_node nodes[4];
         struct vless_sub_stats st;
         static char big[16384];
@@ -331,47 +309,41 @@ int main(void) {
         k += snprintf(big + k, sizeof(big) - (size_t)k, "#one" "anytls://p@h2:443#two");
         big[k] = '\0';
         size_t n = vless_parse_sub(big, nodes, 4, &st);
-        check_n("длинная склейка: узел не взят", 0, (long)n);
-        check_n("длинная склейка: учтена как непригодная", 1, (long)st.skipped);
-        check("длинная склейка: причина про склейку, а не про длину",
-              "ссылки склеены без разделителя", st.reasons[0].reason);
+        check_n("long glue: node not taken", 0, (long)n);
+        check_n("long glue: counted as unusable", 1, (long)st.skipped);
+        check("long glue: reason is the glue, not the length",
+              "links glued without a separator", st.reasons[0].reason);
     }
     {
-        /* Ссылка ВНУТРИ имени узла — не склейка, и узел обязан остаться пригодным.
-         *
-         * Отличие ровно одно: у приклеенной ссылки прокси есть `@` (в ней едут
-         * учётные данные), у адреса канала в имени его нет. Без этого признака общее
-         * правило по форме схемы объявило бы непригодным каждый узел, в имени которого
-         * продавец написал свой телеграм. */
+        /* A link inside a node name is not a glue, and the node stays usable. The one
+         * difference: a glued proxy link has '@' (credentials), a channel address in a name
+         * has none. Without that test every node whose name carries the seller's Telegram
+         * channel would be unusable. */
         struct vless_node nodes[8];
         struct vless_sub_stats st;
         size_t n = vless_parse_sub("vless://a@h1:443#канал https://t.me/shop",
                                    nodes, 8, &st);
-        check_n("ссылка в имени: узел взят", 1, (long)n);
-        check_n("ссылка в имени: непригодных нет", 0, (long)st.skipped);
-        check("ссылка в имени: имя не тронуто", "канал https://t.me/shop", nodes[0].name);
+        check_n("link in name: node taken", 1, (long)n);
+        check_n("link in name: nothing skipped", 0, (long)st.skipped);
+        check("link in name: name unchanged", "канал https://t.me/shop", nodes[0].name);
     }
     {
-        /* Знакомая схема по-прежнему делится, а не объявляется склейкой: правило
-         * границы не тронуто, и это здесь проверяется отдельно от блоков выше — они
-         * стоят до правки, этот стоит после и сторожит порядок «сначала список, потом
-         * общее правило». */
+        /* A known scheme is still split, not reported as a glue: the list of scheme names
+         * is tried before the general glue rule, and this case guards that order. */
         struct vless_node nodes[8];
         struct vless_sub_stats st;
         size_t n = vless_parse_sub("vless://a@h1:443#one" "vless://b@h2:443#two",
                                    nodes, 8, &st);
-        check_n("знакомая схема: по-прежнему две ссылки", 2, (long)n);
-        check_n("знакомая схема: непригодных нет", 0, (long)st.skipped);
-        check("знакомая схема: имя первого чисто", "one", nodes[0].name);
+        check_n("known scheme: still two links", 2, (long)n);
+        check_n("known scheme: nothing skipped", 0, (long)st.skipped);
+        check("known scheme: first name is clean", "one", nodes[0].name);
     }
 
-    /* ---- арифметика подписки (I-027) --------------------------------------
+    /* ---- subscription arithmetic -----------------------------------------------
      *
-     * Заголовок sub.c обещает: «в ней 26 узлов, а steer видит 17» должно объясняться
-     * цифрой. Значит ни одна ссылка не имеет права исчезнуть, не попав ни в один
-     * счётчик. До правки исчезали две: IPv6-литерал в host (первое двоеточие
-     * оказывается внутри скобок, порт читается как 0) и ссылка с портом 0. Обе
-     * возвращают -1, а -1 не считался нигде — узел пропадал из подписки бесследно. */
+     * No link may vanish without landing in a counter. Two of these links make
+     * vless_parse_url return -1: an IPv6 literal host (the first colon is inside the
+     * brackets, so the port reads as 0) and port 0. Both must still count as skipped. */
     {
         struct vless_node nodes[16];
         struct vless_sub_stats st;
@@ -382,16 +354,16 @@ int main(void) {
             "vless://d@9.9.9.9:443?security=tls#tls\n"
             "hy2://e@10.0.0.1:443#foreign\n";
         size_t n = vless_parse_sub(sub, nodes, 16, &st);
-        check_n("пригодных узлов", 1, (long)n);
-        check_n("чужих протоколов", 1, (long)st.foreign);
-        /* Четыре ссылки vless: одна взята, три нет — и все три обязаны быть в счётчике. */
-        check_n("непригодных ссылок vless учтено", 3, (long)st.skipped);
-        check_n("сумма сходится с числом ссылок в тексте",
+        check_n("arithmetic: usable nodes", 1, (long)n);
+        check_n("arithmetic: foreign links", 1, (long)st.foreign);
+        /* Four vless links: one taken, the other three must all be counted. */
+        check_n("arithmetic: unusable vless links counted", 3, (long)st.skipped);
+        check_n("arithmetic: counters add up to the links in the text",
                 5, (long)(n + st.skipped + st.foreign));
     }
 
-    /* Ссылка длиннее буфера строки тоже исчезала бесследно: ветка длины отбрасывала
-     * её раньше разбора. Считается как непригодная — она и есть непригодная. */
+    /* A link longer than the line buffer is counted as unusable, not dropped before
+     * parsing. */
     {
         struct vless_node nodes[4];
         struct vless_sub_stats st;
@@ -400,25 +372,20 @@ int main(void) {
         memset(big + k, 'x', 9000);
         big[k + 9000] = '\0';
         size_t n = vless_parse_sub(big, nodes, 4, &st);
-        check_n("слишком длинная ссылка: не взята", 0, (long)n);
-        check_n("слишком длинная ссылка: учтена как непригодная", 1, (long)st.skipped);
-        check("слишком длинная ссылка: причина названа", "ссылка длиннее 8191 байт",
+        check_n("too long link: not taken", 0, (long)n);
+        check_n("too long link: counted as unusable", 1, (long)st.skipped);
+        check("too long link: reason gives the limit", "link longer than 8191 bytes",
               st.reasons[0].reason);
-        /* Пример у этой причины — длина и начало адреса узла (I-209): по одной причине
-         * нельзя отличить ссылку чуть длиннее предела от блоба на десятки килобайт, а
-         * починки у них разные. Начало берётся после '@': до него идентификатор, которому
-         * в журнале, пересылаемом в трекер, не место. */
-        check("слишком длинная ссылка: пример — длина и начало адреса",
-              "9020 байт: …@h:443?sni=xxxxxxxxxxxxxxxxxxxxxx", st.reasons[0].example);
+        /* The example is the length and the start of the address: the reason alone cannot
+         * tell a link just over the limit from a blob of many kilobytes, and their fixes
+         * differ. The start is taken after '@': the id before it does not belong in a log. */
+        check("too long link: example is the length and start of the address",
+              "9020 bytes: …@h:443?sni=xxxxxxxxxxxxxxxxxxxxxx", st.reasons[0].example);
     }
 
-    /* Ссылка постквантового Reality. Длина взята с живой подписки: Xray-core 25.9+ кладёт
-     * в ссылку `pqv` — публичный ключ ML-DSA-65 (1952 байта, 2603 знака base64url), и одна
-     * такая ссылка весит 2860 байт. При
-     * прежнем пределе в 2048 подписка ровно из неё давала ноль узлов: выход собрать не из
-     * чего, притом что подписка скачалась и верна. Проверяется не сам `pqv` (движок его не
-     * читает — параметр ему незнаком и пропускается, как любой другой), а то, что длина
-     * такой ссылки больше не отбрасывает узел целиком. */
+    /* A post-quantum Reality link. Xray-core 25.9+ puts `pqv`, an ML-DSA-65 public key (1952
+     * bytes, 2603 base64url characters), into the link, which makes a link of about 2860
+     * bytes. This checks that such a length does not drop the node. */
     {
         struct vless_node nodes[4];
         struct vless_sub_stats st;
@@ -432,23 +399,16 @@ int main(void) {
         k += snprintf(big + k, sizeof(big) - (size_t)k, "#Unlim");
         big[k] = '\0';
         size_t n = vless_parse_sub(big, nodes, 4, &st);
-        /* Важна не круглая цифра, а сторона границы: ссылка ЗАВЕДОМО длиннее прежних
-         * 2048 байт — то есть проверяется тот самый случай, на котором узел пропадал. */
-        check_n("постквантовая ссылка: длиннее прежнего предела", 1, k > 2048);
-        check_n("постквантовая ссылка: узел взят", 1, (long)n);
-        check_n("постквантовая ссылка: непригодных нет", 0, (long)st.skipped);
-        check("постквантовая ссылка: имя на месте", "Unlim", nodes[0].name);
-        check("постквантовая ссылка: адрес на месте", "150.241.72.190", nodes[0].host);
+        /* The link must be longer than the old 2048-byte limit, which dropped such nodes. */
+        check_n("pq link: longer than the old 2048-byte limit", 1, k > 2048);
+        check_n("pq link: node taken", 1, (long)n);
+        check_n("pq link: nothing skipped", 0, (long)st.skipped);
+        check("pq link: name intact", "Unlim", nodes[0].name);
+        check("pq link: address intact", "150.241.72.190", nodes[0].host);
     }
 
-    /* ТА ЖЕ ВЕТКА, НО ССЫЛКА ЧУЖОГО ПРОТОКОЛА — и вот она исчезала бесследно.
-     *
-     * Короткая ссылка hy2/ss/trojan считается (st->foreign), потому что заголовок sub.c
-     * обещает объяснить расхождение «26 узлов в подписке, 17 у steer» числом. Длиннее
-     * буфера — не считалась нигде: ветка длины называет причину только для vless://, а
-     * чужую отбрасывала молча. То есть арифметика этого файла (usable + skipped + foreign)
-     * не сходилась ровно там, где текст подписки самый неожиданный, — а именно от такого
-     * текста стенд и заведён. */
+    /* The same branch with a link of another protocol: a long foreign link is counted in
+     * foreign like a short one, or usable + skipped + foreign would not add up. */
     {
         struct vless_node nodes[4];
         struct vless_sub_stats st;
@@ -458,23 +418,18 @@ int main(void) {
         memset(big + k, 'y', 9000);
         big[k + 9000] = '\0';
         size_t n = vless_parse_sub(big, nodes, 4, &st);
-        check_n("длинная чужая ссылка: узел vless взят", 1, (long)n);
-        check_n("длинная чужая ссылка: учтена как чужая", 1, (long)st.foreign);
-        check_n("длинная чужая ссылка: непригодных vless нет", 0, (long)st.skipped);
-        check_n("длинная чужая ссылка: сумма сходится", 2,
+        check_n("long foreign link: vless node taken", 1, (long)n);
+        check_n("long foreign link: counted as foreign", 1, (long)st.foreign);
+        check_n("long foreign link: no vless link skipped", 0, (long)st.skipped);
+        check_n("long foreign link: counters add up", 2,
                 (long)(n + st.skipped + st.foreign));
     }
 
-    /* ---- причины непригодности: сгруппированы и сходятся (splicicd#16) -----
+    /* ---- skip reasons: grouped, and they add up --------------------------------
      *
-     * Движок знал причину и не говорил её: skip_reason читал только этот стенд, а
-     * cmd_vless_nodes печатал «пригодно 0, пропущено 26». Человек с подпиской из
-     * tls-узлов делал единственный возможный вывод — «не подключается».
-     *
-     * Проверяется не наличие поля, а два свойства, на которых оно живёт: причины
-     * СХОДЯТСЯ (сумма count равна skipped — иначе часть узлов пропала бы уже в
-     * объяснении) и СХЛОПЫВАЮТСЯ по тексту (три tls-узла без имени — одна строка со
-     * счётчиком, а не три одинаковых). */
+     * Two properties: the counts add up (their sum equals skipped, so no node is lost in the
+     * explanation), and equal reasons collapse into one line with a count (three tls nodes
+     * without sni give one line, not three). */
     {
         struct vless_node nodes[16];
         struct vless_sub_stats st;
@@ -486,35 +441,33 @@ int main(void) {
             "vless://e@[2001:db8::1]:443?security=none#IPv6\n"
             "vless://f@6.6.6.6:443?security=reality&pbk=K&sni=x.com#Годный\n";
         size_t n = vless_parse_sub(sub, nodes, 16, &st);
-        check_n("причины: пригоден один узел", 1, (long)n);
-        check_n("причины: непригодных пять", 5, (long)st.skipped);
-        check_n("причины: разных причин три", 3, (long)st.reasons_n);
-        check_n("причины: ничего не потерялось", 0, (long)st.reasons_dropped);
+        check_n("reasons: one node usable", 1, (long)n);
+        check_n("reasons: five skipped", 5, (long)st.skipped);
+        check_n("reasons: three distinct reasons", 3, (long)st.reasons_n);
+        check_n("reasons: none dropped", 0, (long)st.reasons_dropped);
 
         size_t sum = 0;
         for (size_t i = 0; i < st.reasons_n; i++) sum += st.reasons[i].count;
-        check_n("причины: сумма сходится со skipped", (long)st.skipped, (long)sum);
+        check_n("reasons: counts add up to skipped", (long)st.skipped, (long)sum);
 
-        /* Порядок — по первому появлению, поэтому он предсказуем и его можно
-         * проверять: иначе стенд молчал бы о том, что причины перепутались. */
-        check("первая причина: tls без имени",
-              "tls по адресу без sni: нечем сверить",
+        /* Reasons keep the order of first appearance, so the order can be checked. */
+        check("first reason: tls to an IP without sni",
+              "tls to an IP address without sni: nothing to verify",
               st.reasons[0].reason);
-        check_n("tls схлопнут в одну строку со счётчиком 3", 3, (long)st.reasons[0].count);
-        check("tls: пример — имя первого узла", "Первый", st.reasons[0].example);
-        check("вторая причина: транспорт kcp", "транспорт kcp не поддержан",
+        check_n("tls reasons collapsed into one line with count 3", 3, (long)st.reasons[0].count);
+        check("tls: example is the first node's name", "Первый", st.reasons[0].example);
+        check("second reason: transport kcp", "transport kcp is not supported",
               st.reasons[1].reason);
-        check("kcp: пример — имя своего узла", "Вебсокет", st.reasons[1].example);
-        /* IPv6-литерал разбор не осиливает и до проверки пригодности не доходит —
-         * причину называет уже сам обход подписки, иначе ссылка снова стала бы
-         * «пропущено на единицу больше» без объяснения. */
-        check("третья причина: ссылка не разобрана", "ссылка не разобрана",
+        check("kcp: example is its own node's name", "Вебсокет", st.reasons[1].example);
+        /* The IPv6 literal does not parse and never reaches the usability check, so the
+         * subscription loop names the reason itself; otherwise it would be one more skip
+         * without an explanation. */
+        check("third reason: link cannot be parsed", "cannot parse the link",
               st.reasons[2].reason);
     }
 
-    /* Причин больше, чем ведёр: девятая обязана попасть в reasons_dropped, а не
-     * потеряться. Сумма count плюс dropped по-прежнему равна skipped — на этом
-     * свойстве держится доверие к числу «пропущено N». */
+    /* More reasons than slots: the ninth goes to reasons_dropped, and the counts plus dropped
+     * still equal skipped. */
     {
         struct vless_node nodes[16];
         struct vless_sub_stats st;
@@ -524,27 +477,23 @@ int main(void) {
             off += (size_t)snprintf(sub + off, sizeof(sub) - off,
                                     "vless://u@h%d:443?security=s%d#n%d\n", i, i, i);
         size_t n = vless_parse_sub(sub, nodes, 16, &st);
-        check_n("переполнение: пригодных нет", 0, (long)n);
-        check_n("переполнение: непригодных девять", 9, (long)st.skipped);
-        check_n("переполнение: причин влезло восемь", VLESS_SKIP_REASONS,
-                (long)st.reasons_n);
-        check_n("переполнение: девятая учтена отдельно", 1, (long)st.reasons_dropped);
+        check_n("overflow: no node usable", 0, (long)n);
+        check_n("overflow: nine skipped", 9, (long)st.skipped);
+        check_n("overflow: eight reasons fit", 8, (long)st.reasons_n);
+        check_n("overflow: ninth counted as dropped", 1, (long)st.reasons_dropped);
         size_t sum = st.reasons_dropped;
         for (size_t i = 0; i < st.reasons_n; i++) sum += st.reasons[i].count;
-        check_n("переполнение: сумма всё равно сходится", (long)st.skipped, (long)sum);
+        check_n("overflow: counts still add up", (long)st.skipped, (long)sum);
     }
 
-    /* ---- идентификатор пользователя: правило XRAY, а не «строгий hex» ------
+    /* ---- user id: Xray's rule, not strict hex ----------------------------------
      *
-     * Панели выдают узлы, у которых id — короткое имя вроде «TMG_74317ba5f91», и это
-     * законный VLESS: Xray в common/uuid/uuid.go смотрит на ДЛИНУ строки. 32-36 знаков
-     * разбираются как шестнадцатеричный UUID (дефисы необязательны), 1-30 знаков —
-     * ВЫВОДЯТСЯ: sha1(16 нулевых байт || строка), первые 16 байт, версия 5 и вариант
-     * в байтах 6 и 8. Ровно 31, длиннее 36 и пустая строка — отказ.
-     *
-     * До правки движок требовал строгий hex, и такой узел проходил проверку пригодности
-     * (то есть попадал в кандидаты и тратил попытки сторожа), а падал молча уже на
-     * подключении: «UUID неразборчив» в пробе и conn_drop без причины в туннеле. */
+     * Panels serve ids like "TMG_74317ba5f91", and that is valid VLESS: Xray
+     * (common/uuid/uuid.go) decides by length. 32 to 36 characters parse as a hex UUID
+     * (dashes optional); 1 to 30 are derived: sha1(16 zero bytes || id), the first 16 bytes,
+     * version 5 and the variant set in bytes 6 and 8. Exactly 31, more than 36, or empty is
+     * refused. The usability check and the UUID parser must agree, or a node is taken and
+     * then fails at connect without a reason. */
     {
         struct vless_node n;
         int rc = vless_parse_url(
@@ -552,53 +501,50 @@ int main(void) {
             "&path=%2FdRh-l74-MZE3z&host=amazon.com&mode=auto&security=reality"
             "&fp=firefox&pbk=KEY&sni=amazon.com&sid=9392&spx=%2F"
             "#TMG_74317ba5f91-%D0%93%D0%B5%D1%80%D0%BC%D0%B0%D0%BD%D0%B8%D1%8F", &n);
-        check_n("ссылка панели с коротким id: узел пригоден", 0, rc);
-        check("ссылка панели: id взят как есть", "TMG_74317ba5f91", n.uuid);
+        check_n("panel link with a short id: node usable", 0, rc);
+        check("panel link: id kept as is", "TMG_74317ba5f91", n.uuid);
 
         unsigned char u[16] = { 0 };
-        check_n("короткий id разобран", 0, vless_uuid_parse(n.uuid, u));
-        /* Вектор посчитан независимо от этого кода — питоном по алгоритму Xray. */
-        check("короткий id даёт UUID версии 5",
+        check_n("short id parses", 0, vless_uuid_parse(n.uuid, u));
+        /* The vector was computed independently, in Python, by Xray's algorithm. */
+        check("short id gives a version 5 UUID",
               "dd4748e6-1f48-5b36-bbc6-656b42ccfd75", uuid_str(u));
     }
 
-    /* SHA-1 прибит к опубликованному вектору. Реализация в vless_proto.c своя (причины —
-     * в комментарии там), и без этой проверки
-     * ошибка в ней выглядела бы как «сервер не признаёт пользователя»: 16 байт уходят
-     * не те, а сказать об этом некому. */
+    /* SHA-1 is pinned to the published NIST vector. vless_proto.c has its own implementation,
+     * and an error in it would only show as a server that rejects the user. */
     {
         unsigned char d[20];
         char hex[41];
-        check_n("sha1: сообщение длиной с блок отвергнуто", -1,
+        check_n("sha1: message too long for one block refused", -1,
                 sha1_short((const unsigned char *)"", 56, d));
-        check_n("sha1(\"abc\") посчитан", 0, sha1_short((const unsigned char *)"abc", 3, d));
+        check_n("sha1(\"abc\") computed", 0, sha1_short((const unsigned char *)"abc", 3, d));
         for (int i = 0; i < 20; i++) snprintf(hex + 2 * i, 3, "%02x", d[i]);
-        check("sha1(\"abc\") — вектор NIST",
+        check("sha1(\"abc\") matches the NIST vector",
               "a9993e364706816aba3e25717850c26c9cd0d89d", hex);
     }
 
-    /* Обычный UUID: с дефисами и без — одни и те же 16 байт. Оба написания встречаются
-     * в подписках, и разойтись они не имеют права. */
+    /* A UUID with and without dashes gives the same 16 bytes; subscriptions use both. */
     {
         unsigned char a[16] = { 0 }, b[16] = { 0 };
-        check_n("UUID 36 знаков с дефисами разобран", 0,
+        check_n("UUID of 36 characters with dashes parses", 0,
                 vless_uuid_parse("11111111-2222-3333-4444-555555555555", a));
-        check_n("UUID 32 знака без дефисов разобран", 0,
+        check_n("UUID of 32 characters without dashes parses", 0,
                 vless_uuid_parse("11111111222233334444555555555555", b));
-        check("UUID с дефисами: те же байты", "11111111-2222-3333-4444-555555555555",
+        check("UUID with dashes: expected bytes", "11111111-2222-3333-4444-555555555555",
               uuid_str(a));
-        check_n("UUID без дефисов даёт то же", 0, memcmp(a, b, 16));
-        /* Заглавные знаки Xray принимает (hex.Decode), значит принимаем и мы. */
+        check_n("UUID without dashes gives the same bytes", 0, memcmp(a, b, 16));
+        /* Xray accepts uppercase (hex.Decode), so this parser must too. */
         unsigned char c[16] = { 0 };
-        check_n("UUID заглавными разобран", 0,
+        check_n("uppercase UUID parses", 0,
                 vless_uuid_parse("AABBCCDD-EEFF-0011-2233-445566778899", c));
-        check("UUID заглавными: байты те же", "aabbccdd-eeff-0011-2233-445566778899",
+        check("uppercase UUID: expected bytes", "aabbccdd-eeff-0011-2233-445566778899",
               uuid_str(c));
     }
 
-    /* Границы длины — то, из-за чего правило нельзя писать как «сначала hex, потом
-     * вывод»: 32 и 36 разбираются, 30 выводится, 31 и 37 отвергаются, и всё это
-     * решается ДЛИНОЙ строки, а не тем, похожа ли она на шестнадцатеричную. */
+    /* Length bounds. The rule cannot be "try hex, else derive": 32 and 36 parse, 30 is
+     * derived, 31 and 37 are refused, all decided by length, not by whether the string looks
+     * like hex. */
     {
         unsigned char u[16] = { 0 };
         char s30[31], s31[32], s37[38];
@@ -606,81 +552,75 @@ int main(void) {
         memset(s31, 'a', 31); s31[31] = '\0';
         memset(s37, 'a', 37); s37[37] = '\0';
 
-        check_n("30 знаков: форма — вывод", VLESS_UUID_DERIVED, vless_uuid_form(s30));
-        check_n("30 знаков: UUID выведен", 0, vless_uuid_parse(s30, u));
-        /* Вектор посчитан питоном по алгоритму Xray, а не этим кодом. */
-        check("30 знаков: вывод совпал", "d20a3bd4-9d58-52e0-8caa-820ca42d1ad0",
+        check_n("30 characters: form is derived", VLESS_UUID_DERIVED, vless_uuid_form(s30));
+        check_n("30 characters: UUID derived", 0, vless_uuid_parse(s30, u));
+        /* The vector was computed in Python by Xray's algorithm, not by this code. */
+        check("30 characters: derived UUID matches", "d20a3bd4-9d58-52e0-8caa-820ca42d1ad0",
               uuid_str(u));
 
-        check_n("31 знак: форма — щель", VLESS_UUID_GAP, vless_uuid_form(s31));
-        check_n("31 знак: разбора нет", -1, vless_uuid_parse(s31, u));
+        check_n("31 characters: form is the gap", VLESS_UUID_GAP, vless_uuid_form(s31));
+        check_n("31 characters: does not parse", -1, vless_uuid_parse(s31, u));
 
-        check_n("37 знаков: форма — слишком длинно", VLESS_UUID_TOOLONG,
+        check_n("37 characters: form is too long", VLESS_UUID_TOOLONG,
                 vless_uuid_form(s37));
-        check_n("37 знаков: разбора нет", -1, vless_uuid_parse(s37, u));
+        check_n("37 characters: does not parse", -1, vless_uuid_parse(s37, u));
 
-        check_n("32 знака hex: форма — UUID", VLESS_UUID_HEX,
+        check_n("32 hex characters: form is UUID", VLESS_UUID_HEX,
                 vless_uuid_form("0123456789abcdef0123456789abcdef"));
-        check_n("36 знаков с дефисами: форма — UUID", VLESS_UUID_HEX,
+        check_n("36 characters with dashes: form is UUID", VLESS_UUID_HEX,
                 vless_uuid_form("01234567-89ab-cdef-0123-456789abcdef"));
 
-        check_n("пусто: форма — пусто", VLESS_UUID_EMPTY, vless_uuid_form(""));
-        check_n("пусто: разбора нет", -1, vless_uuid_parse("", u));
+        check_n("empty: form is empty", VLESS_UUID_EMPTY, vless_uuid_form(""));
+        check_n("empty: does not parse", -1, vless_uuid_parse("", u));
 
-        /* Длина как у UUID, но знак посторонний: у Xray это ошибка hex.Decode, и
-         * коротким именем такая строка стать уже не может — она слишком длинная. */
-        check_n("32 знака с посторонним: форма — не hex", VLESS_UUID_NOTHEX,
+        /* UUID length with a non-hex character: a hex.Decode error in Xray, and too long to
+         * be derived instead. */
+        check_n("32 characters with a non-hex one: form is not hex", VLESS_UUID_NOTHEX,
                 vless_uuid_form("0123456789abcdef0123456789abcdeZ"));
-        check_n("32 знака с посторонним: разбора нет", -1,
+        check_n("32 characters with a non-hex one: does not parse", -1,
                 vless_uuid_parse("0123456789abcdef0123456789abcdeZ", u));
-        /* Дефис допускается ТОЛЬКО между группами: внутри группы это посторонний знак. */
-        check_n("дефис внутри группы: не hex", VLESS_UUID_NOTHEX,
+        /* A dash is allowed only between groups; inside a group it is a non-hex character. */
+        check_n("dash inside a group: not hex", VLESS_UUID_NOTHEX,
                 vless_uuid_form("0123-456789ab-cdef-0123-456789abcdef"));
     }
 
-    /* Длина 31 — щель между двумя формами: для вывода слишком длинно, для UUID коротко.
-     * Знаки при этом шестнадцатеричные, то есть отказ идёт именно по ДЛИНЕ, как у Xray. */
+    /* Length 31 falls between the two forms: too long to derive, too short for a UUID. The
+     * characters are hex, so the refusal is by length, as in Xray. */
     {
         struct vless_node n;
-        check_n("id из 31 знака: узел пропущен", 1,
+        check_n("id of 31 characters: node skipped", 1,
                 vless_parse_url("vless://0123456789abcdef0123456789abcde@h:443"
                                 "?security=none#x", &n));
-        check("id из 31 знака: причина названа", "идентификатор: 31 знак, нужен UUID",
+        check("id of 31 characters: reason given", "id: 31 characters, need a UUID",
               n.skip_reason);
     }
 
-    /* Остальные непригодные формы — каждая со своей причиной: причина уезжает в
-     * интерфейс, и «узел пропущен» без неё уже разбиралось в splicicd#16. */
+    /* The other unusable forms, each with its own reason. */
     {
         struct vless_node n;
         char url[128];
-        check_n("пустой id: узел пропущен", 1,
+        check_n("empty id: node skipped", 1,
                 vless_parse_url("vless://@h:443?security=none#x", &n));
-        check("пустой id: причина названа", "идентификатор пуст", n.skip_reason);
+        check("empty id: reason given", "id is empty", n.skip_reason);
 
         char long_id[40];
         memset(long_id, 'a', 37); long_id[37] = '\0';
         snprintf(url, sizeof(url), "vless://%s@h:443?security=none#x", long_id);
-        check_n("id длиннее UUID: узел пропущен", 1, vless_parse_url(url, &n));
-        check("id длиннее UUID: причина названа", "идентификатор длиннее UUID",
+        check_n("id longer than a UUID: node skipped", 1, vless_parse_url(url, &n));
+        check("id longer than a UUID: reason given", "id longer than a UUID",
               n.skip_reason);
 
-        check_n("id длины UUID с посторонним знаком: пропущен", 1,
+        check_n("id of UUID length with a non-hex character: skipped", 1,
                 vless_parse_url("vless://0123456789abcdef0123456789abcdeZ@h:443"
                                 "?security=none#x", &n));
-        check("id с посторонним знаком: причина названа", "UUID с недопустимым знаком",
+        check("id with a non-hex character: reason given", "UUID with an invalid character",
               n.skip_reason);
     }
 
-    /* Заглушка панели вместо подписки. Панели, привязывающие подписку к устройствам,
-     * отвечают клиенту без идентификатора не отказом, а законными ссылками в никуда —
-     * `0.0.0.0:1`, а сообщение человеку кладут в ИМЯ узла. Проверено на живой подписке:
-     * без заголовка x-hwid приезжает ровно это.
-     *
-     * Свойство, которое здесь стережётся: такой узел непригоден, и причина ДОНОСИТ
-     * сообщение панели — примером в счётчике причин стоит имя узла, то есть человек читает
-     * «0.0.0.0: отвечать некому — например „📱 Неправильный клиент“», а не «узлов два, туннель
-     * не работает». */
+    /* A panel stub instead of a subscription. Panels that bind a subscription to devices
+     * answer a client without a device id (no x-hwid header) with valid links to `0.0.0.0:1`
+     * and put the message for the user in the node name. Such a node is unusable, and the
+     * example of its reason carries the panel's message, so the user sees why. */
     {
         struct vless_node nodes[16];
         struct vless_sub_stats st;
@@ -692,34 +632,40 @@ int main(void) {
             "vless://00000000-0000-0000-0000-000000000000@0.0.0.0:1"
             "?encryption=none&type=tcp&security=none#Happ\n";
         size_t n = vless_parse_sub(stub, nodes, 16, &st);
-        check_n("заглушка панели: пригодных узлов нет", 0, (long)n);
-        check_n("заглушка панели: оба узла сосчитаны", 2, (long)st.skipped);
-        check("заглушка панели: причина называет адрес",
-              "0.0.0.0: отвечать некому", st.reasons[0].reason);
-        check("заглушка панели: примером — сообщение панели из имени узла",
+        check_n("panel stub: no node usable", 0, (long)n);
+        check_n("panel stub: both nodes counted", 2, (long)st.skipped);
+        check("panel stub: reason names the address",
+              "0.0.0.0: nobody to answer", st.reasons[0].reason);
+        check("panel stub: example is the panel's message from the node name",
               "📱 Неправильный клиент", st.reasons[0].example);
-        check_n("заглушка панели: сумма сходится", 2, (long)(n + st.skipped + st.foreign));
+        check_n("panel stub: counters add up", 2, (long)(n + st.skipped + st.foreign));
     }
 
-    /* Обратное свойство: адреса, у которых собеседник бывает, остаются пригодными. Частная
-     * сеть — законная настройка (узел внутри своей сети или поверх второго туннеля), и
-     * отбрасывать её значило бы решить за человека. */
+    /* The other side: addresses that can answer stay usable. A private network is a valid
+     * setup (a node inside the LAN or behind another tunnel). */
     {
         struct vless_node n;
-        check_n("узел в частной сети пригоден", 0,
+        check_n("node in a private network is usable", 0,
                 vless_parse_url("vless://11111111-2222-3333-4444-555555555555@10.8.0.1:443"
                                 "?security=none#Свой", &n));
-        check_n("петля непригодна", 1,
+        check_n("loopback node is unusable", 1,
                 vless_parse_url("vless://11111111-2222-3333-4444-555555555555@127.0.0.1:443"
                                 "?security=none#Петля", &n));
-        check_n("адрес, начинающийся на 127 но не петля, пригоден", 0,
+        /* All of 127.0.0.0/8: stubs use 127.0.0.53 too. */
+        check_n("loopback node other than 127.0.0.1 is unusable", 1,
+                vless_parse_url("vless://11111111-2222-3333-4444-555555555555@127.0.0.53:443"
+                                "?security=none#Петля", &n));
+        check_n("host starting with 127 but not loopback is usable", 0,
                 vless_parse_url("vless://11111111-2222-3333-4444-555555555555@127a.example.com:443"
                                 "?security=none#Имя", &n));
+        /* "127." followed by a name: only an address of digits and dots is loopback. */
+        check_n("name whose first label is 127 is usable", 0,
+                vless_parse_url("vless://11111111-2222-3333-4444-555555555555"
+                                "@127.node.example.com:443?security=none#Имя", &n));
     }
 
-    /* Подписка целиком: пригодные узлы с обоими видами id взяты, непригодный по id
-     * учтён и объяснён. Арифметика та же, на которой стоит весь этот стенд — ни одна
-     * ссылка не имеет права исчезнуть, не попав ни в один счётчик. */
+    /* A whole subscription: nodes with both kinds of id are taken, the one with a bad id is
+     * counted and explained, and the counters add up. */
     {
         struct vless_node nodes[16];
         struct vless_sub_stats st;
@@ -730,23 +676,22 @@ int main(void) {
             "vless://0123456789abcdef0123456789abcde@9.9.9.9:443"
             "?security=reality&pbk=K&sni=x.com#Щель\n";
         size_t n = vless_parse_sub(sub, nodes, 16, &st);
-        check_n("подписка: пригодны оба вида id", 2, (long)n);
-        check("подписка: короткий id сохранён", "TMG_74317ba5f91", nodes[0].uuid);
-        check_n("подписка: непригоден один", 1, (long)st.skipped);
-        check("подписка: причина непригодного названа",
-              "идентификатор: 31 знак, нужен UUID", st.reasons[0].reason);
-        check("подписка: пример — имя своего узла", "Щель", st.reasons[0].example);
-        check_n("подписка: сумма сходится", 3, (long)(n + st.skipped + st.foreign));
+        check_n("subscription: both kinds of id usable", 2, (long)n);
+        check("subscription: short id kept", "TMG_74317ba5f91", nodes[0].uuid);
+        check_n("subscription: one skipped", 1, (long)st.skipped);
+        check("subscription: reason for the skipped node given",
+              "id: 31 characters, need a UUID", st.reasons[0].reason);
+        check("subscription: example is its node's name", "Щель", st.reasons[0].example);
+        check_n("subscription: counters add up", 3, (long)(n + st.skipped + st.foreign));
     }
 
     {
-        /* ---- подписка конфигом Xray ----------------------------------------------
+        /* ---- subscription as an Xray config ------------------------------------
          *
-         * Форма взята с ЖИВОЙ панели, а не придумана: она выбирает формат по User-Agent, и
-         * незнакомому клиенту списка ссылок не даёт вовсе. Проверяется то, что от разбора
-         * действительно нужно: узел собирается из вложенных объектов целиком, чужие
-         * исходящие (freedom, blackhole) не считаются узлами, а порядок ключей значения
-         * не имеет — protocol в JSON законно стоит и после settings. */
+         * The shape comes from a real panel, which picks the format by User-Agent and gives an
+         * unknown client no link list at all. Checked: a node is assembled from the nested
+         * objects, other outbounds (freedom, blackhole) are not nodes, and key order does not
+         * matter ("protocol" may come after "settings"). */
         struct vless_node nodes[16];
         struct vless_sub_stats st;
         const char *cfg =
@@ -771,25 +716,27 @@ int main(void) {
             "   \"protocol\":\"vless\",\"tag\":\"de01_grpc\"}"
             " ]}]";
         size_t n = vless_parse_sub(cfg, nodes, 16, &st);
-        check_n("конфиг Xray: взято узлов", 2, (long)n);
-        check("конфиг Xray: имя из tag", "ch01_tcp", nodes[0].name);
-        check("конфиг Xray: адрес", "179.237.82.105", nodes[0].host);
-        check_n("конфиг Xray: порт", 443, (long)nodes[0].port);
-        check("конфиг Xray: транспорт", "tcp", nodes[0].type);
-        check("конфиг Xray: security", "reality", nodes[0].security);
-        check("конфиг Xray: sni из realitySettings", "ch01.example.org", nodes[0].sni);
-        check("конфиг Xray: pbk", "PBK123", nodes[0].pbk);
-        check("конфиг Xray: sid", "a1b2", nodes[0].sid);
-        check("конфиг Xray: отпечаток", "chrome", nodes[0].fp);
-        check("конфиг Xray: flow", "xtls-rprx-vision", nodes[0].flow);
-        check("конфиг Xray: второй конфиг тоже прочитан", "de01_grpc", nodes[1].name);
-        check("конфиг Xray: grpc serviceName", "svc", nodes[1].service);
-        check_n("конфиг Xray: порт второго", 2087, (long)nodes[1].port);
-        check_n("конфиг Xray: freedom и blackhole не узлы", 0, (long)st.skipped);
-        check_n("конфиг Xray: чужих протоколов не считаем", 0, (long)st.foreign);
+        check_n("Xray config: nodes taken", 2, (long)n);
+        check("Xray config: name from tag", "ch01_tcp", nodes[0].name);
+        check("Xray config: address", "179.237.82.105", nodes[0].host);
+        check_n("Xray config: port", 443, (long)nodes[0].port);
+        check("Xray config: transport", "tcp", nodes[0].type);
+        check("Xray config: security", "reality", nodes[0].security);
+        check("Xray config: sni from realitySettings", "ch01.example.org", nodes[0].sni);
+        check("Xray config: pbk", "PBK123", nodes[0].pbk);
+        check("Xray config: sid", "a1b2", nodes[0].sid);
+        check("Xray config: fingerprint", "chrome", nodes[0].fp);
+        check("Xray config: flow", "xtls-rprx-vision", nodes[0].flow);
+        check("Xray config: second config read too", "de01_grpc", nodes[1].name);
+        check("Xray config: grpc serviceName", "svc", nodes[1].service);
+        /* tcp above is also the default: network is read only if grpc is. */
+        check("Xray config: transport of the second node", "grpc", nodes[1].type);
+        check_n("Xray config: port of the second node", 2087, (long)nodes[1].port);
+        check_n("Xray config: freedom and blackhole not counted as skipped", 0, (long)st.skipped);
+        check_n("Xray config: freedom and blackhole not counted as foreign", 0, (long)st.foreign);
     }
     {
-        /* Один конфиг, а не массив: панели отдают и так. */
+        /* A single config, not an array: panels serve this too. */
         struct vless_node nodes[16];
         struct vless_sub_stats st;
         const char *cfg =
@@ -799,37 +746,36 @@ int main(void) {
             "  \"streamSettings\":{\"network\":\"tcp\",\"security\":\"reality\","
             "    \"realitySettings\":{\"serverName\":\"a.example\",\"publicKey\":\"P\"}}}]}";
         size_t n = vless_parse_sub(cfg, nodes, 16, &st);
-        check_n("конфиг Xray: одиночный объект", 1, (long)n);
-        check("конфиг Xray: одиночный — имя", "one", nodes[0].name);
+        check_n("Xray config: single object", 1, (long)n);
+        check("Xray config: single object, name", "one", nodes[0].name);
     }
     {
-        /* ---- длина набивки xhttp объявляется сервером ------------------------------
+        /* ---- xhttp padding length comes from the server ------------------------
          *
-         * Сервер xhttp ПРОВЕРЯЕТ длину x_padding и на чужую отвечает 400. Диапазон приезжает
-         * в ссылке полем `xPaddingBytes` внутри `extra`. Пока мы его не читали, наши жёсткие
-         * 150…660 не попадали в объявленные продавцом «50-150», и ВСЕ его узлы xhttp
-         * отвечали отказом — при исправных TLS и Reality. Снято на живой подписке. */
+         * An xhttp server checks the length of x_padding and answers 400 to one outside its
+         * range. The range arrives in the link as `xPaddingBytes` inside `extra`; a client
+         * that ignores it fails on every such node although TLS and Reality work. */
         struct vless_node n;
         char url[512];
         const char *base = "vless://u@h:443?type=xhttp&security=reality&pbk=K&sni=a.com&path=%2Fx";
 
         snprintf(url, sizeof(url), "%s#x", base);
-        check_n("без extra: диапазон не объявлен", 0, (int)(vless_parse_url(url, &n), n.pad_to));
+        check_n("no extra: no range set", 0, (int)(vless_parse_url(url, &n), n.pad_to));
 
-        /* Форма ровно та, что приезжает от продавца: JSON в процентной форме. */
+        /* The form servers use: percent-encoded JSON. */
         snprintf(url, sizeof(url),
                  "%s&extra=%%7B%%22xmux%%22%%3A%%7B%%22maxConcurrency%%22%%3A%%2216-32%%22%%7D%%2C"
                  "%%22xPaddingBytes%%22%%3A%%2250-150%%22%%7D#x", base);
         vless_parse_url(url, &n);
-        check_n("extra: нижняя граница", 50, (int)n.pad_from);
-        check_n("extra: верхняя граница", 150, (int)n.pad_to);
+        check_n("extra: lower bound", 50, (int)n.pad_from);
+        check_n("extra: upper bound", 150, (int)n.pad_to);
 
-        /* Длинный extra: продавец кладёт перед xPaddingBytes заголовки на сотни знаков, и в
-         * процентной форме это втрое длиннее. Буфер в 256 байт обрезал JSON до раскодирования,
-         * и диапазон терялся молча. */
+        /* A long extra: headers before xPaddingBytes, about 1500 bytes once percent-encoded,
+         * more than a buffer of 512 or 1024 bytes holds. The JSON must not be cut before
+         * decoding, or the range is lost. */
         {
             char big[2048] = "%7B%22headers%22%3A%7B";
-            for (int i = 0; i < 12; i++) {
+            for (int i = 0; i < 40; i++) {
                 char kv[96];
                 snprintf(kv, sizeof(kv), "%s%%22h%d%%22%%3A%%22" "vvvvvvvvvvvvvvvv" "%%22",
                          i ? "%2C" : "", i);
@@ -840,70 +786,68 @@ int main(void) {
             snprintf(url2, sizeof(url2), "%s&extra=%s#x", base, big);
             memset(&n, 0, sizeof(n));
             vless_parse_url(url2, &n);
-            check_n("длинный extra: нижняя граница доехала", 50, (int)n.pad_from);
-            check_n("длинный extra: верхняя граница доехала", 150, (int)n.pad_to);
+            check_n("long extra: lower bound read", 50, (int)n.pad_from);
+            check_n("long extra: upper bound read", 150, (int)n.pad_to);
         }
 
-        /* Одно число — тоже законная форма: диапазон из самого себя. */
+        /* A single number is valid too: a range of one value. */
         snprintf(url, sizeof(url), "%s&extra=%%7B%%22xPaddingBytes%%22%%3A512%%7D#x", base);
         vless_parse_url(url, &n);
-        check_n("extra: одно число — нижняя", 512, (int)n.pad_from);
-        check_n("extra: одно число — верхняя", 512, (int)n.pad_to);
+        check_n("extra: single number, lower bound", 512, (int)n.pad_from);
+        check_n("extra: single number, upper bound", 512, (int)n.pad_to);
 
-        /* Мусор не портит узел и не выдумывает границ: дальше работает умолчание. */
+        /* Garbage keeps the node usable and sets no bounds; the default applies. */
         snprintf(url, sizeof(url), "%s&extra=%%7B%%22xPaddingBytes%%22%%3A%%22ой%%22%%7D#x", base);
-        check_n("extra: мусор — узел пригоден", 0, vless_parse_url(url, &n));
-        check_n("extra: мусор — границ не выдумали", 0, (int)n.pad_to);
+        check_n("extra: garbage, node usable", 0, vless_parse_url(url, &n));
+        check_n("extra: garbage, no bounds set", 0, (int)n.pad_to);
 
-        /* Перевёрнутый диапазон — тоже мусор: из него нельзя выбрать длину. */
+        /* An inverted range is garbage too: no length can be picked from it. */
         snprintf(url, sizeof(url), "%s&extra=%%7B%%22xPaddingBytes%%22%%3A%%22900-100%%22%%7D#x", base);
         vless_parse_url(url, &n);
-        check_n("extra: перевёрнутый диапазон отвергнут", 0, (int)n.pad_to);
+        check_n("extra: inverted range refused", 0, (int)n.pad_to);
     }
     {
-        /* ---- режимы xhttp -------------------------------------------------------
+        /* ---- xhttp modes -------------------------------------------------------
          *
-         * Пригодность режима решается ЗДЕСЬ, а не при подключении: непригодный узел не
-         * должен попадать в кандидаты и тратить попытки сторожа. Проверяется вся тройка,
-         * которую мы умеем, и отказ на том, чего не умеем. */
+         * Mode support is decided here, not at connect, so an unusable node never becomes a
+         * candidate. Every supported mode is checked, and the refusal of the unsupported one. */
         struct vless_node n;
         const char *base = "vless://u@h:443?type=xhttp&security=reality&pbk=K&sni=a.com"
                            "&path=%2Fx";
         char url[256];
 
         snprintf(url, sizeof(url), "%s#x", base);
-        check_n("xhttp без mode: пригоден", 0, vless_parse_url(url, &n));
+        check_n("xhttp without mode: usable", 0, vless_parse_url(url, &n));
 
         snprintf(url, sizeof(url), "%s&mode=auto#x", base);
-        check_n("xhttp mode=auto: пригоден", 0, vless_parse_url(url, &n));
+        check_n("xhttp mode=auto: usable", 0, vless_parse_url(url, &n));
 
         snprintf(url, sizeof(url), "%s&mode=stream-one#x", base);
-        check_n("xhttp mode=stream-one: пригоден", 0, vless_parse_url(url, &n));
-        check("xhttp mode=stream-one: режим сохранён", "stream-one", n.mode);
+        check_n("xhttp mode=stream-one: usable", 0, vless_parse_url(url, &n));
+        check("xhttp mode=stream-one: mode kept", "stream-one", n.mode);
 
         snprintf(url, sizeof(url), "%s&mode=stream-up#x", base);
-        check_n("xhttp mode=stream-up: пригоден", 0, vless_parse_url(url, &n));
-        check("xhttp mode=stream-up: режим сохранён", "stream-up", n.mode);
+        check_n("xhttp mode=stream-up: usable", 0, vless_parse_url(url, &n));
+        check("xhttp mode=stream-up: mode kept", "stream-up", n.mode);
 
         snprintf(url, sizeof(url), "%s&mode=packet-up#x", base);
-        check_n("xhttp mode=packet-up: пригоден", 0, vless_parse_url(url, &n));
-        check("xhttp mode=packet-up: режим сохранён", "packet-up", n.mode);
+        check_n("xhttp mode=packet-up: usable", 0, vless_parse_url(url, &n));
+        check("xhttp mode=packet-up: mode kept", "packet-up", n.mode);
 
-        /* stream-down — половина связки с отдельным download-сервером, выгрузки в нём нет
-         * вовсе. Отбраковывается с названной причиной, а не молча. */
+        /* stream-down is the half of a split setup with a separate download server and has no
+         * upload at all. It is refused with a reason. */
         snprintf(url, sizeof(url), "%s&mode=stream-down#x", base);
-        check_n("xhttp mode=stream-down: пропущен", 1, vless_parse_url(url, &n));
-        check("xhttp mode=stream-down: причина названа",
-              "xhttp mode=stream-down не поддержан", n.skip_reason);
+        check_n("xhttp mode=stream-down: skipped", 1, vless_parse_url(url, &n));
+        check("xhttp mode=stream-down: reason given",
+              "xhttp mode=stream-down is not supported", n.skip_reason);
     }
     {
-        /* ---- имя из remarks, а не из tag -----------------------------------------
+        /* ---- name from remarks, not from tag -----------------------------------
          *
-         * Форма снята с живой панели (ответ клиенту Happ) и воспроизведена в главном:
-         * remarks стоит ПОСЛЕ outbounds, у обычных узлов tag один на всех — «proxy», а у
-         * конфига с балансировщиком два исходящих с tag'ами, где хвост случаен и меняется
-         * от запроса к запросу. Без remarks список узлов выглядел бы как «proxy, proxy,
-         * proxy» плюс два имени, которые завтра будут другими. */
+         * The shape follows a real panel's answer: remarks comes after outbounds, plain nodes
+         * all have the tag "proxy", and a config with a balancer has two outbounds whose tags
+         * end in a random suffix that changes on every request. Without remarks the list
+         * would read "proxy, proxy, proxy" plus two names that change tomorrow. */
         struct vless_node nodes[16];
         struct vless_sub_stats st;
         const char *cfg =
@@ -935,18 +879,16 @@ int main(void) {
             "     \"realitySettings\":{\"serverName\":\"a.example\",\"publicKey\":\"P4\"}}}],"
             " \"remarks\":\"🇫🇮 Финляндия\"}]";
         size_t n = vless_parse_sub(cfg, nodes, 16, &st);
-        check_n("remarks: взято узлов", 4, (long)n);
-        check("remarks: имя вместо tag «proxy»", "🇩🇪 Германия", nodes[0].name);
-        check("remarks: имя видно, хотя стоит после outbounds", "🇫🇮 Финляндия", nodes[3].name);
-        check("remarks: первый узел конфига без номера", "МОБИЛЬНЫЙ АВТО", nodes[1].name);
-        check("remarks: второй узел того же конфига пронумерован",
+        check_n("remarks: nodes taken", 4, (long)n);
+        check("remarks: name used instead of tag 'proxy'", "🇩🇪 Германия", nodes[0].name);
+        check("remarks: name read although it follows outbounds", "🇫🇮 Финляндия", nodes[3].name);
+        check("remarks: first node of a config has no number", "МОБИЛЬНЫЙ АВТО", nodes[1].name);
+        check("remarks: second node of the same config is numbered",
               "МОБИЛЬНЫЙ АВТО (2)", nodes[2].name);
-        check("remarks: узел под своим адресом", "backup.example.org", nodes[2].host);
+        check("remarks: numbered node keeps its own address", "backup.example.org", nodes[2].host);
     }
     {
-        /* remarks нет — имя остаётся из tag: панели, у которых tag осмысленный, ничего не
-         * теряют. Проверяется отдельно от главного случая, потому что это ровно та граница,
-         * на которой предпросмотр обязан промолчать, а не подставить пустое имя. */
+        /* Empty remarks: the name stays from the tag, never an empty name. */
         struct vless_node nodes[4];
         struct vless_sub_stats st;
         const char *cfg =
@@ -957,12 +899,12 @@ int main(void) {
             "    \"realitySettings\":{\"serverName\":\"a.example\",\"publicKey\":\"P\"}}}],"
             " \"remarks\":\"\"}]";
         size_t n = vless_parse_sub(cfg, nodes, 4, &st);
-        check_n("remarks пустой: узел взят", 1, (long)n);
-        check("remarks пустой: имя осталось из tag", "ch01_tcp", nodes[0].name);
+        check_n("empty remarks: node taken", 1, (long)n);
+        check("empty remarks: name from tag", "ch01_tcp", nodes[0].name);
     }
     {
-        /* Непригодный узел из конфига с remarks объясняется ИМЕНЕМ ИЗ ПАНЕЛИ: человек
-         * ищет в списке панели то слово, которое ему показали, а не «proxy». */
+        /* An unusable node of a config with remarks is reported under the remarks name, the
+         * one the user sees in the panel, not "proxy". */
         struct vless_node nodes[4];
         struct vless_sub_stats st;
         const char *cfg =
@@ -972,14 +914,13 @@ int main(void) {
             "  \"streamSettings\":{\"network\":\"tcp\",\"security\":\"none\"}}],"
             " \"remarks\":\"🇱🇻 Латвия\"}]";
         size_t n = vless_parse_sub(cfg, nodes, 4, &st);
-        check_n("remarks: непригодный не взят", 0, (long)n);
-        check_n("remarks: непригодный посчитан", 1, (long)st.skipped);
-        check("remarks: пример пропуска — имя из панели", "🇱🇻 Латвия", st.reasons[0].example);
+        check_n("remarks: unusable node not taken", 0, (long)n);
+        check_n("remarks: unusable node counted", 1, (long)st.skipped);
+        check("remarks: skip example is the remarks name", "🇱🇻 Латвия", st.reasons[0].example);
     }
     {
-        /* Непригодный узел в конфиге объясняется так же, как непригодная ссылка: правило
-         * пригодности у обоих путей одно (node_usable). Здесь — заглушка панели, которую
-         * она отдаёт клиенту без идентификатора устройства. */
+        /* An unusable node of a config is explained like an unusable link: both paths share
+         * node_usable. Here, the panel stub for a client without a device id. */
         struct vless_node nodes[16];
         struct vless_sub_stats st;
         const char *cfg =
@@ -988,81 +929,90 @@ int main(void) {
             "    \"users\":[{\"id\":\"00000000-0000-0000-0000-000000000000\"}]}]},"
             "  \"streamSettings\":{\"network\":\"tcp\",\"security\":\"none\"}}]}]";
         size_t n = vless_parse_sub(cfg, nodes, 16, &st);
-        check_n("конфиг Xray: заглушка не пригодна", 0, (long)n);
-        check_n("конфиг Xray: заглушка посчитана", 1, (long)st.skipped);
-        check("конфиг Xray: причина заглушки названа",
-              "0.0.0.0: отвечать некому", st.reasons[0].reason);
-        check("конфиг Xray: пример доносит сообщение панели",
+        check_n("Xray config: stub not usable", 0, (long)n);
+        check_n("Xray config: stub counted", 1, (long)st.skipped);
+        check("Xray config: stub reason given",
+              "0.0.0.0: nobody to answer", st.reasons[0].reason);
+        check("Xray config: example carries the panel's message",
               "Неправильный клиент", st.reasons[0].example);
     }
     {
-        /* Форма подписки распознаётся первым знаком, а не поиском «://». У конфига Xray
-         * «://» встречается внутри настроек DNS, и прежнее правило срабатывало случайно. */
+        /* The form is told by the first character. A config with "://" (a DNS URL) would also
+         * pass a search for "://", so this one has none: only the first character keeps it
+         * from being decoded as base64. */
         char dec[256];
-        const char *json = "  [{\"dns\":{\"servers\":[\"https://x/y\"]},\"outbounds\":[]}]";
-        check("форма: конфиг отдаётся как есть", json,
+        const char *json = "  [{\"dns\":{\"servers\":[\"1.1.1.1\"]},\"outbounds\":[]}]";
+        check("form: config without \"://\" returned as is", json,
               vless_sub_text(json, strlen(json), dec, sizeof(dec)));
         const char *links = "vless://a@h:443#n\n";
-        check("форма: список ссылок отдаётся как есть", links,
+        check("form: link list returned as is", links,
               vless_sub_text(links, strlen(links), dec, sizeof(dec)));
-        /* base64 от «vless://a@h:443» */
+        /* base64 of "vless://a@h:443" */
         const char *b64 = "dmxlc3M6Ly9hQGg6NDQz";
         const char *got = vless_sub_text(b64, strlen(b64), dec, sizeof(dec));
-        check("форма: base64 раскодирован", "vless://a@h:443", got);
+        check("form: base64 decoded", "vless://a@h:443", got);
     }
 
-    /* ---- имя узла на границе буфера: UTF-8 не рассекается ------------------ */
+    /* ---- node name at the buffer end: UTF-8 is not split ----------------------- */
     {
-        /* Имя узла — единственное поле, куда подписка кладёт что угодно, и буфер под него
-         * 128 байт. Обрезка шла по байту, а кириллица в UTF-8 занимает два байта на букву:
-         * граница приходилась на середину буквы, и в n->name оставался одинокий ведущий
-         * байт. Дальше это уезжает в JSON статуса (node_json → json_str печатает байты как
-         * есть) и в имя выхода — то есть наружу, потребителям, которые обязаны разбирать
-         * UTF-8. Рассечь можно двумя способами, и стенд проверяет оба:
+        /* A node name can hold anything, and its buffer is 128 bytes. A cut in the middle of a
+         * multi-byte letter leaves a lone lead byte, which goes on to every consumer that must
+         * parse UTF-8. A letter can be split two ways, and both are checked:
          *
-         *   - процентная форма (панели присылают имена именно так): обрезка попадает между
-         *     «%D0» и «%9F», после раскодирования остаётся байт 0xD0 без продолжения;
-         *   - сырые байты UTF-8 во фрагменте — обрезка рассекает букву напрямую.
+         *   - percent form (how panels send names): the cut falls between "%D0" and "%9F",
+         *     and decoding leaves 0xD0 without its continuation;
+         *   - raw UTF-8 bytes in the fragment: the cut splits the letter directly.
          *
-         * Проверяется не длина, а разбираемость: имя обязано остаться целым UTF-8. */
+         * The name must stay valid UTF-8; its length is not checked. */
         struct vless_node n;
         char url[1024];
 
-        /* 70 букв «П» в процентной форме = 420 байт: заведомо больше 128. Префикс из
-         * четырёх букв ASCII ставит границу обрезки ровно за «%D0» — то есть за полным
-         * ведущим байтом, у которого продолжение «%9F» уже не влезло. */
+        /* 70 two-byte letters (D0 9F) percent-encoded are 420 bytes, well over 128. The
+         * four-letter ASCII prefix puts the cut right after a "%D0", whose "%9F" no longer
+         * fits. */
         char pct[512] = {0};
         strcat(pct, "node");
         for (int i = 0; i < 70; i++) strcat(pct, "%D0%9F");
         snprintf(url, sizeof(url),
                  "vless://11111111-2222-3333-4444-555555555555@example.com:8443"
                  "?security=reality&sni=a.example&pbk=k&fp=chrome#%s", pct);
-        check_n("длинное имя: узел разобран", 0, vless_parse_url(url, &n));
-        check_n("длинное имя из процентной формы: UTF-8 цел", 1, utf8_ok(n.name));
+        check_n("long name: node parses", 0, vless_parse_url(url, &n));
+        check_n("long percent-encoded name: UTF-8 intact", 1, utf8_ok(n.name));
 
-        /* Тот же случай сырыми байтами: 70 букв «П» напрямую во фрагменте. */
+        /* The same with raw bytes: 70 letters (D0 9F) directly in the fragment. */
         char raw[512] = {0};
         for (int i = 0; i < 70; i++) strcat(raw, "\xD0\x9F");
         snprintf(url, sizeof(url),
                  "vless://11111111-2222-3333-4444-555555555555@example.com:8443"
                  "?security=reality&sni=a.example&pbk=k&fp=chrome#%s", raw);
-        check_n("длинное имя: узел разобран (сырые байты)", 0, vless_parse_url(url, &n));
-        check_n("длинное имя сырыми байтами: UTF-8 цел", 1, utf8_ok(n.name));
+        check_n("long name: node parses (raw bytes)", 0, vless_parse_url(url, &n));
+        check_n("long raw-byte name: UTF-8 intact", 1, utf8_ok(n.name));
 
-        /* Короткое имя не должно пострадать от правки обрезки. */
+        /* A short name must not be touched by the cut. */
         snprintf(url, sizeof(url),
                  "vless://11111111-2222-3333-4444-555555555555@example.com:8443"
                  "?security=reality&sni=a.example&pbk=k&fp=chrome#%%D0%%A3%%D0%%B7%%D0%%B5%%D0%%BB");
-        check_n("короткое имя: узел разобран", 0, vless_parse_url(url, &n));
-        check("короткое имя не тронуто обрезкой", "Узел", n.name);
+        check_n("short name: node parses", 0, vless_parse_url(url, &n));
+        check("short name not cut", "Узел", n.name);
+
+        /* A cut inside an escape: a prefix of five or six letters leaves "%D" or "%" at the
+         * end, which is dropped rather than shown as text; the 20 whole letters stay. */
+        for (int pre = 5; pre <= 6; pre++) {
+            char cut[512], want[64];
+            snprintf(cut, sizeof(cut), "%.*s", pre, "nodexy");
+            snprintf(want, sizeof(want), "%.*s", pre, "nodexy");
+            for (int i = 0; i < 70; i++) strcat(cut, "%D0%9F");
+            for (int i = 0; i < 20; i++) strcat(want, "\xD0\x9F");
+            snprintf(url, sizeof(url),
+                     "vless://11111111-2222-3333-4444-555555555555@example.com:8443"
+                     "?security=reality&sni=a.example&pbk=k&fp=chrome#%s", cut);
+            vless_parse_url(url, &n);
+            check(pre == 5 ? "long name cut after \"%D\": the fragment dropped"
+                           : "long name cut after \"%\": the fragment dropped", want, n.name);
+        }
     }
 
-    printf("\n%d проверок пройдено", g_pass);
-    if (g_fail) {
-        printf(", %d ПРОВАЛЕНО\n", g_fail);
-        return 1;
-    }
-    /* ---- кривой JSON: разбор возвращается ------------------------------------- */
+    /* ---- malformed JSON: parsing returns ------------------------------------- */
     {
         static const char *const bad[] = {
             "[null]", "[1,{\"outbounds\":[]}]", "{\"outbounds\":[null]}", "{\"outbounds\":[}",
@@ -1075,58 +1025,59 @@ int main(void) {
         for (size_t i = 0; i < sizeof(bad) / sizeof(*bad); i++) {
             struct vless_node nodes[4];
             struct vless_sub_stats st;
+            g_json_case = i;
             alarm(2);
             size_t n = vless_parse_sub(bad[i], nodes, 4, &st);
             alarm(0);
             char what[96];
-            snprintf(what, sizeof(what), "кривой JSON %zu: разбор вернулся", i);
+            snprintf(what, sizeof(what), "malformed JSON %zu: parsing returned", i);
             check_n(what, 1, 1);
-            if (i == 6) check_n("порт строкой в конфиге читается", 443, (long)(n ? nodes[0].port : 0));
+            if (i == 6) check_n("port given as a string is read", 443, (long)(n ? nodes[0].port : 0));
         }
     }
-    /* ---- конфиг Xray: умолчание транспорта и имя raw -------------------------- */
+    /* ---- Xray config: default transport and network raw ---------------------- */
     {
         struct vless_node nodes[4];
         struct vless_sub_stats st;
         size_t n = vless_parse_sub(
             "{\"outbounds\":[{\"protocol\":\"vless\",\"settings\":{\"vnext\":[{\"address\":\"h\",\"port\":443,"
             "\"users\":[{\"id\":\"u\"}]}]}}]}", nodes, 4, &st);
-        check_n("конфиг без streamSettings: узел пригоден", 1, (long)n);
-        check("конфиг без streamSettings: транспорт tcp", "tcp", n ? nodes[0].type : "");
+        check_n("config without streamSettings: node usable", 1, (long)n);
+        check("config without streamSettings: transport tcp", "tcp", n ? nodes[0].type : "");
         n = vless_parse_sub(
             "{\"outbounds\":[{\"protocol\":\"vless\",\"settings\":{\"vnext\":[{\"address\":\"h\",\"port\":443,"
             "\"users\":[{\"id\":\"u\"}]}]},\"streamSettings\":{\"network\":\"raw\"}}]}", nodes, 4, &st);
-        check_n("network raw: узел пригоден", 1, (long)n);
-        check("network raw читается как tcp", "tcp", n ? nodes[0].type : "");
+        check_n("network raw: node usable", 1, (long)n);
+        check("network raw reads as tcp", "tcp", n ? nodes[0].type : "");
     }
-    /* ---- ws и httpupgrade (шаг 5 выпуска 1.10) --------------------------------- */
+    /* ---- ws and httpupgrade -------------------------------------------------- */
     {
         struct vless_node n;
-        check_n("ws по ссылке: пригоден", 0, vless_parse_url(
+        check_n("ws link: usable", 0, vless_parse_url(
             "vless://u@h:443?type=ws&security=tls&sni=s.example&path=%2Fws%3Fed%3D2048&host=cdn.example#w", &n));
-        check("ws: path раскодирован, ed оставлен (вырезает транспорт)", "/ws?ed=2048", n.path);
-        check("ws: host из ссылки", "cdn.example", n.http_host);
-        check_n("httpupgrade по ссылке: пригоден", 0,
+        check("ws: path decoded, ed kept (the transport strips it)", "/ws?ed=2048", n.path);
+        check("ws: host from the link", "cdn.example", n.http_host);
+        check_n("httpupgrade link: usable", 0,
                 vless_parse_url("vless://u@h:443?type=httpupgrade&path=/up#h", &n));
-        check("httpupgrade: тип", "httpupgrade", n.type);
-        /* Длинный путь целиком процентами: раскодируется ДО обрезки по полю. */
-        check_n("длинный путь процентами: пригоден", 0, vless_parse_url(
+        check("httpupgrade: type", "httpupgrade", n.type);
+        /* A long, fully percent-encoded path is decoded before it is cut to the field size. */
+        check_n("long percent-encoded path: usable", 0, vless_parse_url(
             "vless://u@h:443?type=ws&path=%2F%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61"
             "%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61%61#w", &n));
-        check("длинный путь процентами: раскодирован целиком",
+        check("long percent-encoded path: decoded whole",
               "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", n.path);
-        check_n("ws с vision: пропущен", 1,
+        check_n("ws with vision: skipped", 1,
                 vless_parse_url("vless://u@h:443?type=ws&flow=xtls-rprx-vision#w", &n));
-        check("ws с vision: причина", "vision поверх ws не бывает", n.skip_reason);
-        check_n("ws с битым %XX в пути: пропущен", 1,
+        check("ws with vision: reason given", "vision cannot run over ws", n.skip_reason);
+        check_n("ws with bad %XX in path: skipped", 1,
                 vless_parse_url("vless://u@h:443?type=ws&path=/a%25zz#w", &n));
-        check("ws с битым %XX: причина", "битый %XX в path", n.skip_reason);
-        check_n("httpupgrade с тем же путём: пригоден (Xray экранирует его целиком)", 0,
+        check("ws with bad %XX: reason given", "bad %XX in path", n.skip_reason);
+        check_n("httpupgrade with the same path: usable (Xray escapes it whole)", 0,
                 vless_parse_url("vless://u@h:443?type=httpupgrade&path=/a%25zz#w", &n));
-        check_n("host с пробелом: пропущен", 1,
+        check_n("host with a space: skipped", 1,
                 vless_parse_url("vless://u@h:443?type=ws&host=a%20b#w", &n));
-        check("host с пробелом: причина", "негодный host у ws", n.skip_reason);
-        check_n("ws поверх reality: пригоден (security и транспорт независимы)", 0, vless_parse_url(
+        check("host with a space: reason given", "invalid host for ws", n.skip_reason);
+        check_n("ws over reality: usable (security and transport independent)", 0, vless_parse_url(
             "vless://u@h:443?type=ws&security=reality&pbk=Zm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyMDA#w", &n));
     }
     {
@@ -1137,69 +1088,88 @@ int main(void) {
         size_t n = vless_parse_sub(XO("{\"wsSettings\":{\"path\":\"/w?ed=2048\",\"headers\":"
             "{\"Host\":\"hdr.example\",\"X-A\":\"1\"}},\"xhttpSettings\":{\"path\":\"/x\"},\"network\":\"websocket\"}"),
             nodes, 4, &st);
-        check_n("конфиг: network websocket — узел ws", 1, (long)n);
-        check("конфиг ws: тип", "ws", n ? nodes[0].type : "");
-        check("конфиг ws: путь из wsSettings, а не xhttpSettings", "/w?ed=2048", n ? nodes[0].path : "");
-        check("конфиг ws: Host из headers — в host (как Build у Xray)", "hdr.example", n ? nodes[0].http_host : "");
-        check("конфиг ws: прочие заголовки", "X-A: 1\n", n ? nodes[0].headers : "");
+        check_n("config: network websocket gives a ws node", 1, (long)n);
+        check("ws config: type", "ws", n ? nodes[0].type : "");
+        check("ws config: wsSettings path, not xhttpSettings", "/w?ed=2048", n ? nodes[0].path : "");
+        check("ws config: Host header becomes host (as in Xray Build)", "hdr.example", n ? nodes[0].http_host : "");
+        check("ws config: other headers", "X-A: 1\n", n ? nodes[0].headers : "");
         n = vless_parse_sub(XO("{\"network\":\"ws\",\"wsSettings\":{\"host\":\"h1\",\"headers\":{\"host\":\"h2\"}}}"),
                             nodes, 4, &st);
-        check("конфиг ws: явный host главнее Host из headers", "h1", n ? nodes[0].http_host : "");
+        check("ws config: explicit host wins over Host header", "h1", n ? nodes[0].http_host : "");
         n = vless_parse_sub(XO("{\"network\":\"httpupgrade\",\"httpupgradeSettings\":{\"path\":\"/u\","
                                "\"host\":\"c\",\"headers\":{\"x-b\":\"2\"}}}"), nodes, 4, &st);
-        check_n("конфиг httpupgrade: пригоден", 1, (long)n);
-        check("конфиг httpupgrade: путь", "/u", n ? nodes[0].path : "");
-        check("конфиг httpupgrade: заголовок — как написан", "x-b: 2\n", n ? nodes[0].headers : "");
+        check_n("httpupgrade config: usable", 1, (long)n);
+        check("httpupgrade config: path", "/u", n ? nodes[0].path : "");
+        check("httpupgrade config: header kept as written", "x-b: 2\n", n ? nodes[0].headers : "");
         n = vless_parse_sub(XO("{\"network\":\"httpupgrade\",\"httpupgradeSettings\":{\"headers\":{\"Host\":\"x\"}}}"),
                             nodes, 4, &st);
-        check_n("конфиг httpupgrade с Host в headers: пропущен (Xray отвергает)", 0, (long)n);
-        check("его причина", "негодные headers у httpupgrade", st.reasons_n ? st.reasons[0].reason : "");
+        check_n("httpupgrade config with Host in headers: skipped (Xray rejects it)", 0, (long)n);
+        check("httpupgrade Host header: reason", "invalid headers for httpupgrade", st.reasons_n ? st.reasons[0].reason : "");
         n = vless_parse_sub(XO("{\"network\":\"ws\",\"wsSettings\":{\"headers\":{\"Upgrade\":\"x\"}}}"),
                             nodes, 4, &st);
-        check_n("конфиг ws с Upgrade в headers: пропущен", 0, (long)n);
-        /* У httpupgrade Xray такой заголовок принимает (gorilla там нет) — принимается и здесь. */
+        check_n("ws config with Upgrade in headers: skipped", 0, (long)n);
+        /* sing-box and Clash headers get the same checks: a raw line break in a value would
+         * add a header of its own to the request. */
+        n = vless_parse_sub("{\"outbounds\":[{\"type\":\"vless\",\"tag\":\"sb\",\"server\":\"h\","
+                            "\"server_port\":443,\"uuid\":\"8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124\","
+                            "\"transport\":{\"type\":\"ws\",\"headers\":{\"X-A\":\"1\r\nX-Evil: 2\"}}}]}",
+                            nodes, 4, &st);
+        check_n("sing-box header with a line break: skipped", 0, (long)n);
+        n = vless_parse_sub("{\"outbounds\":[{\"type\":\"vless\",\"tag\":\"sb\",\"server\":\"h\","
+                            "\"server_port\":443,\"uuid\":\"8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124\","
+                            "\"transport\":{\"type\":\"ws\",\"headers\":{\"X-A\":\"1\"}}}]}",
+                            nodes, 4, &st);
+        check("sing-box header: kept", "X-A: 1\n", n ? nodes[0].headers : "");
+        n = vless_parse_sub("proxies:\n  - {name: c, type: vless, server: h, port: 443, "
+                            "uuid: 8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124, network: ws, "
+                            "ws-opts: {path: /, headers: {\"X A\": 1}}}\n", nodes, 4, &st);
+        check_n("Clash header name with a space: skipped", 0, (long)n);
+        /* For httpupgrade Xray accepts such a header (gorilla is not used there), and so does
+         * this parser. */
         n = vless_parse_sub(XO("{\"network\":\"httpupgrade\",\"httpupgradeSettings\":{\"headers\":"
                                "{\"connection\":\"keep-alive\"}}}"), nodes, 4, &st);
-        check_n("конфиг httpupgrade с Connection в headers: пригоден", 1, (long)n);
+        check_n("httpupgrade config with Connection in headers: usable", 1, (long)n);
         n = vless_parse_sub(XO("{\"network\":\"ws\",\"wsSettings\":{\"headers\":{\"X\":1}}}"), nodes, 4, &st);
-        check_n("конфиг ws: заголовок не строкой — пропущен", 0, (long)n);
+        check_n("ws config: header value not a string, skipped", 0, (long)n);
         n = vless_parse_sub(XO("{\"network\":\"xhttp\",\"xhttpSettings\":{\"path\":\"/x\"},"
                                "\"wsSettings\":{\"path\":\"/w\"}}"), nodes, 4, &st);
-        check("конфиг xhttp с чужим wsSettings: путь xhttp", "/x", n ? nodes[0].path : "");
+        check("xhttp config with stray wsSettings: xhttp path", "/x", n ? nodes[0].path : "");
 #undef XO
     }
-    /* ---- ссылка: порт и границы имени --------------------------------------- */
+    /* ---- link: port and name boundaries ------------------------------------- */
     {
         struct vless_node n;
-        check_n("порт 70000 — ссылка не разобрана", -1, vless_parse_url("vless://u@h:70000#x", &n));
-        check_n("порт -1 — ссылка не разобрана", -1, vless_parse_url("vless://u@h:-1#x", &n));
-        check_n("порт 443abc — ссылка не разобрана", -1, vless_parse_url("vless://u@h:443abc#x", &n));
-        check_n("имя с '?' без параметров — узел взят", 0, vless_parse_url("vless://u@h:443#Fast?type=ws", &n));
-        check("имя с '?' без параметров — транспорт tcp", "tcp", n.type);
-        check_n("хост с '?' до '#': порт из параметров не берётся", -1,
+        check_n("port 70000: link not parsed", -1, vless_parse_url("vless://u@h:70000#x", &n));
+        check_n("port -1: link not parsed", -1, vless_parse_url("vless://u@h:-1#x", &n));
+        check_n("port 443abc: link not parsed", -1, vless_parse_url("vless://u@h:443abc#x", &n));
+        check_n("'?' only in the name: node taken", 0, vless_parse_url("vless://u@h:443#Fast?type=ws", &n));
+        check("'?' only in the name: transport tcp", "tcp", n.type);
+        check_n("host with '?' before '#': no port taken from the parameters", -1,
                 vless_parse_url("vless://u@host.example?type=tcp#name:1", &n));
     }
-    /* ---- процентная форма: не-шестнадцатеричное остаётся как есть ---------------- */
+    /* ---- percent decoding: non-hex stays as is ---------------------------------- */
     {
         struct vless_node n;
         vless_parse_url("vless://u@h:443#a%40%40b", &n);
-        check("процентная форма: %40 — это @", "a@@b", n.name);
+        check("percent decoding: %40 is @", "a@@b", n.name);
         vless_parse_url("vless://u@h:443#a%@@b", &n);
-        check("процентная форма: %@@ — не цифры, остаётся как есть", "a%@@b", n.name);
+        check("percent decoding: %@@ is not hex, kept as is", "a%@@b", n.name);
     }
 
-    /* ---- список: мест меньше, чем ссылок — остаток считается ------------------ */
+    /* ---- fewer slots than links: the rest is counted ------------------------- */
     {
         struct vless_node nodes[1];
         struct vless_sub_stats st;
         size_t n = vless_parse_sub("vless://a@h1:443#one\nvless://b@h2:443#two\nss://c@h3:443#x\n",
                                    nodes, 1, &st);
-        check_n("мест одно: взят один", 1, (long)n);
-        check_n("второй vless посчитан пропущенным", 1, (long)st.skipped);
-        check_n("чужая ссылка за пределом мест посчитана", 1, (long)st.foreign);
+        check_n("one slot: one node taken", 1, (long)n);
+        check_n("second vless link counted as skipped", 1, (long)st.skipped);
+        /* A usable node without a slot must not read as a link that did not parse. */
+        check("  reason: more nodes than fit", "more nodes than fit", st.reasons[0].reason);
+        check_n("foreign link past the slots counted", 1, (long)st.foreign);
     }
 
-    /* ---- подписка на пятьсот узлов из файла: места растут по числу ссылок -------- */
+    /* ---- 500-node subscription file: slots grow with the number of links -------- */
     {
         char path[64];
         snprintf(path, sizeof(path), "/tmp/submatch-500.%d", (int)getpid());
@@ -1211,12 +1181,50 @@ int main(void) {
         size_t n = 0;
         struct vless_node *nodes = vless_load_sub(path, &n, &st);
         unlink(path);
-        check_n("500 узлов из файла: взяты все", 500, (long)n);
-        check_n("  пропущенных нет", 0, (long)st.skipped);
-        if (nodes && n == 500) check("  последний — со своим именем", "node499", nodes[499].name);
+        check_n("500 nodes from a file: all taken", 500, (long)n);
+        check_n("  none skipped", 0, (long)st.skipped);
+        if (nodes && n == 500) check("  last node has its own name", "node499", nodes[499].name);
         free(nodes);
     }
 
-    printf("\nвсе проверки прошли\n");
+    /* ---- sing-box and Clash files: one slot per node, though they have no "://" ---------- */
+    {
+        static const char *const files[] = {
+            "{\"outbounds\":["
+            "{\"type\":\"vless\",\"tag\":\"sb1\",\"server\":\"h1\",\"server_port\":443,"
+            "\"uuid\":\"8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124\"},"
+            "{\"type\":\"vless\",\"tag\":\"sb2\",\"server\":\"h2\",\"server_port\":443,"
+            "\"uuid\":\"8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124\"},"
+            "{\"type\":\"vless\",\"tag\":\"sb3\",\"server\":\"h3\",\"server_port\":443,"
+            "\"uuid\":\"8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124\"}]}",
+            "proxies:\n"
+            "  - name: c1\n    type: vless\n    server: h1\n    port: 443\n"
+            "    uuid: 8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124\n"
+            "  - {name: c2, type: vless, server: h2, port: 443, uuid: 8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124}\n"
+            "  - name: c3\n    type: vless\n    server: h3\n    port: 443\n"
+            "    uuid: 8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124\n",
+        };
+        static const char *const what[] = { "sing-box file: 3 nodes", "Clash file: 3 nodes" };
+        for (int k = 0; k < 2; k++) {
+            char path[64];
+            snprintf(path, sizeof(path), "/tmp/submatch-cfg.%d", (int)getpid());
+            FILE *f = fopen(path, "w");
+            if (f) { fputs(files[k], f); fclose(f); }
+            struct vless_sub_stats st;
+            size_t n = 0;
+            struct vless_node *nodes = vless_load_sub(path, &n, &st);
+            unlink(path);
+            check_n(what[k], 3, (long)n);
+            check_n("  none skipped for lack of slots", 0, (long)st.skipped);
+            free(nodes);
+        }
+    }
+
+    printf("\n%d checks passed", g_pass);
+    if (g_fail) {
+        printf(", %d FAILED\n", g_fail);
+        return 1;
+    }
+    printf("\n");
     return 0;
 }

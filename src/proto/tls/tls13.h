@@ -1,52 +1,49 @@
-/* Записи TLS 1.3 для Reality. Почему не TLS-стек библиотеки — в tls13.c. Криптография — через
- * слой src/lib/scrypto.h: типов криптобиблиотеки в этом заголовке нет, поэтому его подключают и
- * стенды `make test`, у которых библиотеки нет по построению (h2match, tunnelmatch…). */
+/* TLS 1.3 records for Reality and security=tls; why not a library TLS stack is explained in
+ * tls13.c. Crypto goes through src/lib/scrypto.h: this header has no crypto-library types, so
+ * `make test` programs built without the library include it too (h2match, tunnelmatch...). */
 #ifndef STEER_TLS13_H
 #define STEER_TLS13_H
 #include <stdint.h>
 #include <stddef.h>
 #include "scrypto.h"
 
-#define TLS13_MAX_REC   16640          /* максимум записи по RFC + запас на тег */
+#define TLS13_MAX_REC   16640          /* 2^14 + 256: RFC 8446 limit for a protected record */
 #define TLS13_MAX_PLAIN 16384
-/* Сколько байт ServerHello хранится для проверки ML-DSA (с гибридом он около 1200). */
+/* ServerHello bytes kept for the ML-DSA check (about 1200 with the hybrid). */
 #define TLS13_SH_KEEP   2048
 
 #define TLS13_EIO          (-10)
 #define TLS13_ECLOSED      (-11)
 #define TLS13_EBADREC      (-12)
 #define TLS13_ETOOBIG      (-13)
-#define TLS13_EAUTH        (-14)   /* AEAD не сошёлся: ключи разъехались с сервером */
+#define TLS13_EAUTH        (-14)   /* AEAD failed: our keys diverged from the server's */
 #define TLS13_ECRYPTO      (-15)
-#define TLS13_ENOKEYSHARE  (-16)   /* ServerHello без key_share — не TLS 1.3 */
+#define TLS13_ENOKEYSHARE  (-16)   /* ServerHello without key_share: not TLS 1.3 */
 #define TLS13_EBADSUITE    (-17)
-#define TLS13_EFINISHED    (-18)   /* Finished не совпал: транскрипт или ключи неверны */
+#define TLS13_EFINISHED    (-18)   /* Finished mismatch: wrong transcript or keys */
 #define TLS13_ESTATE       (-19)
-/* Записи целиком ещё нет в сокете. НЕ ошибка: чтение отказалось блокироваться, потому что
- * блокировка посреди записи останавливает не одно соединение, а весь цикл. */
+/* No whole record in the socket yet. NOT an error: the read refused to block, because blocking
+ * in the middle of a record stalls the whole loop, not one connection. */
 #define TLS13_EAGAIN       (-20)
 
-/* Узел не ответил за отведённое время.
+/* The node did not answer in time.
  *
- * Отдельно от TLS13_EIO, и это не косметика диагностики. Рукопожатие читает через
- * блокирующий сокет с SO_RCVTIMEO (см. sock_ready в client.c), и по истечении срока read
- * возвращает EAGAIN. read_full считал это ошибкой ввода-вывода, то есть «молчит» и «сломался
- * на чтении» приходили под одним именем — а это разные причины с разными действиями:
- * молчание означает, что до узла не доходит НАШ пакет (режут по SNI, узел лёг, пакет
- * потерялся), и смотреть надо наружу, а не в движок.
- *
- * Найдено на стенде: проба выдавала «ошибка чтения TLS» ровно через 5 секунд, при полностью
- * исправном TCP-соединении и живом узле — провайдер глушил ClientHello по имени в SNI.
- * Сообщение уводило в сторону настолько, что причину искали в разборе записей. */
+ * Kept apart from TLS13_EIO on purpose: the two have different causes and call for different
+ * action. The handshake reads a blocking socket with SO_RCVTIMEO (sock_ready in trdial.c), and
+ * when the timeout expires read returns EAGAIN. Silence means OUR packets do not reach the node
+ * (SNI filtering, the node is down, packet loss), so the cause is outside, not in the record
+ * parser. A provider dropping the ClientHello by its SNI looks exactly like this: a healthy TCP
+ * connection, a live node, and no answer. */
 #define TLS13_ETIMEOUT     (-21)
-/* Сервер не доказал подлинность: цепочка, имя или подпись. Отдельно от EFINISHED — там
- * «ключи разъехались», а здесь рукопожатие математически верно и собеседник не тот. Точную
- * причину несёт certverify.h; сюда она приходит через tls13_verify_reason(). */
+/* The server did not prove its identity: chain, name or signature. Unlike EFINISHED (diverged
+ * keys), the handshake is mathematically sound but the peer is the wrong one. The exact reason
+ * comes from certverify.h through tls13_verify_reason(). */
 #define TLS13_ECERT        (-22)
-/* Hello ушёл с ECH (Encrypted Client Hello), а сервер его не принял: подтверждения в ServerHello.random
- * нет. Рукопожатие обрывается сразу, до всякой работы с сертификатом: сервер ответил по внешнему Hello, то
- * есть разговаривает с нами не как с клиентом нужного имени (ключ ECH в ссылке устарел или сервер ECH не
- * знает). Продолжать значило бы выдать имя в открытом виде, ради чего ECH и затеян. */
+/* The Hello went out with ECH (Encrypted Client Hello) and the server did not accept it: no
+ * confirmation in ServerHello.random. The handshake stops at once, before any certificate work:
+ * the server answered the outer Hello, so it does not talk to us as a client of the real name
+ * (the ECH key in the link is stale, or the server does not know ECH). Going on would reveal the
+ * name in the clear, which ECH exists to prevent. */
 #define TLS13_EECH         (-23)
 
 enum tls13_aead { TLS13_AEAD_AES128, TLS13_AEAD_AES256, TLS13_AEAD_CHACHA };
@@ -56,212 +53,180 @@ struct tls13_keys {
     size_t key_n;
     unsigned char key[32];
     unsigned char iv[12];
-    /* Контекст шифра, созданный ОДИН РАЗ на соединение.
-     *
-     * Раньше каждая запись делала init + setkey + free. Это не «лишний вызов»: setkey для
-     * GCM разворачивает расписание ключа и строит таблицу GHASH — постоянная работа на каждую
-     * запись независимо от её размера. При мелких записях (а после перехода Vision на прямое
-     * копирование они по 300 байт) это становится основной статьёй расхода.
-     *
-     * Заметить это по бенчмарку было нельзя: прежний замер ставил ключ один раз ВНЕ
-     * измеряемого цикла, поэтому «800 Мбит/с» относились к коду, которого у нас не было.
-     * Нынешний (tests/xsbench.c) разворачивает ключ так же, как рабочий код. */
+    /* Cipher context, set up ONCE per connection: setkey for GCM expands the key schedule and
+     * builds the GHASH table, a fixed cost per call whatever the record size, which dominates
+     * with small records (about 300 bytes with Vision's direct copy). */
     int ctx_ready;
     struct sc_aead ctx;
 };
-/* ВНИМАНИЕ: после tls13_keys_setup структуру НЕ копировать по значению. У mbedtls, на которой
- * это правило родилось, контекст AES внутри GCM лежал в куче, и копия несла тот же указатель —
- * освободив обе, программа освобождала одну память дважды (так упал стенд xsloop). У wolfCrypt
- * за слоем scrypto контекст целиком лежит в самой структуре, но правило остаётся: копия — это
- * два экземпляра одного состояния ключа и два sc_aead_free, а обещать, что библиотека никогда
- * не заведёт в контексте указатель, слой не может. Передавайте указатель; нужен второй
- * экземпляр — разворачивайте его из ключа заново. */
+/* WARNING: do not copy this struct by value after tls13_keys_setup. A copy is two instances of
+ * one key state and two sc_aead_free calls; with a context that holds a pointer (as mbedtls's
+ * GCM did) that is a double free. wolfCrypt behind scrypto keeps the whole context inside the
+ * struct, but the layer cannot promise the library never adds a pointer. Pass a pointer; for a
+ * second instance, set it up from the key again. */
 
 struct tls13 {
     int fd;
     int ready;
-    /* 1 — соединение поднято по TLS 1.2 (tls12_handshake). Записи тогда устроены иначе: у
-     * AES-GCM явная часть nonce в начале тела, в AAD номер записи, тип и длина, а внутреннего
-     * типа в конце нет. Чтение и запись смотрят на флаг сами — вызывающему всё равно. */
+    /* 1: the connection runs TLS 1.2 (tls12_handshake). Records differ then: AES-GCM carries
+     * the explicit nonce part at the start of the body, the AAD holds the record number, type
+     * and length, and there is no inner type at the end. Read and write check the flag. */
     int v12;
-    /* Буфер чтения: берём у сокета всё, что есть, одним вызовом и собираем записи отсюда.
-     *
-     * Без него на каждую запись приходилось по несколько системных вызовов и ожидание её
-     * дособирания — замерено 16 000 чтений в секунду по 600 байт и 80% времени цикла
-     * внутри чтения. Записи в потоке бывают мелкими, и платить за каждую отдельно нельзя.
-     *
-     * Цена — 16 КБ на соединение (при 64 соединениях мегабайт). Это единственное место,
-     * где мы согласились на буфер: он снимает и лишние вызовы, и ожидание, и оба костыля,
-     * которые до него понадобились. */
+    /* Read buffer: take everything the socket has in one call and assemble records from here.
+     * Without it each record cost several system calls and a wait for the rest of it
+     * (16,000 reads a second of 600 bytes, 80% of loop time inside reads). The price is 16 KB
+     * per connection, 1 MB at 64 connections. */
     unsigned char rbuf[TLS13_MAX_REC + 8];
-    size_t rbuf_n;      /* сколько байт лежит */
-    size_t rbuf_off;    /* сколько из них уже разобрано */
-    /* Что сервер выбрал в ALPN, из EncryptedExtensions. Пустая строка означает «не
-     * присылал», то есть согласования не было.
+    size_t rbuf_n;      /* bytes held */
+    size_t rbuf_off;    /* bytes of them already parsed */
+    /* The ALPN protocol the server chose, from EncryptedExtensions; "" if it sent none (as a
+     * Reality server that accepted us does).
      *
-     * Нужно ради одной ошибки: транспорты grpc и xhttp требуют HTTP/2, и если сервер на
-     * него не согласился, всё остальное работает, а данные не идут. Без этой строки
-     * симптом — «узел подключается и молчит», и отличить его от закрытого порта нельзя. */
+     * transport.c checks it against what the transport needs (h2 for grpc and xhttp, http/1.1
+     * for ws and httpupgrade). With another protocol the handshake works but no data flows;
+     * without this field the symptom is "the node connects and stays silent", which cannot be
+     * told from a closed port. */
     char alpn[16];
     struct tls13_keys rd, wr;
-    /* Счётчики записей. НЕ сбрасываются: сброс означал бы повтор nonce, то есть
-     * полную потерю защиты AEAD. */
+    /* Record counters. NEVER reset: a reset repeats a nonce, which voids AEAD entirely. */
     uint64_t rd_seq, wr_seq;
-    /* Транскрипт рукопожатия — СРАЗУ ДВА, по SHA-256 и по SHA-384.
+    /* TWO transcripts at once, SHA-256 and SHA-384.
      *
-     * Хеш расписания ключей задаётся выбранным набором шифров, а узнаём мы его только из
-     * ServerHello — то есть уже после того, как ClientHello пора хешировать. Держать оба и
-     * выбросить лишний дешевле, чем буферизовать сообщения рукопожатия: их всего несколько
-     * килобайт, и второй хеш по ним не стоит ничего.
-     *
-     * Понадобилось это вместе с отпечатком Chrome: его список шифров содержит
-     * AES_256_GCM_SHA384, а список обязан совпадать с браузерным. Предложить набор и не
-     * уметь его обслужить — это «рукопожатие прошло, поток не расшифровывается», ровно то,
-     * что и наблюдалось на узле, выбравшем 0x1302. */
+     * The key schedule hash depends on the cipher suite, known only from ServerHello, after the
+     * ClientHello must already be hashed. Keeping both and dropping one is cheaper than
+     * buffering the handshake messages. Chrome's list offers AES_256_GCM_SHA384, and the list
+     * must match the browser's, so that suite must be served too. */
     struct sc_hash_ctx tr;
     struct sc_hash_ctx tr384;
-    size_t hash_n;                  /* 32 или 48 — известно после ServerHello */
+    size_t hash_n;                  /* 32 or 48, known after ServerHello */
 };
 
-/* client_hello — байты, УЖЕ отправленные серверу (нужны для транскрипта);
- * shared_secret — общий секрет X25519 из reality.c. */
-/* Клиент TLS 1.2 — ровно на один случай: точка веб-клиента Telegram (web.telegram.org),
- * которая 1.3 не говорит вовсе. Наборы ECDHE-RSA с X25519: AES-128-GCM-SHA256 и
- * ChaCha20-Poly1305. Сертификат НЕ проверяется, и это решение, а не пропуск: поверх идёт
- * MTProto, который сам доказывает подлинность сервера ключами Telegram, так что посредник
- * на TLS получает шум и может разве что оборвать соединение. Для чего-то, что держит
- * собственные секреты поверх TLS, эта функция не годится. */
+/* Minimal TLS 1.2 client for a server that does not speak 1.3: ECDHE-RSA with X25519,
+ * AES-128-GCM-SHA256 or ChaCha20-Poly1305, ALPN http/1.1. The certificate is NOT verified, so it
+ * is fit only under a protocol that authenticates the server by itself; a man in the middle on
+ * TLS then gets noise and can at most cut the connection. Nothing that relies on TLS to keep
+ * its secrets may use it. */
 int tls12_handshake(struct tls13 *t, int fd, const char *sni);
 
+/* client_hello: the record ALREADY sent to the server, 5-byte record header included (for the
+ * transcript).
+ * shared_secret: despite the name, our ephemeral X25519 PRIVATE key (reality_state.priv). The
+ * TLS secret needs the server's ephemeral key, which only arrives in ServerHello. */
 int tls13_handshake(struct tls13 *t, int fd,
                     const unsigned char *client_hello, size_t hello_n,
                     const unsigned char *shared_secret);
 
-/* Чем сервер доказывает подлинность. Обе половины необязательны и не исключают друг друга
- * только на бумаге: у настоящих узлов ровно одна из них и бывает.
+/* How the server proves itself. reality_key and host are both optional and could in principle
+ * be combined, but a real node uses exactly one of them.
  *
- * ЗАЧЕМ ЭТО ВООБЩЕ НУЖНО. Рукопожатие TLS 1.3 само по себе не доказывает, С КЕМ мы говорим:
- * Finished сходится у любого, кто провёл обмен ключами, — посредник в том числе. Кто перед
- * нами, показывает только сертификат, и у двух наших видов узлов он показывает это
- * по-разному.
+ * A TLS 1.3 handshake alone does not prove WHO is on the other end: Finished verifies for
+ * anyone who ran the key exchange, a man in the middle included. Only the certificate shows
+ * it, and it does so differently for the two kinds of node.
  *
- * reality_key — 32 байта authkey из struct reality_state. Сервер Reality, признавший
- *   клиента, кладёт в поле подписи временного сертификата HMAC-SHA512 на этом ключе;
- *   посчитать его умеет только владелец постоянного ключа. Не сошлось — нас не признали и
- *   ответил маскировочный сайт. Проверять цепочку при этом бессмысленно: сертификат
- *   настоящий, но чужой.
+ * reality_key: the 32-byte authkey from struct reality_state. A Reality server that recognised
+ *   the client puts an HMAC-SHA512 under this key in the signature field of its temporary
+ *   certificate; only the holder of the static key can compute it. A mismatch means we were
+ *   not recognised and the camouflage site answered. Checking the chain is pointless here: the
+ *   certificate is real, but someone else's.
  *
- * host — имя, которое обязано найтись в сертификате (оно же уехало в SNI). Это путь
- *   security=tls: там нет постоянного ключа, и доказательство одно — цепочка до корня плюс
- *   подпись CertificateVerify над транскриптом.
+ * host: the name the certificate must contain (also sent as SNI). This is security=tls: there
+ *   is no static key, and the proof is the chain to a root plus the CertificateVerify signature
+ *   over the transcript.
  *
- * roots — путь к хранилищу корней, NULL/"" для умолчания. Нужен только вместе с host. */
+ * roots: path to the root store, NULL or "" for the default. Only with host. */
 struct cert_policy;
-/* ECH: внутренний ClientHello (ech.h, ech_state) для проверки принятия и транскрипта. Тип свой, а не
- * ech_state, чтобы tls13.c не зависел от ech.c: заполняет трансп. слой (trsec.c). */
+/* ECH: the inner ClientHello (ech.h, ech_state) for the acceptance check and the transcript.
+ * A type of its own rather than ech_state, so tls13.c does not depend on ech.c; trsec.c fills
+ * it. */
 struct tls13_ech {
-    const unsigned char *inner;     /* handshake-сообщение ClientHelloInner целиком (с заголовком из 4 байт) */
+    const unsigned char *inner;     /* ClientHelloInner handshake message with its 4-byte header */
     size_t inner_n;
-    const unsigned char *random;    /* 32 байта: random Inner */
+    const unsigned char *random;    /* 32 bytes: the inner random */
 };
 struct tls13_auth {
     const unsigned char *reality_key;
     const char *host;
     const char *roots;
-    /* Закрытый ключ ML-KEM-768 (2400 байт), если в ClientHello ушёл настоящий гибрид X25519MLKEM768
-     * (reality_cfg.pq). NULL — гибрид не предлагали, и ServerHello с ним будет отвергнут. */
+    /* ML-KEM-768 private key (2400 bytes) when the ClientHello offered a real X25519MLKEM768
+     * hybrid (reality_cfg.pq). NULL: no hybrid offered, and a ServerHello choosing it is
+     * rejected. */
     const unsigned char *mlkem_dk;
-    /* Открытый ключ ML-DSA-65 (1952 байта) из mldsa65Verify узла (`pqv` в ссылке), или NULL. С ним
-     * сертификат Reality обязан нести подпись ML-DSA-65 над HMAC-SHA512(authkey, pub ‖ ClientHello ‖
-     * ServerHello); без подписи или с неверной узел не признан. Только вместе с reality_key. */
+    /* ML-DSA-65 public key (1952 bytes) from the node's mldsa65Verify (`pqv` in a link), or
+     * NULL. With it the Reality certificate must carry an ML-DSA-65 signature over
+     * HMAC-SHA512(authkey, pub ‖ ClientHello ‖ ServerHello); without one, or with a wrong one,
+     * the node is not recognised. Only with reality_key. */
     const unsigned char *mldsa_pk;
-    /* Правила проверки сертификата при host != NULL (certverify.h): закрепления, имена, insecure.
-     * NULL — умолчание: цепочка до корней и имя host. */
+    /* Certificate rules when host != NULL (certverify.h): pins, names, insecure. NULL: the
+     * default, chain to the roots and the name host. */
     const struct cert_policy *policy;
-    /* Hello, переданный в tls13_handshake_auth, — внешний ClientHelloOuter ECH. NULL — ECH нет. */
+    /* Set when the Hello passed to tls13_handshake_auth is an ECH ClientHelloOuter; NULL: no
+     * ECH. */
     const struct tls13_ech *ech;
 };
 
-/* То же рукопожатие, но с проверкой подлинности сервера.
- *
- * Отдельной функцией, а не признаком в старой: у tls13_handshake три вызывающих, и двум из
- * них (tgws, xsteer) доказательство не нужно ни при каких настройках — они и так знают, с
- * кем говорят. Признак, который у двух вызывающих из трёх всегда выключен, — это не
- * признак, а вторая функция. */
+/* tls13_handshake plus the server authentication described by auth. */
 int tls13_handshake_auth(struct tls13 *t, int fd,
                          const unsigned char *client_hello, size_t hello_n,
                          const unsigned char *shared_secret,
                          const struct tls13_auth *auth);
 
-/* Лежит ли в буфере ЦЕЛАЯ запись, готовая к расшифровке.
- *
- * Нужно потому, что готовность к чтению спрашивают у ядра (epoll), а данные к этому моменту
- * могут уже лежать у НАС: одно чтение сокета приносит до 16 КБ, а записей в них бывает
- * несколько. Разобрав первую и уйдя, мы оставляли вторую ждать нового события на сокете —
- * которого может не быть вовсе. На выгрузке это самоизлечивалось следующей порцией, а вот
- * ХВОСТ ответа так и стоял до таймаута повторной передачи у клиента: снаружи это выглядело
- * как «страница почти открылась и замерла». */
-/* Почему именно не доказал — строкой, после TLS13_ECERT. Пустая строка, если отказа не
- * было. Значение живёт в потоке: рукопожатия идут в нескольких соединителях сразу. */
+/* Why the server failed to prove itself, as a string, after TLS13_ECERT; "" if it did not
+ * fail. Per thread: several connectors handshake at once. */
 const char *tls13_verify_reason(void);
 
+/* Whether a WHOLE record, ready for decryption, is in the buffer.
+ *
+ * Readiness is asked of the kernel (epoll), but the data may already be with US: one socket
+ * read brings up to 16 KB, often several records. Parsing one and leaving makes the next wait
+ * for a socket event that may never come; the TAIL of a response then stalls until the
+ * client's retransmission timeout ("the page almost loaded and froze"). */
 int tls13_has_record(const struct tls13 *t);
 
-/* Сколько байт прочитано у сокета и ещё не разобрано. Для режима прямого копирования, где
- * записей нет вовсе и «целая запись» смысла не имеет. */
+/* Bytes read from the socket and not yet parsed. For direct-copy mode, where there are no
+ * records and a "whole record" means nothing. */
 size_t tls13_buffered(const struct tls13 *t);
 
-/* Забрать байты, которые уже прочитаны у сокета, но ещё не разобраны как записи.
+/* Take the bytes already read from the socket but not yet parsed as records.
  *
- * Нужно ровно в одном случае: сервер перешёл на прямое копирование, и дальше в сокете уже
- * не наши записи. Часть этого сырого потока к тому моменту может лежать у нас в буфере —
- * прочитать сокет напрямую, не отдав её, значит потерять кусок и разъехаться с сервером.
- * Симптом был исчерпывающий: узлы с Vision отдавали ноль байт. */
+ * Needed in one case: the server switched to direct copy, and what follows in the socket is no
+ * longer records. Part of that raw stream may already be in our buffer; reading the socket
+ * directly without taking it loses a piece and desynchronises us from the server (Vision nodes
+ * then deliver zero bytes). */
 size_t tls13_take_pending(struct tls13 *t, unsigned char *out, size_t cap);
 
 int tls13_write(struct tls13 *t, const unsigned char *data, size_t n);
 int tls13_read(struct tls13 *t, unsigned char *out, size_t cap, size_t *got);
 
-/* То же чтение, но БЕЗ КОПИИ: отдаёт указатель внутрь буфера соединения, где запись уже
- * расшифрована на месте.
+/* The same read WITHOUT A COPY: returns a pointer into the connection buffer, where the record
+ * is decrypted in place. All downloaded traffic passes here, and a copy costs an extra pass over
+ * memory per record, which is noticeable on a router's slow memory.
  *
- * Зачем. Через это место проходит весь скачиваемый трафик, и копия сюда добавляла лишний
- * проход по памяти на каждую запись — 16 КБ на 16 КБ данных. На роутере, где память
- * медленная, это несколько процентов от всей работы; и это единственная копия на пути
- * вниз, которую можно было убрать (вторая, в кольцо повтора, нужна по существу).
- *
- * Условие на вызывающего ОДНО и жёсткое: данные надо использовать ДО следующего чтения по
- * этому же соединению. Следующее чтение сдвигает буфер к началу, и прежний указатель
- * начинает показывать на чужие байты. Туннель так и делает — отдаёт порцию клиенту сразу,
- * — но если это правило когда-нибудь нарушат, поломка будет выглядеть как испорченные
- * данные в середине файла, поэтому здесь оно написано, а не подразумевается. */
+ * The one hard rule for the caller: use the data BEFORE the next read on this connection. The
+ * next read may move the unread bytes to the start of the buffer, and the old pointer then shows
+ * other bytes; breaking the rule looks like corrupt data in the middle of a file. */
 int tls13_read_ref(struct tls13 *t, const unsigned char **body, size_t *body_n);
 
-/* Освободить контексты шифров и транскрипта. Обязательно на каждое закрытие: соединений за
- * час работы туннеля проходят тысячи, и ключ, не затёртый при закрытии, остаётся в памяти до
- * следующего использования этой структуры. Повторный вызов безвреден. */
+/* Free the cipher and transcript contexts; this wipes the expanded cipher keys (key[] and iv[]
+ * in struct tls13_keys are left as they are). Required on every close: thousands of connections
+ * pass in an hour, and a key schedule not wiped stays in memory until the struct is reused.
+ * Harmless on a zeroed struct and when called twice. */
 void tls13_free(struct tls13 *t);
 
-/* ---- AEAD отдельно от записей TLS ------------------------------------------
+/* ---- AEAD apart from TLS records --------------------------------------------
  *
- * Объявлено наружу ради xsteer (src/proto/xsteer/xshake.c и xsclient.c): у него свой протокол, но
- * ТОТ ЖЕ путь шифрования — те же два шифра, тот же вывод nonce из номера записи, та же
- * работа на месте. Своя копия означала бы, что оба урока, купленные здесь замерами,
- * придётся выучить второй раз:
+ * Record encryption without the record format: two ciphers, the nonce derived from the record
+ * number, in-place operation. Two lessons from measurements:
  *
- *   - контекст шифра разворачивается ОДИН раз на направление (tls13_keys_setup), а не на
- *     каждую запись: setkey разворачивает расписание ключа и строит таблицу GHASH —
- *     постоянная работа независимо от размера записи, и на мелких записях это основная
- *     статья расхода;
- *   - при расшифровке тег КОПИРУЕТСЯ перед вызовом (внутри tls13_aead_open): расшифровка
- *     идёт на месте, тег лежит сразу за шифротекстом, и зависеть от того, тронет ли его
- *     реализация, дописывая последний неполный блок, незачем (размеры записи до 16401 байта
- *     на месте сторожит tests/scryptomatch.c).
+ *   - the cipher context is set up ONCE per direction (tls13_keys_setup), not per record:
+ *     setkey expands the key schedule and builds the GHASH table, a fixed cost whatever the
+ *     record size, which dominates with small records;
+ *   - on decryption the tag is COPIED before the call (inside tls13_aead_open): decryption runs
+ *     in place, the tag sits right after the ciphertext, and there is no reason to depend on
+ *     whether the implementation touches it while finishing the last partial block
+ *     (tests/scryptomatch.c checks in-place sizes up to 16401 bytes).
  *
- * seq здесь — номер записи, из которого выводится nonce. У TLS это счётчик записей, у
- * xsteer — относительное смещение в поддельном TCP-потоке (см. xswire.h): величина другая,
- * а правило одно и то же — она обязана быть уникальной на ключ, иначе AEAD не защищает
- * вообще ничего. */
+ * seq is the record number the nonce is derived from. It must be unique per key, or AEAD
+ * protects nothing. */
 int  tls13_keys_setup(struct tls13_keys *k);
 void tls13_keys_free(struct tls13_keys *k);
 int  tls13_aead_seal(struct tls13_keys *k, uint64_t seq,

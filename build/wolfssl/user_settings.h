@@ -1,77 +1,72 @@
-/* Опции сборки wolfSSL для steer — ЕДИНСТВЕННОЕ место, где они записаны.
+/* wolfSSL build options for tunvless — the ONLY place they are written.
  *
- * Этот файл видит каждый .c wolfSSL (ключ -DWOLFSSL_USER_SETTINGS, settings.h подключает
- * user_settings.h по имени) и каждый .c движка, который включает заголовок wolfSSL, — то есть
- * ровно один: src/lib/scrypto.c. Больше wolfSSL в дереве не видит никто, и это не вкус, а
- * условие правильности: раскладка структур wolfSSL (Aes, wc_Sha256, Hmac…) зависит от этих
- * макросов, и библиотека, собранная с одними, рядом с вызывающим, собранным с другими, портит
- * память молча. Поэтому опций нет ни в командных строках сборок, ни в configure: их читают
- * build/wolfssl/build.sh (роутер, стенды, замеры), рецепт SDK и Android.bp — один файл на все.
- * Шаг 4 выпуска 1.10 (пакет libsteer-wolfssl, .so) берёт его же.
+ * Every wolfSSL .c sees this file (-DWOLFSSL_USER_SETTINGS), and so does the one tunvless file
+ * that includes wolfSSL headers, src/lib/scrypto.c. That is a correctness condition, not taste:
+ * the layout of wolfSSL structures (Aes, wc_Sha256, Hmac...) depends on these macros, and a
+ * library built with one set next to a caller built with another corrupts memory silently. So
+ * the options live nowhere else — not on command lines, not in configure.
  *
- * ЧТО НУЖНО И ЗАЧЕМ (docs/architecture.md, «Криптография»). Своему TLS 1.3 и
- * REALITY (src/proto/tls) нужны только примитивы: SHA-256/384/512, HMAC, HKDF, AES-GCM,
- * ChaCha20-Poly1305, AES-256-CTR (мост tgws), X25519, проверка цепочки X.509 с именем и сроком
- * и подписей RSA (PKCS#1 v1.5 и PSS) и ECDSA P-256/P-384. TLS-стек самой wolfSSL нам не нужен —
- * TLS у нас свой, — но он нужен QUIC: ngtcp2 (DoQ в 1.11, hysteria2) работает поверх wolfSSL_quic_*,
- * а те стоят на TLS 1.3 wolfSSL, её SNI, ALPN, билетах сессии и слое EVP (OPENSSL_EXTRA —
- * configure wolfSSL включает его при --enable-quic принудительно, и ngtcp2 зовёт wolfSSL_EVP_*).
- * Поэтому QUIC включён заранее: пакет libsteer-wolfssl собирается один раз и для модулей
- * протоколов, и для будущего ngtcp2, а второго набора опций под QUIC не будет.
+ * WHAT IS NEEDED. The TLS and REALITY client is our own (src/proto/tls); wolfSSL provides
+ * primitives only: SHA-256/384/512, HMAC, HKDF, AES-GCM, ChaCha20-Poly1305, AES-CTR (VLESS
+ * encryption), X25519, ML-KEM-768 and ML-DSA-65 verification, and X.509 chain verification with
+ * name and validity (RSA PKCS#1 v1.5 and PSS, ECDSA P-256/P-384 signatures). The chain is checked
+ * by wolfSSL's X509 store, which is why part of its TLS layer (OPENSSL_EXTRA) is built.
  *
- * ЧЕГО НЕТ НАМЕРЕННО. Ни opensslall, ни stunnel, ни lighty (их включает пакет libwolfssl
- * OpenWrt ради чужих программ); ни TLS 1.2 и старше в wolfSSL (наш TLS 1.2 для точки
- * web.telegram.org свой, в tls13.c), ни сервера TLS (QUIC у нас только клиент), ни DH, DSA,
- * DES, RC4, MD4, PSK, PBKDF; ни файловой системы (корни читает certverify.c сам, буфером) и
- * ни сокетного ввода-вывода (WOLFSSL_USER_IO: QUIC отдаёт байты через ngtcp2, а не сокет).
- * Ed25519 не нужен: сертификат REALITY разбирается своим кодом и сверяется HMAC-SHA512
- * (certverify.c), а не подписью.
+ * WHAT IS LEFT OUT ON PURPOSE: wolfSSL's TLS 1.2 and older (tls13.c has its own minimal TLS 1.2
+ * client), a TLS server, QUIC, DH, DSA, DES, RC4, MD4, PSK, PBKDF, Ed25519 and P-521 (certverify.c
+ * reads the Ed25519 Reality certificate itself), the filesystem (certverify.c reads the roots
+ * itself, into a buffer) and socket I/O.
  *
- * РАЗМЕР. В статическом бинарнике то, что не вызывается, выбрасывает компоновщик (-ffunction-
- * sections и --gc-sections в build.sh, LTO у zig), поэтому QUIC, EVP и TLS-стек wolfSSL места в
- * steerd не занимают, пока их никто не зовёт. В разделяемой libsteer-wolfssl.so (шаг 4) они
- * будут целиком — это цена одного пакета на все модули, и она меряется там же.
+ * SIZE. tunvless links wolfSSL statically with -ffunction-sections and --gc-sections, so what is
+ * built but never called does not reach the binary.
  */
 #ifndef STEER_WOLFSSL_USER_SETTINGS_H
 #define STEER_WOLFSSL_USER_SETTINGS_H
 
-/* ---- платформа ------------------------------------------------------------------------- */
-/* Источник случайности для DRBG — getrandom(2), а не открытие /dev/urandom: у процесса на
- * телефоне под SELinux нет права открывать устройство, а системный вызов разрешён всем, и на
- * роутере он есть с ядра 3.17. Свои случайные байты движок берёт так же (reality.c). */
-#define WOLFSSL_GETRANDOM
+/* ---- platform -------------------------------------------------------------------------- */
+/* Seed for the DRBG: os_rand_seed (src/lib/osrand.c) — getrandom(2) where the kernel has it,
+ * /dev/urandom where it does not. WOLFSSL_GETRANDOM alone fails on the 3.4 kernels Entware's mips
+ * and mipsel targets support (the call appeared in 3.17), and NO_FILESYSTEM below removes
+ * wolfSSL's own fallback to /dev/urandom. */
+#if !defined(__ASSEMBLER__)
+extern int os_rand_seed(unsigned char *out, unsigned int n);
+#endif
+#define CUSTOM_RAND_GENERATE_SEED os_rand_seed
+/* Byte order. configure sets WORDS_BIGENDIAN; with user settings nothing does, wolfSSL then assumes
+ * little endian, and on big-endian MIPS (Entware mips-3.4) every hash, cipher and curve comes out
+ * wrong — SHA-256("abc") included. Found by running the crypto tests under qemu-mips. */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define BIG_ENDIAN_ORDER
+#endif
 #define NO_FILESYSTEM
 #define WOLFSSL_USER_IO
-/* Без сокетного ввода-вывода wolfio.h не подключает <sys/time.h>, а tls13.c wolfSSL на Linux
- * ждёт gettimeofday именно оттуда (время билетов сессии). Неявное объявление — ошибка у Soong
- * (-Werror=implicit-function-declaration), поэтому заголовок подключается здесь. Не для
- * ассемблера: этот файл видят и .S (через settings.h), а C-заголовок в них не разбирается. */
+/* Without socket I/O wolfio.h does not include <sys/time.h>, yet wolfSSL's tls13.c on Linux
+ * expects gettimeofday from it. An implicit declaration is an error with new compilers
+ * (-Werror=implicit-function-declaration), so the header is included here. Not for assembler:
+ * .S files see this file too (through settings.h), and a C header does not parse there. */
 #if !defined(__ASSEMBLER__) && defined(__linux__)
 #include <sys/time.h>
 #endif
-/* Потоки соединителей туннеля живут со скромным стеком (src/tunnel/tunnel.c), а разбор
- * сертификата и математика RSA держат на стеке килобайты. SMALL_STACK переносит крупные
- * временные буферы в кучу — медленнее на проценты там, где скорость не важна (рукопожатие), и
- * безопасно там, где переполнение стека молча портит соседний поток. */
+/* The connector threads run with a modest stack (src/tunnel/stack.c), while certificate parsing
+ * and RSA math keep kilobytes on the stack. SMALL_STACK moves large temporary buffers to the
+ * heap: a few percent slower where speed does not matter (the handshake), and safe where a stack
+ * overflow would silently corrupt a neighbouring thread. */
 #define WOLFSSL_SMALL_STACK
-/* Файлы, которые wolfSSL включает в другие .c (ssl_*.c в ssl.c, misc.c как inline), собираются и
- * отдельно — пустыми; без этого ключа каждый такой файл предупреждает, а наши сборки
- * предупреждений не терпят (Soong — -Werror). */
+/* Files that wolfSSL includes into other .c files (ssl_*.c into ssl.c, misc.c as inline) are also
+ * compiled on their own, as empty units; without this each of them warns. */
 #define WOLFSSL_IGNORE_FILE_WARN
 #define NO_ERROR_STRINGS
-/* Воспроизводимая сборка: без даты и времени сборки в бинарнике (строка OpenSSL_version слоя
- * совместимости). Один и тот же исходник обязан давать один и тот же пакет, а Soong отвергает
- * __DATE__ и __TIME__ вовсе (-Werror=date-time). То же делает пакет OpenWrt
- * (--enable-reproducible-build). */
+/* Reproducible build: no build date and time in the binary (OpenSSL_version string of the
+ * compatibility layer). The OpenWrt and Entware wolfssl package does the same. */
 #define HAVE_REPRODUCIBLE_BUILD
 
-/* ---- TLS-стек wolfSSL: ровно то, что нужно QUIC --------------------------------------- */
+/* ---- wolfSSL TLS stack: just what the X509 store needs --------------------------------- */
 #define WOLFSSL_TLS13
 #define WOLFSSL_NO_TLS12
 #define NO_OLD_TLS
-/* Сервера TLS в поставляемой библиотеке нет. Ключ STEER_WOLFSSL_SERVER даёт его стендам
- * (tests/ext-test.sh: эхо-сервер QUIC для проверки клиента), как WOLFSSL_CERT_GEN — выпуск
- * сертификатов; сборки движка его не задают никогда. */
+/* No TLS server in the shipped library. STEER_WOLFSSL_SERVER gives one to the test build of the
+ * library (Makefile) for the tests that need a TLS peer, as WOLFSSL_CERT_GEN gives them
+ * certificate issuing; tunvless builds never set it. */
 #ifndef STEER_WOLFSSL_SERVER
 #define NO_WOLFSSL_SERVER
 #endif
@@ -79,45 +74,31 @@
 #define HAVE_SUPPORTED_CURVES
 #define HAVE_SNI
 #define HAVE_ALPN
-#define HAVE_SESSION_TICKET
-/* 0-RTT (early data) у клиента QUIC: DoQ отправляет первый вопрос в пакетах 0-RTT по билету прошлой
- * сессии (RFC 9250 разрешает — вопрос DNS идемпотентен), см. src/proto/quic/quic.c. Без этого
- * определения wolfSSL_set_quic_early_data_enabled и max_early_data билета в библиотеке нет. Цена —
- * разбор расширения early_data и хранение лимита в билете, порядка килобайта кода; серверной половины
- * (приём 0-RTT) в поставляемой сборке нет по-прежнему. */
-#define WOLFSSL_EARLY_DATA
-#define WOLFSSL_QUIC
 #define HAVE_EX_DATA
 #define OPENSSL_EXTRA
 
-/* ---- примитивы ------------------------------------------------------------------------- */
+/* ---- primitives ------------------------------------------------------------------------ */
 #define HAVE_HKDF
 #define WOLFSSL_SHA384
 #define WOLFSSL_SHA512
-/* SHA-384/512 нужны рукопожатию (набор TLS_AES_256_GCM_SHA384, HMAC-SHA512 у REALITY, подписи в
- * сертификатах) — десяток вызовов на соединение, а развёрнутый цикл сжатия стоил 12 КБ флеша.
- * SHA-256 (им же считается и транскрипт, и Noise у xsteer) остаётся быстрым. */
+/* SHA-384/512 serve the handshake (TLS_AES_256_GCM_SHA384, REALITY's HMAC-SHA512, certificate
+ * signatures): a dozen calls per connection, while the unrolled compression loop cost 12 KB of
+ * flash. SHA-256 (which also hashes the transcript) stays fast. */
 #define USE_SLOW_SHA512
 #define HAVE_HASHDRBG
 
 #define HAVE_AESGCM
-/* Таблица GHASH на 4 бита (256 байт на ключ), а не на 8 (4 КБ): ключей в процессе столько же,
- * сколько направлений у соединений, и при 64 соединениях 8-битная таблица стоила бы полмегабайта
- * памяти. mbedtls, которую wolfSSL здесь сменила, держала ту же 4-битную. */
+/* A 4-bit GHASH table (512 bytes per key), not 8-bit (4 KB): there is a key per direction of
+ * every connection, and with hundreds of connections the 8-bit table would cost megabytes. */
 #define GCM_TABLE_4BIT
-/* AES-256-CTR — гамма обфускации MTProto у моста tgws (src/proto/tgws/tgws.c). DIRECT нужен
- * установке ключа без режима (wc_AesSetKeyDirect) и прямому шифрованию блока. */
+/* AES-CTR — the masking stream of VLESS encryption (src/proto/transport/trvenc.c). DIRECT is needed
+ * for setting a key without a mode (wc_AesSetKeyDirect) and for encrypting one block. */
 #define WOLFSSL_AES_COUNTER
 #define WOLFSSL_AES_DIRECT
-/* AES-ECB — защита заголовка пакета QUIC (RFC 9001, раздел 5.4.3): ngtcp2 берёт маску из
- * одного блока AES-128/256-ECB через слой EVP (wolfSSL_EVP_aes_{128,256}_ecb). ChaCha20 для
- * той же цели (TLS_CHACHA20_POLY1305_SHA256) — HAVE_CHACHA ниже. */
-#define HAVE_AES_ECB
 #define NO_AES_192
 #define NO_AES_CBC
-/* NO_AES_DECRYPT (без таблицы Td и обратного блока — GCM и CTR им не пользуются) здесь был бы
- * законен по смыслу, но в wolfSSL 5.9.4 он заодно снимает wc_AesGcmDecrypt — проверено сборкой.
- * Поэтому не задан. */
+/* Not NO_AES_DECRYPT: GCM and CTR do not use the Td table or the inverse block, but in wolfSSL
+ * 5.9.4 that option also removes wc_AesGcmDecrypt (checked by building). */
 
 #define HAVE_CHACHA
 #define HAVE_POLY1305
@@ -132,25 +113,24 @@
 #define ECC_SHAMIR
 #define ECC_TIMING_RESISTANT
 
-/* ---- постквантовая часть (паритет с Xray-core) ------------------------------------------ */
-/* ML-KEM-768 - половина гибрида X25519MLKEM768 в TLS 1.3 (ClientHello Chrome 131+, ответ
- * сервера REALITY) и обмен «mlkem768x25519plus» у VLESS encryption. ML-KEM-512 и -1024 не
- * нужны никому из тех, кого клиент встречает (Xray и Go используют ровно 768), и без них
- * снимается треть таблиц и кода.
+/* ---- post-quantum (parity with Xray-core) ---------------------------------------------- */
+/* ML-KEM-768 is half of the X25519MLKEM768 hybrid in TLS 1.3 (Chrome 131+ ClientHello, the
+ * REALITY server's answer) and of the "mlkem768x25519plus" exchange of VLESS encryption.
+ * ML-KEM-512 and -1024 are used by no peer the client meets (Xray and Go use only 768); leaving
+ * them out drops a third of the tables and code.
  *
- * SHA-3 (SHAKE128/256, SHA3-256/512) - то, на чём стоит ML-KEM: матрица A разворачивается из seed
- * SHAKE128, шум - SHAKE256, хеши ключа и шифротекста - SHA3.
+ * SHA-3 (SHAKE128/256, SHA3-256/512) is what ML-KEM is built on: the matrix A expands from the
+ * seed with SHAKE128, the noise with SHAKE256, the key and ciphertext hashes are SHA3.
  *
- * ML-DSA-65 нужна ТОЛЬКО ДЛЯ ПРОВЕРКИ: REALITY кладёт подпись в расширение поддельного
- * сертификата, и клиент, у которого в узле задан mldsa65Verify (`pqv` в ссылке), обязан её
- * проверить. Подписывать и выпускать ключи мы не будем никогда, поэтому VERIFY_ONLY снимает
- * подпись, генерацию и разбор закрытого ключа; ASN.1-разбор не нужен (ключ приходит сырым 1952
- * байта). Экономящих память вариантов (SMALL_MEM) не берём: проверка редкая, но скорость не
- * режем ради килобайт (решение владельца: скорость важнее веса). */
-/* ML-KEM — переносимым C, без ассемблера aarch64 (WOLFSSL_ARMASM у wolfSSL включает armv8-mlkem-asm, а тот
- * требует SQRDMLAH из ARMv8.1 (`rdm`): на Cortex-A53 роутеров и в базовой цели NDK его нет, ассемблер
- * отказывает в сборке). Скорость: рукопожатие делает по одному keygen и decaps на соединение, это доли
- * миллисекунды у x86 и единицы у слабых ядер; узким местом оно не бывает. */
+ * ML-DSA-65 is needed FOR VERIFICATION ONLY: REALITY puts a signature into an extension of its
+ * fake certificate, and a client whose node sets mldsa65Verify (`pqv` in the link) must check it.
+ * We never sign or make keys, so VERIFY_ONLY drops signing, key generation and private key
+ * parsing; no ASN.1 parsing is needed (the key comes raw, 1952 bytes). The memory-saving
+ * variants (SMALL_MEM) are not used: verification is rare, but speed matters more than size. */
+/* ML-KEM in portable C, without the aarch64 assembly: WOLFSSL_ARMASM turns on wolfSSL's
+ * armv8-mlkem-asm, which needs SQRDMLAH from ARMv8.1 (`rdm`). The Cortex-A53 of routers lacks it,
+ * and the assembler refuses to build. Speed: a handshake does one keygen and one decaps, a
+ * fraction of a millisecond on x86 and a few on weak cores; it is never the bottleneck. */
 #define WC_MLKEM_NO_ASM
 #define WOLFSSL_HAVE_MLKEM
 #define WOLFSSL_WC_MLKEM
@@ -167,31 +147,27 @@
 #define WOLFSSL_NO_ML_DSA_87
 
 #define WC_RSA_PSS
-/* Соль PSS любой длины — как MBEDTLS_RSA_SALT_LEN_ANY прежде: RFC 8446 требует соль длиной с
- * хеш, но встречаются серверы (и переподписывающие посредники), у которых она другая, и
- * отвергать их значило бы объявить узел неисправным там, где подпись верна (certverify.c). */
+/* PSS salt of any length: RFC 8446 wants it as long as the hash, but some servers (and
+ * re-signing middleboxes) use another length, and rejecting them would declare a node broken
+ * where the signature is valid (certverify.c). */
 #define WOLFSSL_PSS_SALT_LEN_DISCOVER
 #define WOLFSSL_PSS_LONG_SALT
 #define WC_RSA_BLINDING
 #define TFM_TIMING_RESISTANT
 #define WOLFSSL_SP_MATH_ALL
-/* Математика больших чисел нужна только проверке цепочки у security=tls — несколько операций на
- * рукопожатие, — поэтому размер кода здесь важнее скорости. */
+/* Big-number math serves only the certificate checks of security=tls (chain and
+ * CertificateVerify), a few operations per handshake, so code size matters more than speed. */
 #define WOLFSSL_SP_SMALL
 
 #define WOLFSSL_ASN_TEMPLATE
-/* Имя в сертификате бывает и адресом (DoH на 1.1.1.1): без этих двух IP из SAN не разбирается,
- * и проверка имени отвергла бы честный сертификат. */
+/* A certificate name can be an IP address (DoH on 1.1.1.1): without these two an IP SAN is not
+ * parsed and the name check would reject a valid certificate. */
 #define WOLFSSL_ALT_NAMES
 #define WOLFSSL_IP_ALT_NAME
 
-/* MD5, SHA-224 и XChaCha20-Poly1305 — ради протоколов модуля steer-proxy, а не своей
- * криптографии (src/lib/scrypto.h): MD5 зашит в вывод ключей shadowsocks (EVP_BytesToKey) и VMess
- * (cmdKey, ключ ChaCha20 тела), SHA-224 — в пароль trojan на проводе, XChaCha20-Poly1305 — в
- * датаграммы shadowsocks 2022-blake3-chacha20-poly1305. В TLS MD5 не попадает: старые версии TLS,
- * где он был частью рукопожатия, сняты (NO_OLD_TLS выше). */
+/* SHA-224 stays because the hash interface of src/lib/scrypto.h names it (as it names MD5 and
+ * SHA-1); the VLESS path itself does not use them, and the linker drops what is not called. */
 #define WOLFSSL_SHA224
-#define HAVE_XCHACHA
 
 #define NO_DSA
 #define NO_DH
@@ -202,18 +178,17 @@
 #define NO_PSK
 #define NO_PWDBASED
 
-/* ---- ускорение по архитектуре ---------------------------------------------------------- */
-/* x86_64: AES-NI, PCLMUL и AVX/AVX2 — только для AES и AES-GCM, ассемблером wolfSSL (файлы
- * aes_x86_64_asm.S и aes_gcm_asm.S), с выбором по CPUID во время работы: на процессоре без AES-NI
- * путь программный, и бинарник запускается там же, где запускался. Ключ ставит
- * build/wolfssl/build.sh вместе с файлами .S; сборка, где их нет (Android.bp, Soong не собирает
- * здесь ассемблер), остаётся на переносимом C.
+/* ---- per-architecture acceleration ----------------------------------------------------- */
+/* x86_64: AES-NI, PCLMUL and AVX/AVX2 for AES and AES-GCM only, in wolfSSL's assembly
+ * (aes_x86_64_asm.S, aes_gcm_asm.S), chosen by CPUID at run time: on a CPU without AES-NI the
+ * software path runs, so the binary runs wherever it did. build/wolfssl/build.sh sets the macro
+ * together with the .S files; without them the build stays portable C.
  *
- * Почему не USE_INTEL_SPEEDUP целиком (ассемблер ещё и для ChaCha20, Poly1305, SHA и X25519).
- * Замерено сборкой: он добавлял бинарнику x86_64 больше 540 КБ — ассемблер в один раздел, и
- * компоновщик не выбрасывает из него неиспользуемые ветки AVX-512 и VAES. На x86_64 шифр туннеля —
- * AES-GCM (reality.c выбирает его по AES-NI, как Chrome), поэтому ускоряется ровно он, а VAES и
- * AVX-512 (процессоры, которых в роутерах нет) сняты. */
+ * Not the whole USE_INTEL_SPEEDUP (assembly also for ChaCha20, Poly1305, SHA and X25519): it
+ * added over 540 KB to the x86_64 binary, since the assembly is one section and the linker cannot
+ * drop its unused AVX-512 and VAES branches. On x86_64 the tunnel cipher is AES-GCM (reality.c
+ * picks it by AES-NI, as Chrome does), so only that is accelerated; VAES and AVX-512 (CPUs that
+ * routers do not have) are off. */
 #if defined(STEER_WOLFSSL_ASM) && defined(__x86_64__)
 #define WOLFSSL_X86_64_BUILD
 #define WOLFSSL_AESNI
@@ -221,13 +196,13 @@
 #define NO_VAES_SUPPORT
 #define NO_AVX512_SUPPORT
 #endif
-/* aarch64: ARMv8 Crypto для AES, PMULL для GHASH, NEON для ChaCha20 и Poly1305, свой код X25519 и
- * SHA — встроенным ассемблером wolfSSL (файлы port/arm/armv8-*_c.c, то есть обычный C, который
- * собирает и zig, и NDK). Инструкции криптографии выбираются по getauxval(AT_HWCAP) во время
- * работы (wolfcrypt/src/cpuid.c, aes->use_aes_hw_crypto): на Cortex-A53 без расширения (Raspberry
- * Pi 4 и родня) AES идёт программно, а не падает с SIGILL. Прежде тот же путь давала mbedtls
- * (MBEDTLS_AESCE_C) — без него AES-GCM на роутерах aarch64 откатился бы к таблицам. Файлы вне
- * aarch64 собираются в пустоту, поэтому список у build.sh и Android.bp общий. */
+/* aarch64: ARMv8 Crypto for AES, PMULL for GHASH, NEON for ChaCha20 and Poly1305, own X25519 and
+ * SHA code, all as wolfSSL's inline assembly (port/arm/armv8-*_c.c: plain C that any compiler
+ * builds). The crypto instructions are chosen by getauxval(AT_HWCAP) at run time
+ * (wolfcrypt/src/cpuid.c, aes->use_aes_hw_crypto): on a Cortex-A53 without the extension
+ * (Raspberry Pi 4 and the like) AES runs in software instead of dying with SIGILL. Without this,
+ * AES-GCM on aarch64 routers would fall back to tables. Off aarch64 the files compile to nothing,
+ * so build.sh has one file list for all targets. */
 #if defined(__aarch64__) && !defined(STEER_WOLFSSL_NO_ARMASM)
 #define WOLFSSL_ARMASM
 #define WOLFSSL_ARMASM_INLINE

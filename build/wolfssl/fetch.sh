@@ -1,27 +1,28 @@
 #!/bin/sh
-# Исходники wolfSSL для сборки движка: скачать выпуск, СВЕРИТЬ СУММУ, распаковать.
+# wolfSSL sources for the build: download the release, VERIFY THE CHECKSUM, unpack.
 #
-#     sh build/wolfssl/fetch.sh <каталог>
+#     sh build/wolfssl/fetch.sh <directory>
+#     sh build/wolfssl/fetch.sh version      prints the version
 #
-# ВЕРСИЯ И СУММА ЗАПИСАНЫ ЗДЕСЬ И ТОЛЬКО ЗДЕСЬ. Этим же скриптом берут исходники образ сборки
-# (build/Dockerfile копирует его и зовёт), стенды на настоящей библиотеке (tests/ext-test.sh) и
-# проверка сборки под телефон (make ndk-check), поэтому версия у всех одна, а сменить её — это
-# правка двух строк ниже, одним коммитом. Сверяет это tests/buildmatch.sh.
+# THE VERSION AND CHECKSUM ARE WRITTEN HERE ONLY. `make fetch`, the Entware package build
+# (.github/workflows/build.yml) and the tests all get the sources through this script, so they
+# share one version, and changing it is an edit of the two lines below in one commit.
 #
-# ПОЧЕМУ СКАЧИВАНИЕ, А НЕ ИСХОДНИКИ В ДЕРЕВЕ. Выпуск wolfSSL — 35 МБ и больше тысячи файлов, из
-# которых сборке нужно тридцать с небольшим (build/wolfssl/build.sh); класть их в src/third_party
-# значило бы тащить чужой код в каждый клон и в каждую правку истории ради того, что проверяется
-# одной суммой. Так же прежде приезжала mbedtls — в образ, со сверкой суммы (I-033).
+# WHY A DOWNLOAD AND NOT SOURCES IN THE TREE. A wolfSSL release is 35 MB and over a thousand
+# files, of which the build needs a little over thirty (build/wolfssl/build.sh). Keeping them in
+# the tree would put foreign code into every clone and every history rewrite, for what one
+# checksum verifies.
 #
-# ПОЧЕМУ ИМЕННО ЭТА СУММА. Тарбол — архив тега выпуска на GitHub (так же его берёт пакет OpenWrt,
-# package/libs/wolfssl), и wolfSSL подписывает именно его: рядом с выпуском лежит
-# wolfssl-<версия>.tar.gz.asc. Подпись проверена ключом wolfSSL (A2A4 8E7B CB96 C5BE CB98 7314
-# EBC8 0E41 5CA2 9677, «wolfSSL <secure@wolfssl.com>») при записи суммы сюда; сборка дальше
-# сверяет сумму, а не подпись: gpg и сеть к серверу ключей в образе и на машине сборки не нужны.
+# WHY THIS CHECKSUM. The tarball is GitHub's archive of the release tag (the OpenWrt package,
+# package/libs/wolfssl, takes the same one), and that is what wolfSSL signs:
+# wolfssl-<version>.tar.gz.asc sits next to the release. The signature was checked with
+# wolfSSL's key (A2A4 8E7B CB96 C5BE CB98 7314 EBC8 0E41 5CA2 9677, "wolfSSL
+# <secure@wolfssl.com>") when the checksum was recorded here. The build checks the checksum, not
+# the signature, so it needs neither gpg nor a key server.
 #
-# 5.9.4 — последний стабильный выпуск (25 сентября 2026); в его заметках (ChangeLog.md) закрыты
-# шесть CVE, найденных в 5.9.2 и старше (CVE-2026-93302, -89102, -89136, -93304, -89133, -89134).
-# Нашей конфигурации касаются не все, но выбирать выпуск с известными дырами незачем.
+# 5.9.4 (25 September 2026) fixes six CVEs found in 5.9.2 and older (ChangeLog.md: CVE-2026-93302,
+# -89102, -89136, -93304, -89133, -89134). Not all of them touch our configuration, but there is
+# no reason to build a release with known holes.
 set -eu
 
 WOLFSSL_VERSION=5.9.4
@@ -29,36 +30,36 @@ WOLFSSL_SHA256=7256bfc89b183a75183806c7debfa203443873b0b4a562e1b80d68e01b45ac57
 URL="https://github.com/wolfSSL/wolfssl/archive/refs/tags/v${WOLFSSL_VERSION}-stable.tar.gz"
 
 [ "${1:-}" = version ] && { echo "$WOLFSSL_VERSION"; exit 0; }
-DEST="${1:?нужен каталог, куда распаковать исходники}"
+DEST="${1:?need a directory to unpack the sources into}"
 if [ -f "$DEST/wolfssl/wolfcrypt/settings.h" ] && [ "$(cat "$DEST/.steer-wolfssl" 2>/dev/null)" = "$WOLFSSL_SHA256" ]; then
     exit 0
 fi
 
 mkdir -p "$DEST"
 TGZ="$DEST.tar.gz"
-# Готовый тарбол можно подложить (WOLFSSL_TARBALL) — сборка без сети; сверяется он так же.
+# WOLFSSL_TARBALL supplies a tarball for a build without network; it is verified the same way.
 if [ -n "${WOLFSSL_TARBALL:-}" ]; then
     TGZ="$WOLFSSL_TARBALL"
 elif ! curl -fsSL -o "$TGZ" "$URL"; then
-    echo "wolfssl: не скачать $URL" >&2
+    echo "wolfssl: cannot download $URL" >&2
     rm -f "$TGZ"
     exit 1
 fi
 if ! echo "$WOLFSSL_SHA256  $TGZ" | sha256sum -c - >/dev/null 2>&1; then
-    echo "wolfssl: сумма тарбола $TGZ не сошлась (ждали $WOLFSSL_SHA256) — не распаковываю" >&2
+    echo "wolfssl: checksum of $TGZ does not match (expected $WOLFSSL_SHA256) — not unpacking" >&2
     [ -n "${WOLFSSL_TARBALL:-}" ] || rm -f "$TGZ"
     exit 1
 fi
-# Распаковка — в соседний каталог и подмена целиком: исходники прежней версии в том же месте
-# иначе смешались бы с новыми (удалённый в новом выпуске файл остался бы и собрался).
+# Unpack next to DEST and replace DEST as a whole: unpacked in place, an older version would mix
+# with the new one (a file removed in the new release would stay and get built).
 NEW="$DEST.new"
 rm -rf "$NEW"
 mkdir -p "$NEW"
 tar xzf "$TGZ" -C "$NEW" --strip-components=1
 [ -n "${WOLFSSL_TARBALL:-}" ] || rm -f "$TGZ"
-[ -f "$NEW/wolfssl/wolfcrypt/settings.h" ] || { echo "wolfssl: в тарболе нет исходников" >&2; exit 1; }
-# Метка — сумма тарбола: исходники другой версии в том же каталоге будут заменены, а не взяты.
+[ -f "$NEW/wolfssl/wolfcrypt/settings.h" ] || { echo "wolfssl: no sources in the tarball" >&2; exit 1; }
+# The marker is the tarball checksum: sources of another version in DEST are replaced, not used.
 echo "$WOLFSSL_SHA256" > "$NEW/.steer-wolfssl"
 rm -rf "$DEST"
 mv "$NEW" "$DEST"
-echo "wolfssl: исходники $WOLFSSL_VERSION в $DEST (sha256 сошлась)"
+echo "wolfssl: sources $WOLFSSL_VERSION in $DEST (sha256 verified)"

@@ -1,14 +1,8 @@
-/* Транспорт до узла: сборка ярусов, ввод-вывод связи и транспорт tcp. Ярусы — в transport.h.
+/* Transport to the node: assembling the layers, link I/O and the tcp transport. The layers are
+ * described in transport.h.
  *
- * Переехало из клиента VLESS (client.c) при выделении стека туннеля из протокола (шаг 2
- * выпуска 1.10): прежде соединение с узлом было `struct vless_conn`, и транспорт в нём решался
- * перечислением `enum vless_transport { VT_RAW, VT_GRPC, VT_XHTTP }` с разбором по switch в
- * каждой функции обмена. Теперь транспорт — таблица (struct transport_ops), и новый (ws,
- * httpupgrade) — это новая таблица, а не ещё одна ветка в каждом switch.
- *
- * Поведение не менялось ни в чём: порядок шагов установления, кто и чем закрывается на каждом
- * отказе, ALPN, нулевая копия на tcp — те же. Держат это стенды vlessmatch (ветви отказа под
- * AddressSanitizer), xhupmatch (ответы на выгрузку xhttp) и ext-test на настоящей библиотеке.
+ * Who closes what on each failure path is checked by tests/vlessmatch.c (descriptors and heap
+ * after every failure, under LeakSanitizer); the xhttp upload responses by tests/xhupmatch.c.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -21,17 +15,16 @@
 #include "reality.h"
 #include "ech.h"
 
-/* ---- ввод-вывод связи ----------------------------------------------------------------- */
+/* ---- link I/O ------------------------------------------------------------------------ */
 
 int tr_link_write(void *ctx, const unsigned char *d, size_t n) {
     struct tr_link *l = ctx;
     if (l->plain) {
         size_t sent = 0;
         while (sent < n) {
-            /* send с MSG_NOSIGNAL, а не write: закрытый узлом сокет — отказ записи (EPIPE), а не
-             * SIGPIPE, даже у процесса, который его не выключал (проба узла, стенды). Поверх TLS
-             * ту же роль для tls13_write играет выключенный SIGPIPE модульных команд
-             * (cli/modcmd.c): tls13.c защищён от правок, и флага там не поставить. */
+            /* send with MSG_NOSIGNAL, not write: a socket closed by the node fails the write
+             * (EPIPE) instead of raising SIGPIPE, even in a process that did not ignore it (the
+             * tests). Over TLS, tls13_write relies on main ignoring SIGPIPE (src/main.c). */
             ssize_t w = send(l->fd, d + sent, n - sent, MSG_NOSIGNAL);
             if (w <= 0) {
                 if (w < 0 && errno == EINTR) continue;
@@ -46,13 +39,13 @@ int tr_link_write(void *ctx, const unsigned char *d, size_t n) {
 
 int tr_link_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
     struct tr_link *l = ctx;
-    /* Прямое копирование: сервер перестал шифровать в нашу сторону, и расшифровывать
-     * теперь нечего — в сокете лежит поток целевого соединения. Читаем как есть.
+    /* Direct copy: the server stopped encrypting towards us, and the socket carries the target
+     * connection's stream. Read it as is.
      *
-     * Но СНАЧАЛА отдаём то, что уже прочитано у сокета в буфер записей: переход в прямой
-     * режим случается посреди потока, и начало сырых данных к этому моменту обычно уже у
-     * нас. Прочитать сокет, не отдав их, значит выбросить кусок и разъехаться с сервером —
-     * узлы с Vision отдавали ровно ноль байт. */
+     * But FIRST return what the record buffer has already read from the socket: the switch
+     * happens mid-stream, and the start of the raw data is usually here by then. Reading the
+     * socket without returning it drops a piece and desyncs from the server (Vision nodes then
+     * deliver zero bytes). */
     if (l->rx_direct && !l->plain) {
         size_t pending = tls13_take_pending(&l->tls, d, cap);
         if (pending) { *got = pending; return 0; }
@@ -69,14 +62,14 @@ int tr_link_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
 void tr_link_close(struct tr_link *l) {
     if (l->fd >= 0) close(l->fd);
     l->fd = -1;
-    /* Контексты шифров живут в куче: без освобождения туннель за час работы утекает на
-     * тысячах соединений. Зовётся и для связи, до TLS не дошедшей: освобождение пустого
-     * состояния безвредно, а знать здесь, докуда дошло рукопожатие, незачем. */
+    /* The cipher contexts live on the heap and leak over thousands of connections if not freed.
+     * Also called for a link that never reached TLS: freeing an empty state is harmless, and
+     * this place need not know how far the handshake got. */
     if (!l->plain) tls13_free(&l->tls);
     l->tls.ready = 0;
 }
 
-/* ---- транспорт tcp: поток протокола прямо в связи ------------------------------------- */
+/* ---- the tcp transport: the protocol stream straight in the link --------------------- */
 
 static int tcp_write(struct transport *t, const unsigned char *d, size_t n) {
     return tr_link_write(&t->link, d, n);
@@ -91,8 +84,8 @@ const struct transport_ops tr_tcp = {
     .open = NULL, .write = tcp_write, .read = tcp_read, .moved = NULL, .close = NULL,
 };
 
-/* Транспорт по полю ссылки. Неподдержанное отсеивает разбор подписки (sub.c), поэтому сюда
- * доходят только эти пять; всё прочее — tcp, как было всегда. */
+/* The transport by the link field. The node parser drops unsupported types (sl_link_usable_post
+ * in sublink.c), so only these five arrive here; anything else is tcp. */
 static const struct transport_ops *transport_of(const char *type) {
     if (!strcmp(type, "grpc")) return &tr_grpc;
     if (!strcmp(type, "xhttp")) return &tr_xhttp;
@@ -101,17 +94,16 @@ static const struct transport_ops *transport_of(const char *type) {
     return &tr_tcp;
 }
 
-/* Лежит ли у транспорта своё непрочитанное (transport_ops.pending). */
 static int fr_pending(const struct transport *t) {
     return t->fr && t->fr->pending && t->fr->pending(t);
 }
 
-/* Разбирает ли транспорт ещё своё поверх записей TLS (transport_ops.busy). */
 static int fr_busy(const struct transport *t) {
     return t->fr && t->fr->busy && t->fr->busy(t);
 }
 
-/* Шифрование VLESS (encryption узла) — последний ярус: поверх готового транспорта, до запроса VLESS. */
+/* VLESS encryption (the node's encryption) is the last layer: over the ready transport, before
+ * the VLESS request. */
 static int tr_venc_after(struct transport *t, const struct tr_node *n, int timeout_s) {
     if (!n->encryption || !n->encryption[0]) return 0;
     int rc = tr_venc_open(t, n, timeout_s);
@@ -119,53 +111,42 @@ static int tr_venc_after(struct transport *t, const struct tr_node *n, int timeo
     return rc;
 }
 
-/* ---- сборка ярусов -------------------------------------------------------------------- */
+/* ---- assembling the layers ----------------------------------------------------------- */
 
 int transport_open(struct transport *t, const struct tr_node *n, int timeout_s) {
     memset(t, 0, sizeof(*t));
-    /* Транспорт определяется ЗДЕСЬ, один раз: дальше он читается и при открытии, и при каждой
-     * отправке, и независимые разборы строки разошлись бы. */
     t->fr = transport_of(n->type);
     int rc = tr_link_open(&t->link, n, t->fr->alpn, timeout_s);
     if (rc) return rc;
     if (!t->fr->open) return tr_venc_after(t, n, timeout_s);
 
-    /* ALPN здесь НЕ обязателен, и это важно понять правильно.
+    /* ALPN is NOT required here.
      *
-     * Сервер Reality, признавший клиента, обслуживает соединение сам — с
-     * `NextProtos: nil` (так и написано в config.go Xray), то есть ALPN не выбирает
-     * вовсе и присылает пустые EncryptedExtensions. Признаком «h2 согласован» служит
-     * не ответ, а сама конфигурация узла: Xray для reality решает версию HTTP тем же
-     * способом — decideHTTPVersion возвращает «2» при reality, ни на что не глядя.
+     * A Reality server that accepted the client serves the connection itself with
+     * `NextProtos: nil` (Xray config.go): it selects no ALPN and sends empty
+     * EncryptedExtensions. So "h2 negotiated" follows from the node config, not from the answer;
+     * Xray decides the HTTP version for reality the same way (decideHTTPVersion returns "2" for
+     * reality without looking at anything). On a live node openssl with -alpn h2 gets "h2"
+     * because it was NOT accepted and was proxied to the real site. Requiring ALPN would reject
+     * exactly the nodes that work. So only a contradiction is an error: the server named a
+     * protocol, and not the one asked for.
      *
-     * Проверено на живом узле: openssl с -alpn h2 получает «h2», потому что его
-     * НЕ признали и проксировали на настоящий сайт. Наше соединение ALPN не получает
-     * именно потому, что признали. Требование ALPN отвергало бы ровно те узлы,
-     * которые работают, — и первая версия этой проверки так и делала.
-     *
-     * Поэтому ошибка остаётся только на противоречие: сервер назвал протокол, и это
-     * не тот, что просили. Тогда мы точно знаем, что говорить по нему бессмысленно.
-     *
-     * Отказы ПОСЛЕ удавшегося рукопожатия закрываются через transport_close, а не одним
-     * close(fd), и это не стилистика. К этому месту ключи уже развёрнуты, и контексты
-     * шифров живут в КУЧЕ. Дескриптор их не держит, вызывающие тоже не убирают: проверка узла
-     * возвращается сразу, пул запасных сессий лишь помечает слот пустым.
-     *
-     * Стреляет это на узле grpc/xhttp с security=reality, которого Reality не признал:
-     * маскировочный сайт выбирает ALPN http/1.1, ENOH2 приходит на КАЖДОЙ попытке, а пул
-     * пополняется на каждый SYN. Процесс живёт неделями — RSS растёт до OOM-killer, и в
-     * журнале при этом только «поток к узлу не открылся». */
+     * Failures AFTER a successful handshake close through transport_close, not close(fd): the
+     * keys are expanded by now and the cipher contexts live on the HEAP. Callers do not clean up
+     * (the node probe returns at once, the spare pool just marks the slot empty). A grpc/xhttp
+     * node with security=reality that Reality did not accept fails here on EVERY attempt (a
+     * cover site without h2 picks http/1.1), and the spare pool refills on every SYN: a leak
+     * here grows RSS until the OOM killer. */
     if (!t->link.plain && t->fr->alpn && t->link.tls.alpn[0] &&
         strcmp(t->link.tls.alpn, t->fr->alpn) != 0) {
         transport_close(t);
-        /* Код — по тому, ЧТО просили: ws и httpupgrade просят только http/1.1, и «не согласился
-         * на HTTP/2» у них было бы неправдой, отправляющей человека не туда. */
+        /* The code follows WHAT was asked: ws and httpupgrade ask for http/1.1 only, and "did not
+         * agree to HTTP/2" would send the user the wrong way. */
         return strcmp(t->fr->alpn, "h2") ? TR_ENOH1 : TR_ENOH2;
     }
-    /* security=none с транспортом поверх HTTP/2: прежде единственная ветка отказа, которая
-     * дескриптор НЕ закрывала. Узел, который не отвечает по h2, за сутки опроса упирал
-     * процесс в RLIMIT_NOFILE. Теперь отказ открытия закрывается одним путём при любой
-     * безопасности. */
+    /* An open failure closes the same way for every security, security=none included: a
+     * descriptor leaked per probe of a node that does not speak h2 hits RLIMIT_NOFILE within a
+     * day. */
     rc = t->fr->open(t, n, timeout_s);
     if (rc) { transport_close(t); return rc; }
     return tr_venc_after(t, n, timeout_s);
@@ -186,29 +167,28 @@ int transport_read_zc(struct transport *t, unsigned char *buf, size_t cap,
                       const unsigned char **data, size_t *got) {
     *got = 0;
     *data = buf;
-    /* Без копии — только там, где данные лежат в записях TLS как есть (transport_ops.zc).
-     * Прямое копирование (rx_direct) и security=none читают сокет сами. Своё непрочитанное у
-     * транспорта (остаток после ответа 101 у httpupgrade) — раньше записей TLS: оно раньше
-     * их и приехало. */
+    /* Zero copy only where the data sits in the TLS records as is (transport_ops.zc). Direct
+     * copy (rx_direct) and security=none read the socket themselves. The transport's own unread
+     * data (the rest after the 101 of httpupgrade) goes before the TLS records: it arrived
+     * before them. */
     if (!t->enc && t->fr->zc && !t->link.plain && !t->link.rx_direct && !fr_pending(t) && !fr_busy(t))
         return tls13_read_ref(&t->link.tls, data, got);
     return transport_read(t, buf, cap, got);
 }
 
-/* Есть ли у нас непрочитанное, о чём ядро не расскажет.
+/* Whether we hold unread data the kernel will not report.
  *
- * Спрашивает туннель, прежде чем уйти ждать событий: данные, уже вынутые из сокета в буфер
- * записей, для epoll не существуют. Зачем это важно — в tls13.h у tls13_has_record.
+ * The tunnel asks before it waits for events: data already taken from the socket into the
+ * record buffer does not exist for epoll. Why it matters: tls13.h at tls13_has_record.
  *
- * Три режима, а не один. Без TLS буфера нет вовсе. В прямом копировании нет и границ
- * записей — значимо просто «есть байты». В обычном режиме — только ЦЕЛАЯ запись: по части
- * записи мы всё равно ничего не сможем отдать, и считать её готовностью значило бы крутить
- * цикл впустую до прихода остатка.
+ * Three modes. Without TLS there is no buffer. In direct copy there are no record boundaries,
+ * and any byte counts. In normal mode only a WHOLE record counts: part of a record yields
+ * nothing, and counting it as ready would spin the loop until the rest arrives.
  *
- * И четвёртое, раньше всех: своё непрочитанное у транспорта (transport_ops.pending) — остаток
- * после ответа 101 и конец потока ws, о котором сокет уже ничего не скажет. */
+ * Before all of them comes the transport's own unread data (transport_ops.pending): the rest
+ * after the 101 and the ws end of stream, which the socket will not report any more. */
 int transport_has_data(const struct transport *t) {
-    /* Шифрованный поток: расшифрованное и целая запись во входе слоя (trvenc.c) — раньше всего. */
+    /* Encrypted stream: decrypted data or a whole record in the layer's input (trvenc.c). */
     if (t->enc && tr_venc_pending(t)) return 1;
     if (fr_pending(t)) return 1;
     if (t->link.plain) return 0;
@@ -223,11 +203,11 @@ void transport_moved(struct transport *t) {
 }
 
 void transport_close(struct transport *t) {
-    /* Своё транспорт закрывает ПЕРВЫМ, пока связь жива: ws шлёт при закрытии кадр close, как
-     * Xray, и шифровать его после tr_link_close было бы нечем. Вторая связь xhttp закрывается
-     * ЗДЕСЬ ЖЕ и по тому же доводу (transport_ops.close). Забыть её значило бы утечку ровно вдвое
-     * злее обычной: на соединение приходится и лишний дескриптор, и лишний набор контекстов
-     * шифра. fr пуст, если открытие не дошло до выбора транспорта — тогда и второй связи не было. */
+    /* The transport closes its part FIRST, while the link is alive: ws sends a close frame on
+     * closing, as Xray does, and after tr_link_close there is nothing to encrypt it with. The
+     * xhttp second link is closed here too (transport_ops.close); forgetting it leaks both a
+     * descriptor and a set of cipher contexts per connection. fr is NULL if opening did not get
+     * to choosing the transport; then there was no second link either. */
     if (t->enc) tr_venc_close(t);
     if (t->fr && t->fr->close) t->fr->close(t);
     tr_link_close(&t->link);
@@ -236,65 +216,66 @@ void transport_close(struct transport *t) {
 const char *transport_strerror(int rc) {
     switch (rc) {
         case 0: return "ok";
-        case TR_EDNS: return "имя не разрешилось";
-        case TR_ESOCK: return "нет сокета";
-        case TR_ECONNECT: return "TCP не соединился";
-        case TR_EIO: return "обрыв ввода-вывода";
-        case TR_ECLOSED: return "сервер закрыл соединение";
-        case TR_ENOH2: return "сервер не согласился на HTTP/2 (нужен для grpc и xhttp)";
-        case TR_EGRPC: return "поток gRPC в неожиданной форме";
-        case TR_ENOH1: return "сервер выбрал не HTTP/1.1 (нужен для ws и httpupgrade)";
-        /* Код ответа — в тексте: 404 и 400 почти всегда значат не тот path или host (сервер Xray
-         * так отвечает на чужой путь), 403 и 5xx — посредника или CDN перед сервером. */
+        case TR_EDNS: return "name did not resolve";
+        case TR_ESOCK: return "no socket";
+        case TR_ECONNECT: return "TCP connect failed";
+        case TR_EIO: return "I/O error";
+        case TR_ECLOSED: return "server closed the connection";
+        case TR_ENOH2: return "server did not agree to HTTP/2 (needed for grpc and xhttp)";
+        case TR_EGRPC: return "unexpected gRPC stream format";
+        case TR_ENOH1: return "server did not pick HTTP/1.1 (needed for ws and httpupgrade)";
+        /* The status goes in the text: 404 and 400 almost always mean a wrong path or host (that
+         * is Xray's answer to an unknown path), 403 and 5xx point at a proxy or CDN in front. */
         case TR_EUPSTATUS: {
             static __thread char why[96];
-            snprintf(why, sizeof why, "сервер ответил %d вместо 101 (проверьте path и host)",
+            snprintf(why, sizeof why, "server answered %d instead of 101 (check path and host)",
                      tr_h1_last_status());
             return why;
         }
-        case TR_ENOUPGRADE: return "ответ 101 без Upgrade: websocket";
-        case TR_EWSACCEPT: return "ответ 101 с неверным Sec-WebSocket-Accept";
-        case TR_EUPTIMEOUT: return "сервер не ответил на запрос Upgrade (таймаут)";
-        case TR_EUPTOOBIG: return "ответ на запрос Upgrade не разобрался";
-        case TR_EWSFRAME: return "кадр WebSocket не по RFC 6455";
+        case TR_ENOUPGRADE: return "101 response without Upgrade: websocket or Connection: Upgrade";
+        case TR_EWSACCEPT: return "101 response with a wrong Sec-WebSocket-Accept";
+        case TR_EUPTIMEOUT: return "server did not answer the Upgrade request (timeout)";
+        case TR_EUPTOOBIG: return "cannot parse the response to the Upgrade request";
+        case TR_EWSFRAME: return "WebSocket frame violates RFC 6455";
         case TR_EVENC: {
             static __thread char why[128];
             snprintf(why, sizeof why, "VLESS encryption: %s", tr_venc_reason());
             return why;
         }
-        case TR_EVENCAUTH: return "VLESS encryption: ключи разошлись с сервером (проверьте строку encryption)";
-        case TR_EVENC0RTT: return "VLESS encryption: сервер отклонил билет 0-RTT";
+        case TR_EVENCAUTH: return "VLESS encryption: keys do not match the server's "
+                                  "(check the encryption string)";
+        case TR_EVENC0RTT: return "VLESS encryption: server rejected the 0-RTT ticket";
         case H2_EIO: case H2_EPROTO: case H2_ESTATUS:
         case H2_ERESET: case H2_ETOOBIG: case H2_EWINDOW: return h2_strerror(rc);
-        case REALITY_EBADKEY: return "pbk или sid не разобрались";
-        case REALITY_ECRYPTO: return "сбой криптографии";
-        case REALITY_ETOOBIG: return "ClientHello не влез";
-        case TLS13_EAUTH: return "AEAD не сошёлся (ключи разъехались)";
-        case TLS13_EFINISHED: return "Finished не совпал";
-        case TLS13_ENOKEYSHARE: return "ServerHello без key_share";
-        case TLS13_EBADSUITE: return "сервер выбрал неподдержанный шифр";
-        case TLS13_EBADREC: return "испорченная TLS-запись";
-        case TLS13_EECH: return "сервер не принял ECH (ключ ECH в ссылке устарел или сервер его не знает)";
-        case ECH_EPARSE: return "ECH: ECHConfigList из ссылки не разобрался";
-        case ECH_ENOCONFIG: return "ECH: в ECHConfigList нет записи, которую мы умеем (нужен X25519, HKDF-SHA256, AES-128-GCM или ChaCha20)";
-        case ECH_ECRYPTO: return "ECH: сбой криптографии";
-        case ECH_ETOOBIG: return "ECH: ClientHello не влез";
-        case TLS13_ECLOSED: return "TLS закрыт сервером";
-        case TLS13_EIO: return "ошибка чтения TLS";
-        /* «Молчит», а не «ошибка»: соединение TCP встало, а на ClientHello ответа нет. Так
-         * выглядит блокировка по имени в SNI, лежачий узел и потерянный пакет — то есть
-         * причина снаружи движка, и текст обязан отправлять смотреть туда. */
-        case TLS13_ETIMEOUT: return "узел не ответил на ClientHello (таймаут)";
-        /* Причина у отказа проверки одна на код, но РАЗНАЯ по сути — «нечем проверить» это
-         * не то же самое, что «проверили и не сошлось». Точный текст приносит tls13.c, и
-         * общее слово добавляется здесь, чтобы человек видел, о чём вообще речь. */
+        case REALITY_EBADKEY: return "cannot parse pbk or sid";
+        case REALITY_ECRYPTO: return "crypto failure";
+        case REALITY_ETOOBIG: return "ClientHello does not fit";
+        case TLS13_EAUTH: return "AEAD failed (keys out of sync)";
+        case TLS13_EFINISHED: return "server Finished did not verify";
+        case TLS13_ENOKEYSHARE: return "ServerHello without key_share";
+        case TLS13_EBADSUITE: return "server chose an unsupported cipher suite";
+        case TLS13_EBADREC: return "corrupt TLS record";
+        case TLS13_EECH: return "server rejected ECH (stale or unknown ECH key in the link)";
+        case ECH_EPARSE: return "ECH: cannot parse the ECHConfigList from the link";
+        case ECH_ENOCONFIG: return "ECH: no usable config in the ECHConfigList (need X25519, "
+                                   "HKDF-SHA256, AES-128-GCM or ChaCha20-Poly1305)";
+        case ECH_ECRYPTO: return "ECH: crypto failure";
+        case ECH_ETOOBIG: return "ECH: ClientHello does not fit";
+        case TLS13_ECLOSED: return "TLS closed by the server";
+        case TLS13_EIO: return "TLS read error";
+        /* "Did not answer", not "error": TCP is up but ClientHello gets no answer. That is how
+         * SNI blocking, a dead node or a lost packet look, so the cause is outside the client,
+         * and the text must send the user to look there. */
+        case TLS13_ETIMEOUT: return "node did not answer the ClientHello (timeout)";
+        /* One code, different causes: "nothing to verify with" is not "verified and did not
+         * match". tls13.c gives the exact text; the general phrase here says what it is about. */
         case TLS13_ECERT: {
             static __thread char why[128];
             const char *d = tls13_verify_reason();
-            snprintf(why, sizeof why, "сервер не доказал подлинность%s%s",
+            snprintf(why, sizeof why, "server did not prove its identity%s%s",
                      d && d[0] ? ": " : "", d && d[0] ? d : "");
             return why;
         }
-        default: return "неизвестная ошибка";
+        default: return "unknown error";
     }
 }

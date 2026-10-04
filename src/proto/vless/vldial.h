@@ -1,4 +1,4 @@
-/* Дайлер VLESS для стека туннеля (dialer.h). Подробности — в vldial.c. */
+/* VLESS dialer for the tunnel stack (dialer.h). Details in vldial.c. */
 #ifndef STEER_VLDIAL_H
 #define STEER_VLDIAL_H
 #include <stdint.h>
@@ -6,60 +6,57 @@
 #include "dialer.h"
 #include "transport.h"
 #include "vision.h"
+#include "stack.h"
+#include "pool.h"
 
-/* Сессия VLESS на одно соединение клиента: состояние потока и связь с узлом.
+/* The VLESS session of one client connection: the flow state and the link to the node.
  *
- * ПОРЯДОК ПОЛЕЙ НЕ КОСМЕТИКА. Всё, что стек трогает на каждом освобождении слота и при
- * заводе таблицы (dialer_ops.clear), — счётчики, флаги, дескриптор связи — лежит в первых
- * сотнях байт, то есть на одной странице. Буферы TLS внутри связи и буфер сборки датаграммы
- * идут дальше: их страницы берутся только теми соединениями, по которым реально идёт
- * ввод-вывод, как и прежде у `struct sess` в tunnel.c. */
+ * Field order matters. Everything the stack touches on every slot release and at table setup
+ * (dialer_ops.clear), the counters, flags and the link's descriptor, lies in the first few
+ * hundred bytes, on one page. The TLS buffers inside the link and the datagram buffer come
+ * later: their pages are touched only by connections that actually do I/O. */
 struct vl_sess {
-    /* ---- поток: VLESS и Vision ---- */
-    uint8_t header_sent;       /* заголовок запроса VLESS уже ушёл узлу */
-    uint8_t established;       /* заголовок ответа VLESS снят */
-    /* ---- сборка датаграммы UDP (только у потоков UDP) ----
+    /* ---- flow: VLESS and Vision ---- */
+    uint8_t header_sent;       /* the VLESS request header has been sent */
+    uint8_t established;       /* the VLESS response header has been stripped */
+    /* ---- UDP datagram assembly (UDP flows only) ----
      *
-     * VLESS несёт датаграммы потоком: [длина(2)][данные] и снова. Записи TLS про эти
-     * границы не знают ничего — датаграмма может приехать двумя записями, а одна запись
-     * принести полторы, — поэтому недособранное приходится держать между чтениями.
+     * VLESS carries datagrams as a stream: [length(2)][data], repeated. TLS records know
+     * nothing of these boundaries (a datagram may come in two records, one record may bring
+     * one and a half), so a partial datagram is kept between reads.
      *
-     * dg_want == 0 означает «ждём длину». lenb хранит первый байт длины, если запись
-     * кончилась ровно между двумя байтами длины: случай редкий, но молча теряющий
-     * синхронизацию потока навсегда.
+     * dg_want == 0 means "waiting for the length". lenb holds the first length byte when a
+     * record ended exactly between the two: rare, but losing it desyncs the stream for good.
      *
-     * dg_skip — сколько байт слишком большой датаграммы осталось выбросить. Выбросить её
-     * НАДО ЦЕЛИКОМ и точно: оборвав отсчёт, мы приняли бы её хвост за длину следующей. */
+     * dg_skip is how many bytes of an oversized datagram are left to discard. It must be
+     * discarded whole and exactly: stopping early would read its tail as the next length. */
     unsigned char lenb, lenb_n;
     uint16_t dg_want, dg_have;
     uint32_t dg_skip;
-    /* Разобранный UUID узла: нужен один раз на соединение — в заголовке запроса VLESS и
-     * при заводе Vision. */
+    /* The node's parsed UUID, needed once per connection: in the VLESS request header and to
+     * set up Vision. */
     unsigned char uuid[16];
     struct vision vis;
-    /* ---- разбор кадров XUDP (только UDP при vision, см. xudp_downstream в vldial.c) ----
-     * xs — что читаем сейчас (XS_*), xneed — длина метаданных кадра, xdiscard — данные кадра
-     * KeepAlive читаются и выбрасываются. Длины двух байт используют lenb/lenb_n, буфер — dg. */
+    /* ---- XUDP frame parsing (UDP with vision only, see xudp_downstream in vldial.c) ----
+     * xs: what is being read now (XS_*); xneed: the frame's metadata length; xdiscard: the
+     * data of a KeepAlive frame is read and discarded. Two-byte lengths use lenb/lenb_n, the
+     * buffer is dg. */
     uint8_t xs, xdiscard;
     uint16_t xneed;
-    /* ---- связь с узлом ---- */
+    /* ---- link to the node ---- */
     struct transport t;
     unsigned char dg[UDP_DGRAM_MAX];
 };
 
 extern const struct dialer_ops vless_dialer;
 
-/* Трассировка разбора (STEER_TUN_TRACE) — та же, что у стека, и в тот же поток журнала. */
+/* Parse trace (STEER_TUN_TRACE): the same switch as the stack's, to the same log stream. */
 void vl_set_trace(int on);
 
-/* Поднять туннель выхода на пуле узлов pc (src/tunnel/pool.h; узлы — struct vless_node, первый
- * активный — pc->first): проверка узла, которую нельзя отложить до первого соединения, и стек с
- * дайлером VLESS под пулом (pool_run). ready — как у stack_run (stack.h, stack_ready_fn): устройство
- * поднято; up демону говорит пул, модуль — только своё; NULL — ничего. Возвращает код выхода
- * процесса, всегда ненулевой — успешного выхода у цикла нет. */
-struct output;
-struct pool_cfg;
-int vless_tunnel_run(struct output *o, const struct pool_cfg *pc,
-                     void (*ready)(void *arg, const char *dev), void *arg);
+/* Bring the tunnel up over the node pool pc (src/tunnel/pool.h) with this dialer as its protocol:
+ * first the check that cannot wait for the first connection (the UUID of pc->first), then
+ * pool_run. Returns the process exit code, never 0: the loop has no successful exit. */
+int vless_tunnel_run(const struct tun_cfg *tc, const struct pool_cfg *pc, stack_ready_fn ready,
+                     void *arg);
 
 #endif
