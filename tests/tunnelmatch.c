@@ -1296,6 +1296,167 @@ static void t_pool_state(void) {
     rmdir(dir);
 }
 
+/* ---- подтверждения привязаны к очереди дайлера (DC_ACK_PACED) ------------------------------- */
+
+/* Поддельный дайлер с ограниченной очередью: связь — пара SOCK_SEQPACKET (как у hysteria2), второй
+ * конец g_hpeer — «мультиплексор», который стенд разбирает руками. Очередь мала (буфер отправки
+ * 16 КиБ, готовность записи — пока в ней не больше четверти), чтобы заполнить её несколькими пакетами.
+ * Стенд проверяет то, что видно снаружи: подтверждение клиенту не уходит, пока очередь выше нижней
+ * отметки, и уходит, когда она опустела. Ожидание готовности в epoll (ARM_OUT) — дело цикла
+ * worker_loop, и его гоняет стенд в сетевых пространствах (tests/run-hy2.sh, раздел 8). */
+struct hsess { int fd; };
+static int g_hpeer = -1;
+
+static const char *h_peer(const void *ctx) { (void)ctx; return "очередь"; }
+static void h_describe(const void *ctx, char *out, size_t n) { (void)ctx; snprintf(out, n, "очередь"); }
+static const char *h_strerror(int rc) { (void)rc; return "подмена"; }
+static int h_connect(const void *ctx, void *sess, int t) {
+    (void)ctx; (void)t;
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK, 0, sv) != 0) return -1;
+    int sz = 16 * 1024;
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz);
+    g_hpeer = sv[1];
+    ((struct hsess *)sess)->fd = sv[0];
+    return 0;
+}
+static void h_take(void *dst, void *src) { (void)dst; (void)src; }
+static void h_close(void *sess) {
+    struct hsess *s = sess;
+    if (s->fd >= 0) close(s->fd);
+    s->fd = -1;
+}
+static void h_clear(void *sess) { ((struct hsess *)sess)->fd = -1; }
+static int h_fd(const void *sess) { return ((const struct hsess *)sess)->fd; }
+static int h_has_data(const void *sess) { (void)sess; return 0; }
+static int h_flow_open(const void *ctx, void *sess, const struct flow_key *k, int udp) {
+    (void)ctx; (void)sess; (void)k; (void)udp;
+    return 0;
+}
+static int h_send(const void *ctx, void *sess, const struct flow_key *k, int udp,
+                  const unsigned char *d, size_t n) {
+    (void)ctx; (void)k; (void)udp;
+    ssize_t w = send(((struct hsess *)sess)->fd, d, n, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (w == (ssize_t)n) return SEND_OK;
+    return w < 0 && errno == EAGAIN ? SEND_AGAIN : SEND_FATAL;
+}
+static int h_read(void *sess, unsigned char *buf, size_t cap, const unsigned char **data, size_t *got) {
+    ssize_t r = recv(((struct hsess *)sess)->fd, buf, cap, MSG_DONTWAIT);
+    *data = buf;
+    *got = r > 0 ? (size_t)r : 0;
+    return 0;
+}
+static int h_deliver(const void *ctx, void *sess, int udp, const unsigned char *d, size_t n,
+                     dialer_emit_fn emit, void *arg) {
+    (void)ctx; (void)sess; (void)udp;
+    return emit(arg, d, n);
+}
+
+static const struct dialer_ops h_ops = {
+    .name = "очередь", .caps = DC_ACK_PACED, .rcv_wnd_max = 100000, .sess_size = sizeof(struct hsess),
+    .peer = h_peer, .describe = h_describe, .strerror = h_strerror, .connect = h_connect,
+    .take = h_take, .close = h_close, .clear = h_clear, .fd = h_fd, .has_data = h_has_data,
+    .flow_open = h_flow_open, .send = h_send, .dgram_frame = f_dgram_frame, .read = h_read,
+    .deliver = h_deliver,
+};
+
+/* Подтверждения, ушедшие в устройство: сколько и номер подтверждения последнего. */
+static int h_acks(uint32_t *ack) {
+    unsigned char p[70000];
+    int cnt = 0;
+    for (;;) {
+        ssize_t r = recv(g_dev_peer, p, sizeof(p), MSG_DONTWAIT);
+        if (r <= 0) break;
+        struct flow_key k;
+        size_t off;
+        if (ip_parse(p, (size_t)r, &k, &off) == 0 && (k.tcp_flags & TCP_ACK)) {
+            if (ack) *ack = k.ack;
+            cnt++;
+        }
+    }
+    return cnt;
+}
+
+static int h_writable(int fd) {
+    struct pollfd pf = { .fd = fd, .events = POLLOUT };
+    return poll(&pf, 1, 0) > 0 && (pf.revents & POLLOUT);
+}
+
+static void t_ack_paced(void) {
+    static const struct dialer hd = { .ops = &h_ops, .ctx = NULL };
+    while (g_conns && g_live_n) conn_drop(&g_conns[g_live[0]]);
+    g_spare_want = 0;
+    stack_setup(&hd);
+    pm_drain(NULL, NULL);
+    struct conn *c = pm_open(41000, SRV_IP);
+    check(c != NULL, "очередь: соединение открылось, дескриптор — пара SEQPACKET");
+    if (!c) return;
+
+    /* Окно клиента. Потолок стека — мегабайты (rcv_window_set), очередь пары их не вместит, и
+     * дайлер называет свой предел: клиенту с масштабом объявляется он, а не потолок; без масштаба —
+     * 65535, как у любого. */
+    uint32_t save_wnd = g_rcv_wnd;
+    uint8_t save_shift = g_rcv_shift;
+    rcv_window_set(4u << 20);
+    c->ws_on = 1;
+    uint32_t seen = (uint32_t)rcv_win_field(c) << g_rcv_shift;
+    check(seen >= h_ops.rcv_wnd_max && seen < h_ops.rcv_wnd_max + (1u << g_rcv_shift),
+          "окно клиента с масштабом — предел дайлера (rcv_wnd_max), а не потолок стека в 4 МиБ");
+    c->ws_on = 0;
+    check(rcv_win_field(c) == 65535, "  без масштаба — 65535, как у любого дайлера");
+    g_rcv_wnd = save_wnd;
+    g_rcv_shift = save_shift;
+
+    unsigned char d[1000];
+    memset(d, 'x', sizeof d);
+    uint32_t seq = 1001, ack = 0;
+
+    /* Очередь пуста: подтверждение уходит сразу, как у любого дайлера. */
+    pm_send(41000, SRV_IP, seq, 2, TCP_ACK | TCP_PSH, d, sizeof d);
+    seq += sizeof d;
+    flush_acks(&g_tun);
+    check(h_acks(&ack) == 1 && ack == seq && !c->ack_hold && !c->ack_due,
+          "очередь пуста: данные приняты и подтверждены сразу");
+
+    /* Наполняем, пока очередь не выйдет за нижнюю отметку. Каждый пакет принят — мультиплексор
+     * ничего не разбирает, — подтверждений между ними нет (их шлёт flush_acks, а его зовёт цикл
+     * после порции пакетов, не после каждого). */
+    int sent = 0;
+    while (h_writable(c->fd) && sent < 200) {
+        pm_send(41000, SRV_IP, seq, 2, TCP_ACK | TCP_PSH, d, sizeof d);
+        seq += sizeof d;
+        sent++;
+    }
+    check(sent > 1 && sent < 200 && !h_writable(c->fd),
+          "очередь: после нескольких пакетов запись не готова (выше нижней отметки)");
+    check(c->client_seq == seq, "очередь: все пакеты приняты и отданы дайлеру (счётчик продвинут)");
+
+    /* Запись не готова — подтверждение придержано, соединение просит ждать записи. */
+    h_acks(NULL);
+    flush_acks(&g_tun);
+    check(h_acks(NULL) == 0 && c->ack_hold && c->ack_due,
+          "очередь выше нижней отметки: подтверждение придержано, ждём готовности записи");
+
+    /* Ещё порция при придержанном подтверждении — по-прежнему тишина (клиент ограничен окном). */
+    pm_send(41000, SRV_IP, seq, 2, TCP_ACK | TCP_PSH, d, sizeof d);
+    seq += sizeof d;
+    flush_acks(&g_tun);
+    check(h_acks(NULL) == 0 && c->ack_hold, "  и дальше, пока мультиплексор не разобрал очередь");
+
+    /* Мультиплексор разобрал очередь: запись готова, подтверждение уходит и покрывает всё принятое. */
+    unsigned char sink[4096];
+    while (recv(g_hpeer, sink, sizeof sink, MSG_DONTWAIT) > 0) {}
+    check(h_writable(c->fd), "очередь разобрана: запись готова");
+    flush_acks(&g_tun);
+    check(h_acks(&ack) == 1 && ack == seq && !c->ack_hold && !c->ack_due,
+          "запись готова: подтверждение ушло и покрывает всё принятое, придержки нет");
+
+    conn_drop(c);
+    close(g_hpeer);
+    g_hpeer = -1;
+    pm_drain(NULL, NULL);
+}
+
 /* Пул узлов и сброс соединений — после проверок разбора: пул заводит свой дайлер (pool_new), и
  * таблица соединений с этого места живёт с ним. */
 static int pool_part(void) {
@@ -1319,6 +1480,7 @@ static int pool_part(void) {
     t_pool_refill();
     t_pool_spares();
     t_pool_state();
+    t_ack_paced();
     return 0;
 }
 

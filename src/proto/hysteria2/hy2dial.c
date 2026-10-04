@@ -131,7 +131,13 @@ static int h2_deliver(const void *ctx, void *sess, int udp, const unsigned char 
 
 const struct dialer_ops hy2_dialer = {
     .name = "hysteria2",
-    .caps = 0,
+    /* DC_ACK_PACED: очередь к мультиплексору — пара SEQPACKET, и мультиплексор (один поток: шифр
+     * QUIC и системный вызов на каждую датаграмму) разбирает её медленнее, чем клиент способен
+     * лить. Стек подтверждает данные клиента, только пока дескриптор готов к записи, — иначе
+     * очередь переполнялась, и выгрузка вставала (подробно — у бита в dialer.h). Окно клиента — не
+     * больше того, что вмещает очередь пары (HY2_CLIENT_WND, hy2conn.h): потолок стека — мегабайты. */
+    .caps = DC_ACK_PACED,
+    .rcv_wnd_max = HY2_CLIENT_WND,
     .sess_size = sizeof(struct hy2_sess),
     .peer = h2_peer,
     .describe = h2_describe,
