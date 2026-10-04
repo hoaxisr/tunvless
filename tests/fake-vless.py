@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
-"""Минимальный сервер VLESS без TLS — чтобы туннель можно было проверить целиком, без узла.
+"""A minimal VLESS server without TLS, to test the whole tunnel without a real node.
 
-Зачем. Всё, что делает стек туннеля (src/tunnel/stack.c) — синтез TCP, повторная передача, раскладка по потокам, —
-проверяется только на живом трафике. Пока трафик брался у настоящего узла подписки, каждая
-проверка зависела от чужого сервера: он то отвечал, то нет, и «не восстановилось после
-потерь» было не отличить от «узел лёг». Дважды на этом остановились.
+What the tunnel stack does (src/tunnel/stack.c: TCP synthesis, retransmission, spreading over
+threads) can only be tested on live traffic. With a real node every check depends on someone
+else's server, and "did not recover after loss" cannot be told from "the node went down". This
+server speaks exactly the part of VLESS that is needed:
 
-Этот сервер закрывает зависимость. Он говорит ровно ту часть VLESS, которая нужна:
+    request:  version(1) UUID(16) addon_len(1) addon command(1) port(2) addr_type(1) address
+    response: version(1)=0 addon_len(1)=0, then data
 
-    запрос:  версия(1) UUID(16) длина_доп(1) доп команда(1) порт(2) тип_адреса(1) адрес
-    ответ:   версия(1)=0 длина_доп(1)=0, дальше данные
+security=none and type=tcp, so no Reality and no HTTP/2: this tests the tunnel loop, not the
+cryptography.
 
-security=none и type=tcp, то есть без Reality и без HTTP/2: проверяем цикл туннеля, а не
-криптографию — её проверяют векторы в tests/crypto.c.
-
-Куда клиент просил соединиться — НЕ ВАЖНО: адрес разбирается и выбрасывается, а в ответ
-всегда идёт HTTP-ответ заданной длины. Так тест не зависит ещё и от интернета.
+Where the client asked to connect DOES NOT MATTER: the address is parsed and dropped, and the
+answer is always an HTTP response of the given size, so the test does not depend on the
+internet either.
 """
 import argparse
 import os
@@ -40,17 +39,17 @@ def recv_exactly(sock, n):
 
 
 def read_request(sock):
-    """Разобрать заголовок запроса. Возвращает (uuid, cmd, port, адрес) или None.
+    """Parse the request header. Returns (uuid, cmd, port, address) or None.
 
-    Адрес — строкой (IPv4, IPv6 или имя); нужен только пересылке UDP (--udp-relay), остальные
-    режимы его выбрасывают."""
-    head = recv_exactly(sock, 18)           # версия + UUID + длина_доп
+    The address is a string (IPv4, IPv6 or a name); only the UDP relay (--udp-relay) needs it,
+    the other modes drop it."""
+    head = recv_exactly(sock, 18)           # version + UUID + addon_len
     if not head or head[0] != 0:
         return None
     uuid, addon_n = head[1:17], head[17]
     if addon_n and recv_exactly(sock, addon_n) is None:
         return None
-    tail = recv_exactly(sock, 4)            # команда + порт + тип адреса
+    tail = recv_exactly(sock, 4)            # command + port + addr_type
     if not tail:
         return None
     cmd, port, atype = tail[0], (tail[1] << 8) | tail[2], tail[3]
@@ -86,7 +85,7 @@ class Handler(socketserver.BaseRequestHandler):
             return
         uuid, cmd, port, addr = req
         if uuid != self.server.uuid:
-            return                          # чужой ключ — молчим, как настоящий сервер
+            return                          # wrong key: stay silent, like a real server
 
         if cmd == CMD_UDP:
             if self.server.udp_relay:
@@ -95,12 +94,12 @@ class Handler(socketserver.BaseRequestHandler):
                 self.serve_udp(sock)
             return
 
-        # Порт 9 (discard) — соединение, которое ОТКРЫТО и молчит.
+        # Port 9 (discard): a connection that stays OPEN and silent.
         #
-        # Нужно, чтобы стенд умел воспроизводить главный случай слабого роутера: браузер
-        # держит десятки соединений живыми между запросами (keep-alive), и цена витка цикла
-        # растёт с числом таких, а не с трафиком. Без них замер показывает скорость на пустой
-        # таблице — то есть ровно не то, во что упирается настоящий роутер.
+        # This reproduces the main load of a weak router: a browser keeps dozens of connections
+        # alive between requests (keep-alive), and the cost of a loop turn grows with their
+        # number, not with traffic. Without them a benchmark measures an empty table, which is
+        # not what a real router runs into.
         if port == 9:
             try:
                 while sock.recv(65536):
@@ -109,11 +108,11 @@ class Handler(socketserver.BaseRequestHandler):
                 pass
             return
 
-        # Порт 7 (echo) — ответ ТОЛЬКО после того, как дочитан запрос до перевода строки.
+        # Port 7 (echo): the answer comes ONLY after the request is read up to a newline.
         #
-        # Нужен стенду tests/run-tunnel-fin.sh (I-319): клиент шлёт строку и сразу FIN,
-        # часто одним сегментом, и ответ обязан прийти на уже закрытую клиентом половину.
-        # Обычный режим ниже отвечает, не глядя на запрос, и потерю хвоста не заметил бы.
+        # For tests/run-tunnel-fin.sh: the client sends a line and FIN at once, often in one
+        # segment, and the answer must reach the half the client has already closed. The
+        # default mode below answers without looking at the request and would miss a lost tail.
         if port == 7:
             sock.sendall(b"\x00\x00")
             buf = b""
@@ -132,12 +131,10 @@ class Handler(socketserver.BaseRequestHandler):
                 pass
             return
 
-        # Остаток запроса надо ВЫЧИТАТЬ, а не игнорировать, и это не аккуратность.
-        # Клиент присылает за заголовком VLESS ещё и сам запрос HTTP. Закрыть соединение,
-        # оставив его непрочитанным, значит заставить Linux послать RST вместо FIN — а RST
-        # выбрасывает всё, что приёмник ещё не забрал из своего буфера. Стенд из-за этого
-        # терял последние полтора мегабайта на каждой закачке, и выглядело это ровно как
-        # «туннель обрывает передачу под конец»: полдня ушло на поиск не в том месте.
+        # The rest of the request must be READ, not ignored: after the VLESS header the client
+        # sends the HTTP request itself. Closing with unread data makes Linux send RST instead
+        # of FIN, and RST discards whatever the receiver has not yet taken from its buffer: the
+        # end of every download is lost, which looks exactly like the tunnel cutting it short.
         def drain():
             try:
                 while sock.recv(65536):
@@ -147,7 +144,7 @@ class Handler(socketserver.BaseRequestHandler):
         reader = threading.Thread(target=drain, daemon=True)
         reader.start()
 
-        # Ответ VLESS, затем сразу HTTP. Отдельной записью, как это делает Xray.
+        # The VLESS response, then HTTP at once. A separate write, as Xray does.
         sock.sendall(b"\x00\x00")
 
         body_n = self.server.body_n
@@ -161,8 +158,8 @@ class Handler(socketserver.BaseRequestHandler):
         try:
             sock.sendall(head)
             chunk = 64 * 1024
-            # --kbps: отдавать не быстрее заданного — длинная закачка для стенда молчания узла
-            # (tests/run-silence.sh): узел «умирает» посреди передачи, а не после неё.
+            # --kbps: send no faster than this, so a download is long enough for a node to
+            # "die" in the middle of a transfer, not after it.
             rate = self.server.kbps * 1024
             if rate:
                 chunk = min(chunk, max(1024, rate // 10))
@@ -176,33 +173,30 @@ class Handler(socketserver.BaseRequestHandler):
                     if ahead > 0:
                         time.sleep(ahead)
         except Exception as e:
-            # Причину печатаем ВСЕГДА. Молчаливый обрыв тут выглядит как обрыв в туннеле —
-            # именно на это и ушёл один заход отладки: сервер закрывал соединение сам, а
-            # разбирались с повторной передачей.
-            print("fake-vless: обрыв на %d из %d байт: %r" % (sent, body_n, e),
+            # ALWAYS print the reason: a silent break here looks like a break in the tunnel.
+            print("fake-vless: cut at %d of %d bytes: %r" % (sent, body_n, e),
                   file=sys.stderr, flush=True)
             return
-        # Закрываем свою половину и ждём, пока клиент закроет свою: тогда уходит FIN, а не
-        # RST, и всё отправленное доезжает.
+        # Close our half and wait for the client to close its own: then FIN goes out, not RST,
+        # and everything sent arrives.
         try:
             sock.shutdown(socket.SHUT_WR)
         except OSError:
             pass
         reader.join(timeout=10)
-        print("fake-vless: отдал %d байт" % sent, file=sys.stderr, flush=True)
+        print("fake-vless: sent %d bytes" % sent, file=sys.stderr, flush=True)
 
 
     def serve_udp(self, sock):
-        """Поток UDP (команда 2): датаграммы с двухбайтовой длиной, ЭХО обратно.
+        """A UDP stream (command 2): datagrams with a two-byte length, ECHOED back.
 
-        Эхо, а не осмысленный ответ, потому что проверяется ровно перенос датаграмм:
-        сохранились ли границы, дошли ли байты, и не склеились ли две в одну. Любой другой
-        ответ пришлось бы сверять с содержимым, а содержимое здесь и есть проверка.
+        An echo, because what is tested is the transfer itself: boundaries kept, bytes intact,
+        no two datagrams merged into one.
 
-        Длина ответа берётся ЧУЖАЯ — та, что пришла: вернув свою, стенд перестал бы замечать
-        как раз ту ошибку, ради которой он написан (потерянную или сдвинутую длину).
+        The answer reuses the length that ARRIVED: computing its own would hide exactly the
+        error this checks for (a lost or shifted length).
         """
-        sock.sendall(b"\x00\x00")               # ответ VLESS: версия, длины доп нет
+        sock.sendall(b"\x00\x00")               # VLESS response: version, no addon
         buf = b""
         n_dg = 0
         try:
@@ -223,20 +217,19 @@ class Handler(socketserver.BaseRequestHandler):
                 payload = buf[2:2 + want]
                 buf = buf[2 + want:]
                 n_dg += 1
-                # Отдаём тем же кадром. Датаграмма нулевой длины законна — её эхо тоже.
+                # Same framing back. A zero-length datagram is legal, and so is its echo.
                 sock.sendall(bytes([want >> 8, want & 255]) + payload)
         except OSError:
             pass
-        print("fake-vless: UDP-поток закрыт, датаграмм %d" % n_dg, file=sys.stderr, flush=True)
+        print("fake-vless: UDP stream closed, %d datagrams" % n_dg, file=sys.stderr, flush=True)
 
 
     def relay_udp(self, sock, addr, port):
-        """Поток UDP с НАСТОЯЩЕЙ пересылкой: датаграммы уходят туда, куда просил клиент, ответы
-        возвращаются тем же кадром. Включается --udp-relay.
+        """A UDP stream with REAL forwarding (--udp-relay): datagrams go where the client
+        asked, answers come back in the same framing.
 
-        Нужен стенду tests/run-via.sh: WireGuard внутри VLESS (выход awg с via на выход vless)
-        проверяется только настоящим пиром WireGuard за сервером — эхо вернуло бы клиенту его же
-        рукопожатие, и туннель не встал бы никогда."""
+        For a protocol with a handshake inside UDP an echo is useless: it would return the
+        client's own handshake, so such a test needs a real peer behind the server."""
         sock.sendall(b"\x00\x00")
         fam = socket.AF_INET6 if ":" in addr else socket.AF_INET
         u = socket.socket(fam, socket.SOCK_DGRAM)
@@ -274,7 +267,7 @@ class Handler(socketserver.BaseRequestHandler):
             pass
         stop.set()
         u.close()
-        print("fake-vless: пересылка UDP на %s:%d закрыта, датаграмм %d" % (addr, port, n_dg),
+        print("fake-vless: UDP relay to %s:%d closed, %d datagrams" % (addr, port, n_dg),
               file=sys.stderr, flush=True)
 
 
@@ -287,17 +280,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=10800)
     ap.add_argument("--uuid", required=True)
-    ap.add_argument("--mb", type=int, default=20, help="сколько мегабайт отдавать в ответ")
-    # Адрес слушателя — параметром, а не константой 127.0.0.1.
-    #
-    # Движок отвергает узел на петле как «отвечать некому» (sub.c, host_leads_nowhere):
-    # панели пишут туда заглушки, и человеку полезнее внятная причина, чем ошибка TLS.
-    # Стенду от этого доставалось заодно — туннель не поднимался вовсе, — поэтому сервер
-    # стенда слушает на обычном адресе, который туннель считает законным узлом.
-    ap.add_argument("--bind", default="127.0.0.1", help="адрес слушателя")
-    ap.add_argument("--kbps", type=int, default=0, help="предел отдачи, КБ/с (0 — без предела)")
+    ap.add_argument("--mb", type=int, default=20, help="megabytes to send in each answer")
+    # The listening address is a parameter, not a fixed 127.0.0.1: tunvless rejects a node on
+    # loopback as one with no peer (sublink.c, sl_host_leads_nowhere), so the test server
+    # listens on an ordinary address the tunnel accepts as a node.
+    ap.add_argument("--bind", default="127.0.0.1", help="listening address")
+    ap.add_argument("--kbps", type=int, default=0, help="send rate limit, KB/s (0 — none)")
     ap.add_argument("--udp-relay", action="store_true",
-                    help="UDP (команда 2) пересылать по адресу из запроса, а не эхом")
+                    help="forward UDP (command 2) to the address in the request instead of echoing")
     a = ap.parse_args()
 
     srv = Server((a.bind, a.port), Handler)
@@ -305,10 +295,10 @@ def main():
     srv.body_n = a.mb * 1024 * 1024
     srv.udp_relay = a.udp_relay
     srv.kbps = a.kbps
-    # Наполнитель фиксированный: содержимое стенду безразлично, а генерация 64 КБ на
-    # каждую порцию упиралась в питон, а не в туннель.
+    # A fixed filler: the content does not matter, and generating 64 KB per chunk made Python,
+    # not the tunnel, the bottleneck.
     srv.filler = bytes(i * 131 % 251 for i in range(64 * 1024))
-    print("fake-vless: %s:%d, отдаёт %d МБ" % (a.bind, a.port, a.mb), flush=True)
+    print("fake-vless: %s:%d, serves %d MB" % (a.bind, a.port, a.mb), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

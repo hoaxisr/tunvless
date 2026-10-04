@@ -1,20 +1,19 @@
-/* Транспорт grpc: поток протокола в сообщениях gRPC внутри одного потока HTTP/2.
+/* The grpc transport: the protocol stream in gRPC messages inside one HTTP/2 stream (the upper
+ * layer of transport.h).
  *
- * Верхний ярус транспорта (transport.h). Переехал из клиента VLESS (client.c) без изменений.
+ * grpc and xhttp are both HTTP/2, and they differ less than it seems: both open one stream with
+ * a POST and carry bytes in its body. They differ in exactly two things: the path, and whether
+ * data is wrapped in gRPC messages.
  *
- * grpc и xhttp — это HTTP/2, а не «другой формат кадров». Разница между ними меньше, чем
- * кажется: оба открывают один поток запросом POST и гоняют байты в его теле. Отличаются
- * ровно двумя вещами — путём и тем, обёрнуты ли данные в сообщения gRPC.
+ * gRPC message format (gRPC over HTTP/2 spec plus Xray's schema from stream.proto):
  *
- * Формат сообщения gRPC (RFC на gRPC over HTTP/2 плюс schema Xray из stream.proto):
+ *   compressed flag  1 byte  (0 — not compressed; compression is never offered or accepted)
+ *   length           4 bytes big-endian
+ *   body             protobuf message Hunk { bytes data = 1 }: 0x0A, length, bytes
  *
- *   признак сжатия  1 байт  (0 — не сжато; сжатие мы не предлагаем и не принимаем)
- *   длина           4 байта big-endian
- *   тело            protobuf-сообщение Hunk { bytes data = 1 } — то есть 0x0A, длина, байты
- *
- * MultiHunk (mode=multi) отличается только тем, что поле 1 может повторяться. На отправку
- * это неотличимо от Hunk — одно поле и есть законный MultiHunk, — а на приём разбор
- * повторов получается сам, потому что мы читаем поля до конца сообщения.
+ * MultiHunk (mode=multi) differs only in that field 1 may repeat. On send a single field is a
+ * valid MultiHunk, so it is the same as Hunk; on receive repeats are handled because fields are
+ * read to the end of the message.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -22,16 +21,16 @@
 
 #include "transport.h"
 
-/* Путь запроса для gRPC.
+/* The gRPC request path.
  *
- * Обычная форма: serviceName без ведущего слэша, тогда путь — /<service>/Tun. Новая форма
- * из Xray: serviceName начинается со слэша и УЖЕ содержит имя метода целиком, тогда путь
- * это он сам. Различать обязательно: перепутав, мы попадём в несуществующий метод, и
- * сервер ответит 404 — то есть узел будет выглядеть неисправным. */
+ * Usual form: serviceName without a leading slash, the path is /<service>/Tun. Xray's newer form:
+ * serviceName starts with a slash and ALREADY holds the full method name, so it is the path
+ * itself. Mixing them up calls a method that does not exist, the server answers 404, and the node
+ * looks broken. */
 static void grpc_path(const struct tr_node *n, char *out, size_t cap) {
     int multi = !strcmp(n->mode, "multi");
     if (n->service[0] == '/') {
-        /* Форма «/a/b/MyTun» или «/a/b/MyTun|MyTunMulti»: берём нужную половину. */
+        /* "/a/b/MyTun" or "/a/b/MyTun|MyTunMulti": take the half the mode needs. */
         const char *bar = strchr(n->service, '|');
         size_t len = bar ? (size_t)(bar - n->service) : strlen(n->service);
         if (multi && bar) {
@@ -46,18 +45,17 @@ static void grpc_path(const struct tr_node *n, char *out, size_t cap) {
     snprintf(out, cap, "/%s/%s", n->service, multi ? "TunMulti" : "Tun");
 }
 
-/* Обернуть данные в сообщение gRPC. */
 static size_t grpc_wrap(const unsigned char *d, size_t n, unsigned char *out, size_t cap) {
     unsigned char pb[8];
     size_t pb_n = 0;
-    pb[pb_n++] = 0x0A;                    /* поле 1, wire type 2 (bytes) */
+    pb[pb_n++] = 0x0A;                    /* field 1, wire type 2 (bytes) */
     size_t v = n;
     while (v >= 128) { pb[pb_n++] = (unsigned char)((v & 0x7F) | 0x80); v >>= 7; }
     pb[pb_n++] = (unsigned char)v;
 
     size_t msg = pb_n + n;
     if (5 + msg > cap) return 0;
-    out[0] = 0;                            /* не сжато */
+    out[0] = 0;                            /* not compressed */
     out[1] = (unsigned char)(msg >> 24); out[2] = (unsigned char)(msg >> 16);
     out[3] = (unsigned char)(msg >> 8);    out[4] = (unsigned char)msg;
     memcpy(out + 5, pb, pb_n);
@@ -65,39 +63,39 @@ static size_t grpc_wrap(const unsigned char *d, size_t n, unsigned char *out, si
     return 5 + msg;
 }
 
-/* Вынуть данные из потока сообщений gRPC. Работает по кускам любого размера: состояние
- * живёт в struct grpc_de, потому что границы сообщения и записи не совпадают. */
+/* Takes chunks of any size: the state lives in struct grpc_de, because message and record
+ * boundaries do not coincide. */
 static int grpc_unwrap(struct grpc_de *de, const unsigned char *in, size_t n,
                        unsigned char *out, size_t cap, size_t *out_n) {
     *out_n = 0;
     size_t i = 0;
     while (i < n) {
         if (de->msg_left == 0) {
-            /* Заголовок сообщения: признак сжатия и длина. */
+            /* Message header: compressed flag and length. */
             while (de->hdr_n < 5 && i < n) de->hdr[de->hdr_n++] = in[i++];
             if (de->hdr_n < 5) break;
-            if (de->hdr[0] != 0) return TR_EGRPC;   /* сжатие не предлагали */
+            if (de->hdr[0] != 0) return TR_EGRPC;   /* compression was not offered */
             de->msg_left = ((uint32_t)de->hdr[1] << 24) | ((uint32_t)de->hdr[2] << 16) |
                            ((uint32_t)de->hdr[3] << 8) | de->hdr[4];
             de->hdr_n = 0;
             de->pb_n = 0;
             de->field_left = 0;
-            /* Пустое сообщение — законно: сервер так проверяет живость потока. */
+            /* An empty message is legal: the server uses it to check the stream is alive. */
             continue;
         }
         if (de->field_left == 0) {
-            /* Тег и длина поля protobuf внутри сообщения. Собираем побайтно: тег и varint
-             * могут разъехаться по записям так же, как всё остальное. */
+            /* Tag and length of the protobuf field. Collected byte by byte: the tag and the
+             * varint can be split across records like everything else. */
             int complete = 0;
             while (i < n && de->msg_left > 0) {
                 unsigned char b = in[i++];
                 de->msg_left--;
-                if (de->pb_n >= sizeof(de->pb)) return TR_EGRPC;  /* varint длиннее пяти байт не бывает */
-                if (de->pb_n == 0 && b != 0x0A) return TR_EGRPC;  /* ждём только поле 1 */
+                if (de->pb_n >= sizeof(de->pb)) return TR_EGRPC;  /* a varint is at most 5 bytes */
+                if (de->pb_n == 0 && b != 0x0A) return TR_EGRPC;  /* only field 1 is expected */
                 de->pb[de->pb_n++] = b;
                 if (de->pb_n > 1 && !(b & 0x80)) { complete = 1; break; }
             }
-            if (!complete) break;                  /* дочитаем в следующий раз */
+            if (!complete) break;                  /* the rest comes next time */
             uint32_t v = 0;
             unsigned shift = 0;
             for (unsigned k = 1; k < de->pb_n; k++) {
@@ -106,7 +104,7 @@ static int grpc_unwrap(struct grpc_de *de, const unsigned char *in, size_t n,
             }
             de->field_left = v;
             de->pb_n = 0;
-            /* Пустое поле — законно, просто нечего отдавать. */
+            /* An empty field is legal, there is just nothing to return. */
             if (de->field_left == 0) continue;
         }
         size_t take = de->field_left;
@@ -125,8 +123,8 @@ static int grpc_unwrap(struct grpc_de *de, const unsigned char *in, size_t n,
 static int grpc_open(struct transport *t, const struct tr_node *n, int timeout_s) {
     (void)timeout_s;
     struct h2_io io = { .ctx = &t->link, .write = tr_link_write, .read = tr_link_read };
-    /* Имя хоста в :authority — маскировочный домен, как и в SNI: сервер прикрывается им,
-     * и запрос к другому имени выдал бы нас сразу. */
+    /* :authority carries the cover domain, as SNI does: the server hides behind it, and a
+     * request for another name would give the client away at once. */
     const char *authority = n->sni[0] ? n->sni : n->host;
     char path[320];
     grpc_path(n, path, sizeof(path));
@@ -142,10 +140,9 @@ static int grpc_write(struct transport *t, const unsigned char *d, size_t n) {
 }
 
 static int grpc_read(struct transport *t, unsigned char *d, size_t cap, size_t *got) {
-    /* Один буфер на ПОТОК, а не на соединение: по 16 КБ на каждое соединение
-     * это мегабайт на коробке с пятнадцатью, а потоков всего несколько. Общим он
-     * был, пока поток был один; теперь общий массив потоки переписывали бы друг под
-     * другом — и это не «иногда мусор», а перепутанные куски чужого соединения. */
+    /* One buffer per THREAD, not per connection: 16 KB per connection adds up on a router, and
+     * there are only a few threads. A buffer shared between threads would mix chunks of different
+     * connections. */
     static __thread unsigned char raw[H2_MIN_READ_CAP];
     size_t rn = 0;
     int rc = h2_read(&t->h2, raw, sizeof(raw), &rn);
@@ -154,8 +151,8 @@ static int grpc_read(struct transport *t, unsigned char *d, size_t cap, size_t *
     return grpc_unwrap(&t->de, raw, rn, d, cap, got);
 }
 
-/* h2 держит указатель на связь того же соединения (io.ctx) — после переезда структуры он
- * указывал бы в брошенное место. */
+/* h2 keeps a pointer to the connection's link (io.ctx); once the struct moves it would point at
+ * the old place. */
 static void grpc_moved(struct transport *t) { t->h2.io.ctx = &t->link; }
 
 const struct transport_ops tr_grpc = {

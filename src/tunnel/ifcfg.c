@@ -1,14 +1,13 @@
 /* Configuring the TUN device: address, link up, queue length and routes.
  *
- * The stack used to run `ip addr replace`, `ip link set` and `ip route` for this. Routers do not
- * always have iproute2 (Entware ships it as a separate package, and busybox `ip` is not always
- * built in), so the same requests now go to the kernel directly: rtnetlink for the address and
- * the routes, ioctl for the link flags and the queue length. Every request here exists since
- * Linux 2.6, well under Entware's 3.4 floor.
+ * Routers do not always have iproute2 (Entware ships it as a separate package, and busybox `ip` is
+ * not always built in), so the requests go to the kernel directly: rtnetlink for the address and
+ * the routes, ioctl for the link flags and the queue length. Every request here exists since Linux
+ * 2.6, well under Entware's 3.4 floor.
  *
- * Why the device needs an address at all: the stack does not use it — it reads packets and opens
- * a flow per connection — but the kernel treats a route into a device without an address as
- * unusable for locally generated packets.
+ * The device needs an address although the stack does not use it (it reads packets and opens a
+ * flow per connection): the kernel treats a route into a device without an address as unusable
+ * for locally generated packets.
  */
 #define _GNU_SOURCE
 #include <stdio.h>

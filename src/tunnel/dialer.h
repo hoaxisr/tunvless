@@ -1,35 +1,25 @@
-/* Дайлер: протокол, которым стек туннеля (stack.c) везёт потоки TCP и UDP клиента к узлу.
+/* Dialer: the protocol the tunnel stack (stack.c) uses to carry the client's TCP and UDP flows to a
+ * node.
  *
- * Стек знает про TUN, про соединения клиента (SYN-ACK, окно, повтор, ранние данные, сборку
- * фрагментов) и про пул установщиков. Про протокол он не знает ничего: на каждое соединение
- * клиента у него есть непрозрачная сессия дайлера размером sess_size, и всё, что касается
- * узла, — установление, заголовок запроса, обёртки, разбор ответа, — стек просит у дайлера по
- * этой таблице. Дайлер здесь один — VLESS (proto/vless/vldial.c); другой протокол был бы ещё одним
- * дайлером, а не правкой стека.
+ * The stack knows the TUN device, the client's connections (SYN-ACK, window, retransmits, early
+ * data, fragment reassembly) and the connector threads. It knows nothing of the protocol: each
+ * client connection has an opaque dialer session of sess_size bytes, and for everything about the
+ * node (connecting, the request header, framing, parsing the answer) the stack calls this table.
+ * The one dialer is VLESS (proto/vless/vldial.c); another protocol would be another dialer, not a
+ * change to the stack.
  *
- * Таблица шире, чем нужно VLESS: стек вырос рядом с дайлерами hysteria2 и протоколов прокси
- * (shadowsocks, SOCKS5), и их свойства (DC_UDP_OWN, DC_ACK_PACED, rcv_wnd_max) и вопросы пула узлов
- * (peer_of, match, stale, lost) остались в интерфейсе стека. Дайлер VLESS их не задаёт, и для стека
- * это значит «узел один, свойства по умолчанию».
+ * The boundary follows what the stack knows, not what suits VLESS, so the table has no "header" and
+ * no Vision. send gets the client's bytes and the flow key and decides what to put in front;
+ * deliver hands the stack the bare payload through emit: stream pieces for TCP, whole datagrams for
+ * UDP. One session per client connection holds both the link to the node and the protocol state of
+ * the flow; where one ends and the other begins is the dialer's business (see take).
  *
- * ГРАНИЦА ПРОВЕДЕНА ПО ТОМУ, ЧТО ЗНАЕТ СТЕК, А НЕ ПО ТОМУ, ЧТО УДОБНО VLESS. Поэтому в таблице
- * нет слова «заголовок» и нет Vision: отправка получает байты клиента и ключ потока и сама
- * решает, что приклеить впереди; приём отдаёт стеку ровно полезную нагрузку — кусками потока
- * у TCP и целыми датаграммами у UDP — через emit. Сессия одна на соединение клиента: и связь
- * с узлом, и состояние протокола на этом потоке лежат в ней, и граница между ними — дело
- * дайлера (take ниже).
+ * The table has more than VLESS needs: DC_UDP_OWN, DC_ACK_PACED and rcv_wnd_max serve dialers with
+ * their own UDP sockets or a bounded send queue, and VLESS sets none of them. The node questions
+ * (peer_of, match, stale, lost) are answered by the node pool (pool.c), which wraps the dialer.
  *
- * UDP ДАТАГРАММАМИ САМОГО ПРОТОКОЛА (shadowsocks, SOCKS5 UDP ASSOCIATE — по датаграмме UDP на
- * датаграмму клиента, своим сокетом к узлу) ложится в эту же таблицу без отдельного send_dgram,
- * которого здесь ждали прежде. dgram_frame у такого дайлера обрамляет датаграмму длиной, как у
- * VLESS, — и только ради стека: тот придерживает датаграммы, пришедшие до готовности потока,
- * ранними данными и отдаёт их одним куском (early_flush), а границы несёт обрамление; send
- * разрезает кусок по длинам и шлёт каждую датаграмму в свой сокет отдельно. Связь у потока UDP
- * такого протокола — его сокет UDP, а не поток TCP, поэтому запасная связь пула ему не годится:
- * это говорит бит DC_UDP_OWN, и стек берёт для UDP установщика, как без пула. hysteria2 (датаграммы
- * QUIC) ходит третьим путём — парой SOCK_SEQPACKET к своему мультиплексору (hy2dial.c).
- * Мультиплексирования (много потоков клиента в одной связи, XUDP, Mux.Cool) тоже нет: стек
- * держит одну сессию на поток, и это правило записано у udp_packet в stack.c.
+ * There is no multiplexing (several client flows on one link, XUDP, Mux.Cool): the stack keeps one
+ * session per flow (see udp_packet in stack.c).
  */
 #ifndef STEER_DIALER_H
 #define STEER_DIALER_H
@@ -38,154 +28,149 @@
 #include <time.h>
 #include "tun.h"
 
-/* Сколько байт стек берёт у дайлера за одно чтение и сколько места даёт под отправку.
+/* How many bytes the stack reads from a dialer at once and how much room it gives a send.
  *
- * Не меньше целой записи TLS: транспорты поверх HTTP/2 отдают за один раз всё её содержимое,
- * и меньший буфер означал бы «не влезло» на совершенно законном кадре. Плюс запас на заголовок
- * запроса и набивку Vision, которая бывает на 1400 байт длиннее данных.
+ * At least a whole TLS record: transports over HTTP/2 return a record's full contents in one read,
+ * and a smaller buffer would fail on a perfectly valid frame. Plus room for the request header and
+ * Vision padding, which can be 1400 bytes longer than the data. Xray happens to write in 8 KB
+ * buffers, but TLS 1.3 lets a server send 16384 at any time.
  *
- * Прежние 8192 работали случайно: Xray пишет буферами по 8 КБ, поэтому записи крупнее не
- * попадались. Договорённости об этом в TLS 1.3 нет — сервер вправе прислать 16384 в любой
- * момент, и тогда чтение возвращало бы ошибку на исправном соединении.
- *
- * Число, а не выражение от H2_MIN_READ_CAP: стек про HTTP/2 не знает, а дайлер, которому
- * нужно больше, проверяет это сборкой (см. _Static_assert в vldial.c). От этого числа
- * считается запас окна клиента (CLIENT_ROOM_RESERVE в stack.c), поэтому менять его — это
- * менять управление потоком, а не размер буфера. */
+ * A number, not an expression of H2_MIN_READ_CAP: the stack knows nothing of HTTP/2, and a dialer
+ * that needs more checks it at build time (_Static_assert in vldial.c). The client window reserve
+ * (CLIENT_ROOM_RESERVE in stack.c) is derived from it, so changing it changes flow control, not
+ * just a buffer size. */
 #define TUNNEL_BUF (16384 + 16 + 2048)
 
-/* Итог отправки. Три исхода, а не два: «ушло», «сейчас нельзя, повторите» и «всё сломалось».
- * Средний появился вместе с HTTP/2, где закрытое окно — нормальное состояние, а не сбой, и
- * путать его с отказом значит разрывать рабочее соединение. */
+/* Result of a send: sent, "not now, try again", or broken. The middle one exists for HTTP/2, where
+ * a closed flow-control window is normal, and treating it as a failure would cut a working
+ * connection. */
 #define SEND_OK    0
 #define SEND_AGAIN 1
 #define SEND_FATAL (-1)
 
-/* Свойства дайлера. */
 enum dialer_cap {
-    /* Связь с узлом можно установить ДО того, как известен адрес назначения: у VLESS адрес
-     * едет в заголовке запроса вместе с первыми данными, и до этого момента связь ничья. Только
-     * тогда у стека есть пул запасных сессий (spare_* в stack.c). */
+    /* The link to the node can be set up BEFORE the destination is known: VLESS sends the address
+     * in the request header with the first data, and until then the link belongs to nobody. Only
+     * then does the stack keep spare sessions (spare_* in stack.c). */
     DC_PRECONNECT = 1 << 0,
-    /* Поток UDP идёт не по связи, а своим сокетом UDP к узлу (shadowsocks): запасная связь пула —
-     * это поток TCP, и потоку UDP её не отдают; связь ему открывает установщик (connect после
-     * flow_open с udp). Без DC_PRECONNECT бит ничего не меняет — пула нет и так. */
+    /* A UDP flow goes over the dialer's own UDP socket to the node, not over the link. A spare
+     * session is a TCP stream, so a UDP flow never takes one; a connector thread opens its link
+     * (connect after flow_open with udp). Such a dialer still length-frames datagrams in
+     * dgram_frame: the stack holds datagrams that arrive before the flow is ready as early data and
+     * sends them as one piece (early_flush), and send splits it by the lengths. Without
+     * DC_PRECONNECT the bit changes nothing: there are no spares. */
     DC_UDP_OWN = 1 << 1,
-    /* Отправка узлу идёт через ОГРАНИЧЕННУЮ очередь, и её заполнение — единственное управление
-     * потоком в сторону узла (hysteria2: пара SOCK_SEQPACKET к мультиплексору, пока тот шифрует и
-     * шлёт). Такой дайлер просит стек не подтверждать данные клиента, пока дескриптор сессии (fd)
-     * не готов к записи, и ждать этой готовности в epoll (EPOLLOUT): подтверждение уходит
-     * клиенту само, как только очередь опустела до нижней отметки.
+    /* Sending to the node goes through a BOUNDED queue (for example a SOCK_SEQPACKET pair to a
+     * multiplexer that encrypts and sends), and its fill level is the only flow control towards
+     * the node. The stack then does not acknowledge client data until the session fd is writable
+     * and waits for that in epoll (EPOLLOUT); the ACK goes out once the queue drains to its low
+     * mark.
      *
-     * Зачем. Подтверждение уходило, едва данные ложились в очередь, а окно клиента — константа
-     * (65535): кроме собственных сроков, клиент не видел ничего, и лил в очередь со скоростью на
-     * порядок выше мультиплексора. Очередь переполнялась, send отвечал SEND_AGAIN, а на
-     * SEND_AGAIN стек пакет не подтверждает и счётчик не двигает: ВСЕ следующие пакеты того же
-     * окна приходили «не по порядку» и отбрасывались (буфера переупорядочивания нет, SACK мы не
-     * шлём, повторное подтверждение одно на порцию). У клиента оставался таймаут: 200 мс, потом
-     * вдвое, до секунд, — и по одному сегменту за срок. Выгрузка выше ~300 Мбит/с вставала на
-     * нули (замер 2026-10-04, steer-hysteria2). Подтверждение, привязанное к готовности очереди,
-     * возвращает то, что делает настоящий приёмник: окно клиента — это место в очереди, а потерь
-     * нет вовсе.
+     * Without this, the ACK goes out as soon as data is queued, the client sends far faster than
+     * the queue drains, and send returns SEND_AGAIN. On SEND_AGAIN the stack neither acknowledges
+     * nor advances, so every later segment of that window arrives out of order and is dropped (no
+     * reorder buffer, no SACK), and the client falls back to RTO retransmits, one segment each.
+     * Pacing the ACK by the queue makes the client window the room in the queue, with no loss.
      *
-     * Условие дайлеру: очередь, о готовности которой говорит POLLOUT, вмещает окно клиента сверх
-     * нижней отметки (у сокета unix это четверть буфера отправки), — иначе то, что клиент успеет
-     * прислать до следующего подтверждения, всё равно упрётся в SEND_AGAIN. Окно стека — потолок
-     * по памяти машины (rcv_window_init: до мегабайтов), и очередь пары его не вместит, поэтому
-     * такой дайлер называет свой предел окна, rcv_wnd_max ниже, и стек не объявляет клиенту больше.
-     * Потоку UDP бит ничего не меняет: у датаграмм подтверждений нет. */
+     * The dialer's queue must hold the client window above the low mark (for a unix socket a
+     * quarter of the send buffer), or what the client sends before the next ACK still hits
+     * SEND_AGAIN. The stack's window is sized by the machine's memory (rcv_window_init: up to
+     * megabytes), so such a dialer sets rcv_wnd_max below. No effect on UDP: datagrams have no
+     * ACKs. */
     DC_ACK_PACED = 1 << 2,
 };
 
-/* Отдать стеку полезную нагрузку: кусок потока TCP или целую датаграмму UDP. 0 — принято,
- * иначе соединению конец (запись в устройство не удалась, кольцо повтора не выделилось). */
+/* Hand the stack payload: a piece of the TCP stream or a whole UDP datagram. 0 — taken; otherwise
+ * the connection ends (the device write failed, or the retransmit ring could not be allocated). */
 typedef int (*dialer_emit_fn)(void *arg, const unsigned char *p, size_t n);
 
 struct dialer_ops {
-    const char *name;          /* для журнала: vless */
+    const char *name;          /* for the log: vless */
     unsigned caps;             /* enum dialer_cap */
-    size_t sess_size;          /* размер сессии; стек выделяет по одной на соединение клиента */
+    size_t sess_size;          /* the stack allocates one session per client connection */
 
-    /* ---- узел (ctx — то, что модуль положил в struct dialer) ---- */
-    /* Как назвать узел в строке журнала «поток к <peer> не открылся». */
+    /* ---- the node (ctx is what the module put into struct dialer) ---- */
+    /* The node's name in log lines such as "flow to <peer> did not open". */
     const char *(*peer)(const void *ctx);
-    /* Строка подъёма «<dev> -> <описание>» — имя, адрес, транспорт. */
+    /* For the startup line "<dev> -> <description>": name, address, transport. */
     void (*describe)(const void *ctx, char *out, size_t n);
     const char *(*strerror)(int rc);
 
-    /* ---- связь с узлом ---- */
-    /* Установить связь (в потоке установщика: блокирует, пока не выйдет timeout_s). 0 — готово.
-     * На отказе в сессии не остаётся ни дескриптора, ни ключей. */
+    /* ---- the link to the node ---- */
+    /* Connect (in a connector thread: blocks for up to timeout_s). 0 — ready. On failure the
+     * session keeps no descriptor and no keys. */
     int  (*connect)(const void *ctx, void *sess, int timeout_s);
-    /* Переселить установленную связь из запасной сессии src в сессию соединения dst: связь в
-     * dst заменяется, состояние потока в dst (flow_open) не трогается. После вызова src ничья. */
+    /* Move the established link from spare session src into connection session dst: the link in
+     * dst is replaced, the flow state in dst (flow_open) is kept. Afterwards src is empty. */
     void (*take)(void *dst, void *src);
-    /* Закрыть связь: дескрипторы и ключи. Стек зовёт только для занятого соединения. */
+    /* Close the link: descriptors and keys. Called only for a connection in use. */
     void (*close)(void *sess);
-    /* Привести сессию к «пустой» перед новым соединением: без дескриптора, без счётчиков
-     * разбора. Зовётся на каждом освобождении и при заводе таблицы — поэтому обязан трогать
-     * только первые байты сессии, а не всю её (почему — у conn_drop в stack.c). */
+    /* Make the session empty for a new connection: no descriptor, no parser counters. Called on
+     * every release and when the table is set up, so it must touch only the first bytes of the
+     * session, not all of it (why: see conn_drop in stack.c). */
     void (*clear)(void *sess);
     int  (*fd)(const void *sess);
-    /* Лежат ли у сессии уже прочитанные данные, о которых epoll не скажет. */
+    /* Whether the session holds data already read, which epoll will not report. */
     int  (*has_data)(const void *sess);
 
-    /* ---- поток клиента ---- */
-    /* Новое соединение клиента: завести состояние протокола на этом потоке. Не 0 — поток к
-     * этому узлу открыть нельзя (причину дайлер называет сам); стек соединение закрывает. */
+    /* ---- the client's flow ---- */
+    /* A new client connection: set up the protocol state for the flow. Non-zero — no flow to this
+     * node is possible (the dialer logs why); the stack closes the connection. */
     int  (*flow_open)(const void *ctx, void *sess, const struct flow_key *k, int udp);
-    /* Байты клиента — узлу. У UDP это уже обрамлённые датаграммы (dgram_frame). SEND_*. */
+    /* Client bytes to the node; for UDP, datagrams already framed by dgram_frame. SEND_*. */
     int  (*send)(const void *ctx, void *sess, const struct flow_key *k, int udp,
                  const unsigned char *d, size_t n);
-    /* Уложить датаграмму клиента в байты потока к узлу; 0 — не влезла. */
+    /* Frame a client datagram into stream bytes for the node; 0 — it does not fit. */
     size_t (*dgram_frame)(const unsigned char *p, size_t n, unsigned char *out, size_t cap);
-    /* Прочитать у связи. *got — сколько байт пришло от узла (до разбора: по ним стек мерит
-     * свою порцию за проход); 0 при коде 0 — законно (служебный кадр). Не 0 — связь кончилась. */
+    /* Read from the link. *got is how many bytes came from the node before parsing (the stack
+     * meters its per-pass budget by it); *got 0 with rc 0 is valid (a control frame). Non-zero rc
+     * — the link is over. */
     int  (*read)(void *sess, unsigned char *buf, size_t cap, const unsigned char **data,
                  size_t *got);
-    /* Разобрать прочитанное и отдать нагрузку через emit. Не 0 — соединению конец. */
+    /* Parse what was read and hand the payload out through emit. Non-zero — the connection ends. */
     int  (*deliver)(const void *ctx, void *sess, int udp, const unsigned char *d, size_t n,
                     dialer_emit_fn emit, void *arg);
 
-    /* ---- окно клиента (НЕОБЯЗАТЕЛЬНО: 0 — стек объявляет своё) ----
+    /* ---- the client window (OPTIONAL: 0 — the stack advertises its own) ----
      *
-     * Наибольшее окно приёма, которое стек вправе объявить клиенту при этом дайлере, байт: окно —
-     * то, что клиент вправе прислать между двумя подтверждениями, и очередь к узлу у DC_ACK_PACED
-     * (бит выше) обязана вместить его сверх нижней отметки. Объявляется меньшее из двух: потолок
-     * стека (rcv_win_field) и этот предел. */
+     * The largest receive window, in bytes, the stack may advertise to the client with this
+     * dialer: the window is what the client may send between two ACKs, and a DC_ACK_PACED queue
+     * must hold it above its low mark. The smaller of this and the stack's own cap
+     * (rcv_win_field) is advertised. */
     unsigned rcv_wnd_max;
 
-    /* ---- узлов несколько (все НЕОБЯЗАТЕЛЬНЫ: NULL — узел один, тот, что в ctx) ----
+    /* ---- several nodes (all OPTIONAL: NULL — one node, the one in ctx) ----
      *
-     * Для пула узлов: у каждого соединения свой узел, и его знает сессия, а не ctx. Стеку от этого
-     * нужно ровно четыре вопроса, и протокола в них по-прежнему нет. */
-    /* Узел соединения — для строки «поток к <узел> не открылся». */
+     * For the node pool: each connection has its own node, known to the session, not to ctx. The
+     * stack needs just these four questions, none of them about the protocol. */
+    /* The connection's node, for "flow to <node> did not open". */
     const char *(*peer_of)(const void *ctx, const void *sess);
-    /* Годится ли запасная сессия src соединению dst: 1 — взять, 0 — оставить в пуле, -1 — выбросить
-     * (её узел больше не активен). */
+    /* Whether spare session src suits connection dst: 1 — take it, 0 — leave it spare, -1 — drop
+     * it (its node is no longer active). */
     int  (*match)(const void *ctx, const void *dst, const void *src);
-    /* Узел соединения больше не активен (признан мёртвым и заменён): стек сбрасывает такое
-     * соединение — RST клиенту, — когда модуль скажет stack_nodes_changed (stack.h). */
+    /* The connection's node is no longer active (declared dead and replaced): the stack resets
+     * the connection (RST to the client) after stack_nodes_changed (stack.h). */
     int  (*stale)(const void *ctx, const void *sess);
-    /* Связь соединения оборвана, а не закрыта: ядро не дождалось узла дольше порога (silence_s
-     * ниже) или узел её сбросил. Слежке за узлом — повод проверить его сейчас. */
+    /* The connection's link was cut, not closed: the kernel gave up waiting for the node
+     * (silence_s below) or the node reset it. A reason for the health check to probe the node
+     * now. */
     void (*lost)(const void *ctx, const void *sess);
 };
 
-/* Экземпляр: таблица и узел, к которому она соединяет.
+/* An instance: the table and the node it connects to.
  *
- * silence_s — порог молчания узла на живом соединении (ключ `silence` выхода, docs/spec-v2.md): связь
- * с узлом, по которой отправленное не подтверждено дольше порога или которая молчит дольше порога и
- * не отвечает на проверку TCP keepalive, ядро обрывает само (TCP_USER_TIMEOUT, SO_KEEPALIVE), стек
- * сбрасывает соединение клиента (RST) и говорит дайлеру lost. 0 — порога нет, сроки ядра (минуты). */
+ * silence_s is the stall threshold of a node on a live connection (--silence), in seconds. A link
+ * whose sent data stays unacknowledged longer, or that is silent longer and does not answer a TCP
+ * keepalive probe, is cut by the kernel (TCP_USER_TIMEOUT, SO_KEEPALIVE); the stack then resets the
+ * client connection (RST) and calls lost. 0 — no threshold, the kernel's own timeouts (minutes). */
 struct dialer {
     const struct dialer_ops *ops;
     const void *ctx;
     int silence_s;
 };
 
-/* Текущая секунда витка цикла стека — для ограничителей строк журнала в дайлере. Та же, по
- * которой считает сам стек: две разные «секунды» в одном журнале расходились бы на границе. */
+/* The current second of the stack's loop pass, for rate-limiting log lines in a dialer. The same
+ * clock the stack uses, so the two never disagree at a second boundary. */
 time_t stack_now_s(void);
 
 #endif

@@ -1,4 +1,4 @@
-/* Кольцо неподтверждённых байт. Зачем отдельным файлом — в rtx.h. */
+/* Ring of unacknowledged bytes; see rtx.h. */
 #include <stdlib.h>
 #include <string.h>
 
@@ -16,15 +16,13 @@ int rtx_grow(struct rtx *r, uint32_t cap) {
     if (cap <= r->cap) return -1;
     unsigned char *nb = malloc(cap);
     if (!nb) return -1;
-    if (!r->buf) {                      /* кольца ещё не было — просто берём буфер */
+    if (!r->buf) {
         r->buf = nb; r->cap = cap; r->len = 0; r->head = 0;
         return 0;
     }
-    /* Кольцо ВЫПРЯМЛЯЕТСЯ: старое содержимое переносится с начала нового буфера, head
-     * становится нулём. Скопировать буфер как есть нельзя — за краем данные продолжаются с
-     * нуля, и после увеличения размера этот край оказался бы в другом месте, то есть
-     * следующий повтор отдал бы клиенту чужие байты. Ровно тот класс ошибок, из-за которого
-     * кольцо и живёт отдельным файлом с отдельными тестами. */
+    /* Unwrap: the old contents move to the start of the new buffer and head becomes 0. A plain
+     * copy would be wrong: data that wrapped past the old end would no longer follow it, and the
+     * next retransmit would send foreign bytes. */
     uint32_t first = r->cap - r->head;
     if (first > r->len) first = r->len;
     memcpy(nb, r->buf + r->head, first);
@@ -47,10 +45,10 @@ uint32_t rtx_room(const struct rtx *r) {
 }
 
 void rtx_push(struct rtx *r, const unsigned char *p, uint32_t n) {
-    if (n > rtx_room(r)) return;            /* вызывающий проверил; молча не портим кольцо */
+    if (n > rtx_room(r)) return;            /* the caller checks; never corrupt the ring */
     uint32_t tail = r->head + r->len;
-    if (tail >= r->cap) tail -= r->cap;     /* без % : cap не обязан быть степенью двойки,
-                                             * а tail заведомо меньше двух cap */
+    if (tail >= r->cap) tail -= r->cap;     /* no %: cap need not be a power of two, and
+                                             * tail is below 2 * cap */
     uint32_t first = r->cap - tail;
     if (first > n) first = n;
     memcpy(r->buf + tail, p, first);

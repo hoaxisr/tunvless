@@ -1,30 +1,26 @@
-/* Рукопожатие Reality.
+/* Reality handshake.
  *
- * Что тут происходит и почему именно так.
+ * Plain TLS proves the server by its certificate. Reality cannot: the certificate the server
+ * sends belongs to a real third-party site, which the server proxies for anyone who does not
+ * prove themselves. Checking the chain is pointless; the proof works differently:
  *
- * Обычный TLS доказывает подлинность сервера сертификатом. Reality не может: сертификат,
- * который пришлёт сервер, принадлежит настоящему чужому сайту (ads.x5.ru), потому что
- * сервер этот сайт и проксирует всем, кто не предъявил доказательства. Значит проверять
- * цепочку бессмысленно, а подлинность доказывается иначе:
+ *   1. the server has a static X25519 pair; the client knows the public half (pbk);
+ *   2. the client generates an ephemeral pair and puts the public half in the ClientHello
+ *      key_share, exactly where real TLS 1.3 has it;
+ *   3. from its private key and pbk the client computes a shared secret and from it a short
+ *      authenticator, hidden in the 32 bytes of session_id;
+ *   4. the server computes the same secret with its private key and checks it. On a match it
+ *      serves VLESS; otherwise it proxies to the real site.
  *
- *   1. у сервера есть постоянная пара X25519; публичная половина известна клиенту (pbk);
- *   2. клиент генерирует свою эфемерную пару и кладёт публичную половину в key_share
- *      ClientHello — ровно туда, где она была бы в настоящем TLS 1.3;
- *   3. из своего приватного и серверного pbk клиент считает общий секрет, и на его
- *      основе — короткий аутентификатор, который прячет в 32 байта session_id;
- *   4. сервер видит session_id, считает тот же секрет своим приватным ключом и сверяет.
- *      Совпало — обслуживает VLESS. Не совпало — проксирует на настоящий сайт.
+ * Two consequences shape the code below.
  *
- * Отсюда два следствия, которые определяют весь код ниже:
+ * The ClientHello must be INDISTINGUISHABLE from a browser's, not merely similar: the set and
+ * order of extensions, the cipher list, GREASE values. Any deviation makes us an atypical
+ * client, which is a signal by itself even with a valid authenticator. So the Hello is built
+ * here by hand: a library TLS stack would send its own extension order.
  *
- * ClientHello должен быть НЕОТЛИЧИМ от браузерного. Не «похож» — именно неотличим по
- * набору и порядку расширений, списку шифров, GREASE-значениям. Любое отклонение делает
- * нас нетипичным клиентом, и это само по себе признак, даже если аутентификатор верен.
- * Поэтому Hello собирается здесь вручную, а не библиотекой: TLS-стек любой библиотеки прислал
- * бы свой порядок расширений, который на браузер не похож.
- *
- * И: неудача выглядит как успех. Сервер не отвечает ошибкой — он отдаёт настоящий сайт.
- * Проверить «получилось ли» можно только по тому, отвечает ли туннель VLESS дальше.
+ * And failure looks like success. The server answers no error, it serves the real site. The
+ * only test is whether VLESS answers through the tunnel.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -42,27 +38,24 @@
 #include "scrypto.h"
 #include "reality.h"
 
-/* base64url без выравнивания — в таком виде pbk приходит в ссылке. */
+/* Unpadded base64url, the form pbk takes in a link. */
 static int b64url_decode(const char *in, unsigned char *out, size_t out_n) {
     static const char *A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     size_t o = 0;
-    /* БЕЗ ЗНАКА и с маской. Накопитель здесь копит все прочитанные шестёрки битов подряд,
-     * и при знаковом int сдвиг влево переполняет его после нескольких символов — это
-     * неопределённое поведение, найденное санитайзером на стенде xsloop. Практического
-     * вреда не приносило (нужны только младшие биты), но неопределённое поведение в
-     * разборе ключа — это то, что компилятор вправе оптимизировать во что угодно. */
+    /* Unsigned and masked: the accumulator keeps shifting in 6-bit groups, and a signed int
+     * would overflow (undefined behaviour) after a few characters. */
     unsigned acc = 0;
     int bits = 0;
     for (const char *p = in; *p; p++) {
         const char *q = strchr(A, *p);
         if (!q) {
             if (*p == '=' || *p == '\n' || *p == '\r') continue;
-            /* Ссылки иногда несут стандартный алфавит вместо url-safe. */
+            /* Links sometimes carry the standard alphabet instead of the url-safe one. */
             if (*p == '+') q = A + 62;
             else if (*p == '/') q = A + 63;
             else return -1;
         }
-        acc = ((acc << 6) | (unsigned)(q - A)) & 0x3FFFFFu;   /* хватает на 22 бита */
+        acc = ((acc << 6) | (unsigned)(q - A)) & 0x3FFFFFu;   /* 22 bits are enough */
         bits += 6;
         if (bits >= 8) {
             bits -= 8;
@@ -85,9 +78,8 @@ static int hex_decode(const char *in, unsigned char *out, size_t out_n) {
     return (int)o;
 }
 
-/* Случайные байты берём прямо у ядра. Своего DRBG здесь не нужно: getrandom(2) — это то,
- * из чего его всё равно пришлось бы сидировать, а лишний слой добавил бы код и место для
- * ошибки в том единственном месте, где ошибка не обнаруживается тестом. */
+/* Random bytes straight from the kernel. No DRBG of our own: getrandom(2) is what it would be
+ * seeded from anyway, and an extra layer adds code exactly where a bug escapes every test. */
 static int fill_random(unsigned char *buf, size_t n) {
     size_t got = 0;
     while (got < n) {
@@ -101,18 +93,16 @@ static int fill_random(unsigned char *buf, size_t n) {
     return 0;
 }
 
-/* Есть ли у процессора инструкции AES.
+/* Whether the CPU has AES instructions.
  *
- * От этого зависит порядок шифров в ClientHello, и оба варианта — браузерные: Chrome
- * задаёт тот же вопрос (EVP_has_aes_hardware) и так же меняет порядок. Так что здесь мы не
- * выбираем «что нам удобнее», а повторяем поведение браузера на этом железе.
+ * The cipher order in the ClientHello depends on it, and both orders are Chrome's: Chrome asks
+ * the same question (EVP_has_aes_hardware) and reorders the same way, so this repeats the
+ * browser's behaviour on this hardware.
  *
- * Спрашиваем ядро через AT_HWCAP, а не пробуем инструкцию: инструкция, которой нет, даёт
- * SIGILL, а ловить его в статическом бинарнике на роутере — худшая из идей. На MIPS
- * вопроса нет вовсе: там таких инструкций не бывает.
+ * The kernel is asked via AT_HWCAP rather than trying the instruction: a missing instruction
+ * raises SIGILL. MIPS has no such instructions at all.
  *
- * STEER_CIPHER=aes|chacha переопределяет ответ. Нужно, чтобы «стало быстрее от смены
- * шифра» можно было перепроверить на месте, а не поверить на слово. */
+ * STEER_CIPHER=aes|chacha overrides the answer, to check a speed claim on the spot. */
 static int cpu_has_aes(void) {
     const char *env = getenv("STEER_CIPHER");
     if (env && !strcmp(env, "aes")) return 1;
@@ -124,30 +114,25 @@ static int cpu_has_aes(void) {
 #elif defined(__aarch64__)
     return (getauxval(AT_HWCAP) & (1ul << 3)) != 0;      /* HWCAP_AES */
 #else
-    /* Всё остальное — включая 32-битный ARM с расширениями криптографии. Вопрос здесь не
-     * «есть ли инструкции у процессора», а «воспользуется ли ими НАША сборка»: аппаратный
-     * путь AES в нашей сборке wolfSSL есть только для x86_64 (AES-NI) и aarch64 (ARMv8
-     * Crypto), см. build/wolfssl/user_settings.h. На armv7 с crypto extensions AES у нас
-     * табличный, то есть медленный, и объявлять его предпочтительным означало бы выбрать
-     * заведомо худший шифр. */
+    /* Everything else, including 32-bit ARM with crypto extensions. What counts is whether
+     * OUR build uses the instructions: our wolfSSL has a hardware AES path only for x86_64
+     * (AES-NI) and aarch64 (ARMv8 Crypto), see build/wolfssl/user_settings.h. On armv7 AES is
+     * table-based and slow, so preferring it would pick the worse cipher. */
     return 0;
 #endif
 }
 
 /* ---- X25519 --------------------------------------------------------------- */
-/* Через слой примитивов (wolfCrypt): своя реализация тут была бы худшим решением в проекте.
+/* Through the primitives layer (wolfCrypt).
  *
- * Случайный скаляр берётся ЗДЕСЬ, через fill_random, а не внутри слоя, и это не случайность:
- * tests/hellofreeze.c подменяет getrandom макросом до включения этого файла и сверяет собранный
- * Hello байт в байт с заморозкой. Ключ, сгенерированный в другом файле, в подмену не попал бы, и
- * Hello перестал бы быть воспроизводимым. Прижатие скаляра — тоже здесь: оно не нужно слою
- * (X25519 из RFC 7748 прижимает сам), но нужно тому, кто хранит priv и передаёт его дальше —
- * tls13.c считает им секрет с эфемерным ключом сервера, и в st->priv должен лежать ровно тот
- * скаляр, которым посчитан pub. */
+ * The random scalar is drawn HERE through fill_random, not inside the layer: tests/hellofreeze.c
+ * replaces os_getrandom with a macro before including this file and compares the Hello byte for
+ * byte with a frozen copy; a key generated in another file would escape the substitution.
+ * Clamping is here too: the layer does not need it (RFC 7748 X25519 clamps by itself), but
+ * st->priv goes on to tls13.c, which computes the secret with the server's ephemeral key, and it
+ * must hold exactly the scalar pub was computed from. */
 static int x25519_keypair(unsigned char priv[32], unsigned char pub[32]) {
     if (fill_random(priv, 32) != 0) return -1;
-    /* Ограничения X25519 на скаляр: снять три младших бита, снять старший, поставить
-     * второй по старшинству. */
     priv[0] &= 248;
     priv[31] &= 127;
     priv[31] |= 64;
@@ -162,20 +147,16 @@ static int x25519_shared(const unsigned char priv[32], const unsigned char peer[
     return sc_x25519(out, priv, peer) == 0 ? 0 : -1;
 }
 
-/* ---- сборка ClientHello --------------------------------------------------- */
-/* Пишем байты вручную. Порядок расширений повторяет Chrome, потому что весь смысл
- * Reality в том, чтобы Hello не отличался от браузерного; библиотечный Hello выдал бы
- * нас порядком, даже будь аутентификатор верен. */
+/* ---- ClientHello ---------------------------------------------------------- */
 struct buf {
     unsigned char *p;
     size_t len, cap;
 };
 
 static void put(struct buf *b, const void *d, size_t n) {
-    if (b->len + n > b->cap) { b->len = b->cap + 1; return; }   /* переполнение видно снаружи */
-    /* Пустое расширение приходит как (NULL, 0) — так описаны extended_master_secret и
-     * session_ticket в таблице ниже. memcpy с NULL формально неопределён даже при нулевой
-     * длине (санитайзер это и сообщает), поэтому выходим раньше. */
+    if (b->len + n > b->cap) { b->len = b->cap + 1; return; }   /* overflow shows to the caller */
+    /* An empty extension comes as (NULL, 0) (extended_master_secret, session_ticket below), and
+     * memcpy from NULL is undefined even with zero length. */
     if (!n) return;
     memcpy(b->p + b->len, d, n);
     b->len += n;
@@ -183,21 +164,13 @@ static void put(struct buf *b, const void *d, size_t n) {
 static void put8(struct buf *b, unsigned v) { unsigned char c = (unsigned char)v; put(b, &c, 1); }
 static void put16(struct buf *b, unsigned v) { unsigned char c[2] = { (unsigned char)(v >> 8), (unsigned char)v }; put(b, c, 2); }
 
-/* Расширение: тип, длина, тело. */
 static void ext(struct buf *b, unsigned type, const void *body, size_t n) {
     put16(b, type);
     put16(b, (unsigned)n);
     put(b, body, n);
 }
 
-/* GREASE (RFC 8701) пока не используется: состав Hello повторяет openssl, а он GREASE
- * не посылает. Функция удалена вместе с ним — мёртвый код в файле, который отвечает за
- * маскировку, хуже отсутствующего: он выглядит как реализованная возможность.
- *
- * Вернуть придётся вместе с точным отпечатком Chrome, где GREASE обязателен. */
-
-/* Обёртка ради неизменности внешнего вызова: клиент VLESS зовёт её и ничего не знает про
- * носителя. Байты при этом те же, что были до его появления (tests/hellofreeze.c). */
+/* The Hello without a carrier; tests/hellofreeze.c pins its bytes. */
 int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
                         unsigned char *out, size_t out_n, size_t *out_len) {
     return reality_build_hello_carry(cfg, st, NULL, out, out_n, out_len);
@@ -217,29 +190,26 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
 
     st->pq = 0;
     if (car && car->priv) {
-        /* Пара пришла снаружи: xsteer выводит из неё общий секрет ещё до сборки Hello,
-         * потому что этим секретом запечатывается статический ключ в набивке ECH. */
         memcpy(st->priv, car->priv, 32);
         memcpy(st->pub, car->pub, 32);
     } else if (x25519_keypair(st->priv, st->pub) != 0) return REALITY_ECRYPTO;
-    /* Общий секрет с ПОСТОЯННЫМ ключом сервера нужен только аутентификатору. У обычного TLS
-     * его не существует: там есть лишь эфемерный обмен с серверной половиной key_share, и
-     * считает его tls13.c уже по ServerHello. */
+    /* The secret shared with the server's STATIC key serves only the authenticator. Plain TLS
+     * has none: there is only the ephemeral exchange with the server's key_share, which tls13.c
+     * computes from ServerHello. */
     if (!cfg->plain && x25519_shared(st->priv, pbk, st->shared) != 0) return REALITY_ECRYPTO;
 
-    /* Аутентификатор считается ПОСЛЕ сборки Hello — см. ниже, где он вписывается на
-     * место. Причина: он подписывает весь ClientHello целиком, поэтому раньше его
-     * посчитать нечем. Здесь только заготовка: 16 значимых байт и 16 нулей под тег. */
+    /* The authenticator is computed AFTER the Hello is built (below, where it is written in
+     * place), because it signs the whole ClientHello. Here only the plaintext: 16 meaningful
+     * bytes and 16 zeros for the tag. */
     unsigned char sess[32] = {0};
     if (cfg->plain) {
-        /* Браузер шлёт в legacy_session_id 32 случайных байта — со времён TLS 1.2, где это
-         * был идентификатор для возобновления. TLS 1.3 их не использует (сервер обязан
-         * вернуть их как есть), но пустого поля у современного клиента не бывает, и нулевое
-         * стало бы отпечатком не хуже любого другого. */
+        /* A browser sends 32 random bytes in legacy_session_id, a leftover of TLS 1.2
+         * resumption. TLS 1.3 does not use them (the server echoes them back), but a modern
+         * client never leaves the field empty, and a zero one would be a fingerprint. */
         if (fill_random(sess, sizeof(sess)) != 0) return REALITY_ECRYPTO;
     } else {
-        /* Версия клиента Reality — из core.Version_{x,y,z} Xray. Сервер её не проверяет
-         * строго, но она входит в подписываемые 16 байт, так что должна быть осмысленной. */
+        /* Reality client version, from Xray's core.Version_{x,y,z}. The server does not check
+         * it strictly, but it is part of the signed 16 bytes, so it must be plausible. */
         sess[0] = 26; sess[1] = 9; sess[2] = 8; sess[3] = 0;
         uint32_t now = (uint32_t)time(NULL);
         sess[4] = (unsigned char)(now >> 24);
@@ -250,18 +220,16 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
     }
     memcpy(st->session_id, sess, 32);
 
-    /* ---- собственно Hello ---- */
+    /* ---- the Hello itself ---- */
     struct buf b = { out, 0, out_n };
     unsigned char rnd[32];
     if (fill_random(rnd, sizeof(rnd)) != 0) return REALITY_ECRYPTO;
 
-    /* Значения GREASE (RFC 8701) — по одному на каждое место, где Chrome их ставит, и
-     * СВОИ на каждое соединение. Постоянные значения сами стали бы отпечатком: именно
-     * непредсказуемость здесь и есть смысл GREASE.
+    /* GREASE values (RFC 8701): one for each place Chrome puts one, fresh per connection;
+     * constant values would be a fingerprint themselves.
      *
-     * Значения — это 0x0a0a + n*0x1010, то есть шестнадцать вариантов от 0x0a0a до 0xfafa.
-     * Два типа расширений обязаны отличаться друг от друга: одинаковые дали бы расширение,
-     * повторённое дважды, чего в TLS быть не может. */
+     * Values are 0x0a0a + n*0x1010, sixteen of them from 0x0a0a to 0xfafa. The two extension
+     * types must differ: equal ones would repeat an extension, which TLS forbids. */
     unsigned char gr[5];
     if (fill_random(gr, sizeof(gr)) != 0) return REALITY_ECRYPTO;
     unsigned g_cipher  = 0x0A0Au + (unsigned)(gr[0] & 15) * 0x1010u;
@@ -270,13 +238,11 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
     unsigned g_ext_a   = 0x0A0Au + (unsigned)(gr[3] & 15) * 0x1010u;
     unsigned g_ext_b   = 0x0A0Au + (unsigned)((gr[4] & 15) ^ (((gr[4] & 15) == (gr[3] & 15)) ? 1 : 0)) * 0x1010u;
 
-    /* record header заполним в конце: длина известна только тогда */
+    /* The record header is filled in at the end, when the length is known. */
     size_t rec_at = b.len;
     put8(&b, 0x16);            /* handshake */
-    /* Версия записи 0x0301 — так делает и openssl (проверено перехватом его Hello
-     * против этого же сервера), и браузеры. Я успел «исправить» это на 0x0303 в поисках
-     * decode_error и вернул обратно: правка верного кода — цена того, что я гадал
-     * вместо сравнения с рабочим клиентом. */
+    /* Record version 0x0301, as browsers and openssl send it (checked by capture). It is
+     * correct; do not "fix" it to 0x0303. */
     put16(&b, 0x0301);
     size_t rec_len_at = b.len;
     put16(&b, 0);
@@ -284,42 +250,30 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
     size_t hs_at = b.len;
     put8(&b, 0x01);            /* ClientHello */
     size_t hs_len_at = b.len;
-    put8(&b, 0); put16(&b, 0); /* 24-битная длина */
+    put8(&b, 0); put16(&b, 0); /* 24-bit length */
 
-    put16(&b, 0x0303);         /* legacy_version TLS 1.2 — так требует 1.3 */
+    put16(&b, 0x0303);         /* legacy_version TLS 1.2, as TLS 1.3 requires */
     put(&b, rnd, 32);
     put8(&b, 32);
     put(&b, st->session_id, 32);
 
-    /* Наборы шифров Chrome, в его порядке, с GREASE первым. Сверено с перехватом.
-     *
-     * 0x1302 (AES_256_GCM_SHA384) в списке есть, хотя tls13.c умеет только SHA-256. Это не
-     * оплошность: список обязан совпадать с браузерным, иначе весь смысл Reality теряется, —
-     * а выбирает набор сервер, и сервер здесь Go. crypto/tls перебирает СВОЙ порядок
-     * предпочтений (AES_128_GCM_SHA256, CHACHA20, AES_256_GCM_SHA384) и берёт первый, который
-     * предложил клиент, то есть 0x1301; без аппаратного AES — 0x1303. Оба мы умеем.
-     *
-     * Если сервер всё-таки выберет 0x1302, рукопожатие честно упадёт с TLS13_EBADSUITE, а не
-     * даст нерасшифровываемый поток: раньше именно так и было, и выглядело это как рабочее
-     * соединение без данных. Поддержка SHA-384 — отдельная работа: параметризовать длину
-     * хеша во всём расписании ключей, а не подменить одну функцию. */
+    /* Chrome's cipher suites in Chrome's order, GREASE first; checked against a capture. The
+     * server picks: Go's crypto/tls takes the first suite of ITS preference order
+     * (AES_128_GCM_SHA256, CHACHA20, AES_256_GCM_SHA384) that the client offered. tls13.c
+     * serves all three TLS 1.3 suites. */
     static const unsigned suites_aes[] = {
         0x1301, 0x1302, 0x1303, 0xC02B, 0xC02F, 0xC02C, 0xC030,
         0xCCA9, 0xCCA8, 0xC013, 0xC014, 0x009C, 0x009D, 0x002F, 0x0035,
     };
-    /* Тот же список в порядке BoringSSL для процессора БЕЗ инструкций AES: ChaCha20
-     * поднята выше AES-GCM и в 1.3, и в 1.2. Ровно это делает Chrome (EVP_has_aes_hardware
-     * в ssl_cipher.cc), поэтому отпечаток остаётся браузерным — меняется не состав, а
-     * порядок, и меняется он так же, как у настоящего Chrome на таком же процессоре.
+    /* The same list in BoringSSL's order for a CPU WITHOUT AES instructions: ChaCha20 above
+     * AES-GCM in both 1.3 and 1.2. Chrome does exactly this (EVP_has_aes_hardware in
+     * ssl_cipher.cc), so the fingerprint stays a browser's: the order changes, not the set.
      *
-     * Зачем: сервер Reality — это Go, а crypto/tls смотрит на НАШ порядок. Функция
-     * aesgcmPreferred() спрашивает, стоит ли AES-GCM первым в списке клиента, и если нет,
-     * берёт список предпочтений defaultCipherSuitesTLS13NoAES, то есть ChaCha20.
-     *
-     * Зачем это нужно, числами, на роутере с MIPS 24Kc: AES-128-GCM 1,7 МБ/с против
-     * 11,6 МБ/с у ChaCha20-Poly1305 — в шесть раз. Туннель отдавал 1,2 МБ/с, проводя 91%
-     * времени в расшифровке, то есть упирался ровно в этот потолок. Полоса канала при этом
-     * была 48 Мбит/с. Ни один другой предел близко не стоял. */
+     * It matters because Go's crypto/tls looks at OUR order: aesgcmPreferred() checks whether
+     * AES-GCM is first in the client's list, and if not, uses defaultCipherSuitesTLS13NoAES,
+     * i.e. ChaCha20. On a MIPS 24Kc router AES-128-GCM runs at 1.7 MB/s against 11.6 MB/s for
+     * ChaCha20-Poly1305; with AES the tunnel was capped at 1.2 MB/s on a 48 Mbit/s link, 91% of
+     * the time in decryption. */
     static const unsigned suites_chacha[] = {
         0x1303, 0x1301, 0x1302, 0xCCA9, 0xCCA8, 0xC02B, 0xC02F, 0xC02C, 0xC030,
         0xC013, 0xC014, 0x009C, 0x009D, 0x002F, 0x0035,
@@ -336,54 +290,46 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
     put16(&b, 0);
     size_t exts_at = b.len;
 
-    /* Состав, содержимое и порядок расширений повторяют Chrome, сверенные с перехватом
-     * его Hello до этого же сервера (tests/hello-diff.py).
+    /* The set, contents and order of extensions follow Chrome, checked against a capture of
+     * its Hello to the same server (tests/hello-diff.py).
      *
-     * Почему это важно настолько. Аутентификатор Reality подписывает ClientHello ЦЕЛИКОМ,
-     * а весь смысл Reality — быть неотличимым от браузера. Прежняя версия повторяла openssl:
-     * 3 набора шифров вместо 16, 10 расширений вместо 18, ни одного GREASE, без ECH и ALPN,
-     * зато с encrypt_then_mac, которого браузер не посылает. Работало это до тех пор, пока
-     * сервер не стал разборчивее — а потом перестало на всех 26 узлах подписки сразу, при
-     * рабочем sing-box на том же узле и тех же ключах (0 успехов из 10 против 7 из 10).
+     * The Reality authenticator signs the WHOLE ClientHello, and Reality's point is to look
+     * like a browser. An openssl-like Hello (3 suites, 10 extensions, no GREASE, ECH or ALPN,
+     * plus encrypt_then_mac) stopped working on every node at once when servers got pickier,
+     * while sing-box worked with the same keys. The symptom gave no hint: the handshake
+     * completes, the server Finished verifies, only the VLESS answer never comes. Reality has
+     * no negative answer; it silently proxies an unrecognised client to the camouflage site.
      *
-     * Симптом при этом ничего не подсказывал: рукопожатие проходит целиком, серверный
-     * Finished сходится, не приходит только ответ VLESS. У Reality нет отрицательного
-     * ответа — непризнанного клиента он молча проксирует на маскировочный сайт.
-     *
-     * Отсюда правило для этого блока: любое изменение здесь проверяется перехватом рядом с
-     * браузерным эталоном, а не рассуждением о том, что «должно подойти». */
+     * So any change here is verified by a capture next to the browser reference, not by
+     * reasoning about what "should work". */
 
-    /* Расширения складываются в таблицу и лишь потом пишутся: Chrome начиная с 110-й версии
-     * ПЕРЕМЕШИВАЕТ их порядок на каждом соединении, оставляя на месте первое и последнее.
-     * Фиксированный порядок сам был бы отпечатком. */
+    /* Extensions go into a table and are written later: since version 110 Chrome SHUFFLES
+     * their order on every connection, keeping the first and last in place. A fixed order
+     * would be a fingerprint. */
     struct pend { unsigned type; const unsigned char *body; size_t n; };
     struct pend px[20];
     size_t pn = 0;
 
-    /* Буфер постквантового ключа лежит здесь же, рядом с остальными телами расширений: он большой
-     * (1216 байт), и на стеке в этой функции ему место — она не рекурсивная и вызывается раз на
-     * рукопожатие. */
+    /* The post-quantum share (1216 bytes) is per thread, not on the stack, like b_ks below. */
     static __thread unsigned char b_pq[REALITY_MLKEM_SHARE];
     unsigned char b_sni[300], b_alpn[16], b_cc[4], b_ech[220], b_alps[8], b_reneg[1];
     unsigned char b_ocsp[5], b_vers[8], b_sigs[20], b_grp[12], b_pskm[2];
-    /* key_share вырос: с постквантовым обменом его тело — больше килобайта, и на стеке в этой
-     * функции ему уже не место (она вызывается из потоков-соединителей, у которых стек скромный).
-     * __thread, а не общий static: рукопожатия идут параллельно, и общий буфер один перетирал бы
-     * другому — ровно та ошибка, что уже была здесь с буфером AAD. */
+    /* With the post-quantum share the key_share body is over a kilobyte, too much for the small
+     * stacks of connector threads. __thread rather than a shared static: handshakes run in
+     * parallel, and a shared buffer would be overwritten by another one. */
     static __thread unsigned char b_ks[64 + REALITY_MLKEM_SHARE];
     unsigned char b_ecpf[2], b_last[1];
 
-    /* Первым — GREASE, пустой. */
+    /* First: an empty GREASE extension. */
     px[pn].type = g_ext_a; px[pn].body = NULL; px[pn].n = 0; pn++;
 
-    /* server_name: список(2) + тип(1) + длина(2) + имя.
+    /* server_name: list(2) + type(1) + length(2) + name.
      *
-     * ИМЕНИ НЕТ — РАСШИРЕНИЯ НЕТ ВОВСЕ, а не пустое имя. Reality сверяет присланное имя со
-     * своим списком `serverNames`, и пустая строка там законна: сервер тогда ждёт
-     * ClientHello без этого расширения, ровно как его шлёт Xray с пустым `serverName`.
-     * Расширение с именем нулевой длины — не то же самое: такого ClientHello не строит ни
-     * один браузер и ни один клиент, и сверка на сервере его не узнаёт. Живой пример —
-     * подписка, где узел объявлен без `sni` во всех форматах разом (см. sub.c). */
+     * NO NAME MEANS NO EXTENSION, not an empty name. Reality checks the name against its
+     * `serverNames`, where an empty string is legal: the server then expects a ClientHello
+     * without this extension, exactly as Xray sends it with an empty `serverName`. An
+     * extension with a zero-length name is something no browser or client builds, and the
+     * server's check does not recognise it. Subscriptions do declare nodes without `sni`. */
     if (cfg->sni[0]) {
         size_t sni_len = strlen(cfg->sni);
         struct buf sb = { b_sni, 0, sizeof(b_sni) };
@@ -394,16 +340,13 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
         px[pn].type = 0x0000; px[pn].body = b_sni; px[pn].n = sb.len; pn++;
     }
 
-    /* ALPN: ВСЕГДА h2 и http/1.1, как браузер, независимо от транспорта узла.
-     *
-     * Раньше ALPN ставился только для grpc и xhttp — и это само было отличием от браузера,
-     * который присылает его всегда. Транспорту это не вредит: h2 стоит первым, поэтому
-     * сервер, желающий h2, его и выберет, а признавший нас Reality не выбирает ничего
-     * (NextProtos nil в Xray) и присылает пустые EncryptedExtensions. */
+    /* ALPN: ALWAYS "h2, http/1.1" as the browser sends it, whatever the node's transport
+     * (http/1.1 alone with car->alpn_http11, see reality.h). A server that wants h2 picks it;
+     * Reality, having recognised us, picks nothing (NextProtos is nil in Xray) and sends empty
+     * EncryptedExtensions. */
     {
         struct buf ab = { b_alpn, 0, sizeof(b_alpn) };
         if (car && car->alpn_http11) {
-            /* Только http/1.1: см. объяснение у поля в reality.h. */
             put16(&ab, 9);
             put8(&ab, 8); put(&ab, "http/1.1", 8);
         } else {
@@ -414,46 +357,40 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
         px[pn].type = 0x0010; px[pn].body = b_alpn; px[pn].n = ab.len; pn++;
     }
 
-    /* compress_certificate: brotli (2) — но НЕ у обычного TLS.
+    /* compress_certificate: brotli (2), but NOT for plain TLS.
      *
-     * Расширение обещает серверу, что мы разожмём сжатый сертификат (RFC 8879). Reality это
-     * обещание может себе позволить: сертификат он не читает вовсе, а сообщение
-     * CompressedCertificate ложится в транскрипт теми же байтами, что и обычное. У
-     * security=tls всё наоборот — сертификат там единственное доказательство подлинности, и
-     * прочитать его обязательно, а brotli у нас нет и тащить его ради этого некуда.
+     * The extension promises that we decompress a compressed certificate (RFC 8879). Reality
+     * can afford the promise: it never reads the certificate, and CompressedCertificate enters
+     * the transcript as received. With security=tls the certificate is the only proof and must
+     * be read, and there is no brotli here. Whether to compress is the server's choice:
+     * Cloudflare (1.1.1.1:443) accepts the promise and sends CompressedCertificate, Google sends
+     * a plain Certificate.
      *
-     * Снято на живом сервере: Cloudflare (1.1.1.1:443) обещание принимает и присылает
-     * CompressedCertificate, после чего проверять становится нечего — узел выглядел
-     * неисправным. Google в тех же условиях прислал обычный Certificate, поэтому первый же
-     * опыт прошёл, а второй нет: сжимать или нет решает сервер.
-     *
-     * Что теряется. Hello обычного TLS отличается от Chrome на одно расширение. Для Reality
-     * это было бы недопустимо — по составу расширений его и опознают, — но у security=tls
-     * маскировки под браузер нет по смыслу: там настоящее имя в SNI и настоящий сертификат.
-     * Байты Reality-Hello при этом не меняются ни на бит, и это стережёт hellofreeze.c. */
+     * The cost: the plain TLS Hello differs from Chrome's by one extension. That would be fatal
+     * for Reality, but security=tls does not pose as a browser anyway: it has the real name in
+     * SNI and a real certificate. The Reality Hello is unchanged (tests/hellofreeze.c). */
     if (!cfg->plain) {
         struct buf cb = { b_cc, 0, sizeof(b_cc) };
         put8(&cb, 2); put16(&cb, 0x0002);
         px[pn].type = 0x001B; px[pn].body = b_cc; px[pn].n = cb.len; pn++;
     }
 
-    /* encrypted_client_hello — НАБИВКА, а не настоящий ECH.
+    /* encrypted_client_hello: PADDING, not real ECH.
      *
-     * Chrome без конфигурации ECH посылает именно это: расширение правильной формы, набитое
-     * случайными байтами (в utls — GREASE-ECH). Настоящий ECH нам не нужен и не с чем
-     * согласовывать; нужна ровно та же форма и тот же размер, иначе Hello отличим по одному
-     * отсутствующему расширению в 218 байт.
+     * Chrome without an ECH config sends exactly this: a well-formed extension filled with
+     * random bytes (GREASE-ECH in uTLS). Real ECH has nothing to negotiate here; what matters
+     * is the same shape and size, or the Hello stands out by one missing 218-byte extension.
+     * (Real ECH for security=tls wraps the finished Hello instead, see ech.h.)
      *
-     * Раскладка: тип(1)=0 внешний, kdf(2)=HKDF-SHA256, aead(2)=AES-128-GCM, номер
-     * конфигурации(1), длина enc(2)=32 и сам enc, длина payload(2)=176 и payload.
-     * Итого 1+2+2+1+2+32+2+176 = 218 байт — столько же, сколько у эталона. */
+     * Layout: type(1)=0 outer, kdf(2)=HKDF-SHA256, aead(2)=AES-128-GCM, config id(1),
+     * enc length(2)=32 and enc, payload length(2)=176 and payload:
+     * 1+2+2+1+2+32+2+176 = 218 bytes, as in the reference. */
     {
         unsigned char noise[209];
         if (fill_random(noise, sizeof(noise)) != 0) return REALITY_ECRYPTO;
-        /* Носитель заполняет ровно те 176 байт, которые уедут полезной нагрузкой ECH.
-         * Заполняется ЗДЕСЬ, а не после сборки, по двум причинам: набивка входит в байты,
-         * которые потом подписывает session_id, и указатель `noise + 33` — это буквально
-         * будущая нагрузка, а не смещение, посчитанное вручную по раскладке расширения. */
+        /* A carrier fills exactly the 176 bytes that become the ECH payload. It does so HERE,
+         * not after assembly: the padding is part of the bytes session_id later signs, and
+         * `noise + 33` is literally the future payload, not an offset computed by hand. */
         if (car && car->fill_ech &&
             car->fill_ech(car->ctx, noise + 33, 176, st->shared) != 0)
             return REALITY_ECRYPTO;
@@ -469,8 +406,8 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
         px[pn].type = 0xFE0D; px[pn].body = b_ech; px[pn].n = eb.len; pn++;
     }
 
-    /* application_settings (ALPS), новый номер 0x44cd: список из одного "h2". */
-    if (!(car && car->no_alps)) {           /* no_alps — DoH по HTTP/2, см. reality.h */
+    /* application_settings (ALPS), new codepoint 0x44cd: a list of one "h2". */
+    if (!(car && car->no_alps)) {           /* no_alps: see reality.h */
       struct buf ab = { b_alps, 0, sizeof(b_alps) };
       put16(&ab, 3); put8(&ab, 2); put(&ab, "h2", 2);
       px[pn].type = 0x44CD; px[pn].body = b_alps; px[pn].n = ab.len; pn++; }
@@ -481,23 +418,23 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
     px[pn].type = 0x0017; px[pn].body = NULL; px[pn].n = 0; pn++;   /* extended_master_secret */
     px[pn].type = 0x0023; px[pn].body = NULL; px[pn].n = 0; pn++;   /* session_ticket */
 
-    /* status_request: OCSP, пустые списки. */
+    /* status_request: OCSP, empty lists. */
     { struct buf ob = { b_ocsp, 0, sizeof(b_ocsp) };
       put8(&ob, 1); put16(&ob, 0); put16(&ob, 0);
       px[pn].type = 0x0005; px[pn].body = b_ocsp; px[pn].n = ob.len; pn++; }
 
     /* supported_versions: GREASE, 1.3, 1.2.
      *
-     * TLS 1.2 в списке есть потому, что он есть у браузера. Обслужить его tls13.c не умеет,
-     * но Reality — это строго 1.3, и сервер выберет 1.3; если вдруг нет, разбор ServerHello
-     * не найдёт key_share и вернёт ENOKEYSHARE, то есть ошибку, а не молчание. */
+     * TLS 1.2 is listed because the browser lists it. This handshake cannot serve it, but
+     * Reality is strictly 1.3; should a server pick 1.2, ServerHello has no key_share and the
+     * handshake fails with ENOKEYSHARE, an error rather than silence. */
     { struct buf vb = { b_vers, 0, sizeof(b_vers) };
       put8(&vb, 6); put16(&vb, g_version); put16(&vb, 0x0304); put16(&vb, 0x0303);
       px[pn].type = 0x002B; px[pn].body = b_vers; px[pn].n = vb.len; pn++; }
 
     px[pn].type = 0x0012; px[pn].body = NULL; px[pn].n = 0; pn++;   /* signed_cert_timestamp */
 
-    /* signature_algorithms: восемь, в порядке Chrome. */
+    /* signature_algorithms: eight, in Chrome's order. */
     { static const unsigned sigs[] = { 0x0403, 0x0804, 0x0401, 0x0503,
                                        0x0805, 0x0501, 0x0806, 0x0601 };
       struct buf sb = { b_sigs, 0, sizeof(b_sigs) };
@@ -505,14 +442,13 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
       for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) put16(&sb, sigs[i]);
       px[pn].type = 0x000D; px[pn].body = b_sigs; px[pn].n = sb.len; pn++; }
 
-    /* key_share: GREASE-группа с одним нулевым байтом, затем — у современного Chrome —
-     * постквантовый ключ, и только потом наша половина X25519. Номер GREASE-группы тот же, что в
-     * supported_groups: так делает браузер.
+    /* key_share: a GREASE group with one zero byte, then (as in current Chrome) the
+     * post-quantum share, then our X25519 half. The GREASE group is the same as in
+     * supported_groups, as the browser does.
      *
-     * Постквантовая половина заполняется СЛУЧАЙНЫМИ байтами: обмена по ней мы не ведём, а
-     * отвечающая сторона её игнорирует. Для наблюдателя это неотличимо от настоящего ключа (тот
-     * тоже выглядит шумом), и именно она делает Hello браузерного размера — см. поле pq в
-     * reality.h. */
+     * With car->pq alone the post-quantum share is RANDOM bytes: no exchange runs on it, and
+     * the peer ignores it. To an observer it is indistinguishable from a real key (which looks
+     * like noise too), and it gives the Hello a browser's size (see pq in reality.h). */
     { struct buf kb = { b_ks, 0, sizeof(b_ks) };
       int want_pq = (car && car->pq) || cfg->pq;
       unsigned body = 2 + 2 + 1;                       /* GREASE */
@@ -523,10 +459,11 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
       if (want_pq) {
           put16(&kb, REALITY_GROUP_MLKEM); put16(&kb, REALITY_MLKEM_SHARE);
           if (cfg->pq) {
-              /* Настоящий гибрид: ключ ML-KEM-768 (1184) и та же X25519-половина, что в отдельном
-               * X25519-share ниже (так делают BoringSSL и Go: один эфемерный ключ на оба). Порядок
-               * полей — draft-ietf-tls-ecdhe-mlkem: ML-KEM первым. Seed (d‖z) берётся у того же
-               * источника случайности, что и весь Hello, поэтому стенд заморозки его подменяет. */
+              /* The real hybrid: an ML-KEM-768 key (1184) and the same X25519 half as the
+               * separate X25519 share below (BoringSSL and Go use one ephemeral key for both).
+               * Field order per draft-ietf-tls-ecdhe-mlkem: ML-KEM first. The seed (d‖z) comes
+               * from the same random source as the rest of the Hello, so hellofreeze.c
+               * substitutes it too. */
               unsigned char seed[SC_MLKEM768_SEED];
               if (fill_random(seed, sizeof seed) != 0) return REALITY_ECRYPTO;
               if (sc_mlkem768_keygen(b_pq, st->mlkem_dk, seed) != 0) return REALITY_ECRYPTO;
@@ -538,8 +475,8 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
       put16(&kb, 0x001D); put16(&kb, 32); put(&kb, st->pub, 32);
       px[pn].type = 0x0033; px[pn].body = b_ks; px[pn].n = kb.len; pn++; }
 
-    /* supported_groups: GREASE, постквантовая (если предлагаем), X25519, secp256r1, secp384r1 —
-     * ровно набор Chrome. Прежние FFDHE 0x0100..0x0104 браузер не предлагает вовсе. */
+    /* supported_groups: GREASE, post-quantum (if offered), X25519, secp256r1, secp384r1: exactly
+     * Chrome's set. Browsers offer no FFDHE groups (0x0100..0x0104). */
     { struct buf gb = { b_grp, 0, sizeof(b_grp) };
       int want_pq = (car && car->pq) || cfg->pq;
       put16(&gb, want_pq ? 10 : 8);
@@ -554,12 +491,11 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
     b_ecpf[0] = 1; b_ecpf[1] = 0;
     px[pn].type = 0x000B; px[pn].body = b_ecpf; px[pn].n = 2; pn++;  /* ec_point_formats */
 
-    /* Последним — второй GREASE, с одним нулевым байтом. */
+    /* Last: the second GREASE extension, with one zero byte. */
     b_last[0] = 0;
     px[pn].type = g_ext_b; px[pn].body = b_last; px[pn].n = 1; pn++;
 
-    /* Перемешиваем всё, кроме первого и последнего. Тасование Фишера — Йетса на случайных
-     * байтах: без него порядок был бы постоянным, то есть отличимым. */
+    /* Fisher-Yates shuffle of all but the first and last. */
     if (pn > 3) {
         unsigned char sh[20];
         if (fill_random(sh, sizeof(sh)) != 0) return REALITY_ECRYPTO;
@@ -572,7 +508,7 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
 
     if (b.len > b.cap) return REALITY_ETOOBIG;
 
-    /* Обратная засыпка длин. */
+    /* Back-fill the lengths. */
     size_t exts_len = b.len - exts_at;
     out[exts_len_at] = (unsigned char)(exts_len >> 8);
     out[exts_len_at + 1] = (unsigned char)exts_len;
@@ -586,66 +522,50 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
 
     *out_len = b.len;
 
-    /* ---- аутентификатор Reality ------------------------------------------------
+    /* ---- Reality authenticator ------------------------------------------------
      *
-     * Формат взят из реализации Xray, а не выведен из общих соображений — угадать его
-     * нельзя, и моя первая догадка (соль = SNI, nonce = свой pub, пустой AAD) давала
-     * рукопожатие, после которого сервер отвечал маскировочным сайтом.
+     * The format comes from Xray's implementation; it cannot be guessed (salt = SNI,
+     * nonce = own pub and an empty AAD give a handshake the server answers with its camouflage
+     * site).
      *
-     *   ключ   = HKDF-SHA256(ikm = ECDH(наш приватный, pbk сервера),
-     *                        salt = Random[0..20), info = "REALITY")
-     *   nonce  = Random[20..32)
-     *   данные = первые 16 байт session_id (версия, время, short id)
-     *   AAD    = ВЕСЬ ClientHello как handshake-сообщение, с нулями на месте тега
+     *   key   = HKDF-SHA256(ikm = ECDH(our private key, server pbk),
+     *                       salt = Random[0..20), info = "REALITY")
+     *   nonce = Random[20..32)
+     *   data  = the first 16 bytes of session_id (version, time, short id)
+     *   AAD   = the WHOLE ClientHello as a handshake message, zeros in place of session_id
      *
-     * AAD и есть причина, по которой это делается здесь: пока Hello не собран, подписывать
-     * нечего. Сервер повторит тот же расчёт своим приватным ключом и сверит тег — так он и
-     * отличает нас от постороннего, не отвечая при этом ничего отличимого. */
-    /* Обычному TLS подписывать нечего: session_id уже случаен и уехал в Hello как есть.
-     * Ранний возврат ЗДЕСЬ, а не проверкой внутри: ниже лежит расчёт, у которого без
-     * постоянного ключа сервера нет ни одного осмысленного входа. */
+     * The AAD is why this happens here: until the Hello is built there is nothing to sign. The
+     * server repeats the computation with its private key and checks the tag. */
+    /* Plain TLS has nothing to sign: its session_id is random and already in the Hello. */
     if (cfg->plain) return 0;
 
     {
-        const unsigned char *raw = out + 5;              /* handshake без заголовка записи */
-        const unsigned char *random = raw + 4 + 2;       /* после type+len24+version */
+        const unsigned char *raw = out + 5;              /* handshake message, no record header */
+        const unsigned char *random = raw + 4 + 2;       /* after type + len24 + version */
         unsigned char *sid_at = out + 5 + 4 + 2 + 32 + 1;
 
-        /* AAD — это Hello с НУЛЯМИ на месте session_id: Xray обнуляет его до подписи
-         * (`copy(hello.Raw[39:], hello.SessionId)` при пустом SessionId), и сервер
-         * повторяет расчёт так же. С заполненным session_id в AAD тег не сходится, и
-         * сервер молча отвечает маскировочным сайтом — то есть ошибка неотличима от
-         * неверного ключа. Смещение 39 в Xray и наше совпадают: 4+2+32+1 = 39. */
-        /* Открытый текст — 16 значимых байт session_id. Сохраняем их ДО обнуления:
-         * шифрование идёт на месте, а обнуление нужно только в AAD.
-         *
-         * Первая версия обнуляла sid_at перед вызовом и подписывала нули вместо версии,
-         * времени и short id. Сервер, естественно, не признавал такую подпись — и, как
-         * всегда с Reality, отвечал маскировочным сайтом, то есть ошибка выглядела как
-         * неверный ключ. Нашлось только сверкой C с независимой реализацией на Python:
-         * их подписи не расшифровывались одним ключом, хотя X25519 у обоих совпадал. */
+        /* The plaintext: the 16 meaningful bytes of session_id. Encryption runs in place at
+         * sid_at; the zeros belong only in the AAD. */
         unsigned char plain[16];
         memcpy(plain, sid_at, 16);
 
-        /* AAD — Hello с НУЛЯМИ на месте session_id: Xray обнуляет его до подписи
-         * (`copy(hello.Raw[39:], hello.SessionId)` при ещё пустом SessionId), и сервер
-         * повторяет расчёт так же. Копируем Hello, чтобы обнулить в копии: сам Hello
-         * должен уехать серверу с подписью, а не с нулями. */
-        /* __thread, не общий static: рукопожатие асинхронное (CONNECTORS потоков в
-         * tunnel.c), и этот буфер пишется прямо перед AEAD. Общий static под
-         * параллельными соединителями один перетирал бы AAD другому посреди
-         * шифрования AES-GCM — тег не сходился, и сервер Reality молча
-         * проксировал на маскировочный сайт. Все sibling-буферы в этом коде тоже
-         * __thread; этот был единственным исключением. */
+        /* The AAD is the Hello with ZEROS in place of session_id: Xray zeroes it before
+         * signing (`copy(hello.Raw[39:], hello.SessionId)` with an empty SessionId), and the
+         * server does the same; 39 = 4+2+32+1 here too. With session_id filled in, the tag
+         * does not match and the server silently answers with its camouflage site, which looks
+         * exactly like a wrong key. Zeroed in a copy: the Hello itself goes out signed.
+         *
+         * __thread, not a shared static: connector threads handshake in parallel, and a shared
+         * buffer would let one overwrite another's AAD in the middle of AES-GCM. */
         static __thread unsigned char aad[4096];
         size_t aad_n = b.len - 5;
         if (aad_n > sizeof(aad)) return REALITY_ETOOBIG;
         memcpy(aad, raw, aad_n);
         memset(aad + (4 + 2 + 32 + 1), 0, 32);
 
-        /* Носитель подписывает то же самое своим способом. Ему отдаются ровно те байты, с
-         * которыми он же сверится на другой стороне: сообщение рукопожатия с обнулённым
-         * session_id. Дальше аутентификатор Reality не считается вовсе — его место занято. */
+        /* A carrier signs the same bytes its own way: the handshake message with session_id
+         * zeroed, exactly what the peer checks against. The Reality authenticator is then not
+         * computed at all: its place is taken. */
         if (car && car->fill_sid) {
             if (car->fill_sid(car->ctx, sid_at, aad, aad_n, st->shared) != 0)
                 return REALITY_ECRYPTO;
@@ -653,17 +573,16 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
             return 0;
         }
 
-        /* Ключ уезжает в st, а не остаётся местной переменной: им же сервер подписывает
-         * свой сертификат, и проверка этой подписи — единственное, чем он доказывает
-         * подлинность нам (tls13.c). Раньше ключ здесь и умирал, и доказательства не было. */
+        /* The key goes to st rather than a local: the server signs its certificate with it,
+         * and checking that signature is the only way it proves itself to us (tls13.c). */
         unsigned char *authkey = st->authkey;
         if (sc_hkdf(SC_SHA256, random, 20, st->shared, 32,
                     (const unsigned char *)"REALITY", 7, authkey, 32) != 0)
             return REALITY_ECRYPTO;
 
-        /* AES-256-GCM одноразовым ключом: одно шифрование на рукопожатие, держать контекст
-         * дольше незачем. Контекст — в потоке, а не на стеке: он больше килобайта, а
-         * рукопожатия идут в потоках соединителей со скромным стеком (см. b_ks выше). */
+        /* AES-256-GCM with a one-time key: one encryption per handshake. The context is per
+         * thread, not on the stack: it is over a kilobyte, and connector threads have small
+         * stacks (see b_ks above). */
         unsigned char tag[16];
         static __thread struct sc_aead gcm;
         memcpy(sid_at, plain, 16);
@@ -677,21 +596,19 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
     return 0;
 }
 
-/* Тот же обмен, доступный из tls13.c: там нужен секрет с эфемерным ключом сервера из
- * ServerHello, тогда как reality.c считает секрет с его постоянным ключом. Две разные
- * величины, один и тот же примитив. */
+/* The same exchange for tls13.c, which needs the secret with the server's EPHEMERAL key from
+ * ServerHello; reality.c computes the one with its static key. Two values, one primitive. */
 int x25519_shared_ext(const unsigned char priv[32], const unsigned char peer[32],
                       unsigned char out[32]) {
     return x25519_shared(priv, peer, out);
 }
 
-/* ---- примитивы наружу, для xsteer ------------------------------------------
+/* ---- primitives for other files --------------------------------------------
  *
- * Три обёртки над статикой этого файла. Тем же приёмом, которым здесь уже живёт
- * x25519_shared_ext, и по той же причине: xsteer нужны ровно эти три вещи, а копия каждой
- * означала бы второе место, где живёт решение. У cpu_has_aes это особенно важно: от него
- * зависит порядок наборов шифров в Hello, то есть облик, и расхождение между «что мы
- * объявили» и «чем мы шифруем» стоило бы туннелю шестикратной потери скорости на MIPS. */
+ * Wrappers over this file's statics rather than copies, so each decision lives in one place.
+ * It matters most for cpu_has_aes: the Hello's cipher order (the fingerprint) depends on it,
+ * and a mismatch between the cipher we announce and the one we encrypt with would cost a
+ * sixfold slowdown on MIPS. */
 int xc_random(unsigned char *out, size_t n) { return fill_random(out, n); }
 int xc_cpu_has_aes(void) { return cpu_has_aes(); }
 int xc_b64url_decode(const char *in, unsigned char *out, size_t out_n) {
@@ -702,12 +619,8 @@ int xc_x25519_keypair(unsigned char priv[32], unsigned char pub[32]) {
     return x25519_keypair(priv, pub);
 }
 
-/* Публичная половина ДАННОГО приватного ключа. Нужна xsteer: статический ключ пира лежит в
- * конфигурации приватной половиной (как у wg), а публичная выводится, а не переписывается
- * руками — два значения, выведенных одно из другого, обязаны считаться. */
+/* The public half of a GIVEN private key. An unclamped key is clamped by the layer (RFC 7748),
+ * as wireguard-go and Go do, so the result matches theirs. */
 int xc_x25519_public(const unsigned char priv[32], unsigned char pub[32]) {
-    /* Неприжатый ключ из конфигурации слой прижимает сам (RFC 7748) — так же считают его
-     * wireguard-go и сторона xsteer на Go, поэтому публичная половина совпадает с их расчётом.
-     * mbedtls такой ключ отвергала, то есть прежде он давал отказ там, где Go давал ключ. */
     return sc_x25519_base(pub, priv) == 0 ? 0 : -1;
 }

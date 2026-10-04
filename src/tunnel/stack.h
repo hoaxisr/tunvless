@@ -1,4 +1,5 @@
-/* Стек туннеля: пакеты из TUN в потоки к узлу через дайлер (dialer.h). Границы — в stack.c. */
+/* The tunnel stack: packets from the TUN device into flows to a node through a dialer (dialer.h).
+ * Its limits are described in stack.c. */
 #ifndef STEER_STACK_H
 #define STEER_STACK_H
 #include <stdint.h>
@@ -21,10 +22,10 @@ typedef void (*stack_ready_fn)(void *arg, const char *dev);
  * Always returns 1: the loop has no successful exit (see the end of stack_run). */
 int stack_run(const struct tun_cfg *tc, const struct dialer *d, stack_ready_fn ready, void *arg);
 
-/* Набор активных узлов изменился: соединения, чей узел больше не активен (dialer_ops.stale), стек
- * сбрасывает — RST клиенту, — чтобы приложения переподключались сразу, а не ждали своего таймаута
- * на повисшем соединении. Зовётся из любого потока; поток цикла замечает это на ближайшем витке (не
- * позже секунды). */
+/* The set of active nodes changed: the stack resets (RST to the client) every connection whose node
+ * is no longer active (dialer_ops.stale), so applications reconnect at once instead of waiting for
+ * their own timeout on a hung connection. Callable from any thread; each loop thread notices on its
+ * next pass (within a second). */
 void stack_nodes_changed(void);
 
 #endif

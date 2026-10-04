@@ -7,9 +7,9 @@
  * The address is in network order and keeps its host bits. */
 int ifcfg_parse_cidr(const char *s, uint32_t *addr, int *prefix);
 
-/* Address, link up and transmit queue length of dev: what `ip addr replace`, `ip link set up` and
- * `ip link set txqueuelen 4096` did. Every failed step is reported on stderr; returns how many
- * failed (0 — all done). */
+/* Address, link up and transmit queue length of dev: the equivalent of `ip addr replace`,
+ * `ip link set up` and `ip link set txqueuelen 4096`. Every failed step is reported on stderr;
+ * returns how many failed (0 — all done). */
 int ifcfg_bring_up(const char *dev, uint32_t addr, int prefix);
 
 /* Route dst/prefix into dev (replace if it exists) in routing table `table` (0 — main). 0, or a

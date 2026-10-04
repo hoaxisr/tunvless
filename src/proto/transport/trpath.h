@@ -1,38 +1,39 @@
-/* Путь запроса Upgrade у транспортов ws и httpupgrade — ровно тот, что шлёт Xray.
+/* The Upgrade request path of the ws and httpupgrade transports — exactly the one Xray sends.
  *
- * ЗАЧЕМ ОТДЕЛЬНЫЙ ФАЙЛ. Путь из ссылки узла до строки запроса проходит у Xray через ТРИ разбора
- * адреса библиотекой Go, и каждый что-то меняет: при сборке настройки (infra/conf,
- * WebSocketConfig.Build и HttpUpgradeConfig.Build) из запроса вырезается `ed=` — ранние данные —
- * и оставшийся запрос пересобирается по правилам url.Values.Encode; у ws затем gorilla/websocket
- * снова разбирает адрес `ws://хост` + путь и печатает RequestURI; у httpupgrade путь целиком, с
- * `?`, кладётся в URL.Path, и `?` уезжает как `%3F` (снято перехватом с Xray 26.3.27:
- * `GET /p/q%3Fx=1 HTTP/1.1`). Сервер Xray сравнивает с этим же своим путём, поэтому «примерно
- * так же» здесь значит «не тот путь» — 404 и узел, который выглядит мёртвым.
+ * On the way from the node link to the request line Xray parses the path with Go's url package
+ * three times, and each pass changes something. Building the config (infra/conf,
+ * WebSocketConfig.Build and HttpUpgradeConfig.Build) cuts `ed=` (early data) out of the query and
+ * re-encodes the rest with url.Values.Encode; for ws, gorilla/websocket then parses `ws://host` +
+ * path again and prints RequestURI; httpupgrade puts the whole path, `?` included, into URL.Path,
+ * so `?` goes out as `%3F` (captured from Xray 26.3.27: `GET /p/q%3Fx=1 HTTP/1.1`). The Xray
+ * server compares against its own copy of the same path, so "roughly the same" means "wrong path":
+ * a 404 and a node that looks dead.
  *
- * Функция чистая (только строки, без сети и библиотек): её зовут и транспорт при открытии, и
- * разбор подписки (sub.c) — чтобы путь, на котором Xray споткнулся бы, отбраковать заранее, с
- * названной причиной, а не тратить на такой узел попытки сторожа. Правило одно на оба места. */
+ * The functions are pure (strings only, no network, no libraries): both the transport and the
+ * subscription parser (sub.c) call them, so a path Xray would trip over is rejected up front with
+ * a stated reason. One rule for both places. */
 #ifndef STEER_TRPATH_H
 #define STEER_TRPATH_H
 #include <stddef.h>
 #include <stdint.h>
 
-/* Строка запроса (request-target) для пути узла.
+/* The request-target for a node's path.
  *
- * ws — 1 для WebSocket, 0 для HTTPUpgrade. 0 — готово, в out строка с ведущим слэшем; иначе -1 и
- * *why — причина для человека (короткая: она уезжает в skip_reason узла, 64 байта, а буква
- * кириллицы — это два). why допускает NULL.
+ * ws — 1 for WebSocket, 0 for HTTPUpgrade. Returns 0 with a path starting with a slash in out;
+ * otherwise -1 and *why, a short human-readable reason (it ends up in the node's skip_reason).
+ * why may be NULL.
  *
- * Что принимается — то, что Xray разбирает однозначно, и только оно: путь без управляющих
- * знаков, без `#` (url.Parse отрезал бы его как фрагмент), не начинающийся с `//` (читался бы как
- * имя хоста) и без `:` в первом сегменте пути без ведущего слэша (Go принял бы его за схему). У ws
- * вдобавок процентные последовательности в пути обязаны быть целыми — иначе url.Parse отказывает,
- * и Xray не соединяется вовсе. */
+ * Accepted is what Xray parses unambiguously, and nothing else: no control characters, no `#`
+ * (url.Parse would cut it off as a fragment), no leading `//` (read as a host name), and no `:`
+ * in the first segment of a path without a leading slash (Go would take it for a scheme). For ws,
+ * percent sequences in the path must also be complete, or url.Parse fails and Xray does not
+ * connect at all. */
 int tr_upgrade_target(const char *path, int ws, char *out, size_t cap, const char **why);
 
-/* То же и Ed — число ранних данных, как его считает Build у Xray (`uint32(strconv.Atoi(ed))`):
- * 0, если `ed=` не вырезался (нет его, пусто, путь не разобрался) или не число. ed_out допускает
- * NULL. Что Ed меняет на проводе — trws.c и trupgrade.c. */
+/* The same, plus Ed — the early data size as Xray's Build computes it
+ * (`uint32(strconv.Atoi(ed))`): 0 if `ed=` was not cut out (absent, empty, or the path did not
+ * parse) or is not a number. ed_out may be NULL. What Ed changes on the wire: trws.c and
+ * trupgrade.c. */
 int tr_upgrade_target_ed(const char *path, int ws, char *out, size_t cap, const char **why,
                          uint32_t *ed_out);
 

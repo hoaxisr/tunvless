@@ -1,29 +1,25 @@
-/* Минимальный клиент HTTP/2: один запрос, один поток, тело в обе стороны.
+/* A minimal HTTP/2 client: one request at a time on one stream, a body both ways.
  *
- * Зачем он здесь. Транспорты grpc и xhttp — это не «другой способ упаковать байты», а
- * HTTP/2: сервер ждёт преамбулу, кадры и управление потоком, и без них соединение просто
- * висит. Восемь узлов подписки из двадцати шести говорят по grpc и восемь по xhttp, то
- * есть без HTTP/2 две трети узлов недоступны. Это и есть причина писать его.
+ * The grpc and xhttp transports are HTTP/2: the server expects the preface, frames and flow
+ * control, and without them the connection just hangs.
  *
- * Чего здесь сознательно НЕТ, и почему это можно:
+ * Deliberately NOT here, and why that is fine:
  *
- *   - мультиплексирования. Поток всегда один, номер 1. Xray на каждое соединение VLESS
- *     открывает своё TCP+TLS, и мы делаем так же: мультиплексирование экономило бы
- *     рукопожатия, но потребовало бы планировщика окон между потоками — то есть кода,
- *     который на роутере с одним ядром отлаживать дороже, чем он стоит;
- *   - HPACK на приём. Заголовки ответа не разбираются, из них добывается только :status:
- *     статическим индексом или литералом с именем из таблицы, цифрами или кодом Хаффмана
- *     (Go-сервер пишет так 502, 401, 301 — см. status_huff). Полный HPACK
- *     потребовал бы динамической таблицы, то есть памяти на соединение и кода, который
- *     исполняется один раз за соединение;
- *   - PUSH_PROMISE. Выключается в SETTINGS, поэтому его не может быть;
- *   - приоритетов и TRAILERS. Первое ничего не решает, второе только закрывает поток.
+ *   - multiplexing. One stream at a time. Xray opens its own TCP+TLS for every VLESS
+ *     connection, and so do we: multiplexing would save handshakes but needs a window
+ *     scheduler between streams, code that costs more to debug on a single-core router than
+ *     it is worth;
+ *   - HPACK on receive. Response headers are not parsed; only :status is extracted: a static
+ *     index, or a literal with an indexed name as digits or Huffman code (a Go server sends
+ *     502, 401, 301 this way, see status_huff). Full HPACK needs a dynamic table, i.e. memory
+ *     per connection;
+ *   - PUSH_PROMISE. Disabled in SETTINGS, so it cannot arrive;
+ *   - priorities and trailers. The first decides nothing, the second only closes the stream.
  *
- * Память. По одному такому состоянию на соединение VLESS, а их до 64, поэтому буфера на
- * кадр здесь нет: записи читаются в общий буфер, а между вызовами переносится только то,
- * что нельзя разобрать сразу — обрывок заголовка кадра (9 байт), тело служебного кадра
- * (64) и счётчик непрочитанного тела. 16 КБ на соединение означали бы мегабайт на
- * коробке с пятнадцатью.
+ * Memory: one state per VLESS connection, up to 64, so there is no frame buffer. Records are
+ * read into a shared buffer, and only what cannot be parsed at once carries over between
+ * calls: a split frame header (9 bytes), a control frame body (64) and the count of unread
+ * body. 16 KB per connection would be a megabyte.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -48,17 +44,16 @@
 #define FLAG_PRIORITY    0x20
 
 
-/* Наше окно приёма. Большое намеренно: при 65535 по умолчанию каждые 64 КБ загрузки
- * требуют обмена WINDOW_UPDATE, и на канале с задержкой 100 мс это режет скорость до
- * ~5 Мбит независимо от полосы. Мегабайт стоит нам ничего — это лишь разрешение серверу
- * присылать, память под данные мы не держим. */
+/* Our receive window. Large on purpose: with the default 65535 every 64 KB of download waits
+ * for a WINDOW_UPDATE, which on a 100 ms link caps speed at about 5 Mbit/s whatever the
+ * bandwidth. A megabyte costs nothing: it only lets the server send; we hold no memory for it. */
 #define OUR_WINDOW       (1024 * 1024)
-/* Когда пополнять: раз в 32 КБ, а не на каждый кадр. Пополнение на каждый кадр — это
- * лишняя запись TLS на каждые 16 КБ данных, то есть заметный признак в потоке. */
+/* Refill every 32 KB, not every frame: a refill per frame is an extra TLS record per 16 KB of
+ * data, a visible pattern in the stream. */
 #define WINDOW_REFILL    (32 * 1024)
 
-/* Максимум, который сервер обязан принимать по умолчанию (RFC 7540 §4.2). Больше можно
- * только если сервер сам разрешил в SETTINGS. */
+/* The largest frame a server must accept by default (RFC 7540 §4.2); more only if the server
+ * allows it in SETTINGS. */
 #define DEFAULT_MAX_FRAME 16384
 
 static void put32(unsigned char *p, uint32_t v) {
@@ -69,17 +64,17 @@ static uint32_t get32(const unsigned char *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
 }
 
-/* ---- HPACK на отправку ------------------------------------------------------
+/* ---- HPACK on send ----------------------------------------------------------
  *
- * Только «литеральное поле без индексации»: имя берётся из статической таблицы по
- * индексу, значение едет строкой как есть. Динамической таблицы у нас нет вовсе, и это
- * законно — HPACK разрешает не индексировать ничего. Huffman тоже не применяется: он
- * сэкономил бы десятки байт на соединение и потребовал бы таблицы кодов.
+ * Only "literal without indexing": the name comes from the static table by index, the value is
+ * sent as a plain string. There is no dynamic table at all, which is legal: HPACK allows
+ * indexing nothing. No Huffman either: it would save tens of bytes per connection and need the
+ * code table.
  *
- * Индексы статической таблицы (RFC 7541, приложение A) выписаны числами, потому что
- * таблица неизменна — это часть протокола, а не настройка. */
+ * Static table indices (RFC 7541, appendix A) are plain numbers: the table is part of the
+ * protocol and never changes. */
 #define HP_AUTHORITY   1
-#define HP_METHOD_GET  2   /* статическая таблица HPACK, RFC 7541 приложение A */
+#define HP_METHOD_GET  2
 #define HP_METHOD_POST 3
 #define HP_PATH        4
 #define HP_SCHEME_HTTPS 7
@@ -90,27 +85,23 @@ static uint32_t get32(const unsigned char *p) {
 #define HP_ACCEPT_LANG 17
 #define HP_CACHE_CTRL  24
 
-/* ---- облик браузера для xhttp -------------------------------------------------------
+/* ---- browser look for xhttp ---------------------------------------------------------
  *
- * ЗАЧЕМ ЭТО ЗДЕСЬ. Транспорт xhttp — это обычный HTTP-запрос к обычному на вид адресу, и
- * ходить по нему полагается тем, кем мы уже притворились в ClientHello, — браузером. Мы же
- * до сих пор слали в КАЖДОМ запросе `te: trailers` и `user-agent: grpc-go/1.60.0`: заголовки
- * gRPC, к xhttp отношения не имеющие.
+ * xhttp is a plain HTTP request to an ordinary-looking path, and it should come from what the
+ * ClientHello already claims to be: a browser. gRPC headers (`te: trailers`,
+ * `user-agent: grpc-go/1.60.0`) give xhttp away: nodes with CDN-cache-like paths
+ * (`/static/v1/cache/<hash>`) answered them with RST/GOAWAY even though Reality accepted us;
+ * something in front of the server cut them.
  *
- * Чем это плохо не в теории. Снято на живой подписке: четыре узла xhttp из четырёх отвечали
- * RST/GOAWAY, притом что Reality нас признавал — то есть сервер наш, а запрос отвергался уже
- * после. Путь у этих узлов вида `/static/v1/cache/<хеш>`, то есть сделан похожим на путь
- * кеша CDN; `grpc-go` в такой не стучится никто, и что-то перед сервером это резало.
+ * The set is Xray's (transport/internet/splithttp/config.go: GetRequestHeader →
+ * TryDefaultHeadersWith(header, "fetch") → applyMasqueradedHeaders(chrome, fetch)), repeated
+ * name by name. Xray derives the Chrome version from the date: 144 on 2026-01-13 plus one per
+ * 35 days, 149 for September 2026. sec-ch-ua follows its rule: three brands, one fake, shuffled
+ * by the version number (seed 149 gives exactly this order).
  *
- * Набор взят у Xray (transport/internet/splithttp/config.go: GetRequestHeader →
- * TryDefaultHeadersWith(header, "fetch") → applyMasqueradedHeaders(chrome, fetch)) и повторён
- * поимённо. Версия Chrome у Xray считается от даты: 144 на 13.01.2026 плюс единица за 35
- * дней; на сентябрь 2026 это 149. Заголовок sec-ch-ua собран его же правилом — три марки,
- * одна поддельная, перемешанные по номеру версии (seed=149 даёт именно такой порядок).
- *
- * Сами строки (UA_CHROME, UA_CH_CHROME) — в h2.h: тем же обликом представляются и запросы
- * Upgrade у ws и httpupgrade (proto/transport/trupgrade.c), и версия браузера у двух
- * транспортов одного узла расходиться не должна. */
+ * The strings (UA_CHROME, UA_CH_CHROME) are in h2.h: the Upgrade requests of ws and
+ * httpupgrade (proto/transport/trupgrade.c) use the same look, and two transports of one node
+ * must not disagree on the browser version. */
 
 struct wbuf { unsigned char *p; size_t n, cap; };
 
@@ -123,8 +114,8 @@ static void wb8(struct wbuf *b, unsigned v) {
     wb(b, &c, 1);
 }
 
-/* Целое HPACK с префиксом в N бит. Нужно и для индексов, и для длин строк: длина пути с
- * набивкой xhttp доходит до тысячи, а в семь бит влезает только 126. */
+/* An HPACK integer with an N-bit prefix, for indices and string lengths: an xhttp path with
+ * padding reaches a thousand bytes, while seven bits hold only 126. */
 static void hp_int(struct wbuf *b, unsigned prefix, unsigned bits, uint32_t v) {
     uint32_t max = (1u << bits) - 1;
     if (v < max) { wb8(b, prefix | v); return; }
@@ -135,29 +126,29 @@ static void hp_int(struct wbuf *b, unsigned prefix, unsigned bits, uint32_t v) {
 }
 
 static void hp_str(struct wbuf *b, const char *s, size_t n) {
-    hp_int(b, 0x00, 7, (uint32_t)n);     /* без Huffman: старший бит нулевой */
+    hp_int(b, 0x00, 7, (uint32_t)n);     /* no Huffman: high bit clear */
     wb(b, s, n);
 }
 
-/* Поле с именем из статической таблицы и своим значением. */
+/* A field with a name from the static table and our own value. */
 static void hp_field(struct wbuf *b, unsigned name_index, const char *value) {
-    hp_int(b, 0x00, 4, name_index);      /* 0000 — литерал без индексации */
+    hp_int(b, 0x00, 4, name_index);      /* 0000 — literal without indexing */
     hp_str(b, value, strlen(value));
 }
 
-/* Поле с именем, которого в таблице нет. */
+/* A field whose name is not in the table. */
 static void hp_new(struct wbuf *b, const char *name, const char *value) {
     wb8(b, 0x00);
     hp_str(b, name, strlen(name));
     hp_str(b, value, strlen(value));
 }
 
-/* Индексированное поле: имя И значение из статической таблицы. */
+/* An indexed field: name AND value from the static table. */
 static void hp_indexed(struct wbuf *b, unsigned index) {
     hp_int(b, 0x80, 7, index);
 }
 
-/* ---- кадры ------------------------------------------------------------------ */
+/* ---- frames ------------------------------------------------------------------ */
 static int frame_out(struct h2 *h, unsigned char type, unsigned char flags, uint32_t sid,
                      const unsigned char *body, size_t n) {
     unsigned char hdr[9];
@@ -165,8 +156,8 @@ static int frame_out(struct h2 *h, unsigned char type, unsigned char flags, uint
     hdr[3] = type;
     hdr[4] = flags;
     put32(hdr + 5, sid);
-    /* Заголовок и тело одной записью: разделение их по записям TLS создаёт узнаваемый
-     * рисунок длин (9 + N, 9 + N, …), ради избавления от которого и существует Vision. */
+    /* Header and body in one write: split across TLS records they make a recognizable length
+     * pattern (9 + N, 9 + N, …), the very thing Vision exists to remove. */
     static __thread unsigned char one[9 + DEFAULT_MAX_FRAME];
     if (n > DEFAULT_MAX_FRAME) return H2_ETOOBIG;
     memcpy(one, hdr, 9);
@@ -174,19 +165,17 @@ static int frame_out(struct h2 *h, unsigned char type, unsigned char flags, uint
     return h->io.write(h->io.ctx, one, 9 + n);
 }
 
-/* HEADERS одного запроса. Псевдозаголовки обязаны идти первыми и в этом порядке.
+/* HEADERS of one request. Pseudo-headers must come first and in this order.
  *
- * Вынесено из h2_start потому, что запросов на соединении стало больше одного: packet-up
- * шлёт череду коротких POST, и заголовки для второго и дальше собираются тем же кодом. Два
- * места, собирающих заголовки, однажды разошлись бы — и симптомом был бы не отказ сборки, а
- * сервер, который на первый запрос отвечает, а на второй нет. */
+ * One function for every request of a connection (packet-up sends a series of short POSTs):
+ * two places building headers would drift apart, and the symptom would be a server that
+ * answers the first request and not the second. */
 static int put_headers(struct h2 *h, struct wbuf *b, const char *authority,
                        const char *path, const char *content_type, const char *referer,
                        int method, int end_stream) {
     const int browser = h->browser;
-    /* 4 КБ, а не 2: облик браузера — это дюжина заголовков, и рядом с ними едет Referer с
-     * набивкой до 1400 байт. В прежние 2 КБ они вместе не влезали, а отказ по размеру
-     * выглядел бы как «узел не работает». Буфер свой на поток, платится он один раз. */
+    /* 4 KB: the browser look is a dozen headers, and with them goes a Referer with up to 1400
+     * bytes of padding; a size failure would look like a dead node. One buffer per thread. */
     static __thread unsigned char hb[4096];
     struct wbuf hp = { hb, 0, sizeof(hb) };
     hp_indexed(&hp, method == H2_GET ? HP_METHOD_GET : HP_METHOD_POST);
@@ -195,9 +184,8 @@ static int put_headers(struct h2 *h, struct wbuf *b, const char *authority,
     hp_field(&hp, HP_AUTHORITY, authority);
     if (content_type) hp_field(&hp, HP_CONTENT_TYPE, content_type);
     if (browser) {
-        /* Порядок — как у Chrome: приметы клиента, потом кто он, потом чего хочет и откуда
-         * пришёл. Referer здесь же, среди прочих, а не отдельно: в нём едет набивка xhttp, и
-         * стоять он должен там, где браузер его и ставит. */
+        /* Chrome's order: client hints, then who it is, then what it wants and where it came
+         * from. Referer carries the xhttp padding and stands where a browser puts it. */
         hp_new(&hp, "sec-ch-ua", UA_CH_CHROME);
         hp_new(&hp, "sec-ch-ua-mobile", "?0");
         hp_new(&hp, "sec-ch-ua-platform", "\"Windows\"");
@@ -214,17 +202,17 @@ static int put_headers(struct h2 *h, struct wbuf *b, const char *authority,
         hp_new(&hp, "pragma", "no-cache");
     } else {
         if (referer) hp_field(&hp, HP_REFERER, referer);
-        /* te: trailers — единственный заголовок из «запрещённых для HTTP/2», который
-         * разрешён явно, и gRPC его требует. */
+        /* te: trailers is the one connection-specific header HTTP/2 explicitly allows, and
+         * gRPC requires it. */
         hp_new(&hp, "te", "trailers");
         hp_field(&hp, HP_USER_AGENT, "grpc-go/1.60.0");
     }
     if (hp.n > sizeof(hb)) return -1;
 
-    /* END_STREAM по требованию вызывающего. У постоянного потока его нет: тело запроса —
-     * это канал наверх, и он живёт всё соединение. У GET-запроса скачивания тела нет вовсе,
-     * и сервер ждёт закрытия прямо здесь. END_HEADERS ставим всегда: продолжений не бывает,
-     * заголовки короткие. */
+    /* END_STREAM as the caller asks. A long-lived stream has none: the request body is the
+     * upstream channel and lives as long as the connection. A download GET has no body, and
+     * the server waits for the close right here. END_HEADERS always: the headers are short and
+     * need no CONTINUATION. */
     unsigned char hdr[9];
     hdr[0] = (unsigned char)(hp.n >> 16); hdr[1] = (unsigned char)(hp.n >> 8);
     hdr[2] = (unsigned char)hp.n;
@@ -242,19 +230,19 @@ int h2_start_ex(struct h2 *h, const struct h2_io *io, const char *authority,
     memset(h, 0, sizeof(*h));
     h->io = *io;
     h->browser = browser;
-    h->sid = 1;                          /* первый поток клиента — всегда первый нечётный */
-    h->send_win = 65535;                 /* до SETTINGS сервера — значение по умолчанию */
+    h->sid = 1;                          /* a client's first stream: the first odd id */
+    h->send_win = 65535;                 /* the default until the server's SETTINGS */
     h->send_win_conn = 65535;
-    h->peer_init_win = 65535;            /* то же умолчание, от него считается сдвиг */
+    h->peer_init_win = 65535;            /* the same default; shifts count from it */
 
     static __thread unsigned char buf[4096];
     struct wbuf b = { buf, 0, sizeof(buf) };
 
-    /* Преамбула. Байт в байт из RFC 7540 §3.5 — сервер сверяет её дословно. */
+    /* The preface, byte for byte from RFC 7540 §3.5: the server compares it literally. */
     wb(&b, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24);
 
-    /* SETTINGS: запретить push (нам он не нужен и только усложнил бы разбор) и объявить
-     * своё окно потока. */
+    /* SETTINGS: disable push (not needed, it would only complicate parsing) and announce our
+     * stream window. */
     {
         unsigned char s[12];
         s[0] = 0; s[1] = 0x02; put32(s + 2, 0);              /* ENABLE_PUSH = 0 */
@@ -264,9 +252,8 @@ int h2_start_ex(struct h2 *h, const struct h2_io *io, const char *authority,
         wb(&b, s, 12);
     }
 
-    /* Окно СОЕДИНЕНИЯ настройками не задаётся — только этим кадром. Без него сервер
-     * пришлёт 65535 байт и остановится, а выглядеть это будет как «скачивание зависает
-     * на 64 килобайтах». */
+    /* The CONNECTION window is not set by SETTINGS, only by this frame. Without it the server
+     * sends 65535 bytes and stops: "downloads hang at 64 KB". */
     {
         unsigned char wu[4];
         put32(wu, OUR_WINDOW - 65535);
@@ -279,20 +266,19 @@ int h2_start_ex(struct h2 *h, const struct h2_io *io, const char *authority,
         return H2_ETOOBIG;
 
     if (b.n > sizeof(buf)) return H2_ETOOBIG;
-    /* Всё одной записью: преамбула, настройки и запрос уезжают вместе, как это делает
-     * любой браузер. Порознь они дали бы три записи подряд характерных длин.
+    /* All in one write: preface, settings and request leave together, as any browser sends
+     * them; separately they would make three records of telltale lengths.
      *
-     * Ответа НЕ ждём. Сервер пришлёт свои SETTINGS и HEADERS, но ждать их здесь значило
-     * бы добавить круг задержки перед первым байтом данных — а данные можно отправлять
-     * сразу, HTTP/2 это разрешает. Статус узнаем при первом чтении. */
+     * The answer is NOT awaited. The server will send its SETTINGS and HEADERS, but waiting
+     * for them would add a round trip before the first data byte, and HTTP/2 allows sending
+     * data at once. The status shows on the first read. */
     h->started = 1;
     return h->io.write(h->io.ctx, buf, b.n);
 }
 
 int h2_start(struct h2 *h, const struct h2_io *io, const char *authority,
              const char *path, const char *content_type, const char *referer) {
-    /* Прежнее поведение слово в слово: POST с открытым телом. Так ходят grpc, xhttp в
-     * режиме stream-one и выгружающий поток stream-up. */
+    /* POST with an open body: grpc, xhttp stream-one and the stream-up upload stream. */
     return h2_start_ex(h, io, authority, path, content_type, referer, H2_POST, 0, 0);
 }
 
@@ -300,26 +286,24 @@ int h2_next(struct h2 *h, const char *authority, const char *path,
             const char *content_type, const char *referer, int method) {
     if (!h->started) return H2_EPROTO;
 
-    /* Номер растёт на два: у клиента потоки нечётные (RFC 7540 §5.1.1), а переиспользовать
-     * номер закрытого потока нельзя — сервер ответит на такое ошибкой соединения, а не
-     * потока, и связь оборвётся целиком. */
+    /* The id grows by two: client streams are odd (RFC 7540 §5.1.1). Reusing a closed
+     * stream's id is a connection error, not a stream error: the whole connection drops. */
     h->sid += 2;
 
-    /* Состояние ПОТОКА свежее, состояние СОЕДИНЕНИЯ нетронуто. Разница существенная: окно
-     * соединения и настройки сервера общие для всех запросов, а окно потока сервер выдаёт
-     * заново — начальным значением из его же SETTINGS. Сбросить общее вместе с частным
-     * значило бы забыть, сколько нам уже разрешили, и переполнить окно соединения. */
+    /* Fresh STREAM state, CONNECTION state untouched. The connection window and the server's
+     * settings are shared by all requests, while each stream's window is granted anew at the
+     * initial value from the server's SETTINGS. Resetting the shared state too would forget
+     * how much we were already allowed and overrun the connection window. */
     h->status = 0;
     h->done = 0;
     h->send_win = h->peer_init_win;
-    /* Обнуляется долг перед окном ПОТОКА: прежний поток закрыт, растить его окно незачем.
-     * recv_credit_conn при этом НЕ трогается — он про соединение, и переходит вместе с ним;
-     * обнулить его здесь значило бы не вернуть серверу уже потраченное окно. */
+    /* The STREAM credit is dropped: the old stream is closed, its window need not grow.
+     * recv_credit_conn is NOT touched: it belongs to the connection, and zeroing it would never
+     * return window the server already spent. */
     h->recv_credit = 0;
 
-    /* Столько же, сколько у h2_start_ex: заголовки те же (облик браузера и Referer с
-     * набивкой до 1400 байт), и в 2 КБ второй кусок с длинным путём узла не влезал, хотя
-     * первый с теми же заголовками уходил. */
+    /* The same size as in h2_start_ex: the same headers (browser look, Referer with up to
+     * 1400 bytes of padding, a long node path). */
     static __thread unsigned char buf[4096];
     struct wbuf b = { buf, 0, sizeof(buf) };
     if (put_headers(h, &b, authority, path, content_type, referer, method, 0) != 0)
@@ -330,19 +314,18 @@ int h2_next(struct h2 *h, const char *authority, const char *path,
 
 int h2_end_stream(struct h2 *h) {
     if (!h->started) return H2_EPROTO;
-    /* Пустой DATA с END_STREAM. Отдельным кадром, а не признаком на последнем куске данных:
-     * кусок мог не влезть в окно и уехать по частям, и тогда END_STREAM оказался бы не на
-     * последней из них. */
+    /* An empty DATA with END_STREAM. A separate frame, not a flag on the last data chunk: the
+     * chunk may go out in several frames, and END_STREAM would then not be on the last one. */
     return frame_out(h, FR_DATA, FLAG_END_STREAM, h->sid, NULL, 0);
 }
 
-/* Пополнить окно приёма, если накопилось достаточно. Оба уровня сразу: соединение и
- * поток считаются отдельно, и забыть один — значит остановиться на его пределе. */
+/* Refills the receive windows when enough has accumulated. Both levels: connection and stream
+ * are counted apart, and forgetting one stalls at its limit. */
 static int window_refill(struct h2 *h) {
     unsigned char wu[4];
-    /* Порог у каждого уровня СВОЙ, и прибавка тоже: у соединения долг больше, потому что в
-     * него входят и кадры закрытых потоков. Прежде оба кадра уходили с одним числом —
-     * числом потока, — и окно соединения пополнялось на меньше, чем было потрачено. */
+    /* Each level has ITS OWN threshold and increment: the connection's credit is larger, since
+     * it includes frames of closed streams. One number for both would refill the connection
+     * window by less than was spent. */
     if (h->recv_credit >= WINDOW_REFILL) {
         put32(wu, (uint32_t)h->recv_credit);
         int rc = frame_out(h, FR_WINDOW_UPDATE, 0, h->sid, wu, 4);
@@ -358,28 +341,25 @@ static int window_refill(struct h2 *h) {
     return 0;
 }
 
-/* Разобрать служебный кадр, тело которого собрано целиком. */
+/* Handles a control frame whose body is complete. */
 static int ctl_handle(struct h2 *h) {
     switch (h->frame_type) {
         case FR_SETTINGS:
             if (h->frame_flags & FLAG_ACK) return 0;
-            /* Настройки сервера, которые нас касаются. INITIAL_WINDOW_SIZE меняет окно
-             * ОТПРАВКИ уже открытого потока на разницу — так требует RFC 7540 §6.9.2, и
-             * без этого мы либо не используем данное нам окно, либо переполняем его. */
+            /* INITIAL_WINDOW_SIZE shifts the SEND window of the open stream by the difference
+             * (RFC 7540 §6.9.2); without it we either waste the window or overrun it. */
             for (size_t i = 0; i + 6 <= h->ctl_n; i += 6) {
                 unsigned id = ((unsigned)h->ctl[i] << 8) | h->ctl[i + 1];
                 uint32_t v = get32(h->ctl + i + 2);
-                /* MAX_FRAME_SIZE сервера сознательно не читается: по RFC он не может быть
-                 * меньше 16384, а больше нам не нужно — крупные кадры не дают ничего,
-                 * зато потребовали бы буфер под них на каждое соединение. Мы всегда
-                 * отправляем не больше 16384, и это законно при любых его настройках. */
+                /* The server's MAX_FRAME_SIZE is ignored on purpose: it cannot be below
+                 * 16384, and we need no more; larger frames gain nothing and would need a
+                 * buffer per connection. We never send more than 16384, which is legal under
+                 * any setting. */
                 if (id == 0x04) {
-                    /* Окно ПОТОКА сдвигается на разницу; окно соединения настройками не
-                     * меняется вовсе — только кадром WINDOW_UPDATE.
-                     *
-                     * Разница считается с ПРЕДЫДУЩИМ значением, а не с 65535 (RFC 7540
-                     * §6.9.2): вторые такие же SETTINGS применяли сдвиг ещё раз, и окно
-                     * уезжало на величину, которой сервер не давал. */
+                    /* The STREAM window shifts by the difference; SETTINGS never change the
+                     * connection window, only WINDOW_UPDATE does. The difference is from the
+                     * PREVIOUS value, not from 65535 (RFC 7540 §6.9.2): a repeated identical
+                     * SETTINGS must not shift the window again. */
                     if (v > 0x7FFFFFFFu) return H2_ERESET;
                     int64_t w = (int64_t)h->send_win + ((int64_t)v - h->peer_init_win);
                     if (w > 0x7FFFFFFF || w < -0x7FFFFFFF) return H2_ERESET;
@@ -391,22 +371,20 @@ static int ctl_handle(struct h2 *h) {
 
         case FR_PING:
             if (h->frame_flags & FLAG_ACK) return 0;
-            /* Ответить обязательно: сервер шлёт PING как keep-alive и молчание считает
-             * мёртвым соединением. Xray ставит период по образцу Chrome. */
+            /* Must be answered: the server sends PING as a keep-alive and takes silence for a
+             * dead connection. Xray sets the period after Chrome. */
             return frame_out(h, FR_PING, FLAG_ACK, 0, h->ctl, h->ctl_n);
 
         case FR_WINDOW_UPDATE: {
             if (h->ctl_n < 4) return 0;
             int32_t inc = (int32_t)(get32(h->ctl) & 0x7FFFFFFF);
-            /* Предел 2^31-1 обязателен (RFC 7540 §6.9.1), и это не педантизм: прибавление
-             * без проверки — знаковое переполнение, то есть неопределённое поведение, а на
-             * практике окно уходит в МИНУС и больше не возвращается. Дальше h2_write
-             * навсегда отвечает H2_EWINDOW, и отправка наверх по этому соединению встаёт
-             * насмерть — от сервера для этого достаточно нескольких WINDOW_UPDATE,
-             * близких к 0x7FFFFFFF. Превышение предела RFC велит считать ошибкой потока,
-             * поэтому рвём соединение, а не подрезаем окно молча: подрезанное окно
-             * разошлось бы с тем, что считает сервер, и встало бы всё равно — но уже
-             * непонятно почему. */
+            /* The 2^31-1 limit is mandatory (RFC 7540 §6.9.1). Adding without the check is
+             * signed overflow; in practice the window goes NEGATIVE for good, h2_write answers
+             * H2_EWINDOW forever and uploads on this connection stall. A few WINDOW_UPDATEs
+             * near 0x7FFFFFFF from the server are enough. The RFC makes exceeding the limit an
+             * error, so the connection is dropped rather than the window clamped: a clamped
+             * window would disagree with the server's count and stall anyway, for no visible
+             * reason. */
             int64_t w = (int64_t)(h->frame_ours ? h->send_win : h->send_win_conn) + inc;
             if (w > 0x7FFFFFFF) return H2_ERESET;
             if (h->frame_ours) h->send_win = (int32_t)w;
@@ -415,38 +393,31 @@ static int ctl_handle(struct h2 *h) {
         }
 
         case FR_RST_STREAM:
-            /* Сброс ЗАКРЫТОГО потока — не наш конец. Go-сервер шлёт RST_STREAM(NO_ERROR) на
-             * поток, обработчик которого уже отработал, и у packet-up он приходит по прежнему
-             * куску, когда открыт следующий. Раньше такой кадр рвал всё соединение. */
+            /* A reset of a CLOSED stream is not our end. A Go server sends
+             * RST_STREAM(NO_ERROR) on a stream whose handler has finished; with packet-up it
+             * arrives for an earlier chunk while the next one is open. */
             if (!h->frame_ours) return 0;
             return H2_ERESET;
 
         case FR_GOAWAY:
-            /* Номер потока у GOAWAY всегда нулевой: это конец СОЕДИНЕНИЯ, чужим он не бывает.
-             * Новых запросов по нему сервер уже не примет, поэтому и рвём. */
+            /* GOAWAY is always on stream 0: it ends the CONNECTION, which accepts no new
+             * requests after it. */
             return H2_ERESET;
     }
     return 0;
 }
 
-/* Статус ответа из первых байт HEADERS.
- *
- * Разбираем только то, что можно разобрать без динамической таблицы. В жизни сервер
- * отдаёт «:status 200» индексом 8 — один байт 0x88. Если встретилось что-то другое,
- * ставим -1 и НЕ считаем это ошибкой: догадка о статусе хуже, чем его отсутствие, а
- * пришли данные или нет — покажет чтение. */
-/* Код последнего чужого статуса — для объяснения отказа. В потоке: соединители работают
- * параллельно, и общий на всех перетирался бы. */
+/* The last non-200 status, to name it in the error. Per thread: connectors run in parallel,
+ * and a shared one would be overwritten. */
 static __thread int g_last_status;
 
-/* Три цифры статуса, записанные кодом Хаффмана HPACK (RFC 7541, приложение B). Go-сервер
- * (Xray) кодирует значение так всякий раз, когда это короче: «502», «401», «301» — два байта
- * вместо трёх. Без этого разбора статус такого ответа оставался -1, и отказ сервера выглядел
- * не отказом, а ответом без данных.
+/* Three status digits in HPACK Huffman code (RFC 7541, appendix B). A Go server (Xray)
+ * encodes the value so whenever that is shorter: "502", "401", "301" take two bytes instead of
+ * three. Without this the status stays -1, and a refusal looks like an answer without data.
  *
- * Нужны только цифры: у «0», «1», «2» пятибитные коды 00000…00010, у «3»…«9» шестибитные
- * 011001…011111. Любой другой символ значит, что это не код ответа, — тогда -1. После трёх
- * цифр допускается только набивка единицами короче байта (§5.2). */
+ * Only digits are needed: "0", "1", "2" have 5-bit codes 00000…00010, "3"…"9" 6-bit codes
+ * 011001…011111. Any other symbol means this is not a status: -1. After three digits only
+ * padding of ones shorter than a byte is allowed (§5.2). */
 static int status_huff(const unsigned char *p, size_t n) {
     uint32_t acc = 0;
     unsigned bits = 0;
@@ -470,11 +441,14 @@ static int status_huff(const unsigned char *p, size_t n) {
     return v;
 }
 
+/* The response status from the first bytes of HEADERS, without the dynamic table. In practice
+ * the server sends ":status 200" as index 8, the single byte 0x88. Anything unknown gives -1,
+ * NOT an error: a guessed status is worse than none, and the read shows whether data came. */
 static void status_peek(struct h2 *h, const unsigned char *p, size_t n) {
     size_t i = 0;
-    /* Обновление размера динамической таблицы (001xxxxx) идёт первым, если вообще есть.
-     * Значение — целое с префиксом в 5 бит: при 0x1F в младших битах продолжение лежит
-     * в следующих байтах со старшим битом 1. */
+    /* A dynamic table size update (001xxxxx) comes first, if at all. Its value is an integer
+     * with a 5-bit prefix: with 0x1F in the low bits it continues in the next bytes, high bit
+     * set. */
     while (i < n && (p[i] & 0xE0) == 0x20) {
         int cont = (p[i] & 0x1F) == 0x1F;
         i++;
@@ -492,14 +466,14 @@ static void status_peek(struct h2 *h, const unsigned char *p, size_t n) {
         case 0x8D: h->status = 404; break;
         case 0x8E: h->status = 500; break;
         default:
-            /* Литерал с именем :status (индекс 8) — значение строкой из трёх цифр. */
+            /* A literal with the :status name (index 8): the value as three digits. */
             if ((p[i] & 0x0F) == 0x08 && i + 2 < n) {
                 size_t len = p[i + 1] & 0x7F;
                 if (!(p[i + 1] & 0x80) && len == 3 && i + 4 < n) {
                     h->status = (p[i + 2] - '0') * 100 + (p[i + 3] - '0') * 10 + (p[i + 4] - '0');
                     break;
                 }
-                /* То же значение кодом Хаффмана: три цифры занимают от 15 до 18 бит. */
+                /* The same value in Huffman code: three digits take 15 to 18 bits. */
                 if ((p[i + 1] & 0x80) && len >= 2 && len <= 3 && i + 1 + len < n) {
                     int v = status_huff(p + i + 2, len);
                     if (v >= 100) { h->status = v; break; }
@@ -513,13 +487,12 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
     *got = 0;
     if (!h->started) return H2_EPROTO;
     if (h->done) return H2_ERESET;
-    /* Договор проверяется ДО чтения. Отказ посреди кадра (ниже) выбрасывал уже прочитанную
-     * запись вместе с хвостом, а счётчик тела оставался — и следующий кадр читался как
-     * продолжение прежнего. Отказ здесь не трогает ни сети, ни состояния. */
+    /* The contract is checked BEFORE reading. A failure mid-frame (below) would drop the
+     * record already read while the body counter stays, and the next frame would be read as a
+     * continuation of the old one. Failing here touches neither the network nor the state. */
     if (cap < H2_MIN_READ_CAP) return H2_ETOOBIG;
 
-    /* Общий буфер на всех: разбор идёт в один поток, и держать по 16 КБ на соединение
-     * значило бы мегабайт там, где хватает одного буфера. */
+    /* One buffer per thread, not per connection: 16 KB per connection would be a megabyte. */
     static __thread unsigned char rec[TLS13_MAX_PLAIN + sizeof(h->pend)];
     size_t avail = 0;
     if (h->pend_n) {
@@ -537,9 +510,9 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
     while (p < avail) {
         if (h->frame_left) {
             if (h->pad_wait) {
-                /* Байт длины набивки. Набивка вместе с приоритетом обязана уместиться в
-                 * остаток кадра, иначе это ошибка протокола (RFC 7540 §6.1), а не повод
-                 * читать за край. */
+                /* The pad length byte. Padding and priority must fit into the rest of the
+                 * frame, or it is a protocol error (RFC 7540 §6.1), not a reason to read past
+                 * the end. */
                 h->pad_wait = 0;
                 if ((uint32_t)rec[p] + h->skip_left > h->frame_left - 1) return H2_EPROTO;
                 h->pad_left = rec[p];
@@ -551,27 +524,25 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
                 h->frame_left--;
             }
             if (h->skip_left) {
-                /* Приоритет HEADERS: пять байт, которые нам ни к чему. Не доехали целиком —
-                 * остаток пропустится в следующей записи, а take ниже выйдет нулём. */
+                /* HEADERS priority: five bytes we do not need. If not all arrived, the rest
+                 * is skipped in the next record, and take below comes out zero. */
                 size_t sk = h->skip_left < avail - p ? h->skip_left : avail - p;
                 h->skip_left = (unsigned char)(h->skip_left - sk);
                 p += sk;
                 h->frame_left -= (uint32_t)sk;
             }
             size_t take = h->frame_left < avail - p ? h->frame_left : avail - p;
-            /* Содержимое — то, что до набивки; сама набивка только пропускается. Когда граница
-             * записи прошла внутри набивки, frame_left уже меньше pad_left: содержимого не
-             * осталось вовсе, и беззнаковая разность ушла бы через ноль — остаток набивки
-             * попал бы в тело. */
+            /* The content is what precedes the padding; the padding is only skipped. When a
+             * record boundary falls inside the padding, frame_left is already below pad_left:
+             * no content is left, and the unsigned difference would wrap, putting the rest of
+             * the padding into the body. */
             size_t body = h->frame_left > h->pad_left ? h->frame_left - h->pad_left : 0;
             size_t real = take < body ? take : body;
             if (h->frame_type == FR_DATA) {
-                /* Окну СОЕДИНЕНИЯ байты зачитываются всегда, даже когда кадр пришёл от уже
-                 * закрытого потока прежнего куска: из общего окна они вычтены, и вернуть их
-                 * обязаны мы. Раньше такой кадр не считался нигде — он попадал в ветку
-                 * служебных, где его тело копировалось в h->ctl и выбрасывалось.
-                 *
-                 * Зачитывается и набивка: окно тратит весь кадр (RFC 7540 §6.9.1). */
+                /* The CONNECTION window is always credited, even for a frame of the closed
+                 * stream of an earlier chunk: the bytes came out of the shared window, and it
+                 * is on us to return them. Padding counts too: the window pays for the whole
+                 * frame (RFC 7540 §6.9.1). */
                 h->recv_credit_conn += (int32_t)take;
                 if (h->frame_ours) {
                     if (*got + real > cap) return H2_ETOOBIG;
@@ -582,9 +553,10 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
             } else if (h->frame_type == FR_HEADERS) {
                 if (h->frame_ours && h->status == 0 && real) status_peek(h, rec + p, real);
                 else if (!h->frame_ours && !h->frame_peeked && real) {
-                    /* Ответ на прежний поток (packet-up: прошлый кусок). Спрашивается только
-                     * начало кадра, как и у своего: статус в HEADERS идёт первым полем.
-                     * status_peek пишет в h->status — текущий поток его не должен видеть. */
+                    /* An answer on an earlier stream (packet-up: the previous chunk). Only
+                     * the start of the frame is looked at, as for our own: the status is the
+                     * first field. status_peek writes h->status, which the current stream must
+                     * not see. */
                     int keep = h->status;
                     h->status = 0;
                     status_peek(h, rec + p, real);
@@ -593,8 +565,8 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
                 }
                 if (real) h->frame_peeked = 1;
             } else {
-                /* Служебный кадр: собираем тело, пока влезает. Не влезло — значит это
-                 * SETTINGS с десятком настроек, из которых нас интересуют первые. */
+                /* A control frame: collect the body while it fits. One that does not fit is a
+                 * SETTINGS with a dozen entries, of which only the first ones matter. */
                 size_t room = sizeof(h->ctl) - h->ctl_n;
                 size_t cp = take < room ? take : room;
                 if (cp) memcpy(h->ctl + h->ctl_n, rec + p, cp);
@@ -616,8 +588,7 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
         }
 
         if (avail - p < 9) {
-            /* Заголовок кадра разорван границей записи. Девять байт — весь перенос
-             * состояния, который для этого нужен. */
+            /* The frame header is split by the record boundary; carry its bytes over. */
             h->pend_n = avail - p;
             memcpy(h->pend, rec + p, h->pend_n);
             break;
@@ -627,11 +598,11 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
         h->frame_type = rec[p + 3];
         h->frame_flags = rec[p + 4];
         uint32_t sid = get32(rec + p + 5) & 0x7FFFFFFF;
-        /* «Наш» — только ТЕКУЩИЙ поток. У packet-up позади остаются закрытые потоки
-         * прежних кусков, и сервер вправе досылать по ним HEADERS и END_STREAM уже после
-         * того, как мы открыли следующий. Такие кадры считаются в окно соединения (это
-         * делает общий разбор ниже) и отбрасываются: их содержимое — пустой ответ 200 на
-         * выгрузку, читать в нём нечего. */
+        /* "Ours" is only the CURRENT stream. packet-up leaves the closed streams of earlier
+         * chunks behind, and the server may still send HEADERS and END_STREAM on them after
+         * we opened the next. Such frames count toward the connection window (the body
+         * parsing does that) and are dropped: their content is an empty 200 answer to an
+         * upload. A non-200 status there goes to old_status. */
         h->frame_ours = (sid == h->sid);
         h->frame_peeked = 0;
         h->frame_left = len;
@@ -647,7 +618,8 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
             if (h->pad_wait + h->skip_left > len) return H2_EPROTO;
         }
 
-        /* Кадр без тела обрабатывается сразу: цикл выше ждёт байт, которых не будет. */
+        /* A frame without a body is handled at once: the loop above would wait for bytes
+         * that never come. */
         if (len == 0) {
             if (h->frame_type != FR_DATA && h->frame_type != FR_HEADERS) {
                 rc = ctl_handle(h);
@@ -662,32 +634,30 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
     if (h->old_status) { g_last_status = h->old_status; return H2_ESTATUS; }
     rc = window_refill(h);
     if (rc) return rc;
-    /* Ноль байт — это законный результат: в записи мог приехать только PING или SETTINGS.
-     * Возвращать при этом ошибку значило бы рвать рабочее соединение из-за служебного
-     * кадра, а закрытие — потерять его. Вызывающий обязан отличать «нечего отдать» от
-     * «конец потока», и именно поэтому конец приходит кодом, а не нулём. */
+    /* Zero bytes is a legal result: the record may have held only a PING or SETTINGS. An
+     * error here would drop a working connection over a control frame. The caller must tell
+     * "nothing to give" from "end of stream", which is why the end comes as a code, not as
+     * zero. */
     return 0;
 }
 
-/* Отправить данные ЦЕЛИКОМ или не отправлять вовсе.
+/* Sends the data WHOLE or not at all.
  *
- * «Или ничего» — не упрощение, а единственный вариант без буфера. Выше нас лежит Vision,
- * и половина кадра, ушедшая в сеть, ломает поток безвозвратно. Значит либо мы держим
- * недоотправленный остаток у себя (16 КБ на каждое из 64 соединений), либо не отправляем
- * ничего и говорим об этом вызывающему.
+ * "Or nothing" is the only option without a buffer. Vision sits above us, and half a frame
+ * sent breaks the stream for good. So either we keep the unsent rest (16 KB for each of 64
+ * connections), or we send nothing and tell the caller.
  *
- * Второе к тому же честнее по отношению к TCP: закрытое окно означает, что сервер не
- * успевает, и правильная реакция — НЕ подтверждать пакет клиенту. Клиент повторит его
- * сам, ровно так, как повёл бы себя при потере, а память под это не нужна вовсе. Именно
- * поэтому здесь нет ни ожидания окна, ни чтения: и то и другое означало бы, что кто-то
- * должен куда-то деть уже прочитанные данные. */
+ * The latter also suits TCP: a closed window means the server cannot keep up, and the right
+ * reaction is NOT to acknowledge the packet to the client. The client retransmits it as after
+ * a loss, and no memory is needed. That is why there is no waiting for the window and no
+ * reading here: both would mean someone must put already-read data somewhere. */
 int h2_write(struct h2 *h, const unsigned char *d, size_t n) {
     if (!h->started) return H2_EPROTO;
-    /* Сравнение ЗНАКОВОЕ. send_win/send_win_conn — int32_t и законно уходят в минус:
-     * SETTINGS с INITIAL_WINDOW_SIZE меньше 65535 вычитает разницу из уже выданного
-     * окна (RFC 7540 §6.9.2). Приведение к size_t превращало -60000 в 1,8·10^19, и
-     * проверка окна не срабатывала никогда — кадр уходил за пределы окна, а сервер
-     * отвечал RST_STREAM с FLOW_CONTROL_ERROR. */
+    /* The comparison is SIGNED. send_win and send_win_conn are int32_t and may legally go
+     * negative: a SETTINGS with INITIAL_WINDOW_SIZE below 65535 subtracts the difference from
+     * the window already granted (RFC 7540 §6.9.2). Cast to size_t, -60000 becomes 1.8·10^19,
+     * the check never fires, the frame overruns the window, and the server answers RST_STREAM
+     * with FLOW_CONTROL_ERROR. */
     if (n > INT32_MAX) return H2_ETOOBIG;
     if ((int32_t)n > h->send_win || (int32_t)n > h->send_win_conn) return H2_EWINDOW;
 
@@ -705,21 +675,20 @@ int h2_write(struct h2 *h, const unsigned char *d, size_t n) {
 
 const char *h2_strerror(int rc) {
     switch (rc) {
-        case H2_EIO: return "обрыв HTTP/2";
-        case H2_EPROTO: return "неожиданный кадр HTTP/2";
-        /* КОД НАЗЫВАЕТСЯ, а не прячется за словами «не 200». Разница между 404, 403 и 502
-         * — это разница между «путь не тот», «нас не пустили» и «за сервером ничего нет», то
-         * есть между тремя совершенно разными разговорами с владельцем узла. Без кода все
-         * три выглядели одинаково, и на живом узле пришлось гадать. */
+        case H2_EIO: return "HTTP/2 connection lost";
+        case H2_EPROTO: return "unexpected HTTP/2 frame";
+        /* The CODE is named, not hidden behind "not 200": 404, 403 and 502 mean "wrong path",
+         * "not let in" and "nothing behind the server", three different talks with the node's
+         * owner. */
         case H2_ESTATUS: {
             static __thread char st[64];
-            if (g_last_status > 0) snprintf(st, sizeof st, "сервер ответил %d, а не 200", g_last_status);
-            else                   snprintf(st, sizeof st, "сервер ответил не 200");
+            if (g_last_status > 0) snprintf(st, sizeof st, "server answered %d, not 200", g_last_status);
+            else                   snprintf(st, sizeof st, "server did not answer 200");
             return st;
         }
-        case H2_ERESET: return "поток закрыт сервером (RST/GOAWAY)";
-        case H2_ETOOBIG: return "кадр не влез";
-        case H2_EWINDOW: return "окно HTTP/2 закрыто";
-        default: return "неизвестная ошибка HTTP/2";
+        case H2_ERESET: return "stream closed by the server (RST/GOAWAY)";
+        case H2_ETOOBIG: return "HTTP/2 frame too large";
+        case H2_EWINDOW: return "HTTP/2 window closed";
+        default: return "unknown HTTP/2 error";
     }
 }

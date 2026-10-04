@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
-"""Клиент локальной сети для стенда tests/sigpipe.sh: много соединений через туннель, которые
-обрываются в самый неудобный момент.
+"""A LAN client for tests/sigpipe.sh: many connections through the tunnel, cut at the worst
+moment.
 
-    sigpipe-client.py ЦЕЛЬ --ping                       одно соединение «строка — эхо»: туннель жив?
-    sigpipe-client.py ЦЕЛЬ --storm СЕК [--up N] [--abort-up N] [--abort-down N]
+    sigpipe-client.py TARGET --ping       one "line — echo" connection: is the tunnel alive?
+    sigpipe-client.py TARGET --storm SECS [--up N] [--abort-up N] [--abort-down N]
 
-Три вида рабочих, все — в цикле «соединиться, нагрузить, оборвать, снова» до конца срока:
+Three kinds of workers, each looping "connect, load, cut, again" until the deadline:
 
-  up        выгрузка на порт 80 поддельного узла (tests/sigpipe-node.py): узел сам закрывает соединение
-            после случайного числа байт, пока клиент ещё шлёт, — стек туннеля дописывает в закрытый
-            сокет узла пакеты, уже лежавшие в очереди TUN. Рабочий шлёт, пока запись не вернёт ошибку
-            (туннель ответил RST) или не кончится срок.
-  abort-up  выгрузка на порт 82 (приёмник, который не закрывается): клиент сам обрывает соединение
-            посреди передачи — RST (SO_LINGER 1,0), пока данные ещё в пути.
-  abort-down скачивание с порта 81 (источник): клиент обрывает соединение RST, пока узел ещё шлёт.
+  up        upload to port 80 of the fake node (tests/sigpipe-node.py): the node closes the
+            connection after a random number of bytes while the client is still sending, and the
+            tunnel stack writes packets already queued in TUN into the node's closed socket. The
+            worker sends until a write fails (the tunnel answered RST) or time runs out.
+  abort-up  upload to port 82 (a sink that does not close): the client itself aborts mid-transfer
+            with RST (SO_LINGER 1,0) while data is still in flight.
+  abort-down download from port 81 (a source): the client aborts with RST while the node is still
+            sending.
 
-Печатает одну строку с итогами по видам — сколько соединений открыто, сколько оборвано каким способом и
-сколько байт ушло, — чтобы стенд видел, что нагрузка была настоящей.
+Prints one line of totals per kind — connections opened, how many were cut and how, bytes sent —
+so the test sees the load was real.
 """
 import argparse
 import random
@@ -28,7 +29,7 @@ import time
 
 
 def rst_close(s):
-    """Закрыть, отправив RST: непрочитанное и неотправленное выбрасывается, а не доводится."""
+    """Close with an RST: unread and unsent data is dropped, not delivered."""
     try:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
     except OSError:
@@ -48,9 +49,9 @@ def connect(target, port, timeout=5.0):
 
 
 def ping(target):
-    """Строка в туннель, эхо обратно: 0 — туннель жив."""
+    """A line into the tunnel, an echo back: 0 — the tunnel is alive."""
     t0 = time.time()
-    last = "нет попыток"
+    last = "no attempts"
     while time.time() - t0 < 20:
         try:
             s = connect(target, 7, 3.0)
@@ -64,13 +65,13 @@ def ping(target):
                 buf += c
             s.close()
             if buf == b"PONG ping\n":
-                print("ping: ответ через %.2f с" % (time.time() - t0))
+                print("ping: answer after %.2f s" % (time.time() - t0))
                 return 0
-            last = "ответ %r" % buf
+            last = "answer %r" % buf
         except OSError as e:
             last = "%s: %s" % (type(e).__name__, e)
         time.sleep(0.3)
-    print("ping: туннель не ответил за 20 с (%s)" % last)
+    print("ping: no answer through the tunnel in 20 s (%s)" % last)
     return 1
 
 
@@ -91,35 +92,35 @@ def worker(kind, target, deadline, st):
             if kind == "up":
                 s = connect(target, 80)
                 s.settimeout(10.0)
-                st.add("up:открыто")
+                st.add("up:opened")
                 sent = 0
                 try:
                     while time.time() < deadline:
                         sent += s.send(blob)
-                    st.add("up:срок вышел")
+                    st.add("up:deadline")
                 except OSError:
-                    # узел закрыл соединение, туннель ответил RST (или оборвал запись) — штатный исход
-                    st.add("up:оборвано узлом")
-                st.add("байт ушло", sent)
+                    # the node closed, the tunnel answered RST (or cut the write): the expected end
+                    st.add("up:cut-by-node")
+                st.add("bytes-out", sent)
                 rst_close(s)
             elif kind == "abort-up":
                 s = connect(target, 82)
                 s.settimeout(10.0)
-                st.add("abort-up:открыто")
+                st.add("abort-up:opened")
                 want = random.randint(100 * 1024, 3 * 1024 * 1024)
                 sent = 0
                 try:
                     while sent < want and time.time() < deadline:
                         sent += s.send(blob[:min(len(blob), want - sent)])
                 except OSError:
-                    st.add("abort-up:ошибка записи")
-                st.add("байт ушло", sent)
+                    st.add("abort-up:write-error")
+                st.add("bytes-out", sent)
                 rst_close(s)
                 st.add("abort-up:RST")
             elif kind == "abort-down":
                 s = connect(target, 81)
                 s.settimeout(10.0)
-                st.add("abort-down:открыто")
+                st.add("abort-down:opened")
                 want = random.randint(50 * 1024, 2 * 1024 * 1024)
                 got = 0
                 try:
@@ -129,12 +130,12 @@ def worker(kind, target, deadline, st):
                             break
                         got += len(c)
                 except OSError:
-                    st.add("abort-down:ошибка чтения")
-                st.add("байт принято", got)
+                    st.add("abort-down:read-error")
+                st.add("bytes-in", got)
                 rst_close(s)
                 st.add("abort-down:RST")
         except OSError as e:
-            st.add("%s:не соединился (%s)" % (kind, type(e).__name__))
+            st.add("%s:connect-failed (%s)" % (kind, type(e).__name__))
             time.sleep(0.05)
 
 
@@ -142,7 +143,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("target")
     ap.add_argument("--ping", action="store_true")
-    ap.add_argument("--storm", type=float, default=0, metavar="СЕК")
+    ap.add_argument("--storm", type=float, default=0, metavar="SECS")
     ap.add_argument("--up", type=int, default=12)
     ap.add_argument("--abort-up", type=int, default=6)
     ap.add_argument("--abort-down", type=int, default=6)
@@ -150,7 +151,7 @@ def main():
     if a.ping:
         sys.exit(ping(a.target))
     if a.storm <= 0:
-        ap.error("нужен --ping или --storm СЕК")
+        ap.error("need --ping or --storm SECS")
     st = Stats()
     deadline = time.time() + a.storm
     ts = []
@@ -161,7 +162,7 @@ def main():
         t.start()
     for t in ts:
         t.join(timeout=a.storm + 30)
-    print("клиент: " + " ".join("%s=%d" % kv for kv in sorted(st.d.items())))
+    print("client: " + " ".join("%s=%d" % kv for kv in sorted(st.d.items())))
 
 
 main()

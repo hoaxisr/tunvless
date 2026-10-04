@@ -1,21 +1,20 @@
-/* Проверка разгрузки записи в TUN: доходят ли данные и сходятся ли контрольные суммы.
+/* TUN write offload: does the data arrive, and do the checksums add up.
  *
- * Зачем нужен отдельный тест. При разгрузке мы кладём в поле check НЕДОСЧИТАННУЮ сумму —
- * только псевдозаголовок, — и рассчитываем, что ядро досчитает остальное при нарезке. Это
- * договорённость, а не наблюдаемое поведение: ошибись в ней на слагаемое длины, и пакеты
- * будут уходить, а приёмник — молча их отбрасывать. Отладка такого на роутере обходится
- * дороже всего, потому что «скорость не выросла» и «данные не доходят» выглядят одинаково.
+ * With offload the check field holds an UNFINISHED sum — the pseudo header only — and the kernel
+ * is trusted to finish it while segmenting. That is a contract, not observable behaviour: get one
+ * length term wrong and packets still go out while the receiver silently drops them, which on a
+ * router looks just like "no speedup".
  *
- * Проверить это локальной доставкой НЕЛЬЗЯ, и это главная тонкость: пакет с
- * CHECKSUM_PARTIAL, доставленный в сокет на той же машине, проверку суммы не проходит вовсе
- * (skb_csum_unnecessary считает такой пакет доверенным). Тест прошёл бы при любой сумме.
+ * Local delivery CANNOT check this: a CHECKSUM_PARTIAL packet delivered to a socket on the same
+ * machine skips checksum verification (skb_csum_unnecessary trusts it), so the test would pass
+ * with any sum.
  *
- * Поэтому схема такая: пишем в одно устройство, а читаем из ДРУГОГО, заставив ядро
- * маршрутизировать пакет между ними. На выходе ядро обязано и нарезать сегмент, и досчитать
- * суммы — то есть мы читаем ровно то, что увидел бы клиент, и можем проверить суммы сами.
+ * So the test writes to one device and reads from ANOTHER, making the kernel route the packet
+ * between them. On the way out the kernel must both segment and finish the sums, so the test
+ * reads exactly what a client would see and checks the sums itself.
  *
- * Запускать в своём сетевом пространстве (см. tests/run-tun-gso.sh): тест поднимает
- * устройства, включает пересылку и выключает проверку обратного пути.
+ * Run in a network namespace of its own (tests/run-tun-gso.sh): the test brings up devices,
+ * enables forwarding and turns off reverse path filtering.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -34,11 +33,11 @@
 
 static int sh(const char *cmd) {
     int rc = system(cmd);
-    if (rc != 0) fprintf(stderr, "не удалось: %s\n", cmd);
+    if (rc != 0) fprintf(stderr, "failed: %s\n", cmd);
     return rc;
 }
 
-/* Сумма по RFC 1071 — своя копия, чтобы тест не зависел от той, которую проверяет. */
+/* RFC 1071 sum: a copy of its own, so the test does not depend on the code it checks. */
 static uint16_t csum(const unsigned char *d, size_t n, uint32_t acc) {
     for (size_t i = 0; i + 1 < n; i += 2) acc += ((uint32_t)d[i] << 8) | d[i + 1];
     if (n & 1) acc += (uint32_t)d[n - 1] << 8;
@@ -48,13 +47,13 @@ static uint16_t csum(const unsigned char *d, size_t n, uint32_t acc) {
 
 int main(void) {
     struct tun_dev in, outq[QUEUES];
-    if (tun_open(&in, 1, "tgin") < 0) { fprintf(stderr, "tgin не открылся\n"); return 2; }
-    /* Приёмную сторону открываем НЕСКОЛЬКИМИ очередями: на них проверяется свойство, на
-     * котором стоит вся многопоточность, — что ядро кладёт весь поток в одну очередь. */
+    if (tun_open(&in, 1, "tgin") < 0) { fprintf(stderr, "cannot open tgin\n"); return 2; }
+    /* The receiving side opens SEVERAL queues to check what all the multithreading relies on:
+     * the kernel puts a whole flow into one queue. */
     int nq = tun_open(outq, QUEUES, "tgout");
-    if (nq < 0) { fprintf(stderr, "tgout не открылся\n"); return 2; }
+    if (nq < 0) { fprintf(stderr, "cannot open tgout\n"); return 2; }
     struct tun_dev out = outq[0];
-    printf("разгрузка: tgin=%d tgout=%d; очередей tgout: %d из %d\n",
+    printf("offload: tgin=%d tgout=%d; tgout queues: %d of %d\n",
            in.gso, out.gso, nq, QUEUES);
 
     if (sh("ip addr add 10.77.0.1/24 dev tgin && ip link set tgin up") ||
@@ -62,13 +61,13 @@ int main(void) {
         sh("sysctl -qw net.ipv4.ip_forward=1") ||
         sh("sysctl -qw net.ipv4.conf.all.rp_filter=0") ||
         sh("sysctl -qw net.ipv4.conf.tgin.rp_filter=0") ||
-        /* Соседа для 10.88.0.2 нет и быть не может — устройство точка-точка, но ядро всё
-         * равно ищет его. Прописываем вручную, иначе пакет уйдёт в ARP-ожидание. */
+        /* There is no neighbour 10.88.0.2 on a point-to-point device, but the kernel still
+         * looks for one. Set it by hand, or the packet waits for ARP. */
         sh("ip neigh replace 10.88.0.2 dev tgout lladdr 00:00:00:00:00:00 nud permanent"))
         return 2;
 
-    /* Читаем всё, что ядро уже успело положить в tgout до нашей записи (объявления и
-     * прочий шум): иначе оно попадёт в проверку и будет выглядеть как испорченный сегмент. */
+    /* Drain what the kernel put into tgout before our write (announcements and other noise),
+     * or it would be checked and look like a broken segment. */
     unsigned char junk[65536];
     for (int q = 0; q < nq; q++) {
         int fl = fcntl(outq[q].fd, F_GETFL, 0);
@@ -83,10 +82,9 @@ int main(void) {
     inet_pton(AF_INET, "10.77.0.2", &src);
     inet_pton(AF_INET, "10.88.0.2", &dst);
 
-    /* Нарезка ровно та же, что в emit_to_client: с разгрузкой отдаём запись целиком, без
-     * неё — по MSS. Отдать 16 КБ одним пакетом БЕЗ разгрузки нельзя, и это не мелочь: ядро
-     * примет такой пакет и порежет его на фрагменты IP, а не на сегменты TCP. Проверено
-     * этим же тестом: 11 фрагментов, из которых только первый несёт заголовок TCP. */
+    /* The same cut as emit_to_client: with offload the whole write at once, without it by MSS.
+     * 16 KB in one packet WITHOUT offload is wrong: the kernel accepts it and cuts it into IP
+     * fragments, not TCP segments (11 fragments, only the first with a TCP header). */
     size_t seg = in.gso ? (size_t)TUN_GSO_MAX : (size_t)TUN_MSS;
     for (size_t sent = 0; sent < sizeof(payload); ) {
         size_t chunk = sizeof(payload) - sent > seg ? seg : sizeof(payload) - sent;
@@ -94,13 +92,12 @@ int main(void) {
         tcp_hdr_build(hdr, src, dst, 12345, 9999, (uint32_t)(1000 + sent), 2000,
                       TCP_ACK | TCP_PSH, chunk, 65535);
         if (tun_write_data(&in, hdr, payload + sent, chunk) != 0) {
-            fprintf(stderr, "запись не удалась: %s\n", strerror(errno));
+            fprintf(stderr, "write failed: %s\n", strerror(errno));
             return 2;
         }
         sent += chunk;
     }
 
-    /* Собираем то, что вышло с другой стороны. */
     size_t got = 0, segs = 0, bad_ip = 0, bad_tcp = 0, bad_data = 0;
     size_t per_queue[QUEUES] = {0};
     for (int idle = 0; idle < 200 && got < sizeof(payload); ) {
@@ -137,7 +134,6 @@ int main(void) {
         for (int i = 0; i < 12; i += 2) acc += ((uint32_t)pseudo[i] << 8) | pseudo[i + 1];
         if (csum(pkt + ihl, doff + dn, acc) != 0) bad_tcp++;
 
-        /* Номер последовательности говорит, куда этот сегмент ложится. */
         uint32_t seq = ((uint32_t)pkt[ihl + 4] << 24) | ((uint32_t)pkt[ihl + 5] << 16) |
                        ((uint32_t)pkt[ihl + 6] << 8) | pkt[ihl + 7];
         size_t off = seq - 1000;
@@ -147,20 +143,20 @@ int main(void) {
         segs++;
     }
 
-    printf("сегментов %zu, байт %zu из %zu; суммы IP плохих %zu, TCP плохих %zu, данные "
-           "разошлись %zu раз\n", segs, got, sizeof(payload), bad_ip, bad_tcp, bad_data);
+    printf("segments %zu, bytes %zu of %zu; bad IP sums %zu, bad TCP sums %zu, data "
+           "mismatches %zu\n", segs, got, sizeof(payload), bad_ip, bad_tcp, bad_data);
 
-    /* Весь поток обязан лежать в ОДНОЙ очереди. Разложись он по нескольким — и соединение
-     * обслуживали бы разные потоки, у каждого своя таблица; получилось бы два независимых
-     * состояния одного TCP, то есть тихая порча вместо ошибки. */
+    /* The whole flow must be in ONE queue. Spread over several, the connection would be served
+     * by different threads, each with its own table: two independent states of one TCP
+     * connection, silent corruption instead of an error. */
     int used = 0, spread = 0;
     for (int q = 0; q < nq; q++) {
         if (!per_queue[q]) continue;
         used++;
-        printf("  очередь %d: %zu пакетов\n", q, per_queue[q]);
+        printf("  queue %d: %zu packets\n", q, per_queue[q]);
     }
-    if (nq > 1 && used != 1) { printf("FAIL: поток разложился по %d очередям\n", used); spread = 1; }
-    if (nq == 1) printf("  (ядро без IFF_MULTI_QUEUE — привязку проверить нечем)\n");
+    if (nq > 1 && used != 1) { printf("FAIL: the flow spread over %d queues\n", used); spread = 1; }
+    if (nq == 1) printf("  (kernel without IFF_MULTI_QUEUE: queue affinity not checked)\n");
 
     int ok = got == sizeof(payload) && !bad_ip && !bad_tcp && !bad_data && !spread;
     printf("%s\n", ok ? "PASS" : "FAIL");

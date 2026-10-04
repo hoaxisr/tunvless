@@ -1,14 +1,11 @@
-/* Ссылка узла в форме Xray: строки ссылки и поля транспорта (sublink.c).
+/* The transport and security half of a node link in Xray form (sublink.c): link strings, the
+ * parameters type, security, sni, fp, pbk, sid, path, host, serviceName, mode, extra, pcs, vcn,
+ * ech, allowInsecure, pqv, headerType, and whether the node is usable for the transport.
  *
- * Половина ссылки узла, которая касается транспорта и безопасности: type, security, sni, fp, pbk,
- * sid, path, host, serviceName, mode, extra, pcs, vcn, ech, allowInsecure, pqv, headerType — и
- * годность узла для транспорта.
+ * The VLESS half (flow, encryption, the UUID) and whole subscriptions (link lists, Xray and
+ * sing-box configs, Clash YAML) are in sub.c.
  *
- * Узел — struct vless_node: его половина транспорта и безопасности здесь, а VLESS-своё (flow,
- * encryption, UUID) разбирает и проверяет sub.c. Чего здесь нет — подписок целиком (список ссылок,
- * конфиги Xray и sing-box, YAML Clash): это знание VLESS, оно осталось в sub.c.
- *
- * Ни сети, ни криптографии: стенды подписки собирают файл без библиотек. */
+ * No network and no cryptography: the subscription tests build this file without libraries. */
 #ifndef STEER_SUBLINK_H
 #define STEER_SUBLINK_H
 #include <stddef.h>
@@ -17,81 +14,78 @@
 #include "vless.h"
 #include "transport.h"
 
-/* ---- строки ссылки -------------------------------------------------------------------------- */
+/* ---- link strings ---------------------------------------------------------------------------- */
 
-/* Адрес, по которому собеседника не бывает в принципе (0.0.0.0, ::, петля, широковещательный). */
+/* An address where no peer can ever be (0.0.0.0, ::, loopback, broadcast). */
 int sl_host_leads_nowhere(const char *h);
-/* Имя это (1) или адрес IPv4/IPv6 (0) — строкой, без разрешения имён. */
+/* A name (1) or an IPv4/IPv6 address (0), judged by the string, without resolving. */
 int sl_host_is_name(const char *h);
 void sl_pct_decode(char *s);
 void sl_set_field(char *dst, size_t n, const char *src, size_t len);
-/* Поле в процентной форме: раскодировать, потом обрезать по полю. */
+/* A percent-encoded field: decode first, then cut to the field size. */
 void sl_set_pct(char *dst, size_t n, const char *src, size_t len);
-/* Снять с конца строки неполную последовательность UTF-8. */
+/* Drop an incomplete UTF-8 sequence from the end of the string. */
 void sl_utf8_trim_tail(char *s);
-/* Имя узла: процентная форма, обрезка по буферу без оборванных знаков. */
+/* Node name: percent-decoded and cut to the buffer without broken characters. */
 void sl_set_name(char *dst, size_t n, const char *src);
-/* Порт из строки цифр: 1..65535, иначе 0. */
+/* Port from a string of digits: 1..65535, else 0. */
 uint16_t sl_port_of(const char *s);
-/* UUID (16 байт) из строки: 32 шестнадцатеричных знака, дефисы необязательны (форма vmess id). 0 —
- * разобран, -1 — не UUID. Короткую строку хэшем (как делает VLESS, vless_uuid_form) здесь НЕ
- * выводим: vmess id всегда полный UUID. */
+/* UUID (16 bytes) from 32 hex digits, hyphens optional. 0 — parsed, -1 — not a UUID. Unlike
+ * vless_uuid_form, a short string is not hashed into a UUID. */
 int sl_uuid_parse(const char *s, unsigned char out[16]);
-/* 1, true, yes — «включено». */
+/* 1, true, yes — on. */
 int sl_truthy(const char *v);
-/* Значение параметра в куче, процентная форма раскрыта; NULL — нет памяти. */
+/* A parameter value on the heap, percent-decoded; NULL — out of memory. */
 char *sl_param_dup(const char *v, size_t vlen);
 
-/* ---- длинные значения и проверка сертификата ------------------------------------------------ */
+/* ---- long values and certificate checks ------------------------------------------------------ */
 
-/* Метки непригодных значений: указатель сравнивается с адресом, поэтому они — одни на процесс. */
+/* Markers of bad values: compared by address, so there is one of each per process. */
 extern const char SL_BAD_PQV[], SL_FULL[], SL_BAD_PIN[], SL_BAD_ECH[], SL_ECH_DNS[];
-/* Общая таблица длинных строк (pqv, encryption, отпечатки): одинаковые значения — один экземпляр. */
+/* Shared table of long strings (pqv, encryption, fingerprints): equal values share one copy. */
 const char *sl_intern(const char *v, size_t n);
 void sl_set_pqv(struct vless_node *n, const char *v);
 void sl_add_pins(struct vless_node *n, const char *v, int spki);
 void sl_set_vcn(struct vless_node *n, const char *v);
 void sl_set_ech(struct vless_node *n, const char *v);
-/* xhttp: длина набивки «512» или «50-150» и поле extra ссылки (JSON). */
+/* xhttp: padding length "512" or "50-150", and the link's extra field (JSON). */
 void sl_pad_range(struct vless_node *n, const char *v);
 void sl_parse_extra(struct vless_node *n, const char *extra);
 
-/* ---- ссылка целиком ------------------------------------------------------------------------- */
+/* ---- the whole link -------------------------------------------------------------------------- */
 
-/* Свой параметр протокола: 1 — разобран (дальше не смотреть), 0 — не его. */
+/* A protocol's own parameter: 1 — parsed (look no further), 0 — not its own. */
 typedef int (*sl_own_fn)(struct vless_node *n, const char *k, size_t klen, const char *v, size_t vlen);
 
-/* схема://секрет@хост:порт?параметры#имя. Узел обнуляется; секрет (до '@', как есть) ложится в
- * n->uuid, а его начало и длина в ссылке — в *secret и *secret_n (для протокола, которому нужен
- * длиннее поля или раскодированным). Параметры: сначала own (может быть NULL), затем поля
- * транспорта и безопасности (sl_link_param). type по умолчанию — tcp. 0 — разобрана (годность ещё
- * не проверена), -1 — не эта схема или ссылка не разбирается. */
+/* scheme://secret@host:port?params#name. The node is zeroed; the secret (up to '@', as is) goes
+ * to n->uuid, and its start and length in the link to *secret and *secret_n (for a protocol that
+ * needs it longer than the field, or decoded). Each parameter goes to own first (own may be NULL),
+ * then to the transport and security fields (sl_link_param). type defaults to tcp. 0 — parsed
+ * (usability not checked yet), -1 — another scheme or a link that does not parse. */
 int sl_link_parse(const char *url, const char *scheme, struct vless_node *n, sl_own_fn own,
                   const char **secret, size_t *secret_n);
-/* Поле транспорта или безопасности ссылки: 1 — разобрано, 0 — не из них. */
+/* A transport or security parameter of the link: 1 — parsed, 0 — not one of them. */
 int sl_link_param(struct vless_node *n, const char *k, size_t klen, const char *v, size_t vlen);
 
-/* Годность транспорта и безопасности узла, в две половины — между ними протокол проверяет своё
- * (у VLESS — идентификатор), чтобы порядок причин у VLESS остался прежним. 0 — годен, 1 — нет
- * (причина в skip_reason). pre: значения, которые не разобрались (pqv, отпечатки, ech), tcp
- * headerType=http, обфускация xhttp, проверка сертификата и allowInsecure. post: security,
- * tls без sni, reality без pbk, транспорт и его путь, адрес «отвечать некому», режим xhttp. */
+/* Whether the node's transport and security are usable, in two halves; between them the protocol
+ * checks its own fields (VLESS: the id), which sets the order in which reasons are reported.
+ * 0 — usable, 1 — not (reason in skip_reason). pre: values that did not parse (pqv, fingerprints,
+ * ech), tcp headerType=http, xhttp obfuscation, certificate checks and allowInsecure. post:
+ * security, tls without sni, reality without pbk, the transport and its path, an address with
+ * nobody to answer, the xhttp mode. */
 int sl_link_usable_pre(struct vless_node *n);
 int sl_link_usable_post(struct vless_node *n);
 
-/* Ключ `insecure` выхода — vless_set_insecure (vless.h): им же решается allowInsecure у узлов
- * протоколов steer-proxy. */
+/* ---- skip reasons ---------------------------------------------------------------------------- */
 
-/* ---- причины пропуска ----------------------------------------------------------------------- */
-
-/* Отнести непригодный узел к его причине (группировка по тексту, пример — имя узла или хост:порт). */
+/* Count an unusable node under its reason (grouped by text; example: the name or host:port). */
 void sl_skip_note(struct vless_sub_stats *st, const struct vless_node *n, const char *reason);
 
-/* ---- узел глазами транспорта ---------------------------------------------------------------- */
+/* ---- the node as the transport sees it ------------------------------------------------------- */
 
-/* Указатели в узел, без копий. Проверка сертификата — только у security=tls: у reality эти поля
- * ничего не значат. Встроена здесь, а не в sublink.c, чтобы разбору подписки (стенды без
- * транспорта) не тянуть за собой transport.c. */
+/* Pointers into the node, no copies. Certificate checks apply only to security=tls: for reality
+ * these fields mean nothing. Inline here, not in sublink.c, so that the subscription parser (tests
+ * without the transport) does not pull in transport.c. */
 static inline void sl_tr_node(const struct vless_node *n, struct tr_node *t) {
     t->host = n->host;
     t->port = n->port;

@@ -1,30 +1,24 @@
 #!/usr/bin/env python3
-"""Сравнить ClientHello двух клиентов из двух перехватов.
+"""Compare the ClientHellos of two clients from two captures.
 
-Зачем это в репозитории. Вся идея Reality в том, что клиент неотличим от браузера, а
-аутентификатор подписывает ClientHello ЦЕЛИКОМ. Значит форма Hello — не косметика, а условие
-работы, и проверить её можно только сравнением с эталоном на проводе. На глаз и по коду это
-не видно: наш Hello собирается вручную, и «похож на браузерный» ничего не значит, пока не
-разложено по полям рядом с настоящим.
+Reality relies on the client being indistinguishable from a browser, and the authenticator signs
+the WHOLE ClientHello, so the shape of the Hello is a working condition, not cosmetics. Our Hello
+is built by hand, and it can only be checked field by field against a reference on the wire.
+A wrong Hello (too few cipher suites or extensions, no GREASE, no encrypted_client_hello or alpn,
+an encrypt_then_mac Chrome never sends) gets no negative answer: Reality silently proxies an
+unrecognised client to the cover site, and the node looks dead.
 
-Так была найдена причина, по которой узел перестал нас признавать при рабочем sing-box на том
-же узле и тех же ключах: у нас 3 набора шифров против 16, 10 расширений против 18, ни одного
-GREASE, нет encrypted_client_hello и alpn, зато есть encrypt_then_mac, которого Chrome не
-посылает. Симптом при этом выглядел как «узел умер» — у Reality нет отрицательного ответа,
-непризнанного клиента он молча проксирует на маскировочный сайт.
+Capture (tcpdump writes to stdout: with restricted rights it may fail to create a file):
 
-Снять перехваты (tcpdump пишет в stdout: под ограничениями прав файл он может не создать):
+    tcpdump -i eth0 -s 0 -U -w - "tcp port 9443" > reference.pcap &
+    <run the reference client>
+    tcpdump -i eth0 -s 0 -U -w - "tcp port 9443" > ours.pcap &
+    tunvless --probe --node N <link or file>
 
-    tcpdump -i eth0 -s 0 -U -w - "tcp port 9443" > эталон.pcap &
-    <запустить эталонный клиент>
-    tcpdump -i eth0 -s 0 -U -w - "tcp port 9443" > наш.pcap &
-    steer vless-probe ВЫХОД --node N --spec СПЕКА
+    tests/hello-diff.py reference.pcap ours.pcap
 
-    tests/hello-diff.py эталон.pcap наш.pcap
-
-ВАЖНО: оба перехвата должны быть до ОДНОГО И ТОГО ЖЕ узла. Первый раз я сравнил свой клиент
-на одном узле с эталоном на другом (номер узла в подписке значит разное в разных её версиях),
-и разница в SNI выглядела как находка, которой не было.
+IMPORTANT: both captures must go to THE SAME node. A node's number in a subscription can change
+between versions of it, and a different SNI then looks like a finding that is not there.
 """
 import struct, sys
 
@@ -72,7 +66,6 @@ def pcap_streams(path):
     return out
 
 def parse_hello(b):
-    # запись TLS
     if len(b) < 5 or b[0] != 0x16: return None
     body = b[5:5+struct.unpack('>H', b[3:5])[0]]
     if not body or body[0] != 0x01: return None
@@ -102,11 +95,11 @@ def show(tag, path):
         h = parse_hello(pl)
         if h:
             print("=== %s" % tag)
-            print("  запись версия %s, всего %d байт" % (h['record_version'], h['total']))
+            print("  record version %s, %d bytes in all" % (h['record_version'], h['total']))
             print("  legacy_version %s" % h['legacy_version'])
-            print("  session_id (%d байт): %s" % (len(h['session_id'])//2, h['session_id']))
-            print("  шифров %d: %s" % (len(h['suites']), ' '.join(h['suites'])))
-            print("  расширений %d:" % len(h['exts']))
+            print("  session_id (%d bytes): %s" % (len(h['session_id'])//2, h['session_id']))
+            print("  %d cipher suites: %s" % (len(h['suites']), ' '.join(h['suites'])))
+            print("  %d extensions:" % len(h['exts']))
             for n_, ln, raw in h['exts']:
                 extra = ''
                 if n_ == 'supported_groups':
@@ -127,15 +120,15 @@ def show(tag, path):
                     extra = ' -> ' + repr(raw[2:])
                 print("    %-26s %4d%s" % (n_, ln, extra))
             return h
-    print("=== %s: ClientHello не найден" % tag)
+    print("=== %s: no ClientHello found" % tag)
     return None
 
-a = show('sing-box (РАБОТАЕТ)', sys.argv[1])
+a = show('reference (works)', sys.argv[1])
 print()
-b = show('steer (отказ)', sys.argv[2])
+b = show('tunvless (fails)', sys.argv[2])
 if a and b:
-    print("\n=== чего нет у steer, но есть у sing-box:")
+    print("\n=== in the reference but not in tunvless:")
     sa = [e[0] for e in a['exts']]; sb_ = [e[0] for e in b['exts']]
-    print("   ", [x for x in sa if x not in sb_] or "ничего")
-    print("=== чего нет у sing-box, но есть у steer:")
-    print("   ", [x for x in sb_ if x not in sa] or "ничего")
+    print("   ", [x for x in sa if x not in sb_] or "nothing")
+    print("=== in tunvless but not in the reference:")
+    print("   ", [x for x in sb_ if x not in sa] or "nothing")

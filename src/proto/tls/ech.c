@@ -1,10 +1,10 @@
-/* Encrypted Client Hello, клиентская половина — см. ech.h (что это, что здесь, чего нет).
+/* Encrypted Client Hello, client side; see ech.h.
  *
- * Свой HPKE, а не wolfCrypt HPKE: режим base с DHKEM(X25519) — это два HKDF и один AEAD, и всё нужное уже
- * лежит в слое примитивов (scrypto.h: X25519, HKDF-SHA256, AES-128-GCM, ChaCha20-Poly1305). Включать ради
- * ста строк HAVE_HPKE в поставляемую wolfSSL значило бы менять раскладку библиотеки и её размер для всех
- * пакетов; своя реализация сверена с Go crypto/hpke (tests/echmatch.sh) и с настоящим сервером ECH
- * (Xray-core на crypto/tls Go) — оба расшифровывают то, что она запечатывает. */
+ * Own HPKE rather than wolfCrypt's: base mode with DHKEM(X25519) is two HKDFs and one AEAD, all
+ * already in the primitives layer (scrypto.h). Turning on HAVE_HPKE in the bundled wolfSSL for a
+ * hundred lines would change the library's layout and size. This implementation is checked
+ * against Go crypto/hpke (tests/echmatch.c) and a real ECH server, Xray-core on Go crypto/tls
+ * (tests/ech.sh): both decrypt what it seals. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <string.h>
@@ -42,11 +42,11 @@ int ech_b64_decode(const char *in, uint8_t *out, size_t cap) {
 
 /* ---- ECHConfigList ---------------------------------------------------------------------------
  *
- *   ECHConfigList  = u16 длина, затем ECHConfig подряд
- *   ECHConfig      = u16 версия (0xfe0d), u16 длина, содержимое
- *   содержимое     = u8 config_id, u16 kem_id, u16 длина + открытый ключ,
- *                    u16 длина + пары (u16 kdf_id, u16 aead_id), u8 maximum_name_length,
- *                    u8 длина + public_name, u16 длина + расширения (u16 тип, u16 длина + данные)
+ *   ECHConfigList  = u16 length, then ECHConfigs back to back
+ *   ECHConfig      = u16 version (0xfe0d), u16 length, contents
+ *   contents       = u8 config_id, u16 kem_id, u16 length + public key,
+ *                    u16 length + pairs (u16 kdf_id, u16 aead_id), u8 maximum_name_length,
+ *                    u8 length + public_name, u16 length + extensions (u16 type, u16 length + data)
  */
 static int name_ok(const char *s, size_t n) {
     if (n == 0 || n > 253) return 0;
@@ -69,9 +69,9 @@ int ech_pick(const uint8_t *list, size_t n, struct ech_cfg *out) {
         const uint8_t *raw = list + p;
         size_t rawn = 4 + len;
         p += rawn;
-        if (ver != 0xfe0d) continue;                      /* другая версия — не наша, пропуск */
+        if (ver != 0xfe0d) continue;
 
-        /* Содержимое: структурная ошибка — список негоден целиком, смысловое несоответствие — пропуск записи. */
+        /* A structural error rejects the whole list; an entry we cannot use is skipped. */
         size_t q = 0;
         if (len < 1 + 2 + 2) return ECH_EPARSE;
         uint8_t id = c[q++];
@@ -94,7 +94,7 @@ int ech_pick(const uint8_t *list, size_t n, struct ech_cfg *out) {
             unsigned xt = be16(c + q + x);
             size_t xl = be16(c + q + x + 2);
             if (x + 4 + xl > xn) return ECH_EPARSE;
-            if (xt & 0x8000u) mandatory = 1;              /* обязательное расширение, которого мы не знаем */
+            if (xt & 0x8000u) mandatory = 1;              /* a mandatory extension we do not know */
             x += 4 + xl;
         }
         if (mandatory || kem != 0x0020 || pkn != 32 || !name_ok(pn, pnn) || rawn > sizeof out->raw) continue;
@@ -116,9 +116,10 @@ int ech_pick(const uint8_t *list, size_t n, struct ech_cfg *out) {
     return ECH_ENOCONFIG;
 }
 
-/* ---- HPKE (RFC 9180), режим base ----------------------------------------------------------- */
+/* ---- HPKE (RFC 9180), base mode ------------------------------------------------------------ */
 
-/* Buf под "HPKE-v1" ‖ suite_id ‖ label ‖ ikm: самый длинный ikm — info ("tls ech\0" ‖ ECHConfig ≤ 1032 байт). */
+/* Buffer for "HPKE-v1" ‖ suite_id ‖ label ‖ ikm. The longest ikm is info:
+ * "tls ech\0" ‖ ECHConfig, at most 1032 bytes. */
 #define HB 1200
 
 static int labeled_extract(const uint8_t *suite, size_t sn, const uint8_t *salt, size_t saltn,
@@ -174,7 +175,7 @@ int ech_hpke_seal(const struct ech_cfg *cfg, const uint8_t *eph,
     info[7] = 0;
     memcpy(info + 8, cfg->raw, cfg->raw_n);
     uint8_t ksc[1 + 32 + 32];
-    ksc[0] = 0;                                              /* режим base */
+    ksc[0] = 0;                                              /* mode: base */
     if (labeled_extract(suite, 10, NULL, 0, "psk_id_hash", NULL, 0, ksc + 1) != 0 ||
         labeled_extract(suite, 10, NULL, 0, "info_hash", info, 8 + cfg->raw_n, ksc + 33) != 0 ||
         labeled_extract(suite, 10, shared, 32, "secret", NULL, 0, secret) != 0) return ECH_ECRYPTO;
@@ -183,7 +184,7 @@ int ech_hpke_seal(const struct ech_cfg *cfg, const uint8_t *eph,
     if (labeled_expand(secret, suite, 10, "key", ksc, sizeof ksc, kn, key) != 0 ||
         labeled_expand(secret, suite, 10, "base_nonce", ksc, sizeof ksc, 12, nonce) != 0) return ECH_ECRYPTO;
 
-    /* Первое сообщение контекста: seq = 0, nonce = base_nonce. */
+    /* The context's first message: seq = 0, so nonce = base_nonce. */
     struct sc_aead k;
     if (sc_aead_setkey(&k, alg, key) != 0) return ECH_ECRYPTO;
     if (pt_n) memcpy(ct, pt, pt_n);
@@ -194,7 +195,7 @@ int ech_hpke_seal(const struct ech_cfg *cfg, const uint8_t *eph,
     return rc == 0 ? 0 : ECH_ECRYPTO;
 }
 
-/* ---- сборка Outer/Inner ------------------------------------------------------------------- */
+/* ---- building Outer/Inner ----------------------------------------------------------------- */
 
 struct wb {
     uint8_t *p;
@@ -214,7 +215,7 @@ static void w_u24(struct wb *w, size_t v) { uint8_t b[3] = { (uint8_t)(v >> 16),
 
 int ech_wrap(const struct ech_cfg *cfg, const uint8_t *hello, size_t hello_n,
              uint8_t *out, size_t cap, size_t *out_n, struct ech_state *st) {
-    /* ---- разбор готового Hello ---- */
+    /* ---- parse the finished Hello ---- */
     if (hello_n < 5 + 4 + 35 || hello[0] != 0x16 || hello[5] != 0x01) return ECH_EPARSE;
     if ((size_t)be16(hello + 3) + 5 != hello_n || be24(hello + 6) + 9 != hello_n) return ECH_EPARSE;
     const uint8_t *b = hello + 9;
@@ -226,32 +227,34 @@ int ech_wrap(const struct ech_cfg *cfg, const uint8_t *hello, size_t hello_n,
     p += 2 + be16(b + p);
     if (p + 1 > bn) return ECH_EPARSE;
     p += 1 + b[p];
-    size_t pre_end = p;                                     /* здесь длина списка расширений */
+    size_t pre_end = p;                                     /* the extensions length is here */
     if (p + 2 > bn) return ECH_EPARSE;
     size_t ext_raw_n = be16(b + p), ext_off = p + 2;
     if (ext_off + ext_raw_n != bn) return ECH_EPARSE;
-    /* Расширения без ECH: сборщик Hello по образцу Chrome кладёт в Hello GREASE-расширение ECH (0xfe0d со
-     * случайной нагрузкой), и оно уступает место настоящему — два расширения одного типа недопустимы. */
-    uint8_t ex[ECH_INNER_MAX], exi[ECH_INNER_MAX];         /* расширения Outer и Inner */
+    /* Copy the extensions without ECH: the Chrome-like Hello carries a GREASE ECH extension (0xfe0d
+     * with a random payload), and it makes way for the real one, since two extensions of one type
+     * are not allowed. */
+    uint8_t ex[ECH_INNER_MAX], exi[ECH_INNER_MAX];         /* extensions of Outer and Inner */
     size_t ex_n = 0, exi_n = 0, sni_len = 0;
     int have_sni = 0;
     for (size_t q = ext_off; q + 4 <= bn;) {
         unsigned t = be16(b + q);
         size_t l = be16(b + q + 2);
         if (q + 4 + l > bn) return ECH_EPARSE;
-        if (t == 0 && l >= 5) { sni_len = be16(b + q + 5 + 2); have_sni = 1; }   /* список(2) тип(1) длина(2) */
+        /* server_name data: list length(2), name type(1), name length(2), name. */
+        if (t == 0 && l >= 5) { sni_len = be16(b + q + 5 + 2); have_sni = 1; }
         if (t != EXT_ECH) {
             if (ex_n + 4 + l > sizeof ex || exi_n + 4 + l > sizeof exi) return ECH_ETOOBIG;
             memcpy(ex + ex_n, b + q, 4 + l);
             ex_n += 4 + l;
             if (t == 0x002b && l >= 1) {
-                /* supported_versions Inner: только TLS 1.3 и выше (RFC 9849, 6.1) — Go и BoringSSL отвергают
-                 * Inner, предлагающий 1.2; GREASE-значения остаются, как в Hello. */
+                /* Inner's supported_versions: TLS 1.3 and above only (RFC 9849, 6.1); Go and
+                 * BoringSSL reject an Inner that offers 1.2. GREASE values stay as in the Hello. */
                 size_t ln = b[q + 4], keep = 0;
                 if (1 + ln != l || (ln & 1)) return ECH_EPARSE;
-                exi[exi_n++] = b[q]; exi[exi_n++] = b[q + 1];       /* тип */
+                exi[exi_n++] = b[q]; exi[exi_n++] = b[q + 1];       /* type */
                 size_t len_at = exi_n;
-                exi_n += 3;                                          /* длина данных и длина списка — ниже */
+                exi_n += 3;                                          /* both lengths: below */
                 for (size_t v = 0; v < ln; v += 2) {
                     unsigned ver = be16(b + q + 5 + v);
                     int grease = (ver & 0x0F0F) == 0x0A0A && (ver & 0xFF) == (ver >> 8);
@@ -269,19 +272,20 @@ int ech_wrap(const struct ech_cfg *cfg, const uint8_t *hello, size_t hello_n,
     }
     if (!have_sni) return ECH_EPARSE;
 
-    /* ---- Inner: полное сообщение для транскрипта (то же Hello + расширение ech_is_inner) ---- */
+    /* ---- Inner: the full message for the transcript (the Hello + an inner ECH extension) ---- */
     struct wb w = { st->inner, 0, sizeof st->inner, 0 };
     w_u8(&w, 0x01);
     w_u24(&w, pre_end + 2 + exi_n + 5);
     w_put(&w, b, pre_end);
     w_u16(&w, exi_n + 5);
     w_put(&w, exi, exi_n);
-    w_u16(&w, EXT_ECH); w_u16(&w, 1); w_u8(&w, 1);          /* inner: тип 1 */
+    w_u16(&w, EXT_ECH); w_u16(&w, 1); w_u8(&w, 1);          /* type 1: inner */
     if (w.bad) return ECH_ETOOBIG;
     st->inner_n = w.n;
     memcpy(st->random, b + 2, 32);
 
-    /* ---- EncodedClientHelloInner: то же без legacy_session_id (сервер вернёт его из Outer) + набивка ---- */
+    /* ---- EncodedClientHelloInner: the same without legacy_session_id (the server restores it
+     * from Outer), plus padding ---- */
     uint8_t enc_in[ECH_INNER_MAX + 64];
     struct wb e = { enc_in, 0, sizeof enc_in - 64, 0 };
     w_put(&e, b, 34);
@@ -291,7 +295,8 @@ int ech_wrap(const struct ech_cfg *cfg, const uint8_t *hello, size_t hello_n,
     w_put(&e, exi, exi_n);
     w_u16(&e, EXT_ECH); w_u16(&e, 1); w_u8(&e, 1);
     if (e.bad) return ECH_ETOOBIG;
-    /* Набивка (RFC 9849, 6.1.3): имя дополняется до maximum_name_length, целое — до кратного 32. */
+    /* Padding (RFC 9849, 6.1.3): the name up to maximum_name_length, then the whole up to a
+     * multiple of 32. */
     size_t pad = cfg->max_name > sni_len ? cfg->max_name - sni_len : 0;
     pad += 31 - ((e.n + pad - 1) % 32);
     if (e.n + pad > sizeof enc_in) return ECH_ETOOBIG;
@@ -304,8 +309,8 @@ int ech_wrap(const struct ech_cfg *cfg, const uint8_t *hello, size_t hello_n,
     uint8_t orand[32];
     if (xc_random(orand, 32) != 0) return ECH_ECRYPTO;
     const size_t pn = strlen(cfg->public_name);
-    const size_t ech_ext_n = 1 + 2 + 2 + 1 + 2 + 32 + 2 + payload_n;       /* данные расширения */
-    /* Длина расширений Outer: исходные, за вычетом старого SNI, плюс новый SNI и ECH. */
+    const size_t ech_ext_n = 1 + 2 + 2 + 1 + 2 + 32 + 2 + payload_n;       /* extension data */
+    /* Outer's extensions: the original ones, the old SNI replaced by the new one, plus ECH. */
     size_t old_sni_total = 0;
     for (size_t q = 0; q + 4 <= ex_n;) {
         size_t l = be16(ex + q + 2);
@@ -321,10 +326,10 @@ int ech_wrap(const struct ech_cfg *cfg, const uint8_t *hello, size_t hello_n,
     w_u8(&o, 0x16); w_u16(&o, 0x0301); w_u16(&o, 4 + o_body_n);
     w_u8(&o, 0x01); w_u24(&o, o_body_n);
     const size_t body0 = o.n;
-    w_put(&o, b, 2);                                        /* версия */
-    w_put(&o, orand, 32);                                   /* свой random у Outer */
+    w_put(&o, b, 2);                                        /* version */
+    w_put(&o, orand, 32);                                   /* Outer has its own random */
     w_u8(&o, sid_n);
-    w_put(&o, b + sid_off, sid_n);                          /* session_id один и тот же у обоих */
+    w_put(&o, b + sid_off, sid_n);                          /* the same session_id in both */
     w_put(&o, b + sid_off + sid_n, pre_end - (sid_off + sid_n));
     w_u16(&o, o_ext_n);
     for (size_t q = 0; q + 4 <= ex_n;) {
@@ -349,7 +354,7 @@ int ech_wrap(const struct ech_cfg *cfg, const uint8_t *hello, size_t hello_n,
     for (size_t z = payload_n; z > 0;) { size_t t = z < sizeof zero ? z : sizeof zero; w_put(&o, zero, t); z -= t; }
     if (o.bad || o.n != 5 + 4 + o_body_n) return ECH_ETOOBIG;
 
-    /* AAD — Outer без заголовков (тело сообщения) с обнулённой нагрузкой; запечатывается Inner. */
+    /* AAD is Outer's message body with the payload zeroed; Inner is what gets sealed. */
     uint8_t ct[ECH_INNER_MAX + 64 + 16], enc_check[32];
     int rc = ech_hpke_seal(cfg, eph, out + body0, o_body_n, enc_in, enc_n, enc_check, ct);
     if (rc != 0) return rc;

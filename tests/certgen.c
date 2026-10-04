@@ -1,19 +1,19 @@
-/* Выпуск сертификатов и подписи для стендов — то, чего у движка нет и быть не должно.
+/* Certificates and signatures for the tests — something the program itself does not and should
+ * not have.
  *
- * Движку от X.509 нужна только ПРОВЕРКА (src/lib/scrypto.c). Стендам security=tls
- * (tests/vlessmatch.c, tests/androidroots.c) нужна и другая половина: выпустить корень и листы
- * на месте, со сроком от текущего времени (замороженный в репозитории сертификат однажды истёк
- * бы и покрасил стенд не по своей вине, R-118), и подписать CertificateVerify от имени сервера.
- * Прежде это делал mbedtls_x509write; теперь — wolfCrypt, собранный для стендов с добавочным
- * ключом WOLFSSL_CERT_GEN (tests/ext-test.sh, STEER_WOLFSSL_DEFS). В опциях движка
- * (build/wolfssl/user_settings.h) выпуска сертификатов нет.
+ * The program only VERIFIES X.509 (src/lib/scrypto.c). The security=tls tests (tests/vlessmatch.c)
+ * need the other half too: issue a root and leaves on the spot, valid from the current time (a
+ * certificate frozen in the repository would one day expire and fail the test for no fault of
+ * its own), and sign CertificateVerify as the server. That is wolfCrypt built for the tests with
+ * the extra WOLFSSL_CERT_GEN option (Makefile, STEER_WOLFSSL_DEFS); the program's options
+ * (build/wolfssl/user_settings.h) have no certificate generation.
  *
- * ОТДЕЛЬНЫЙ ФАЙЛ, А НЕ КОД ВНУТРИ СТЕНДА, по той же причине, по какой в движке wolfSSL видит один
- * scrypto.c: стенды включают исходник клиента целиком (#include client.c), и заголовки wolfSSL
- * рядом с ним — это их макросы и имена в одной единице трансляции с нашими. Здесь интерфейс без
- * единого типа библиотеки, как у слоя.
+ * A SEPARATE FILE, NOT CODE INSIDE THE TEST, for the same reason only scrypto.c sees wolfSSL in
+ * the program: the tests include program sources whole, and wolfSSL headers next to them would put
+ * its macros and names into one translation unit with ours. The interface here has no library
+ * type at all, like the crypto layer.
  *
- * Ключи — ECDSA P-256: генерация RSA занимает секунды и ничего не добавила бы проверяемому. */
+ * Keys are ECDSA P-256: RSA generation takes seconds and would add nothing to what is tested. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,7 +27,7 @@
 #include "certgen.h"
 
 #if !defined(WOLFSSL_CERT_GEN)
-#error "tests/certgen.c собирается с WOLFSSL_CERT_GEN (tests/ext-test.sh, STEER_WOLFSSL_DEFS)"
+#error "tests/certgen.c needs WOLFSSL_CERT_GEN (Makefile, STEER_WOLFSSL_DEFS)"
 #endif
 
 struct tcg_key {
@@ -71,14 +71,14 @@ int tcg_issue(struct tcg_key *subj, const char *cn, const char *org, int is_ca,
     if (org) snprintf(c->subject.org, sizeof(c->subject.org), "%s", org);
     c->isCA = is_ca ? 1 : 0;
     c->sigType = CTC_SHA256wECDSA;
-    /* Срок — от текущего времени: wolfSSL ставит начало на «сейчас», конец — через daysValid. */
+    /* Validity from the current time: wolfSSL sets the start to now, the end daysValid later. */
     c->daysValid = 365 * 5;
 #ifdef WOLFSSL_CERT_EXT
     if (wc_SetSubjectKeyIdFromPublicKey(c, NULL, &subj->k) != 0) goto out;
     if (is_ca) c->keyUsage = KEYUSE_KEY_CERT_SIGN | KEYUSE_CRL_SIGN;
 #endif
     if (issuer_der) {
-        /* Издатель — чужой сертификат: имя и (при CERT_EXT) идентификатор ключа берутся из него. */
+        /* Issued by another certificate: the name and (with CERT_EXT) the key id come from it. */
         if (wc_SetIssuerBuffer(c, issuer_der, (int)issuer_n) != 0) goto out;
 #ifdef WOLFSSL_CERT_EXT
         if (wc_SetAuthKeyIdFromCert(c, issuer_der, (int)issuer_n) != 0) goto out;
@@ -122,8 +122,8 @@ int tcg_count_pem_certs(const char *pem, size_t n) {
         const char *e = strstr(b, E);
         if (!e) break;
         e += sizeof(E) - 1;
-        /* Каждый блок — отдельно: разбирается ровно он, текст вокруг (формат Android: вывод
-         * `openssl x509 -text` перед PEM) в разбор не попадает. */
+        /* Each block on its own: only the block is parsed, text around it (the Android format:
+         * `openssl x509 -text` output before the PEM) is not. */
         int dn = wc_CertPemToDer((const unsigned char *)b, (int)(e - b), der, 8192, CERT_TYPE);
         if (dn > 0) {
             DecodedCert dc;

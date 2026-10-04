@@ -1,44 +1,44 @@
-/* Соединение с узлом VLESS/Reality и проверка «нас признали». Подробности — в client.c.
+/* Connection to a VLESS node and the check that the node accepted us (details in client.c).
  *
- * Соединение — это struct transport (proto/transport/transport.h): сокет, безопасность и
- * транспорт узла. VLESS над ним — заголовок запроса (vless_proto.h) и кадры Vision (vision.h);
- * их кладёт в поток дайлер стека туннеля (vldial.c) и проверка узла ниже. */
+ * The connection is a struct transport (proto/transport/transport.h): the node's socket,
+ * security and transport. VLESS on top of it is the request header (vless_proto.h) and Vision
+ * frames (vision.h), written by the tunnel's dialer (vldial.c) and by the probe below. */
 #ifndef STEER_CLIENT_H
 #define STEER_CLIENT_H
 #include "vless.h"
 #include "transport.h"
 
-/* Коды самого VLESS — поверх кодов транспорта TR_* (transport.h), с которыми они делят одно
- * пространство чисел: -30…-38 были общими и прежде. */
+/* VLESS's own codes. They share one number space with the transport's TR_* codes
+ * (transport.h), so the values must not collide. */
 #define VLESS_CONN_EBADUUID  (-35)
-/* Reality не признал ключ: TLS установлен, но отвечает маскировочный сайт. Отдельный код,
- * потому что это единственная ошибка, которая иначе выглядит как рабочий узел. */
+/* Reality did not accept the key: TLS is up, but the cover site answers. A separate code,
+ * since this is the one failure that otherwise looks like a working node. */
 #define VLESS_CONN_EREJECTED (-36)
 
-/* Соединение с узлом: TCP, безопасность и транспорт из ссылки узла. 0 — готово. */
+/* Connects to the node: TCP, security and transport from the node's link. 0 on success. */
 int vless_connect(const struct vless_node *node, struct transport *conn, int timeout_s);
 
+/* Checks the node with a VLESS request (see client.c). 0 if the node answers as VLESS; why
+ * gets the reason, or a short note on success. */
 int vless_probe(const struct vless_node *node, int timeout_s, char *why, size_t why_n);
 
-/* То же, но с замерами. Оба в миллисекундах, -1 если до этого шага не дошло:
+/* The same, with timings in milliseconds, -1 if that step was not reached:
  *
- *   handshake_ms — от начала TCP до готового транспорта (TCP + TLS + HTTP/2, если он есть).
- *                  Это цена ПОДКЛЮЧЕНИЯ к узлу, платится один раз;
- *   ttfb_ms      — от отправки запроса до первого байта ответа ОТ 1.1.1.1 через туннель.
- *                  Это то, что чувствуется как задержка, и то же самое, что показывает
- *                  curl своим временем до первого байта.
+ *   handshake_ms  from the start of TCP to a ready transport (TCP + TLS + HTTP/2 if any):
+ *                 the cost of connecting to the node, paid once;
+ *   ttfb_ms       from sending the request to the first byte of the target's answer through
+ *                 the tunnel: the latency a user feels, what curl reports as time to first byte.
  *
- * Именно ttfb, а не ICMP: пинг через наш TUN не ходит вовсе (ICMP мы не пересылаем), и
- * «пинг» через туннель был бы не тем, что измеряют. Здесь измеряется ровно тот путь, по
- * которому пойдёт трафик. */
+ * ttfb rather than ICMP: the tunnel does not forward ICMP, and this measures exactly the path
+ * traffic takes. */
 int vless_probe_timed(const struct vless_node *node, int timeout_s, char *why, size_t why_n,
                       int *handshake_ms, int *ttfb_ms);
 
-/* Текст причины для кода VLESS или транспорта. */
+/* The reason text for a VLESS or transport code. */
 const char *vless_strerror(int rc);
 
-/* Сколько места обязан дать вызывающий при чтении: транспорты поверх HTTP/2 отдают за
- * один раз до целой записи TLS. */
+/* The smallest read buffer a caller may pass: transports over HTTP/2 return up to a whole TLS
+ * record in one read. */
 #define VLESS_MIN_RECV_CAP TRANSPORT_MIN_READ_CAP
 
 #endif

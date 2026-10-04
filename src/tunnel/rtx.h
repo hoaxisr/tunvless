@@ -1,11 +1,9 @@
-/* Кольцо неподтверждённых байт — то, чем повторяется потерянное клиенту.
+/* Ring of bytes sent to the client and not yet acknowledged: what a retransmit resends.
  *
- * Отдельным файлом, а не парой функций внутри стека (stack.c), по одной причине: здесь всё
- * держится на арифметике по модулю, а ошибка в ней не выглядит как ошибка. Кольцо
- * провернётся не туда, клиент получит мусор вместо повтора, TCP его отбросит — и снаружи
- * это будет «иногда встаёт передача», то есть тот же симптом, что и вовсе без повтора.
- * Единственный способ поймать такое до роутера — проверить границы отдельно, и для этого
- * логика обязана вылезти из цикла туннеля. См. tests/rtx.c.
+ * Kept apart from stack.c because all of it is modular arithmetic, and an error there does not
+ * look like one: the ring turns the wrong way, the client gets garbage instead of a retransmit,
+ * TCP drops it, and from outside the transfer just stalls now and then. Its bounds have to be
+ * testable on their own, outside the tunnel loop.
  */
 #ifndef STEER_RTX_H
 #define STEER_RTX_H
@@ -15,44 +13,36 @@
 struct rtx {
     unsigned char *buf;
     uint32_t cap;
-    uint32_t len;       /* сколько неподтверждённых байт лежит */
-    uint32_t head;      /* где в кольце начинается самый старый неподтверждённый */
+    uint32_t len;       /* unacknowledged bytes held */
+    uint32_t head;      /* offset of the oldest unacknowledged byte */
 };
 
-/* Выделить кольцо. 0 — успех, -1 — нет памяти. */
+/* 0, or -1 when out of memory. */
 int rtx_init(struct rtx *r, uint32_t cap);
 void rtx_done(struct rtx *r);
 
-/* Увеличить кольцо, сохранив содержимое. 0 — успех, -1 — не вышло (кольцо остаётся прежним
- * и полностью годным). Уменьшать нельзя — вернёт -1.
+/* Enlarge the ring, keeping its contents. 0, or -1 on failure (the ring stays as it was and fully
+ * usable). Shrinking is refused with -1.
  *
- * Зачем расти, а не выделять сразу максимум: кольцо выделяется на каждое соединение при
- * SYN, и простаивающее соединение стоило столько же, сколько качающее на полной скорости.
- * Браузер держит десятки соединений живыми и ничего по ним не передаёт — за них платилась
- * память, которой потом не хватало на новые. Поэтому SYN получает малое кольцо, а до
- * полного дорастает только то соединение, по которому реально пошли данные.
- *
- * Отказ роста НЕ ошибка соединения: оно продолжает работать с прежним кольцом, просто окно
- * останется меньше. Это и есть причина, по которой рост безопаснее ленивого выделения:
- * там отказ приходил посреди передачи, когда отвечать клиенту уже нечем. */
+ * The ring is allocated per connection at SYN, so it starts small and grows only on a connection
+ * that actually carries data: browsers keep dozens of idle connections open, and a full-size ring
+ * on each would eat the memory new ones need. A failed grow is not a connection error: the
+ * connection goes on with the old ring and a smaller window. */
 int rtx_grow(struct rtx *r, uint32_t cap);
 
-/* Сколько ещё влезет. */
 uint32_t rtx_room(const struct rtx *r);
 
-/* Запомнить отправленное. Вызывающий обязан заранее убедиться, что n <= rtx_room(). */
+/* Remember sent bytes. The caller must ensure n <= rtx_room(). */
 void rtx_push(struct rtx *r, const unsigned char *p, uint32_t n);
 
-/* Клиент подтвердил n байт — выбросить их. Возвращает, сколько выбросила НА САМОМ ДЕЛЕ:
- * подтверждение может назвать больше, чем мы отправляли, и молча провернуть кольцо на
- * лишнее значило бы отдавать при следующем повторе чужие байты. */
+/* The client acknowledged n bytes: drop them. Returns how many were actually dropped: an ACK may
+ * cover more than was sent, and turning the ring past its data would resend foreign bytes. */
 uint32_t rtx_drop(struct rtx *r, uint32_t n);
 
-/* Непрерывный кусок с начала неподтверждённого, не длиннее want.
+/* A contiguous piece from the start of the unacknowledged data, at most want bytes.
  *
- * Именно НЕПРЕРЫВНЫЙ: за краем кольца данные продолжаются с нуля, и отдать их одним
- * указателем нельзя. Вызывающий отправит то, что дали, а остальное уйдёт следующим
- * повтором — дробить один сегмент на две записи в устройство незачем. */
+ * Contiguous: past the end of the buffer the data wraps to offset 0 and cannot be returned as one
+ * pointer. The caller sends what it gets; the rest goes with the next retransmit. */
 uint32_t rtx_peek(const struct rtx *r, uint32_t want, const unsigned char **p);
 
 #endif

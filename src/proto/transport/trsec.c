@@ -1,15 +1,11 @@
-/* Безопасность связи: security=none, tls и reality — рукопожатие поверх сокета к узлу.
+/* Link security: security=none, tls and reality — the handshake over the socket to the node (the
+ * middle layer of transport.h). The handshake is shared by every link, the main one and xhttp's
+ * second one; the only difference is the alpn the transport passes in.
  *
- * Средний ярус транспорта (transport.h). Переехал из клиента VLESS (client.c), где одно и то же
- * рукопожатие было написано дважды — у основной связи и у второй связи xhttp, — и копии уже
- * различались мелочами (где живёт состояние Reality, какой ALPN просить). Теперь рукопожатие
- * одно, а различие — в параметре alpn, который приносит транспорт.
- *
- * Ключевая мысль, ради которой здесь так мало кода: у Reality нет отрицательного ответа.
- * Сервер, не узнавший клиента, не отвечает отказом — он проксирует соединение на настоящий
- * сайт, которым прикрывается. Рукопожатие может пройти целиком, и всё равно это будет чужой
- * сайт. Отличить одно от другого может только протокол над транспортом (vless_probe в
- * proto/vless/client.c), поэтому здесь «рукопожатие прошло» и означает ровно это, не больше.
+ * Reality has no negative answer. A server that does not recognise the client does not refuse:
+ * it proxies the connection to the real site it hides behind. The handshake can complete and
+ * still lead to someone else's site. Only the protocol above the transport can tell (vless_probe
+ * in proto/vless/client.c), so here "the handshake passed" means exactly that and no more.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -25,72 +21,71 @@
 #include "certverify.h"
 #include "ech.h"
 
-/* security=none — голый поток, без TLS вообще. Полезен в доверенной сети, и именно поэтому он
- * не «частный случай reality», а отдельная ветка: ставить TLS там, где его нет, значило бы
- * просто не соединиться. Без TLS согласовывать ALPN нечем, поэтому транспорт поверх HTTP/2
- * начинает его сразу: голый h2 по TCP («h2c») сервер либо примет, либо ответит мусором, и это
- * увидит проверка. */
+/* security=none — a bare stream, no TLS at all (for a trusted network). Without TLS there is no
+ * ALPN negotiation, so an HTTP/2 transport starts HTTP/2 at once: the server either accepts bare
+ * h2 over TCP (h2c) or answers with garbage, and the probe sees it. */
 static int sec_none(struct tr_link *l, const struct tr_node *n, const char *alpn) {
     (void)n; (void)alpn;
     l->plain = 1;
     return 0;
 }
 
-/* security=tls — обычный TLS, без Reality, и security=reality.
+/* security=tls (plain TLS) and security=reality.
  *
- * Отличий между ними ровно три, и все три обязательны. ClientHello без аутентификатора (иначе
- * сервер увидел бы в session_id мусор — безвредный, но бессмысленный). ИМЯ обязано быть: у
- * Reality пустой SNI законен (сервер ждёт Hello без расширения), а обычному TLS без имени нечего
- * предъявить и нечем проверить сертификат. И сама проверка сертификата — единственное, что здесь
- * доказывает подлинность сервера.
+ * They differ in exactly three things, all required. Plain TLS sends a ClientHello without the
+ * authenticator (the server would see harmless garbage in session_id). It needs a NAME: Reality
+ * allows an empty SNI (the server expects a Hello without the extension), but plain TLS without a
+ * name has nothing to send and nothing to check the certificate against. And it verifies the
+ * certificate, the only proof of the server's identity here.
  *
- * Имя берётся из sni, а host — только запасным: sni это то, что мы просим у сервера, и
- * проверять сертификат надо против него же. Узел, объявленный одним адресом без имени,
- * проверяется против адреса — и не пройдёт, если сертификат выдан не на него. Это
- * правильный отказ, а не наша строгость: ровно так же поступает Xray.
+ * The name is sni, with host only as a fallback: sni is what the server is asked for, so the
+ * certificate is checked against it. A node given only as an address is checked against the
+ * address and fails if the certificate was not issued for it; Xray does the same.
  *
- * Состояние Reality (наш эфемерный ключ и ключ аутентификатора) живёт на стеке этой функции, а
- * не в соединении: после рукопожатия оно не нужно никому, и держать приватный ключ в памяти
- * соединения до его закрытия было незачем. */
+ * The Reality state (our ephemeral key and the authenticator key) lives on this function's stack,
+ * not in the connection: nothing needs it after the handshake. */
 static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *alpn,
                         int is_tls) {
     const char *verify_host = n->sni[0] ? n->sni : n->host;
     struct reality_cfg cfg = {
         .sni = is_tls ? verify_host : n->sni,
         .pbk = n->pbk, .sid = n->sid, .fp = n->fp,
-        /* ALPN просим ровно тогда, когда он нужен транспорту. Для tcp его нет — и Hello
-         * остаётся тем самым, который проверен на живых узлах. */
+        /* ALPN only when the transport needs it. tcp has none, and its Hello stays the one
+         * verified against live nodes. */
         .alpn = alpn,
         .plain = is_tls,
-        /* Гибрид X25519MLKEM768 в ClientHello — как у Chrome 131+, uTLS HelloChrome_Auto и Go 1.24+,
-         * то есть у любого клиента Xray с fp=chrome и без fp. Без него наш Hello — «Chrome позапрошлого
-         * года» и по размеру (537 байт вместо около 1760), и по составу supported_groups. Выключатель
-         * STEER_NOPQ=1 — для разбора: посредник, роняющий Hello больше одного сегмента. */
+        /* The X25519MLKEM768 hybrid in the ClientHello, as in Chrome 131+, uTLS
+         * HelloChrome_Auto and Go 1.24+, so in any Xray client with fp=chrome or no fp. Without
+         * it the Hello looks like an old Chrome both by size (537 bytes instead of about 1760)
+         * and by supported_groups. STEER_NOPQ=1 turns it off, for debugging a middlebox that
+         * drops a Hello longer than one segment. */
         .pq = !getenv("STEER_NOPQ"),
     };
-    /* pqv: ключ ML-DSA-65, base64url. Разбирается ДО отправки Hello: испорченный ключ — отказ узла, а не
-     * повод отправить Hello и потом молча не проверять подпись. Разбор подписки (sub.c) такой ключ
-     * отсеивает раньше, так что сюда он не доходит; это вторая линия. */
+    /* pqv: an ML-DSA-65 key, base64url. Decoded BEFORE the Hello is sent: a broken key fails the
+     * node rather than letting the handshake go on without checking the signature. The
+     * subscription parser (sub.c) already rejects such keys; this is the second line. */
     unsigned char pqv[SC_MLDSA65_PK];
     const int have_pqv = !is_tls && n->pqv && n->pqv[0];
     if (have_pqv && xc_b64url_decode(n->pqv, pqv, sizeof pqv) != SC_MLDSA65_PK) return REALITY_EBADKEY;
     struct reality_state rst;
     unsigned char hello[2560];
     size_t hello_n = 0;
-    /* ws и httpupgrade просят в ALPN ТОЛЬКО http/1.1 — как Xray (WebsocketHandshakeContext у
-     * uTLS переписывает ALPN отпечатка на один http/1.1) и как сам Chrome на соединении
-     * веб-сокета. С обычной парой «h2, http/1.1» сервер за TLS вправе выбрать h2, и наш запрос
-     * Upgrade по HTTP/1.1 уйдёт в соединение HTTP/2 мусором. У остальных транспортов Hello не
-     * меняется ни на бит (tests/hellofreeze.c): носитель зовётся только ради этих двух. */
+    /* ws and httpupgrade offer ONLY http/1.1 in ALPN, as Xray does (uTLS
+     * WebsocketHandshakeContext rewrites the fingerprint's ALPN to http/1.1 alone) and as Chrome
+     * does on a WebSocket connection. With the usual "h2, http/1.1" the server behind TLS may pick
+     * h2, and the HTTP/1.1 Upgrade request becomes garbage on an HTTP/2 connection. For the other
+     * transports the Hello does not change by a bit (tests/hellofreeze.c): the carrier is used
+     * only for these two. */
     struct reality_carrier car = { .alpn_http11 = 1 };
     const int h11 = alpn && !strcmp(alpn, "http/1.1");
     int rc = h11 ? reality_build_hello_carry(&cfg, &rst, &car, hello, sizeof(hello), &hello_n)
                  : reality_build_hello(&cfg, &rst, hello, sizeof(hello), &hello_n);
     if (rc) return rc;
 
-    /* ECH (security=tls, `ech=` узла): собранный выше Hello с настоящим SNI становится внутренним, по
-     * проводу идёт внешний с public_name из ECHConfig (ech.h). Буферы — в куче: внешний Hello вмещает
-     * зашифрованную копию внутреннего, то есть вдвое больше обычного, а стек рабочих потоков мал. */
+    /* ECH (security=tls, the node's `ech=`): the Hello built above, with the real SNI, becomes the
+     * inner one; the outer one with public_name from the ECHConfig goes on the wire (ech.h). The
+     * buffers are on the heap: the outer Hello holds an encrypted copy of the inner one, twice the
+     * usual size, and worker thread stacks are small. */
     struct ech_heap {
         struct ech_cfg cfg;
         struct ech_state st;
@@ -109,7 +104,7 @@ static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *
         if (er == 0) er = ech_wrap(&eh->cfg, hello, hello_n, eh->outer, sizeof eh->outer, &eh->outer_n, &eh->st);
         if (er != 0) {
             free(eh);
-            return er;                              /* причина — ECH_E* (transport.c, tr_strerror) */
+            return er;                              /* an ECH_E* code (transport.c, tr_strerror) */
         }
         send_hello = eh->outer;
         send_n = eh->outer_n;
@@ -120,7 +115,8 @@ static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *
 
     size_t sent = 0;
     while (sent < send_n) {
-        /* MSG_NOSIGNAL: узел, закрывший соединение до ClientHello, — отказ записи, а не сигнал. */
+        /* MSG_NOSIGNAL: a node that closes before the ClientHello is a write error, not a
+         * signal. */
         ssize_t w = send(l->fd, send_hello + sent, send_n - sent, MSG_NOSIGNAL);
         if (w <= 0) {
             if (w < 0 && errno == EINTR) continue;
@@ -130,14 +126,15 @@ static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *
         sent += (size_t)w;
     }
 
-    /* Передаётся наш ПРИВАТНЫЙ ключ, а не готовый секрет: TLS-расписание строится на
-     * обмене с эфемерным ключом сервера, который приедет только в ServerHello. */
-    /* Чем доказывать подлинность — решается видом узла, и вариант всегда ровно один.
-     * У обычного TLS это цепочка и имя, у Reality — HMAC в поле подписи временного
-     * сертификата на ключе, который есть только у владельца постоянной пары. */
+    /* Our PRIVATE key is passed, not a ready secret: the TLS key schedule needs the server's
+     * ephemeral key, which only arrives in the ServerHello. */
+    /* The node kind decides how the server proves itself, always exactly one way: plain TLS by
+     * the chain and the name, Reality by an HMAC in the signature field of a temporary
+     * certificate, keyed with what only the owner of the long-term key pair has. */
     struct tls13_auth auth = { 0 };
-    /* Закрепления, имена проверки и явный отказ от проверки — из узла и выхода (certverify.h). Без
-     * них указатель остаётся NULL, и проверка идёт прежним путём: цепочка до корней и SNI. */
+    /* Pins, verify names and an explicit opt-out of verification come from the node
+     * (certverify.h). Without them the pointer stays NULL and verification is the default:
+     * the chain up to the roots, and SNI. */
     struct cert_policy pol = { .pcs = n->pcs, .pks = n->pks, .vcn = n->vcn, .insecure = n->insecure };
     if (is_tls) {
         auth.host = verify_host;
@@ -165,8 +162,8 @@ const struct security_ops tr_sec_none    = { .name = "none",    .handshake = sec
 const struct security_ops tr_sec_tls     = { .name = "tls",     .handshake = sec_tls };
 const struct security_ops tr_sec_reality = { .name = "reality", .handshake = sec_reality };
 
-/* Всё, что не none и не tls, — reality: так было всегда, а неподдержанное значение отсеивает
- * разбор подписки (sub.c) раньше, чем узел доходит сюда. */
+/* Anything that is not none or tls is reality: the subscription parser (sub.c) rejects an
+ * unsupported value before the node gets here. */
 const struct security_ops *tr_security(const char *name) {
     if (!strcmp(name, "none")) return &tr_sec_none;
     if (!strcmp(name, "tls")) return &tr_sec_tls;
@@ -178,9 +175,9 @@ int tr_link_open(struct tr_link *l, const struct tr_node *n, const char *alpn, i
     int fd = tr_dial(n->host, n->port, timeout_s);
     if (fd < 0) return fd;
     l->fd = fd;
-    /* На отказе рукопожатия — один close, а не tr_link_close, как было и прежде: за собой в
-     * куче на отказе убирает сам tls13_handshake_auth, и это держит стенд vlessmatch под
-     * AddressSanitizer — по отдельной проверке кучи на каждую ветвь отказа. */
+    /* On a failed handshake only close(), not tr_link_close: tls13_handshake_auth frees its own
+     * heap state on failure, and tests/vlessmatch.c checks that under AddressSanitizer for every
+     * failure branch. */
     int rc = tr_security(n->security)->handshake(l, n, alpn);
     if (rc) { close(fd); l->fd = -1; return rc; }
     return 0;

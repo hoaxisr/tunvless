@@ -1,13 +1,10 @@
-/* Транспорт xhttp: поток протокола в теле запросов HTTP/2 — одним запросом или двумя связями.
+/* The xhttp transport: the protocol stream in HTTP/2 request bodies, over one request or two
+ * links.
  *
- * Верхний ярус транспорта (transport.h). Переехал из клиента VLESS (client.c) без изменений в
- * поведении; вторая связь под выгрузку поднимается теперь тем же tr_link_open, что и основная,
- * — прежде рукопожатие было скопировано в неё отдельной функцией.
- *
- * xhttp в режиме stream-one не оборачивает ничего: тело запроса — это поток наверх, тело
- * ответа — поток вниз. Зато он требует набивки: сервер проверяет длину x_padding в
- * Referer и без неё отвечает 400 (см. hub.go в Xray). Это не украшение — это условие.
- * Режимы stream-up и packet-up — в transport.h у enum xhttp_mode.
+ * In stream-one mode xhttp wraps nothing: the request body is the stream up, the response body
+ * the stream down. But it needs padding: the server checks the x_padding length in Referer and
+ * answers 400 without it (see Xray hub.go). The stream-up and packet-up modes are described at
+ * enum xhttp_mode in transport.h.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -19,12 +16,11 @@
 
 #include "transport.h"
 
-/* Путь xhttp: с ведущим и завершающим слэшем.
+/* The xhttp path, with a leading and a trailing slash.
  *
- * Завершающий слэш — не косметика. Сервер вычисляет идентификатор сессии как остаток
- * пути после своего, и режим stream-one опознаётся именно по ПУСТОМУ остатку. Путь без
- * завершающего слэша даёт непустой остаток, сервер уходит в режим packet-up и отвечает
- * 400 — а выглядит это как «узел не работает». */
+ * The trailing slash matters: the server takes the rest of the path after its own as the session
+ * id and recognizes stream-one by an EMPTY rest. Without the trailing slash the rest is not
+ * empty, the server switches to packet-up and answers 400, which looks like a dead node. */
 static void xhttp_path(const struct tr_node *n, char *out, size_t cap) {
     const char *p = n->path[0] ? n->path : "/";
     size_t len = strlen(p);
@@ -32,54 +28,51 @@ static void xhttp_path(const struct tr_node *n, char *out, size_t cap) {
              len && p[len - 1] == '/' ? "" : "/");
 }
 
-/* Режим xhttp узла. Пусто и «auto» — stream-one: его же выбирает Xray при reality, и он
- * дешевле всех. Всё остальное названо в ссылке явно, и разбор подписки уже отсеял то, чего
- * мы не умеем (sub.c), так что сюда доходят только эти три. */
+/* The node's xhttp mode. Empty and "auto" mean stream-one: Xray picks it with reality too, and
+ * it is the cheapest. Other modes are named in the link, and the subscription parser (sub.c)
+ * has dropped what we do not support, so only these three arrive here. */
 static enum xhttp_mode xhttp_mode_of(const struct tr_node *n) {
     if (!strcmp(n->mode, "packet-up")) return XH_PACKET_UP;
     if (!strcmp(n->mode, "stream-up")) return XH_STREAM_UP;
     return XH_STREAM_ONE;
 }
 
-/* Идентификатор сессии. Ровно им сервер связывает запрос выгрузки с запросом загрузки, и
- * поэтому он обязан быть непредсказуемым: угадав его, посторонний влил бы свои байты в чужую
- * сессию. Форма — как у Xray по умолчанию, строка UUID: она же встречается в путях обычных
- * приложений и ничем не выделяется. */
+/* The session id. The server ties the upload requests to the download request by it, so it must
+ * be unpredictable: whoever guesses it could inject bytes into someone else's session. Its form
+ * is Xray's default, a UUID string, which also appears in ordinary application paths and does
+ * not stand out. */
 static void session_id(char *out, size_t cap) {
     unsigned char r[16];
     if (os_getrandom(r, sizeof r, 0) != (ssize_t)sizeof r) {
-        /* Источник случайности отказал. Нули здесь были бы ХУЖЕ отказа: сессия стала бы
-         * предсказуемой, оставаясь на вид рабочей. Пусть будет заведомо негодная строка —
-         * сервер её примет, но такой узел не поднимется, и это заметят. */
+        /* The random source failed. Zero random bytes would be WORSE than failing: the session
+         * would be predictable while looking valid. Use a clearly invalid string (the nil UUID):
+         * the server accepts it, but such a node does not come up, and that gets noticed. */
         snprintf(out, cap, "00000000-0000-0000-0000-000000000000");
         return;
     }
-    r[6] = (unsigned char)((r[6] & 0x0F) | 0x40);   /* версия 4 */
-    r[8] = (unsigned char)((r[8] & 0x3F) | 0x80);   /* вариант   */
+    r[6] = (unsigned char)((r[6] & 0x0F) | 0x40);   /* version 4 */
+    r[8] = (unsigned char)((r[8] & 0x3F) | 0x80);   /* variant   */
     snprintf(out, cap,
              "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
              r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
              r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]);
 }
 
-/* Referer с набивкой для одного запроса.
+/* Referer with padding for one request.
  *
- * Своя длина у КАЖДОГО запроса, а не одна на соединение: у packet-up запросов череда, и
- * одинаковая длина набивки во всех превратила бы саму набивку в признак — то есть в ровно
- * то, против чего она заведена. Диапазон 100..1000 знаков задан сервером Xray
- * (GetNormalizedXPaddingBytes), и выйти за него значит получить отказ. */
+ * Each request gets its own length, not one per connection: packet-up sends a series of
+ * requests, and the same padding length in all of them would turn the padding itself into a
+ * signature, the very thing it is there against. The 100..1000 range comes from the Xray server
+ * (GetNormalizedXPaddingBytes); going outside it gets the request refused. */
 static int xhttp_referer(char *out, size_t cap, const char *authority, const char *path,
                          uint16_t pf, uint16_t pt) {
-    /* ДЛИНУ ЗАДАЁТ СЕРВЕР, А НЕ МЫ. Она приезжает в ссылке полем `xPaddingBytes` (см.
-     * pad_range в sub.c), и сервер её ПРОВЕРЯЕТ: не попал в диапазон — 400 и всё.
+    /* THE SERVER SETS THE LENGTH, NOT US. It comes in the link as `xPaddingBytes` (see
+     * sl_pad_range in sublink.c), and the server CHECKS it: outside the range means 400. A
+     * fixed range that fits Xray's default fails every xhttp node of a provider that announces,
+     * say, "50-150": TLS passes, Reality accepts, then 400, and the nodes look dead.
      *
-     * Прежде здесь стояло жёсткое 150…660. Оно укладывается в умолчание Xray (100…1000) и
-     * потому работало почти везде — а на подписке, где продавец объявил «50-150», отвечали
-     * отказом ВСЕ его узлы xhttp. Выглядело это как «узлы мёртвые»: TLS проходит, Reality
-     * признаёт, и только потом 400.
-     *
-     * Пусто — умолчание Xray 100…1000 (GetNormalizedXPaddingBytes), а не прежние 150…660:
-     * повторяем upstream, чтобы у нас и у него совпадали не только границы, но и середина. */
+     * Empty: Xray's default 100..1000 (GetNormalizedXPaddingBytes), to match upstream in both
+     * the bounds and the middle. */
     size_t lo = pt ? pf : 100;
     size_t hi = pt ? pt : 1000;
     unsigned char r = 0;
@@ -94,7 +87,7 @@ static int xhttp_referer(char *out, size_t cap, const char *authority, const cha
     return 0;
 }
 
-/* ---- вторая связь: под выгрузку ------------------------------------------------------- */
+/* ---- the second link, for the upload -------------------------------------------------- */
 
 static int up_write(void *ctx, const unsigned char *d, size_t n) {
     struct xh_up *u = ctx;
@@ -103,16 +96,16 @@ static int up_write(void *ctx, const unsigned char *d, size_t n) {
 
 static int up_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
     struct xh_up *u = ctx;
-    /* Прямого копирования здесь не бывает: Vision живёт на потоке ЗАГРУЗКИ, а эта связь
-     * только пишет. Ответы сервера на выгрузку — пустые 200, и читаются они лишь затем,
-     * чтобы разобрать служебные кадры HTTP/2 и не переполнить окно.
+    /* No direct copy here: Vision lives on the DOWNLOAD stream, and this link only writes. The
+     * server's answers to the upload are empty 200s, read only to process the HTTP/2 control
+     * frames and keep the window from filling.
      *
-     * ЖДАТЬ ЗДЕСЬ НЕЛЬЗЯ. Слив ответов делается попутно с отправкой, и блокирующее чтение
-     * остановило бы выгрузку до прихода ответа — то есть превратило бы поток в череду
-     * «отправил и жду». Поверх TLS ожидания и нет: tls13_read опрашивает сокет с нулевым
-     * сроком и отдаёт ноль байт, когда записи ещё нет. На голом сокете (security=none)
-     * такого поведения нет, и опрос приходится ставить самим — поэтому чтение этой связи
-     * своё, а не tr_link_read основной. */
+     * NO WAITING HERE. The answers are drained along with sending, and a blocking read would
+     * stop the upload until an answer arrives, turning the stream into "send and wait". Over
+     * TLS there is no waiting: tls13_read polls the socket with a zero timeout and returns zero
+     * bytes when no record is there. A bare socket (security=none) does not behave like that,
+     * and we poll ourselves; hence this link has its own read, not tr_link_read of the main
+     * one. */
     if (u->link.plain) {
         struct pollfd p = { .fd = u->link.fd, .events = POLLIN };
         if (poll(&p, 1, 0) <= 0 || !(p.revents & POLLIN)) { *got = 0; return 0; }
@@ -128,21 +121,21 @@ static int up_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
     return tls13_read(&u->link.tls, d, cap, got);
 }
 
-/* Слить то, что сервер ответил на выгрузку.
+/* Drain what the server answered to the upload.
  *
- * ЗАЧЕМ ЭТО ВООБЩЕ НАДО. На каждый кусок packet-up сервер отвечает пустым 200: заголовки,
- * пустой DATA, END_STREAM — десятки байт. Не читать их значит копить в приёмном буфере
- * сокета; когда он заполнится, сервер перестанет писать, а следом застрянет и разбор его
- * стороны — выгрузка встанет, причём тем позже, чем больше буфер, то есть «иногда и на
- * больших файлах». Заодно этот же вызов забирает служебные кадры HTTP/2 (SETTINGS,
- * WINDOW_UPDATE, PING) — без них окно соединения не пополнялось бы вовсе.
+ * WHY. For each packet-up chunk the server answers an empty 200: headers, an empty DATA,
+ * END_STREAM, tens of bytes. Not reading them piles them up in the socket receive buffer; once
+ * it is full the server stops writing, and its side of the parsing stalls too: the upload
+ * hangs, the later the bigger the buffer, so "sometimes, on big files". The same call also
+ * takes the HTTP/2 control frames (SETTINGS, WINDOW_UPDATE, PING); without them the connection
+ * window would never be replenished.
  *
- * Ничего не ждёт и данных не отдаёт: прочитанное выбрасывается. Отдаёт ОТКАЗ: сервер xhttp
- * отвечает не-200 на кусок, который не принял (например, 400 на набивку не той длины), и
- * этот кусок потерян — поток за ним цел уже не будет. Прежде код выбрасывался вместе с
- * телом, отправка возвращала успех, и узел выглядел живым, а трафик не шёл (I-219). Прочие
- * коды h2_read здесь не отказ: H2_ERESET у packet-up — это законный конец ответа на кусок,
- * а обрыв связи назовёт следующая запись. */
+ * It does not wait and returns no data: what it reads is dropped. It does return a FAILURE: the
+ * xhttp server answers non-200 to a chunk it refused (for example 400 to a padding of the wrong
+ * length), and that chunk is lost, so the stream after it cannot be whole. Without this the
+ * node looks alive while no traffic flows. Other h2_read codes are not failures here: H2_ERESET
+ * in packet-up is the normal end of a chunk's answer, and a broken link is reported by the next
+ * write. */
 static int up_drain(struct xh_up *u) {
     if (!u->started) return 0;
     static __thread unsigned char sink[H2_MIN_READ_CAP];
@@ -156,8 +149,8 @@ static int up_drain(struct xh_up *u) {
     return 0;
 }
 
-/* Поднять вторую связь. Тот же путь установления, что и у основной: TCP, и дальше либо
- * ничего (security=none), либо Reality, либо обычный TLS с проверкой. ALPN — всегда h2. */
+/* Open the second link the same way as the main one: TCP, then nothing (security=none), Reality,
+ * or TLS with verification. ALPN is always h2. */
 static int up_connect(struct transport *t, const struct tr_node *n, int timeout_s) {
     struct xh_up *u = &t->xh.up;
     memset(u, 0, sizeof(*u));
@@ -170,8 +163,8 @@ static int up_connect(struct transport *t, const struct tr_node *n, int timeout_
     return 0;
 }
 
-/* Открыть очередной запрос выгрузки. seq < 0 — постоянный поток stream-up (номера у него
- * нет), иначе номер куска packet-up. */
+/* Open the next upload request. seq < 0: the long-lived stream-up request (no number); otherwise
+ * the packet-up chunk number. */
 static int up_request(struct transport *t, long long seq) {
     struct xh_state *x = &t->xh;
     struct xh_up *u = &x->up;
@@ -194,70 +187,68 @@ static int up_request(struct transport *t, long long seq) {
     return h2_next(&u->h2, x->authority, path, "application/grpc", ref, H2_POST);
 }
 
-/* Поднять выгрузку, если она нужна этому режиму. Для stream-one не делает ничего: там
- * выгрузка идёт телом того же единственного запроса. */
+/* Start the upload if this mode needs one. stream-one needs nothing: there the upload is the
+ * body of the same single request. */
 static int up_open(struct transport *t, const struct tr_node *n, int timeout_s) {
     if (t->xh.mode == XH_STREAM_ONE) return 0;
 
     int rc = up_connect(t, n, timeout_s);
     if (rc) return rc;
 
-    /* stream-up открывает свой POST сразу и держит его открытым до конца соединения: тело
-     * этого запроса и есть канал наверх.
+    /* stream-up opens its POST at once and keeps it open for the life of the connection: the
+     * body of that request is the upstream channel.
      *
-     * packet-up НЕ открывает ничего заранее. Запрос там живёт ровно один кусок, и открыть
-     * его до того, как кусок появился, значило бы держать на сервере пустую выгрузку —
-     * причём с номером 0, который потом пришлось бы пропустить. Первый запрос откроется в
-     * первой же отправке. */
+     * packet-up opens NOTHING in advance. A request there lives for exactly one chunk; opening
+     * it before the chunk exists would hold an empty upload on the server, with number 0, which
+     * would then have to be skipped. The first request opens on the first send. */
     if (t->xh.mode == XH_STREAM_UP) return up_request(t, -1);
     t->xh.seq = 0;
     return 0;
 }
 
-/* ---- транспорт ------------------------------------------------------------------------ */
+/* ---- the transport -------------------------------------------------------------------- */
 
 static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_s) {
     struct xh_state *x = &t->xh;
     struct h2_io io = { .ctx = &t->link, .write = tr_link_write, .read = tr_link_read };
-    /* Имя хоста в :authority — маскировочный домен, как и в SNI: сервер прикрывается им,
-     * и запрос к другому имени выдал бы нас сразу. */
+    /* The host in :authority is the camouflage domain, as in SNI: the server hides behind it,
+     * and a request to another name would give us away at once. */
     const char *authority = n->sni[0] ? n->sni : n->host;
     char path[320];
 
-    /* Режим определяется ЗДЕСЬ, один раз: дальше он читается и при открытии потоков, и при
-     * каждой отправке, и три независимых разбора строки разошлись бы. */
     x->mode = xhttp_mode_of(n);
     xhttp_path(n, path, sizeof(path));
     snprintf(x->authority, sizeof(x->authority), "%s", authority);
     x->pad_from = n->pad_from;
     x->pad_to = n->pad_to;
 
-    /* __thread: буфер живёт между вызовами, но потоков теперь несколько, и один общий
-     * массив они переписывали бы друг под другом. Своя копия на поток — 1,4 КБ. */
+    /* __thread, not plain static: several threads would overwrite one shared array. A copy per
+     * thread is 1.4 KB. */
     static __thread char ref[1400];
 
     if (x->mode == XH_STREAM_ONE) {
         if (xhttp_referer(ref, sizeof(ref), authority, path, n->pad_from, n->pad_to))
             return H2_ETOOBIG;
-        /* Content-Type: application/grpc и здесь — так делает Xray (FillStreamRequest ставит
-         * его на любой запрос С ТЕЛОМ), и посредники по нему не пытаются буферизовать поток.
-         * Всё остальное в заголовках — облик БРАУЗЕРА, а не gRPC: см. put_headers в h2.c. */
+        /* Content-Type: application/grpc here too, as Xray does (FillStreamRequest sets it on
+         * every request WITH A BODY), and proxies do not try to buffer the stream because of
+         * it. Everything else in the headers is the look of a BROWSER, not gRPC: see
+         * put_headers in h2.c. */
         return h2_start_ex(&t->h2, &io, authority, path, "application/grpc", ref,
                            H2_POST, 0, 1);
     }
 
-    /* Два оставшихся режима начинаются одинаково: сессия получает имя, и по этому имени
-     * сервер потом свяжет с ней запросы выгрузки. Имя дописывается к пути — так у Xray
-     * задано по умолчанию (session placement = path), и так его читает hub.go. */
+    /* The other two modes start the same way: the session gets a name, by which the server then
+     * ties the upload requests to it. The name is appended to the path: Xray's default (session
+     * placement = path), and hub.go reads it there. */
     char sid[40];
     session_id(sid, sizeof(sid));
     if (snprintf(x->up_path, sizeof(x->up_path), "%s%s", path, sid) >= (int)sizeof(x->up_path))
         return H2_ETOOBIG;
 
-    /* ЭТА связь — за загрузкой, и запрос у неё GET без тела. Метод здесь не украшение:
-     * сервер отличает выгрузку от загрузки именно им (hub.go: GET без номера куска — это
-     * stream-down). POST без тела сервер счёл бы выгрузкой и стал бы ждать байт, которых
-     * не будет, а вниз не отдал бы ничего. */
+    /* THIS link is for the download, and its request is a GET without a body. The method
+     * matters: the server tells the upload from the download by it (hub.go: a GET without a
+     * chunk number is stream-down). The server would take a bodiless POST for an upload, wait
+     * for bytes that never come, and send nothing down. */
     if (xhttp_referer(ref, sizeof(ref), authority, x->up_path, n->pad_from, n->pad_to))
         return H2_ETOOBIG;
     int rc = h2_start_ex(&t->h2, &io, authority, x->up_path, NULL, ref, H2_GET, 1, 1);
@@ -271,22 +262,21 @@ static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
         case XH_STREAM_ONE:
             return h2_write(&t->h2, d, n);
         case XH_STREAM_UP: {
-            /* Один длинный POST на всё соединение: пишем в него и попутно забираем то, что
-             * сервер успел ответить. */
+            /* One long POST for the whole connection: write into it and drain whatever the
+             * server has answered meanwhile. */
             int rc = h2_write(&x->up.h2, d, n);
             int dr = up_drain(&x->up);
             return rc ? rc : dr;
         }
         case XH_PACKET_UP: {
-            /* Кусок = отдельный запрос: открыть, записать, закрыть свою половину.
+            /* A chunk is a request of its own: open, write, close our half.
              *
-             * БЕЗ НАКОПЛЕНИЯ. Xray собирает мелкие записи в куски до мегабайта и
-             * прямо пишет, что без этого полоса «крайне ограничена». У нас копить
-             * нечем: накопитель требует срока сброса, то есть таймера или своего
-             * потока на каждое соединение, — а туннель зовёт отправку сам и о
-             * времени ничего не знает. Поэтому один запрос на один вызов, и это
-             * честная плата за режим, который выбирают тогда, когда другие не
-             * проходят вовсе. */
+             * NO BATCHING. Xray gathers small writes into chunks of up to a megabyte and says
+             * outright that without it the bandwidth is "extremely limited". We have nothing
+             * to batch with: a batcher needs a flush deadline, i.e. a timer or a thread per
+             * connection, while the tunnel calls send itself and knows nothing of time. So one
+             * request per call: the honest price of a mode chosen when the others do not pass
+             * at all. */
             int rc = up_request(t, (long long)x->seq);
             if (rc) return rc;
             rc = h2_write(&x->up.h2, d, n);
@@ -304,17 +294,17 @@ static int xhttp_read(struct transport *t, unsigned char *d, size_t cap, size_t 
     return h2_read(&t->h2, d, cap, got);
 }
 
-/* Самоуказателей ДВА: у загрузки (h2.io.ctx — основная связь) и у выгрузки (up.h2.io.ctx —
- * вторая связь; для stream-up он ставится ещё до переезда, внутри открытия). Пока чинился
- * только первый, выгрузка соединения, взятого из пула запасных, уезжала через вторую связь
- * чужой запасной сессии, которая тут же заводилась в том же слоте. */
+/* TWO self-pointers: the download's (h2.io.ctx, the main link) and the upload's (up.h2.io.ctx,
+ * the second link; for stream-up it is set before the move, during open). Fixing only the first
+ * sends the upload of a connection taken from the spare pool through the second link of another
+ * spare session, set up in the same slot right after. */
 static void xhttp_moved(struct transport *t) {
     t->h2.io.ctx = &t->link;
     t->xh.up.h2.io.ctx = &t->xh.up;
 }
 
-/* Вторая связь. Существует она только у stream-up и packet-up; у stream-one её fd равен
- * нулю после memset, поэтому проверка на «больше нуля», а не «не -1». */
+/* The second link exists only in stream-up and packet-up; in stream-one its fd is zero after the
+ * memset, hence the check is "greater than zero", not "not -1". */
 static void xhttp_close(struct transport *t) {
     struct xh_up *u = &t->xh.up;
     if (u->link.fd > 0) close(u->link.fd);

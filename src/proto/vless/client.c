@@ -1,19 +1,15 @@
-/* Соединение с узлом VLESS/Reality: от TCP до проверки «нас признали».
+/* Connection to a VLESS node and the check that the node accepted us.
  *
- * Ключевая мысль этого файла: у Reality нет отрицательного ответа. Сервер, не узнавший
- * клиента, не отвечает отказом — он проксирует соединение на настоящий сайт, которым
- * прикрывается. Значит рукопожатие может пройти полностью, ключи сойтись, TLS
- * установиться, и всё равно это будет чужой сайт, а не туннель.
+ * Reality has no negative answer. A server that does not recognise the client does not refuse:
+ * it proxies the connection to the real site it hides behind. The handshake can complete, the
+ * keys agree, TLS comes up, and it is still that site, not the tunnel.
  *
- * Отличить одно от другого можно только по первому байту ответа VLESS: сервер отвечает
- * версией 0, а настоящий сайт пришлёт что угодно другое — HTTP, HTML, редирект. Поэтому
- * vless_probe() ниже и есть единственная честная проверка узла, и именно её использует
- * сторож вместо пинга.
+ * Only the first byte of the VLESS response tells them apart: the server answers with version 0,
+ * the real site with anything else (HTTP, HTML, a redirect). So vless_probe() below is the only
+ * honest check of a node, and the pool's health check uses it.
  *
- * Установление соединения (TCP по всем адресам, security, транспорты grpc и xhttp) жило здесь
- * же до шага 2 выпуска 1.10 и переехало в proto/transport: от VLESS в нём не зависело ничего,
- * а следующему протоколу поверх тех же транспортов оно нужно то же самое. Здесь осталось то,
- * что знает про VLESS: узел подписки как параметры транспорта и проверка узла запросом VLESS.
+ * Connection setup (TCP to every address, security, transports) lives in proto/transport. This
+ * file holds what knows VLESS: the node as transport parameters and the probe by a VLESS request.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -26,10 +22,8 @@
 #include "vless_proto.h"
 #include "vision.h"
 #include "client.h"
-/* Узел глазами транспорта (sl_tr_node) — общий с модулем steer-proxy. */
 #include "sublink.h"
 
-/* Полное установление: TCP + безопасность + транспорт. Возвращает 0 и заполняет conn. */
 int vless_connect(const struct vless_node *node, struct transport *conn, int timeout_s) {
     struct tr_node tn;
     sl_tr_node(node, &tn);
@@ -42,37 +36,19 @@ static int64_t now_ms(void) {
     return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 
-/* Проверка узла: единственный способ узнать, признал ли нас Reality.
+/* The node check: the only way to learn whether Reality accepted us.
  *
- * Просим у сервера соединение с заведомо живым адресом и смотрим на ПЕРВЫЙ БАЙТ ответа.
- * Версия 0 — это ответ VLESS, то есть сервер наш. Что угодно другое означает, что нас не
- * признали и мы разговариваем с настоящим сайтом: соединение при этом рабочее, страница
- * откроется, и без этой проверки узел выглядел бы полностью здоровым.
+ * Ask the server to connect to a known live address and look at the first byte of the answer.
+ * Version 0 is a VLESS response: the server is ours. Anything else means we were not accepted
+ * and talk to the real site; that connection works and a page loads, so without this check the
+ * node would look healthy. The answer also measures latency over the path real traffic takes.
  *
- * Обращаемся к чужому адресу и ждём хоть какой-то ответ: цель не проверить интернет, а
- * получить от СЕРВЕРА подтверждение, что он понял запрос VLESS. Побочно это и есть
- * измерение задержки — тот же путь, по которому пойдёт настоящий трафик. */
-
-/* КУДА ПРОСИТЬСЯ — ДВА АДРЕСА, А НЕ ОДИН, И ЭТО НЕ ПЕРЕСТРАХОВКА.
- *
- * Здесь была единственная зашитая цель 1.1.1.1:80. Узел, который её не пропускает —
- * провайдер сервера её блокирует, у хостера свой DNS на этом адресе, у самого сервера
- * правило на 1.1.1.1, — не отвечал ничем, проба возвращала «сервер не прислал данных»,
- * и узел браковался ЦЕЛИКОМ. Дальше по цепочке это стоило дорого: автоматический режим
- * вызывает пробу для каждого узла и негодный пропускает, cmd_vless возвращает 1, при
- * on_fail=drop (умолчание) канал просто стоит. Тот же самый узел, выбранный номером
- * вручную, берётся без пробы и работает — отсюда дословное «с автоматическим режимом
- * ничего не загружается, приходится выбирать вручную».
- *
- * У сторожа выходов рядом (failover.c) две цели с того самого дня, и причина там записана
- * теми же словами: один адрес может быть недоступен именно в этом туннеле, и тогда
- * здоровый путь выглядит мёртвым. Здесь ровно тот же случай, только цена выше — сторож
- * переключает выход, а проба вычёркивает узел из подбора.
- *
- * Вторая цель пробуется ТОЛЬКО тогда, когда виновата может быть цель: соединение с
- * сервером состоялось, а данных в ответ не пришло. Отказ рукопожатия и отказ Reality
- * (маскировочный сайт вместо туннеля) — свойства узла, повторять их со второй целью
- * значило бы удваивать время подбора на всех мёртвых узлах подписки. */
+ * Two targets, not one: a node may not pass a given address (the server's provider blocks it,
+ * the hoster runs its own DNS on it, a rule on the server), and with a single target such a
+ * node would be rejected as a whole. The second target is tried only when the target may be
+ * to blame: the server connection came up but no data came back. A handshake failure or a
+ * Reality rejection belongs to the node, and retrying it would double the probe time of every
+ * dead node. */
 struct probe_target { unsigned char ip[4]; const char *host; };
 static const struct probe_target PROBE_TARGETS[] = {
     { { 1, 1, 1, 1 }, "1.1.1.1" },
@@ -95,7 +71,7 @@ int vless_probe_timed(const struct vless_node *node, int timeout_s, char *why, s
         rc = probe_once(node, timeout_s, why, why_n, handshake_ms, ttfb_ms,
                         &PROBE_TARGETS[i], &connected);
         if (rc == 0) return 0;
-        /* До сервера не дошли, либо он нас не признал — цель ни при чём. */
+        /* The server was not reached or did not accept us: not the target's fault. */
         if (!connected || rc == VLESS_CONN_EREJECTED || rc == VLESS_CONN_EBADUUID)
             return rc;
     }
@@ -122,23 +98,22 @@ static int probe_once(const struct vless_node *node, int timeout_s, char *why, s
     unsigned char uuid[16];
     if (vless_uuid_parse(node->uuid, uuid) != 0) {
         transport_close(&c);
-        snprintf(why, why_n, "UUID неразборчив");
+        snprintf(why, why_n, "bad UUID");
         return VLESS_CONN_EBADUUID;
     }
 
     unsigned char req[512];
     size_t req_n = vless_build_request(uuid, VLESS_CMD_TCP, NULL, tg->ip, 80,
                                        node->flow, req, sizeof(req));
-    if (!req_n) { transport_close(&c); snprintf(why, why_n, "заголовок не собрался"); return TR_EIO; }
+    if (!req_n) { transport_close(&c); snprintf(why, why_n, "cannot build the request header"); return TR_EIO; }
 
-    /* Минимальный HTTP-запрос вместе с заголовком: сервер не отвечает, пока не получит
-     * данные для пересылки, и без них проверка ждала бы до таймаута. */
+    /* A minimal HTTP request goes with the header: the server does not answer until it has
+     * data to forward, and without it the probe would wait for the timeout. */
     char http[128];
     int http_n = snprintf(http, sizeof(http),
                           "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", tg->host);
-    /* Сколько данных реально уехало за заголовком. Отдельной переменной, а не sizeof:
-     * ниже Vision вычитает ровно это число, чтобы отделить заголовок VLESS от данных, и
-     * при не влезшем запросе прежняя формула вычла бы длину того, чего в буфере нет. */
+    /* How much data actually follows the header. Vision below subtracts exactly this to split
+     * the VLESS header from the data, and the HTTP request may not have fit. */
     size_t http_used = 0;
     if (http_n > 0 && req_n + (size_t)http_n <= sizeof(req)) {
         memcpy(req + req_n, http, (size_t)http_n);
@@ -146,76 +121,59 @@ static int probe_once(const struct vless_node *node, int timeout_s, char *why, s
         http_used = (size_t)http_n;
     }
 
-    /* Заголовок VLESS и данные с Vision — РАЗНЫЕ вещи, и порядок здесь не произволен.
-     *
-     * Заголовок уходит сырым, сразу за ним первый кадр Vision с данными. В Xray это видно
-     * по XtlsPadding: обёртка применяется к буферам ДАННЫХ, а комментарий «we do a long
-     * padding to hide vless header» означает, что заголовок прячет набивка СЛЕДУЮЩЕГО
-     * кадра, попадая с ним в одну TLS-запись — а не что заголовок лежит внутри кадра.
-     *
-     * Первая версия заворачивала заголовок внутрь кадра. Сервер тогда читал UUID (он
-     * совпадал), брал следующие 5 байт как команду и длины — а там была версия VLESS и
-     * начало UUID из заголовка. Длины выходили бессмысленные, и сервер закрывал
-     * соединение: read возвращал -11, то есть выглядело как отказ по ключу. */
+    /* With Vision the VLESS header goes raw, immediately followed by the first Vision frame
+     * with the data; the header is not inside the frame. In Xray's XtlsPadding the wrapping
+     * applies to data buffers, and "we do a long padding to hide vless header" means the next
+     * frame's padding hides the header by sharing its TLS record. With the header inside the
+     * frame the server reads the VLESS version and UUID as the frame's command and lengths and
+     * closes the connection, which looks like a key rejection. */
     if (node->flow[0]) {
         struct vision vis;
         vless_uuid_parse(node->uuid, uuid);
         vision_init(&vis, uuid);
         static __thread unsigned char framed[8192];
-        /* Заголовок VLESS занимает первые header_n байт req — остальное это HTTP-данные. */
         size_t header_n = req_n - http_used;
         size_t fn = vision_wrap(&vis, req + header_n, req_n - header_n,
                                 framed, sizeof(framed));
-        if (!fn) { transport_close(&c); snprintf(why, why_n, "кадр Vision не собрался"); return TR_EIO; }
-        /* Одной записью: заголовок и кадр должны уехать вместе, иначе их разделение по
-         * записям само становится признаком. */
+        if (!fn) { transport_close(&c); snprintf(why, why_n, "cannot build the Vision frame"); return TR_EIO; }
+        /* One write: the header and the frame must leave together, or their split across
+         * records becomes a recognisable feature itself. */
         static __thread unsigned char together[8704];
-        if (header_n + fn > sizeof(together)) { transport_close(&c); snprintf(why, why_n, "не влезло"); return TR_EIO; }
+        if (header_n + fn > sizeof(together)) { transport_close(&c); snprintf(why, why_n, "request too large"); return TR_EIO; }
         memcpy(together, req, header_n);
         memcpy(together + header_n, framed, fn);
         rc = transport_write(&c, together, header_n + fn);
     } else {
         rc = transport_write(&c, req, req_n);
     }
-    if (rc) { transport_close(&c); snprintf(why, why_n, "запрос не ушёл: %s", vless_strerror(rc)); return rc; }
+    if (rc) { transport_close(&c); snprintf(why, why_n, "request not sent: %s", vless_strerror(rc)); return rc; }
     int64_t t_sent = now_ms();
 
-    /* Буфер по мерке транспорта, а не «с запасом»: поверх HTTP/2 за один раз приезжает до
-     * целой записи TLS, и меньший буфер дал бы ошибку на совершенно законном кадре. */
+    /* Sized by the transport's minimum: over HTTP/2 one read returns up to a whole TLS record,
+     * and a smaller buffer would fail on a legal frame. */
     static __thread unsigned char buf[VLESS_MIN_RECV_CAP];
     size_t got = 0;
-    /* Ждём данных ПО ЧАСАМ, а не заданным числом попыток.
-     *
-     * Ноль байт от чтения означает «пока нечего», и причин тому две: служебный кадр
-     * HTTP/2 (SETTINGS, WINDOW_UPDATE) или запись, которая ещё не приехала целиком. Чтение
-     * записей неблокирующее — оно обязано таким быть, потому что в туннеле один цикл на все
-     * соединения, — поэтому восемь попыток подряд проходили за микросекунды, ещё до того
-     * как ответ вообще успевал прийти по сети.
-     *
-     * Стоило это дорого: проба объявляла «сервер не прислал данных» на полностью рабочем
-     * узле. Туннель при этом работал, потому что при заданном номере узла он пробу не
-     * вызывает вовсе, — и расхождение между «узел не проходит проверку» и «через узел идёт
-     * трафик» выглядело как что угодно, кроме ошибки в самой проверке. Проверено на своём
-     * Reality-сервере (tests/run-reality.sh): сервер отвечал, в его логе видно и разбор
-     * нашего кадра Vision, и отправленный нам ответ.
-     *
-     * Ждём на сокете, а не в холостом цикле: иначе это те же микросекунды, только дороже. */
+    /* Wait for data by the clock, not by a number of attempts. A read of zero bytes means
+     * "nothing yet": an HTTP/2 control frame (SETTINGS, WINDOW_UPDATE) or a record not fully
+     * arrived. Reads are non-blocking (the tunnel runs one loop for all connections), so a
+     * fixed number of attempts passes in microseconds, before the answer can arrive, and fails
+     * a working node. Wait on the socket, not in a busy loop. */
     int64_t rx_deadline = now_ms() + (int64_t)(timeout_s > 0 ? timeout_s : 8) * 1000;
     for (;;) {
         rc = transport_read(&c, buf, sizeof(buf), &got);
-        if (rc) { transport_close(&c); snprintf(why, why_n, "ответа нет: %s", vless_strerror(rc)); return rc; }
+        if (rc) { transport_close(&c); snprintf(why, why_n, "no response: %s", vless_strerror(rc)); return rc; }
         if (got) break;
         if (now_ms() >= rx_deadline) break;
         struct pollfd pw = { .fd = transport_fd(&c), .events = POLLIN, .revents = 0 };
         poll(&pw, 1, 200);
     }
-    if (!got) { transport_close(&c); snprintf(why, why_n, "сервер не прислал данных"); return TR_EIO; }
-    /* Первый байт пришёл. Замер сделан ДО разбора ответа: разбор ничего не ждёт, а
-     * включать его в задержку значило бы мерить свою же работу. */
+    if (!got) { transport_close(&c); snprintf(why, why_n, "server sent no data"); return TR_EIO; }
+    /* Timed before parsing: parsing waits for nothing, and counting it would measure our own
+     * work. */
     if (ttfb_ms) *ttfb_ms = (int)(now_ms() - t_sent);
 
-    /* Ответ Vision тоже в кадрах, и первым в них идёт заголовок VLESS. Разворачиваем
-     * до разбора: иначе version-байт читался бы из поля команды кадра. */
+    /* With Vision the answer is framed too, the VLESS response header first. Unwrap before
+     * parsing, or the version byte would be read from the frame header. */
     const unsigned char *body = buf;
     size_t body_n = got;
     if (node->flow[0]) {
@@ -235,25 +193,25 @@ static int probe_once(const struct vless_node *node, int timeout_s, char *why, s
     transport_close(&c);
 
     if (pr == VLESS_EPROTO) {
-        /* Вот он, тихий отказ Reality. Говорим прямо, потому что иначе это неотличимо
-         * от рабочего узла: TLS установлен, ответ пришёл, но он от чужого сайта. */
+        /* The silent Reality rejection. Say it plainly: otherwise it looks like a working
+         * node, since TLS is up and an answer came, only from the cover site. */
         snprintf(why, why_n,
-                 "сервер не признал ключ — отвечает маскировочный сайт, а не туннель "
-                 "(проверьте pbk, sid и sni)");
+                 "server did not accept the key — the cover site answers, not the tunnel "
+                 "(check pbk, sid and sni)");
         return VLESS_CONN_EREJECTED;
     }
     if (pr == VLESS_EAGAIN) {
-        snprintf(why, why_n, "ответ слишком короткий (%zu байт)", got);
+        snprintf(why, why_n, "response too short (%zu bytes)", got);
         return TR_EIO;
     }
-    snprintf(why, why_n, "ok, ответ VLESS (%zu байт)", got);
+    snprintf(why, why_n, "ok, VLESS response (%zu bytes)", got);
     return 0;
 }
 
 const char *vless_strerror(int rc) {
     switch (rc) {
-        case VLESS_CONN_EBADUUID: return "UUID неразборчив";
-        case VLESS_CONN_EREJECTED: return "сервер не признал ключ";
+        case VLESS_CONN_EBADUUID: return "bad UUID";
+        case VLESS_CONN_EREJECTED: return "server did not accept the key";
         default: return transport_strerror(rc);
     }
 }

@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
-"""Поддельный узел VLESS для стенда tests/sigpipe.sh: закрывает соединения так, как закрывает их
-настоящий сервер под нагрузкой, — раньше, чем клиент закончил писать.
+"""A fake VLESS node for tests/sigpipe.sh: it closes connections the way a real server under load
+does — before the client has finished writing.
 
-Нужен ровно один случай. Клиент туннеля (steer-vless) переносит в узел байты клиента локальной сети
-по мере их прихода из TUN. Узел закрывает соединение — а в очереди TUN у клиента ещё лежат пакеты,
-которые стек дописывает в уже закрытый сокет. Закрытие на стороне узла идёт в два шага: FIN, затем RST
-на каждый следующий сегмент (закрытый сокет с непрочитанным входом отвечает сбросом). Запись в сокет,
-получивший и то и другое, — EPIPE, а без выключенного SIGPIPE — смерть процесса (cli/modcmd.c). Настоящий
-узел (Xray в измерении, где это нашли) делает то же самое, когда сервер по ту сторону — iperf3 — закрывает
-потоки в конце испытания.
+The tunnel carries a LAN client's bytes to the node as they arrive from TUN. When the node closes
+a connection, the client's TUN queue may still hold packets the stack then writes into the
+closed socket. The node closes in two steps: FIN, then RST for every following segment (a closed
+socket with unread input answers with a reset). A write to a socket that got both is EPIPE, and
+unless SIGPIPE is ignored the process dies. A real node (Xray) does the same when the server
+behind it, e.g. iperf3, closes its streams at the end of a test.
 
-Что узел делает с соединением, решает порт назначения, который клиент назвал в заголовке VLESS (сам адрес
-разбирается и выбрасывается, как у tests/fake-vless.py):
+The destination port the client names in the VLESS header decides what happens (the address
+itself is parsed and dropped, as in tests/fake-vless.py):
 
-    7    эхо строки: ответ VLESS, затем читает строку до \\n, отвечает «PONG <строка>» и закрывает штатно —
-         проверка, что туннель жив;
-    80   приёмник, который закрывается рано: ответ VLESS, дочитывает случайное число байт из диапазона
-         --early-min..--early-max и закрывается так, как описано выше (shutdown(WR), затем close с
-         непрочитанным входом — FIN и сразу RST);
-    81   источник: ответ VLESS и поток данных, пока клиент не уйдёт;
-    82   приёмник, который не закрывается: читает до конца потока.
+    7    line echo: the VLESS response, then reads a line up to \\n, answers "PONG <line>" and
+         closes normally — checks that the tunnel is alive;
+    80   a sink that closes early: the VLESS response, reads a random number of bytes in
+         --early-min..--early-max and closes as described above (shutdown(WR), then close with
+         unread input — FIN and an RST right after);
+    81   a source: the VLESS response and a data stream until the client leaves;
+    82   a sink that does not close: reads to the end of the stream.
 
-security=none и security=tls (TLS 1.3 средствами ssl; сертификат стенда самоподписанный, клиент ходит с
-insecure: true). Счётчики по портам печатаются в stderr раз в секунду и по завершении — так стенд видит, что
-нагрузка дошла до узла.
+security=none and security=tls (TLS 1.3 from the ssl module; the test certificate is
+self-signed, the client uses insecure: true). Counters are printed to stderr every second, so
+the test sees the load reached the node.
 """
 import argparse
 import os
@@ -55,8 +54,8 @@ def recv_exactly(sock, n):
 
 
 def read_request(sock):
-    """Заголовок VLESS: версия, UUID, длина допов, допы, команда, порт, тип и тело адреса.
-    Возвращает (uuid, команда, порт) или None."""
+    """VLESS header: version, UUID, addon length, addons, command, port, address type and body.
+    Returns (uuid, command, port) or None."""
     head = recv_exactly(sock, 18)
     if not head or head[0] != 0:
         return None
@@ -84,9 +83,9 @@ def read_request(sock):
 
 
 def close_like_a_busy_server(sock):
-    """FIN, а следом RST: shutdown(WR) отправляет FIN, close с непрочитанным входом — сброс. Клиент
-    сначала видит конец потока (CLOSE_WAIT), а следующий же сегмент своей записи получает RST и,
-    записав ещё раз, — EPIPE."""
+    """FIN, then RST: shutdown(WR) sends FIN, close with unread input sends a reset. The client
+    first sees end of stream (CLOSE_WAIT), its next segment gets an RST, and the write after
+    that gets EPIPE."""
     try:
         sock.shutdown(socket.SHUT_WR)
     except OSError:
@@ -118,7 +117,7 @@ class Node:
             sock.settimeout(30)
             req = read_request(sock)
             if req is None or req[0] != self.uuid:
-                bump("отказ")
+                bump("refused")
                 return
             _, _, port = req
             sock.sendall(b"\x00\x00")
@@ -130,7 +129,7 @@ class Node:
                         return
                     buf += c
                 sock.sendall(b"PONG " + buf)
-                bump("эхо")
+                bump("echo")
                 time.sleep(0.2)
             elif port == 80:
                 span = self.early_max - self.early_min
@@ -139,11 +138,11 @@ class Node:
                 while got < want:
                     c = sock.recv(min(262144, want - got))
                     if not c:
-                        bump("клиент закрыл раньше")
+                        bump("client-closed-first")
                         return
                     got += len(c)
-                bump("рано закрыто")
-                bump("байт принято", got)
+                bump("closed-early")
+                bump("bytes-in", got)
                 close_like_a_busy_server(sock)
                 sock = None
             elif port == 81:
@@ -154,8 +153,8 @@ class Node:
                         sock.sendall(chunk)
                         sent += len(chunk)
                 except OSError:
-                    bump("источник: клиент ушёл")
-                bump("байт отдано", sent)
+                    bump("source-client-left")
+                bump("bytes-out", sent)
             elif port == 82:
                 got = 0
                 while True:
@@ -163,10 +162,10 @@ class Node:
                     if not c:
                         break
                     got += len(c)
-                bump("приёмник дочитан")
-                bump("байт принято", got)
+                bump("sink-drained")
+                bump("bytes-in", got)
         except (OSError, ssl.SSLError):
-            bump("обрыв")
+            bump("broken")
         finally:
             if sock is not None:
                 try:
@@ -180,7 +179,7 @@ def main():
     ap.add_argument("--bind", required=True)
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--uuid", required=True)
-    ap.add_argument("--tls", nargs=2, metavar=("СЕРТИФИКАТ", "КЛЮЧ"))
+    ap.add_argument("--tls", nargs=2, metavar=("CERT", "KEY"))
     ap.add_argument("--early-min", type=int, default=64 * 1024)
     ap.add_argument("--early-max", type=int, default=1024 * 1024)
     a = ap.parse_args()
@@ -196,7 +195,7 @@ def main():
             time.sleep(1)
             with clock:
                 line = " ".join("%s=%d" % kv for kv in sorted(counters.items()))
-            print("узел:", line, file=sys.stderr, flush=True)
+            print("node:", line, file=sys.stderr, flush=True)
     threading.Thread(target=report, daemon=True).start()
     while True:
         c, _ = ls.accept()

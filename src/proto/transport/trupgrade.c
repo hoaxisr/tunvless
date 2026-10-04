@@ -1,23 +1,22 @@
-/* Запрос Upgrade по HTTP/1.1 — общий у ws и httpupgrade — и транспорт httpupgrade.
+/* The HTTP/1.1 Upgrade request shared by ws and httpupgrade, and the httpupgrade transport.
  *
- * Верхний ярус транспорта (transport.h), шаг 5 выпуска 1.10. Оба транспорта начинаются одним и тем
- * же: GET с `Connection: Upgrade` и `Upgrade: websocket`, ответ 101 — и расходятся после него. У
- * ws дальше кадры (trws.c), у httpupgrade — поток как есть: это «апгрейд без WebSocket», который
- * Xray и sing-box завели ради посредников (CDN), пропускающих только запросы, похожие на
- * WebSocket, — без затрат на кадры и маску.
+ * Both transports start the same way, a GET with `Connection: Upgrade` and `Upgrade: websocket`
+ * and a 101 response, and part after it: ws continues with frames (trws.c), httpupgrade with the
+ * stream as is. httpupgrade is an "upgrade without WebSocket" that Xray and sing-box added for
+ * proxies (CDNs) that pass only WebSocket-like requests, without the cost of frames and masking.
  *
- * ЧТО ШЛЁМ — ТО ЖЕ, ЧТО XRAY, ДО БАЙТА. Так сделано ради того, чтобы не выделяться: запрос
- * Upgrade идёт первым байтом после TLS (а у security=none — открытым текстом), и посредник,
- * отличающий клиентов по составу и порядку заголовков, видит его целиком. Повторён клиент Xray
- * (transport/internet/websocket/dialer.go, httpupgrade/dialer.go), а не sing-box: у Xray облик
- * Chrome (common/utils/browser.go, applyMasqueradedHeaders с вариантом "ws"), у sing-box —
- * «Go-http-client/1.1», то есть заведомо не браузер. Сверено перехватом Xray 26.3.27 (клиент в
- * docker, сервер — слушающий сокет):
+ * WE SEND WHAT XRAY SENDS, BYTE FOR BYTE, so as not to stand out: the Upgrade request is the
+ * first thing after TLS (in clear text with security=none), and a middlebox that tells clients
+ * apart by header set and order sees all of it. The model is the Xray client
+ * (transport/internet/websocket/dialer.go, httpupgrade/dialer.go), not sing-box: Xray looks like
+ * Chrome (common/utils/browser.go, applyMasqueradedHeaders with variant "ws"), sing-box sends
+ * "Go-http-client/1.1", plainly not a browser. Checked against a capture of Xray 26.3.27 (client
+ * in docker, server a listening socket):
  *
- *   GET /p/q?x=1 HTTP/1.1                         ← ws; у httpupgrade `?` уезжает как %3F
- *   Host: cdn.example.com                         ← host, иначе sni, иначе адрес узла
+ *   GET /p/q?x=1 HTTP/1.1                         <- ws; httpupgrade sends `?` as %3F
+ *   Host: cdn.example.com                         <- host, else sni, else the node address
  *   User-Agent: Mozilla/5.0 (Windows NT 10.0; …) Chrome/151.0.0.0 Safari/537.36
- *   Accept: * / *                                 ← без пробелов (в комментарии C иначе нельзя)
+ *   Accept: * / *                                 <- no spaces (a C comment cannot hold it)
  *   Accept-Language: en-US,en;q=0.9
  *   Cache-Control: no-cache
  *   Connection: Upgrade
@@ -29,45 +28,46 @@
  *   Sec-Fetch-Dest: empty
  *   Sec-Fetch-Mode: websocket
  *   Sec-Fetch-Site: same-origin
- *   Sec-WebSocket-Key: U9ViAcDvC6DKctF7OLzaBA==   ← только ws
- *   Sec-WebSocket-Version: 13                     ← только ws
+ *   Sec-WebSocket-Key: U9ViAcDvC6DKctF7OLzaBA==   <- ws only
+ *   Sec-WebSocket-Version: 13                     <- ws only
  *   Upgrade: websocket
  *
- * Порядок — не выбор Xray, а net/http Go: http.Request.Write печатает Host, потом User-Agent,
- * потом ВСЕ остальные заголовки по алфавиту ключа (байтово: заглавные раньше строчных), каждый
- * своим регистром. Регистр ключей тоже от Go: заголовки, которые Xray кладёт прямым присваиванием
- * (`Sec-CH-UA`, `DNT`, у gorilla — `Sec-WebSocket-Key`), остаются как написаны; поставленные через
- * Set и Add — приводятся к каноническому виду (`Sec-Fetch-Mode`); свои заголовки узла у ws тоже
- * приводятся (header.Add), у httpupgrade — нет (AddHeader в dialer.go кладёт ключ как есть, ради
- * тех, кто хочет «WebSocket» с большой S). Ниже это повторено моделью «словарь с точными ключами
- * и печатью по алфавиту», а не списком строк: тогда совпадают и случаи, где свой заголовок узла
- * перекрывает облик браузера, и случаи, где нет.
+ * The order is Go's net/http, not Xray's choice: http.Request.Write prints Host, then User-Agent,
+ * then ALL other headers sorted by key (bytewise: capitals before lowercase), each in its own
+ * case. Key case comes from Go too: headers Xray sets by direct assignment (`Sec-CH-UA`, `DNT`,
+ * gorilla's `Sec-WebSocket-Key`) stay as written; those set with Set and Add are canonicalized
+ * (`Sec-Fetch-Mode`); the node's own headers are canonicalized for ws (header.Add) but not for
+ * httpupgrade (AddHeader in dialer.go keeps the key as is, for those who want "WebSocket" with a
+ * capital S). Below this is modelled as a map with exact keys printed in sorted order, not as a
+ * fixed list of lines, so the result matches Xray also when a node header overrides the browser
+ * look.
  *
- * Версия Chrome — наша зашитая (UA_CHROME в h2.h), а не 151 из перехвата: у Xray она считается от
- * даты со сдвигом от процессора, то есть у двух клиентов Xray тоже разная. Строка sec-ch-ua — та,
- * что Xray собрал бы для нашей версии (h2.h).
+ * The Chrome version is ours (UA_CHROME in h2.h), not the 151 of the capture: Xray derives it
+ * from the date with a CPU-dependent shift, so two Xray clients differ too. The sec-ch-ua line
+ * is what Xray would build for our version (h2.h).
  *
- * Где Xray и sing-box расходятся — делаем как Xray (решение владельца 2026-09-29: эталон байтов на
- * проводе для VLESS и его транспортов — Xray-core). В том числе:
- *   - прочие облики по слову в своём User-Agent узла (firefox, safari, edge, curl, golang) —
- *     try_default_ws ниже;
- *   - РАННИЕ ДАННЫЕ (`?ed=N`, Ed у Xray, trpath.h). У ws — delayDialConn: запрос откладывается до
- *     первой записи, и она, если не длиннее Ed, уезжает в Sec-WebSocket-Protocol (base64url без
- *     выравнивания, tr_h1_send), иначе — кадрами после 101 (trws.c). У httpupgrade — ConnRF: запрос
- *     уходит при открытии, но ответа не ждём, данные идут следом, ответ разбирает первое чтение
- *     (hu_read_wait). sing-box делает иначе (режет первую запись по Ed и шлёт хвост отдельно) — ему
- *     не следуем. Что у ws цикл туннеля не может, как Xray, ждать ответа внутри записи, закрыто
- *     очередью: записи до 101 копятся и уходят сразу за ним, то есть на проводе тот же порядок —
- *     запрос, ответ, кадры (слать кадры раньше 101 нельзя: gorilla на стороне сервера рвёт такое
- *     соединение, «client sent data before handshake is complete»). Цена одна: у отложенного
- *     ответа нет своего срока (у Xray — HandshakeTimeout 8 с); молчащий сервер снимает простой
- *     соединения в стеке туннеля.
+ * Where Xray and sing-box differ we follow Xray: Xray-core is the reference for the bytes of
+ * VLESS and its transports on the wire. In particular:
+ *   - the other looks, picked by a word in the node's own User-Agent (firefox, safari, edge,
+ *     curl, golang): try_default_ws below;
+ *   - EARLY DATA (`?ed=N`, Xray's Ed, trpath.h). ws, as delayDialConn: the request waits for the
+ *     first write, which goes in Sec-WebSocket-Protocol if no longer than Ed (unpadded
+ *     base64url, tr_h1_send), otherwise as frames after the 101 (trws.c). httpupgrade, as
+ *     ConnRF: the request goes out on open, but the response is not awaited; data follows, and
+ *     the first read parses the response (hu_read_wait). sing-box differs (it cuts the first
+ *     write at Ed and sends the tail separately); we do not follow it. Unlike Xray, the tunnel
+ *     loop cannot wait for the ws response inside a write, so writes made before the 101 are
+ *     queued and sent right after it: the wire order is the same, request, response, frames
+ *     (frames must not precede the 101: gorilla on the server drops such a connection, "client
+ *     sent data before handshake is complete"). The one cost: the deferred response has no
+ *     deadline of its own (Xray: HandshakeTimeout 8 s); a silent server is cut by the stack's
+ *     silence timeout.
  *
- * ALPN — только http/1.1, как у Xray (tls.WithNextProto("http/1.1") и WebsocketHandshakeContext у
- * uTLS: он переписывает расширение ALPN отпечатка на один http/1.1). С парой «h2, http/1.1»
- * сервер за TLS вправе выбрать h2, и тогда наш запрос HTTP/1.1 для него мусор — ровно это уже
- * снято на мосту tgws (alpn_http11 в reality.h). Сам Chrome для веб-сокета поступает так же:
- * отдельное соединение с ALPN http/1.1. */
+ * ALPN is http/1.1 only, as in Xray (tls.WithNextProto("http/1.1"), and uTLS's
+ * WebsocketHandshakeContext rewrites the fingerprint's ALPN extension to http/1.1 alone). With
+ * "h2, http/1.1" the server behind TLS may pick h2, and then our HTTP/1.1 request is garbage to
+ * it (see alpn_http11 in reality.h). Chrome itself does the same for WebSocket: a separate
+ * connection with ALPN http/1.1. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,12 +81,12 @@
 #include "transport.h"
 #include "trpath.h"
 
-/* ---- мелочи: случайность, base64, SHA-1 ------------------------------------------------ */
+/* ---- helpers: randomness, base64, SHA-1 ------------------------------------------------ */
 
-/* Случайные байты у ядра. У слоя scrypto своего генератора нет: случайность в проекте берётся у
- * getrandom напрямую (reality.c, trxhttp.c, vision.c), и у ключа запроса и маски кадров нет
- * причины идти другим путём. Отказ — отказ соединения, а не нули: предсказуемая маска — ровно то,
- * против чего RFC 6455 (10.3) её и вводит. */
+/* Random bytes from the kernel. Randomness in the project comes from getrandom directly
+ * (reality.c, trxhttp.c, vision.c), and the request key and frame mask have no reason to differ.
+ * A failure fails the connection instead of using zeros: a predictable mask is exactly what RFC
+ * 6455 (10.3) introduces masking against. */
 int tr_h1_random(unsigned char *out, size_t n) {
     size_t got = 0;
     while (got < n) {
@@ -116,13 +116,13 @@ static size_t b64_std(const unsigned char *in, size_t n, char *out) {
     return o;
 }
 
-/* SHA-1 (FIPS 180-4) — только для Sec-WebSocket-Accept.
+/* SHA-1 (FIPS 180-4), only for Sec-WebSocket-Accept.
  *
- * Своя, а не из слоя scrypto, и это не небрежность. Accept — не защита: он лишь доказывает, что
- * ответил сервер, понявший запрос WebSocket, а не кеш или посредник, вернувший чужой ответ 101
- * (RFC 6455, 1.3). Заводить ради него SHA-1 в слое примитивов значило бы тащить в криптографию
- * движка устаревший хэш, которым ничего нельзя подписывать, — и ещё терять проверку в `make
- * test`, где библиотеки нет. Сорок строк за одну проверку на соединение — дешевле. */
+ * Our own, not from the scrypto layer, on purpose. Accept is not protection: it only proves that
+ * a server that understood the WebSocket request answered, not a cache or proxy returning someone
+ * else's 101 (RFC 6455, 1.3). SHA-1 in the primitives layer would bring an obsolete hash, unfit
+ * for signing anything, into the crypto code, and the unit tests, built without the library,
+ * could no longer check it. Forty lines for one check per connection are cheaper. */
 struct sha1 { uint32_t h[5]; unsigned char b[64]; size_t bn; uint64_t len; };
 
 static uint32_t rol(uint32_t x, int k) { return (x << k) | (x >> (32 - k)); }
@@ -183,14 +183,14 @@ void tr_ws_accept(const char *key, char out[29]) {
     b64_std(h, sizeof(h), out);
 }
 
-/* ---- заголовки запроса: словарь net/http ------------------------------------------------ */
+/* ---- request headers: the net/http map -------------------------------------------------- */
 
 #define HM_MAX 40
 struct hent { char k[48]; const char *v; size_t vn; };
 struct hmap { struct hent e[HM_MAX]; size_t n; int over; };
 
-/* textproto.CanonicalMIMEHeaderKey: первая буква и буквы после `-` заглавные, прочие строчные;
- * ключ с незаконным для имени заголовка знаком возвращается как есть. */
+/* textproto.CanonicalMIMEHeaderKey: the first letter and letters after `-` upper case, the rest
+ * lower case; a key with a character not valid in a header name is returned as is. */
 static int token_char(unsigned char c) {
     if (c >= 'a' && c <= 'z') return 1;
     if (c >= 'A' && c <= 'Z') return 1;
@@ -230,7 +230,7 @@ static void hm_del(struct hmap *m, const char *k) {
     m->n = o;
 }
 
-/* Присваивание по ТОЧНОМУ ключу: и header.Set (ключ уже канонический), и header["Sec-CH-UA"]. */
+/* Assignment by EXACT key: header.Set (the key is already canonical) and header["Sec-CH-UA"]. */
 static void hm_set(struct hmap *m, const char *k, const char *v) {
     hm_del(m, k);
     hm_add(m, k, v, strlen(v));
@@ -247,13 +247,13 @@ static void hm_set_empty(struct hmap *m, const char *k, const char *v) {
     if (!e || !e->vn) hm_set(m, k, v);
 }
 
-/* Прочие облики Xray (common/utils/browser.go) — для узла, чей User-Agent в headers задан словом
- * firefox, safari, edge, curl или golang: Xray понимает это слово как «представляйся этим
- * клиентом». Версии у Xray считаются от даты со сдвигом от процессора (FirefoxVersion,
- * SafariVersion, CurlVersion); здесь они зашиты тем же правилом, что UA_CHROME в h2.h, —
- * значением формулы на сентябрь 2026 при срединном сдвиге. Edge у Xray — ChromeUA и сразу, без
- * пробела, «Edg/…»: так в browser.go, так и здесь. sec-ch-ua у Edge собран правилом
- * getGreasedChUa для версии 149 (перестановка {2,1,0}, та же поддельная марка, что у Chrome). */
+/* Xray's other looks (common/utils/browser.go), for a node whose User-Agent in headers is the
+ * word firefox, safari, edge, curl or golang: Xray reads the word as "pose as this client". Xray
+ * derives the versions from the date with a CPU-dependent shift (FirefoxVersion, SafariVersion,
+ * CurlVersion); here they are fixed by the same rule as UA_CHROME in h2.h: the formula's value
+ * for September 2026 at the middle shift. Xray's Edge is ChromeUA followed directly, with no
+ * space, by "Edg/...": so in browser.go, so here. Edge's sec-ch-ua is built by the getGreasedChUa
+ * rule for version 149 (permutation {2,1,0}, the same fake brand as Chrome). */
 #define UA_FIREFOX \
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0"
 #define UA_SAFARI \
@@ -267,7 +267,7 @@ static void hm_set_empty(struct hmap *m, const char *k, const char *v) {
 
 enum browser { BR_CHROME, BR_EDGE, BR_FIREFOX, BR_SAFARI, BR_CURL, BR_GOLANG };
 
-/* applyMasqueradedHeaders(header, browser, "ws") — построчно. */
+/* applyMasqueradedHeaders(header, browser, "ws"), line by line. */
 static void masq_ws(struct hmap *m, enum browser b) {
     switch (b) {
     case BR_CHROME:
@@ -289,8 +289,8 @@ static void masq_ws(struct hmap *m, enum browser b) {
         hm_set(m, "Accept-Language", "en-US,en;q=0.9");
         break;
     case BR_GOLANG:
-        /* «Показать умолчание net/http»: User-Agent снимается, дальше http.Request.Write сам
-         * поставит Go-http-client/1.1; заголовков варианта нет (return в browser.go). */
+        /* "Show the net/http default": User-Agent is removed, and http.Request.Write then sets
+         * Go-http-client/1.1 itself; the variant has no headers (return in browser.go). */
         hm_del(m, "User-Agent");
         return;
     case BR_CURL:
@@ -298,7 +298,7 @@ static void masq_ws(struct hmap *m, enum browser b) {
         return;
     }
     hm_set(m, "Sec-Fetch-Mode", "websocket");
-    /* «Safari is NOT web-compliant here!» — у Safari Sec-Fetch-Dest другой (browser.go). */
+    /* "Safari is NOT web-compliant here!": Safari's Sec-Fetch-Dest differs (browser.go). */
     hm_set(m, "Sec-Fetch-Dest", b == BR_SAFARI ? "websocket" : "empty");
     hm_set(m, "Sec-Fetch-Site", "same-origin");
     hm_set_empty(m, "Cache-Control", "no-cache");
@@ -306,8 +306,8 @@ static void masq_ws(struct hmap *m, enum browser b) {
     hm_set_empty(m, "Accept", "*/*");
 }
 
-/* TryDefaultHeadersWith(header, "ws"): своего User-Agent нет — облик Chrome; есть и это одно из
- * слов Xray — облик этого клиента; иначе — ничего, User-Agent уходит как написан. */
+/* TryDefaultHeadersWith(header, "ws"): no User-Agent of its own gets the Chrome look; one of
+ * Xray's words gets that client's look; otherwise nothing, the User-Agent goes as written. */
 static void try_default_ws(struct hmap *m) {
     const struct hent *ua = hm_get(m, "User-Agent");
     if (!ua) { masq_ws(m, BR_CHROME); return; }
@@ -328,14 +328,14 @@ static void w_s(struct wb *b, const char *s, size_t n) {
 }
 static void w_z(struct wb *b, const char *s) { w_s(b, s, strlen(s)); }
 
-/* textproto.TrimString: пробелы и табуляции по краям. */
+/* textproto.TrimString: spaces and tabs at both ends. */
 static void trim(const char **v, size_t *vn) {
     while (*vn && (**v == ' ' || **v == '\t')) { (*v)++; (*vn)--; }
     while (*vn && ((*v)[*vn - 1] == ' ' || (*v)[*vn - 1] == '\t')) (*vn)--;
 }
 
-/* Имя хоста для Host: host, иначе sni, иначе адрес узла (у Xray — wsSettings.Host,
- * tConfig.ServerName, dest.Address). Адрес IPv6 — в скобках, как его печатает Xray. */
+/* The name for Host: host, else sni, else the node address (Xray: wsSettings.Host,
+ * tConfig.ServerName, dest.Address). An IPv6 address goes in brackets, as Xray prints it. */
 static const char *host_of(const struct tr_node *n, char *buf, size_t cap) {
     if (n->http_host && n->http_host[0]) return n->http_host;
     if (n->sni && n->sni[0]) return n->sni;
@@ -354,9 +354,9 @@ size_t tr_h1_request(const struct tr_node *n, int ws, const char *key, const cha
     char hostbuf[160];
     const char *host = host_of(n, hostbuf, sizeof(hostbuf));
 
-    /* Свои заголовки узла. Host в них у ws Xray переносит в host (Build, с предупреждением
-     * «устарело»), а у httpupgrade отвергает — это решает разбор подписки (sub.c); сюда Host
-     * не доходит. */
+    /* The node's own headers. A Host among them Xray moves into host for ws (Build, with a
+     * "deprecated" warning) and rejects for httpupgrade; the subscription parser (sub.c) does
+     * that, so no Host arrives here. */
     const char *h = n->headers ? n->headers : "";
     while (*h) {
         const char *eol = strchr(h, '\n');
@@ -378,10 +378,10 @@ size_t tr_h1_request(const struct tr_node *n, int ws, const char *key, const cha
     try_default_ws(&m);
 
     if (ws) {
-        /* Ранние данные: Xray — header.Set("Sec-WebSocket-Protocol", …), то есть канонический
-         * ключ Sec-Websocket-Protocol (перекрывает свой такой же у узла), а gorilla перекладывает
-         * его под ключ Sec-WebSocket-Protocol. Своё значение узла без ранних данных — так же
-         * переложенным ключом. */
+        /* Early data: Xray does header.Set("Sec-WebSocket-Protocol", ...), i.e. the canonical key
+         * Sec-Websocket-Protocol (replacing the node's own), and gorilla moves it under the key
+         * Sec-WebSocket-Protocol. The node's own value, without early data, goes under the moved
+         * key too. */
         const struct hent *sp = hm_get(&m, "Sec-Websocket-Protocol");
         if (proto) {
             hm_del(&m, "Sec-Websocket-Protocol");
@@ -391,20 +391,20 @@ size_t tr_h1_request(const struct tr_node *n, int ws, const char *key, const cha
             hm_del(&m, "Sec-Websocket-Protocol");
             hm_add(&m, "Sec-WebSocket-Protocol", e.v, e.vn);
         }
-        /* gorilla/websocket (client.go, DialContext): четыре своих заголовка точными ключами. */
+        /* gorilla/websocket (client.go, DialContext): its four headers, exact keys. */
         hm_set(&m, "Upgrade", "websocket");
         hm_set(&m, "Connection", "Upgrade");
         hm_set(&m, "Sec-WebSocket-Key", key ? key : "");
         hm_set(&m, "Sec-WebSocket-Version", "13");
     } else {
-        /* httpupgrade/dialer.go: req.Header.Set — ключи канонические. */
+        /* httpupgrade/dialer.go: req.Header.Set, canonical keys. */
         hm_set(&m, "Connection", "Upgrade");
         hm_set(&m, "Upgrade", "websocket");
     }
     if (m.over) return 0;
 
-    /* http.Request.Write: строка запроса, Host, User-Agent (своего нет — умолчание Go), затем
-     * остальные по алфавиту ключа; одинаковые ключи — в порядке добавления. */
+    /* http.Request.Write: request line, Host, User-Agent (none of its own: Go's default), then
+     * the rest sorted by key; equal keys in insertion order. */
     struct wb b = { out, 0, cap, 0 };
     w_z(&b, "GET ");
     w_z(&b, target);
@@ -442,10 +442,11 @@ size_t tr_h1_request(const struct tr_node *n, int ws, const char *key, const cha
     return b.n;
 }
 
-/* ---- ответ ------------------------------------------------------------------------------- */
+/* ---- response ---------------------------------------------------------------------------- */
 
-/* Предел заголовков ответа. Ответ 101 — сотня байт; 16 КБ хватает любому посреднику, а без
- * предела сервер, льющий бесконечную строку, держал бы установщика до срока соединения. */
+/* Response header limit. A 101 response is about a hundred bytes; 16 KB is enough for any proxy,
+ * and without a limit a server sending an endless line would hold the connector until the
+ * connect timeout. */
 #define H1_RESP_MAX 16384
 
 #define SEEN_UP   1u
@@ -464,7 +465,7 @@ static int eqfold(const char *a, size_t an, const char *b) {
     return 1;
 }
 
-/* Есть ли слово в списке через запятую (tokenListContainsValue у gorilla). */
+/* Whether a word is in a comma-separated list (gorilla's tokenListContainsValue). */
 static int token_in(const char *v, size_t vn, const char *want) {
     size_t i = 0;
     while (i <= vn) {
@@ -480,7 +481,7 @@ static int token_in(const char *v, size_t vn, const char *want) {
     return 0;
 }
 
-/* Строка статуса по правилам http.ReadResponse: «HTTP/x.y КОД причина», код — ровно три цифры. */
+/* Status line by the http.ReadResponse rules: "HTTP/x.y CODE reason", CODE exactly three digits. */
 static int status_of(const char *l, size_t n) {
     if (n < 12 || strncmp(l, "HTTP/", 5) != 0) return -1;
     if (l[5] < '0' || l[5] > '9' || l[6] != '.' || l[7] < '0' || l[7] > '9' || l[8] != ' ') return -1;
@@ -500,7 +501,7 @@ static void resp_line(struct h1_resp *r, int ws, const char *accept) {
         return;
     }
     if (!n) { r->done = 1; return; }
-    if (l[0] == ' ' || l[0] == '\t') return;      /* продолжение прежней строки — не наше */
+    if (l[0] == ' ' || l[0] == '\t') return;      /* continuation line: not ours */
     const char *colon = memchr(l, ':', n);
     if (!colon) return;
     size_t kn = (size_t)(colon - l);
@@ -508,8 +509,8 @@ static void resp_line(struct h1_resp *r, int ws, const char *accept) {
     size_t vn = n - kn - 1;
     trim(&v, &vn);
     if (eqfold(l, kn, "Upgrade")) {
-        /* gorilla (ws) ищет слово во ВСЕХ строках Upgrade; Xray и sing-box (httpupgrade)
-         * сравнивают первое значение целиком. */
+        /* gorilla (ws) looks for the word in ALL Upgrade lines; Xray and sing-box (httpupgrade)
+         * compare the first value whole. */
         if (ws) { if (token_in(v, vn, "websocket")) r->up_ok = 1; }
         else if (!(r->seen & SEEN_UP)) r->up_ok = (uint8_t)eqfold(v, vn, "websocket");
         r->seen |= SEEN_UP;
@@ -534,9 +535,9 @@ void tr_h1_resp_feed(struct h1_resp *r, int ws, const char *accept,
             r->line_n = 0;
             continue;
         }
-        /* Строка длиннее буфера обрезается, а не отвергается: нужные нам заголовки короткие,
-         * а длинная строка посредника (Set-Cookie, CSP) законна и нам не нужна. Обрезанная
-         * строка с нужным именем даст несовпадение значения — то есть честный отказ. */
+        /* A line longer than the buffer is cut, not rejected: the headers we need are short,
+         * and a long proxy line (Set-Cookie, CSP) is legal and not needed. A cut line with a
+         * name we need gives a value mismatch, i.e. an honest failure. */
         if (r->line_n < sizeof(r->line)) r->line[r->line_n++] = (char)c;
     }
     *used = i;
@@ -550,8 +551,8 @@ int tr_h1_resp_verdict(const struct h1_resp *r, int ws) {
     return 0;
 }
 
-/* Код ответа последнего отказа TR_EUPSTATUS — для текста (transport_strerror). На поток: отказы
- * у установщиков параллельные. */
+/* The status of the last TR_EUPSTATUS failure, for the text (transport_strerror). Per thread:
+ * connectors fail in parallel. */
 static __thread int g_last_status;
 int tr_h1_last_status(void) { return g_last_status; }
 
@@ -561,8 +562,8 @@ static int64_t mono_ms(void) {
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* base64.RawURLEncoding — ранние данные у Xray («RawURLEncoding is support by both V2Ray/V2Fly
- * and XRay», websocket/dialer.go): алфавит URL и без выравнивания `=`. */
+/* base64.RawURLEncoding, Xray's early data encoding ("RawURLEncoding is support by both
+ * V2Ray/V2Fly and XRay", websocket/dialer.go): the URL alphabet, no `=` padding. */
 static size_t b64_url(const unsigned char *in, size_t n, char *out) {
     static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     size_t o = 0;
@@ -588,8 +589,8 @@ int tr_h1_send(struct transport *t, int ws, const unsigned char *ed, size_t ed_n
         b64_std(r, sizeof(r), key);
         tr_ws_accept(key, s->accept);
     }
-    /* В куче, а не __thread: с ранними данными запрос несёт до всей первой записи в base64 —
-     * десятки килобайт, которые держать на каждый поток незачем. */
+    /* On the heap, not __thread: with early data the request carries up to the whole first
+     * write in base64, tens of kilobytes not worth keeping per thread. */
     size_t bn = ed ? (ed_n + 2) / 3 * 4 + 1 : 0;
     size_t cap = 4096 + bn;
     char *req = malloc(cap + bn);
@@ -619,11 +620,11 @@ int tr_h1_lazy(struct transport *t, int ws, const unsigned char *in, size_t n, s
     return 1;
 }
 
-/* Ответ 101 синхронно — путь без ранних данных. */
+/* The 101 response synchronously: the path without early data. */
 static int h1_wait(struct transport *t, int ws, int timeout_s) {
     int rc;
     const char *accept = t->h1.accept;
-    /* Ответ ждём здесь, синхронно: открытие идёт в потоке установщика, со сроком соединения. */
+    /* Waiting here is fine: opening runs in a connector thread, within the connect timeout. */
     struct h1_resp r;
     memset(&r, 0, sizeof(r));
     int64_t deadline = mono_ms() + (int64_t)(timeout_s > 0 ? timeout_s : 8) * 1000;
@@ -663,7 +664,8 @@ static int h1_wait(struct transport *t, int ws, int timeout_s) {
         rc = tr_h1_resp_verdict(&r, ws);
         if (rc == TR_EUPSTATUS) g_last_status = r.status;
         if (rc) return rc;
-        /* То, что приехало за ответом тем же куском, — уже поток: сохранить (см. h1_state). */
+        /* What came after the response in the same chunk is already the stream: keep it
+         * (see h1_state). */
         if (used < got) {
             t->h1.stash = malloc(got - used);
             if (!t->h1.stash) return TR_EIO;
@@ -676,13 +678,13 @@ static int h1_wait(struct transport *t, int ws, int timeout_s) {
     }
 }
 
-/* Открытие по Ed — как у Xray:
- *   ws, Ed > 0          delayDialConn: ничего не шлём до первой записи (trws.c, H1_DEFER). У Xray
- *                       отложен даже сам TCP; у нас TCP и TLS открыты заранее — байты на проводе
- *                       те же, раньше лишь время;
- *   httpupgrade, Ed > 0 запрос сразу, а ответ читает первое чтение (ConnRF у Xray, H1_WAIT): данные
- *                       клиента идут вслед за запросом, не дожидаясь 101;
- *   Ed == 0             запрос и ответ синхронно. */
+/* Opening by Ed, as in Xray:
+ *   ws, Ed > 0          delayDialConn: nothing is sent until the first write (trws.c, H1_DEFER).
+ *                       Xray defers even the TCP connect; we open TCP and TLS in advance: the
+ *                       bytes on the wire are the same, only the timing is earlier;
+ *   httpupgrade, Ed > 0 the request at once, the response read by the first read (Xray's ConnRF,
+ *                       H1_WAIT): client data follows the request without waiting for the 101;
+ *   Ed == 0             request and response synchronously. */
 int tr_h1_upgrade(struct transport *t, const struct tr_node *n, int ws, int timeout_s) {
     struct h1_state *s = &t->h1;
     s->node = *n;
@@ -692,14 +694,14 @@ int tr_h1_upgrade(struct transport *t, const struct tr_node *n, int ws, int time
     if (ws && s->ed) { s->phase = H1_DEFER; return 0; }
     int rc = tr_h1_send(t, ws, NULL, 0);
     if (rc) return rc;
-    /* httpupgrade с Ed > 0 не ждёт ответа — но только поверх TLS или REALITY. Без TLS (security=
-     * none) ответ ждём, как при Ed == 0: сервер httpupgrade у Xray читает запрос через bufio и
-     * дальше отдаёт голое соединение (hub.go), поэтому данные, приехавшие с запросом ОДНИМ
-     * сегментом TCP, у него пропадают — снято на Xray 26.3.27: наш запрос и первая запись,
-     * ушедшие подряд, давали «invalid request version» на каждом соединении. Клиент Xray на этом
-     * не спотыкается лишь потому, что его первая запись уходит позже, уже отдельным сегментом.
-     * Поверх TLS сервер читает запись TLS целиком и не больше, и потери нет. Байты на проводе в
-     * обоих случаях те же, что у Xray, — различается только момент, когда уходит первая запись. */
+    /* httpupgrade with Ed > 0 does not wait for the response, but only over TLS or REALITY.
+     * Without TLS (security=none) it waits as with Ed == 0: Xray's httpupgrade server reads the
+     * request through bufio and then hands over the bare connection (hub.go), so data that came
+     * with the request in ONE TCP segment is lost. Seen on Xray 26.3.27: our request and first
+     * write sent back to back gave "invalid request version" on every connection. The Xray
+     * client avoids it only because its first write goes later, in a separate segment. Over TLS
+     * the server reads one whole TLS record and no more, and nothing is lost. The bytes on the
+     * wire are Xray's in both cases; only the moment of the first write differs. */
     if (s->ed && !t->link.plain) {
         s->resp = calloc(1, sizeof(*s->resp));
         if (!s->resp) return TR_EIO;
@@ -720,19 +722,20 @@ void tr_h1_free(struct transport *t) {
     t->h1.q_n = t->h1.q_cap = 0;
 }
 
-/* ---- транспорт httpupgrade ----------------------------------------------------------------- */
+/* ---- the httpupgrade transport ------------------------------------------------------------- */
 
 static int hu_open(struct transport *t, const struct tr_node *n, int timeout_s) {
     return tr_h1_upgrade(t, n, 0, timeout_s);
 }
 
-/* Как ConnRF.Write у Xray — поток как есть, и в H1_WAIT тоже: ответа 101 запись не ждёт. */
+/* Like Xray's ConnRF.Write: the stream as is, in H1_WAIT too; a write does not wait for the 101. */
 static int hu_write(struct transport *t, const unsigned char *d, size_t n) {
     return tr_link_write(&t->link, d, n);
 }
 
-/* Отложенный ответ 101 (Ed > 0): первое чтение сперва дочитывает ответ, а то, что за ним, — уже
- * поток (ConnRF.Read у Xray отдаёт буферизованное за ответом тем же вызовом). */
+/* Deferred 101 response (Ed > 0): the first read finishes the response, and what follows is
+ * already the stream (Xray's ConnRF.Read returns the data buffered past the response in the
+ * same call). */
 static int hu_read_wait(struct transport *t, unsigned char *d, size_t cap, size_t *got) {
     const unsigned char *in = d;
     size_t n = 0;
@@ -755,8 +758,8 @@ static int hu_read_wait(struct transport *t, unsigned char *d, size_t cap, size_
     return 0;
 }
 
-/* Сначала — остаток, приехавший вместе с ответом 101: это начало потока, и отдать его позже
- * следующего чтения сокета значило бы переставить байты. */
+/* First the rest that came with the 101 response: it is the start of the stream, and returning
+ * it after the next socket read would reorder bytes. */
 static int hu_read(struct transport *t, unsigned char *d, size_t cap, size_t *got) {
     struct h1_state *s = &t->h1;
     if (s->phase == H1_WAIT) return hu_read_wait(t, d, cap, got);
@@ -778,8 +781,9 @@ static int hu_busy(const struct transport *t) { return t->h1.phase == H1_WAIT; }
 
 static void hu_close(struct transport *t) { tr_h1_free(t); }
 
-/* zc = 1: после ответа 101 данные лежат в записях TLS как есть, как у tcp, и чтение без копии
- * годится — пока остатка нет и ответ разобран (transport_read_zc спрашивает pending и busy). */
+/* zc = 1: after the 101 the data sits in the TLS records as is, as with tcp, and zero-copy reads
+ * work while nothing is stashed and the response is parsed (transport_read_zc asks pending and
+ * busy). */
 const struct transport_ops tr_httpupgrade = {
     .name = "httpupgrade", .alpn = "http/1.1", .zc = 1,
     .open = hu_open, .write = hu_write, .read = hu_read,

@@ -1,27 +1,24 @@
-/* Транспорт: как поток протокола (VLESS, позже другие дайлеры) едет до узла.
+/* Transport: how a protocol stream (VLESS) reaches its node.
  *
- * Три яруса снизу вверх, и у каждого свой файл:
+ * Three layers, bottom up, each in its own files:
  *
- *   сокет         TCP до узла по всем адресам имени, с меткой выхода-подложки (trdial.c);
- *   безопасность  поле security= ссылки узла: none, tls, reality (trsec.c, struct security_ops);
- *   транспорт     поле type= ссылки узла: tcp, grpc, xhttp, ws, httpupgrade (transport.c,
- *                 trgrpc.c, trxhttp.c, trws.c, trupgrade.c; struct transport_ops).
+ *   socket      TCP to the node over every address of its name, with SO_MARK and SO_BINDTODEVICE
+ *               when set (trdial.c);
+ *   security    the link's security= field: none, tls, reality (trsec.c, struct security_ops);
+ *   transport   the link's type= field: tcp, grpc, xhttp, ws, httpupgrade (transport.c,
+ *               trgrpc.c, trxhttp.c, trws.c, trupgrade.c; struct transport_ops).
  *
- * ПОЧЕМУ ДВЕ ТАБЛИЦЫ, А НЕ ОДНА ЦЕПОЧКА «tcp → tls → grpc» (docs/architecture.md, «Туннели:
- * стек, дайлер, транспорт»). В первом проекте все они перечислены одним списком
- * transport_ops, но в ссылке узла это ДВА независимых поля, и сочетаются они любые: grpc
- * поверх reality, xhttp поверх tls, tcp без security вовсе. Одна цепочка слоёв одного типа
- * потребовала бы правила, какой слой над каким вправе стоять, — то есть второго способа сказать
- * то, что два поля ссылки говорят и так.
- * Кроме того, слои безопасности различаются ТОЛЬКО рукопожатием: после него у tls и reality
- * одни и те же записи TLS 1.3, у none — сокет как есть. Поэтому у security_ops одна функция,
- * а поток после рукопожатия читает и пишет общий код связи (tr_link_* в transport.c).
+ * Security and transport are two tables, not one chain of layers ("tcp -> tls -> grpc"): in the
+ * node link they are two independent fields and any pair is valid (grpc over reality, xhttp over
+ * tls, tcp with no security). One chain would need rules on which layer may sit on which, a
+ * second way of saying what the two fields already say. Security kinds differ only in the
+ * handshake: after it tls and reality carry the same TLS 1.3 records, and none is the bare
+ * socket. So security_ops has one function, and after the handshake the stream goes through the
+ * shared link code (tr_link_* in transport.c).
  *
- * КТО ЭТИМ ПОЛЬЗУЕТСЯ. Клиент VLESS (proto/vless/client.c: vless_connect и проверка узла) и
- * через него дайлер стека туннеля (proto/vless/vldial.c). Про протокол транспорт не знает
- * ничего: узел приходит ему struct tr_node — теми полями ссылки, которые касаются транспорта,
- * указателями в узел подписки. Поэтому следующий протокол поверх тех же транспортов (trojan,
- * shadowsocks через ws) — это новый дайлер, а не правка этого слоя.
+ * Users: the VLESS client (proto/vless/client.c: vless_connect and the node probe) and, through
+ * it, the tunnel dialer (proto/vless/vldial.c). The transport knows nothing of the protocol: it
+ * gets the node as struct tr_node, the link fields that concern it, pointing into the parsed node.
  */
 #ifndef STEER_TRANSPORT_H
 #define STEER_TRANSPORT_H
@@ -30,271 +27,270 @@
 #include "tls13.h"
 #include "h2.h"
 
-/* Коды отказа транспорта. Значения — прежние VLESS_CONN_* клиента: их видят журнал, строка
- * причины проверки узла и стенды, а менять число ради переезда в другой файл незачем.
- * -35 и -36 заняты кодами самого VLESS (client.h) — там они и остались. */
+/* Transport error codes. They share one number space with the VLESS client's codes: -35 and -36
+ * are VLESS_CONN_* (client.h). */
 #define TR_EDNS      (-30)
 #define TR_ESOCK     (-31)
 #define TR_ECONNECT  (-32)
 #define TR_EIO       (-33)
 #define TR_ECLOSED   (-34)
-/* Транспорт требует HTTP/2, а сервер на него не согласился. Отдельный код: всё остальное при
- * этом работает, данные просто не идут, и без имени этой ошибки узел выглядит как
- * «подключается и молчит». */
+/* The transport needs HTTP/2 and the server chose something else. A code of its own because all
+ * else works and only the data does not flow: without it the node looks like it connects and
+ * stays silent. */
 #define TR_ENOH2     (-37)
-#define TR_EGRPC     (-38)   /* поток gRPC устроен не так, как мы умеем читать */
-/* ws и httpupgrade (trupgrade.c, trws.c). Отдельные коды, а не один «апгрейд не удался»: человеку
- * здесь нужны РАЗНЫЕ действия. Ответ не 101 — это почти всегда не тот path или host (сервер Xray
- * отвечает 404 на чужой путь), и код ответа называется в тексте; 101 без Upgrade или без верного
- * Accept — ответил не сервер WebSocket, а посредник или кеш; не http/1.1 в ALPN — сервер за TLS
- * выбрал другой протокол, а апгрейд идёт только по HTTP/1.1. */
-#define TR_ENOH1      (-39)  /* сервер согласовал в ALPN не http/1.1 */
-#define TR_EUPSTATUS  (-40)  /* на запрос Upgrade ответ не 101 (код — в тексте) */
-#define TR_ENOUPGRADE (-41)  /* 101 без Upgrade: websocket или Connection: upgrade */
-#define TR_EWSACCEPT  (-42)  /* 101 без верного Sec-WebSocket-Accept */
-#define TR_EUPTIMEOUT (-43)  /* ответа на запрос Upgrade нет за срок соединения */
-#define TR_EUPTOOBIG  (-44)  /* ответ на Upgrade не разобрался: длиннее предела или не HTTP */
-#define TR_EWSFRAME   (-45)  /* кадр WebSocket нарушает RFC 6455 */
-#define TR_EVENC      (-46)  /* VLESS encryption: рукопожатие или формат (причина — tr_venc_reason) */
-#define TR_EVENCAUTH  (-47)  /* VLESS encryption: AEAD не сошёлся — ключи разошлись с сервером */
-#define TR_EVENC0RTT  (-48)  /* VLESS encryption: сервер отклонил билет 0-RTT, следующее соединение — полное */
+#define TR_EGRPC     (-38)   /* the gRPC stream has a shape we cannot read */
+/* ws and httpupgrade (trupgrade.c, trws.c). Separate codes because each needs a different fix. A
+ * status other than 101 is almost always a wrong path or host (Xray answers 404 to an unknown
+ * path); the text names the status. 101 without Upgrade or without a valid Accept means a proxy or
+ * cache answered, not a WebSocket server. An ALPN other than http/1.1 means the server behind TLS
+ * chose another protocol, and the upgrade works only over HTTP/1.1. */
+#define TR_ENOH1      (-39)  /* the server negotiated an ALPN other than http/1.1 */
+#define TR_EUPSTATUS  (-40)  /* the Upgrade request got a status other than 101 (named in text) */
+#define TR_ENOUPGRADE (-41)  /* 101 without Upgrade: websocket or Connection: upgrade */
+#define TR_EWSACCEPT  (-42)  /* 101 without a valid Sec-WebSocket-Accept */
+#define TR_EUPTIMEOUT (-43)  /* no answer to the Upgrade request within the connect timeout */
+#define TR_EUPTOOBIG  (-44)  /* the Upgrade answer is over the limit or not HTTP */
+#define TR_EWSFRAME   (-45)  /* a WebSocket frame breaks RFC 6455 */
+#define TR_EVENC      (-46)  /* VLESS encryption: handshake or format (reason: tr_venc_reason) */
+#define TR_EVENCAUTH  (-47)  /* VLESS encryption: AEAD failed, the keys differ from the server's */
+#define TR_EVENC0RTT  (-48)  /* VLESS encryption: 0-RTT ticket rejected, next connect is full */
 
-/* Узел глазами транспорта: только то, что касается связи. Указатели — в узел подписки
- * (struct vless_node), без копий: узел живёт дольше любого соединения к нему. */
+/* The node as the transport sees it: only what concerns the connection. The pointers point into
+ * the parsed node (struct vless_node), no copies: the node outlives every connection to it. */
 struct tr_node {
     const char *host;
     uint16_t port;
     const char *type;          /* tcp | grpc | xhttp | ws | httpupgrade */
     const char *security;      /* none | tls | reality */
-    const char *sni;           /* маскировочный домен — он же SNI в ClientHello */
-    const char *fp;            /* отпечаток браузера */
-    const char *pbk;           /* публичный ключ Reality, base64url */
-    const char *sid;           /* short id Reality, hex */
-    const char *path;          /* xhttp, ws, httpupgrade; у ws/httpupgrade — с `?ed=` (trpath.h) */
-    /* ws и httpupgrade: заголовок Host (пусто — sni, затем адрес узла, как у Xray) и свои
-     * заголовки запроса строками «Имя: значение\n» (из конфига Xray в подписке, см. vless.h).
-     * NULL — то же, что пусто. */
+    const char *sni;           /* the camouflage domain, also the SNI in ClientHello */
+    const char *fp;            /* browser fingerprint */
+    const char *pbk;           /* Reality public key, base64url */
+    const char *sid;           /* Reality short id, hex */
+    const char *path;          /* xhttp, ws, httpupgrade; ws/httpupgrade keep `?ed=` (trpath.h) */
+    /* ws and httpupgrade: the Host header (empty: sni, then the node address, as in Xray) and
+     * extra request headers as "Name: value\n" lines (from an Xray config, see vless.h). NULL is
+     * the same as empty. */
     const char *http_host;
     const char *headers;
     const char *service;       /* grpc serviceName */
-    const char *mode;          /* grpc: multi/gun; xhttp: auto/packet-up… */
-    /* Длина набивки xhttp, объявленная узлом (см. vless_node.pad_from в vless.h). 0 в pad_to —
-     * не объявлено, тогда умолчание Xray. */
+    const char *mode;          /* grpc: multi/gun; xhttp: auto/packet-up... */
+    /* xhttp padding length announced by the node (see vless_node.pad_from in vless.h). pad_to 0:
+     * not announced, the Xray default applies. */
     uint16_t pad_from, pad_to;
-    /* Reality: открытый ключ ML-DSA-65 для проверки подписи сертификата, base64url (1952 байта в
-     * бинарном виде), или NULL. Поле mldsa65Verify конфига Xray, `pqv` ссылки. */
+    /* Reality: ML-DSA-65 public key that verifies the certificate signature, base64url (1952
+     * bytes decoded), or NULL. Xray's mldsa65Verify, `pqv` in the link. */
     const char *pqv;
-    /* security=tls: клиентская проверка сертификата узла (Xray: pinnedPeerCertSha256, verifyPeerCertByName;
-     * sing-box: certificate_public_key_sha256) и явный отказ от неё. Строки — как в vless_node; NULL — нет.
-     * insecure — ключ выхода, не подписка. */
+    /* security=tls: certificate checks set by the node (Xray: pinnedPeerCertSha256,
+     * verifyPeerCertByName; sing-box: certificate_public_key_sha256), strings as in vless_node,
+     * NULL when absent. insecure comes from --insecure, not from the subscription. */
     const char *pcs, *pks, *vcn;
     int insecure;
-    /* security=tls: ECHConfigList в base64 (Xray echConfigList, `ech=` ссылки) или NULL — без ECH. */
+    /* security=tls: ECHConfigList in base64 (Xray echConfigList, `ech=` in the link), or NULL. */
     const char *ech;
-    /* VLESS encryption: строка `encryption` узла без изменений (mlkem768x25519plus.…) или NULL —
-     * шифрования нет. Разбирает и исполняет vlenc.c поверх готовой связи. */
+    /* VLESS encryption: the node's `encryption` string as is (mlkem768x25519plus...), or NULL for
+     * none. trvenc.c parses and runs it over the open transport. */
     const char *encryption;
 };
 
-/* Связь: сокет и безопасность над ним — один защищённый поток байт.
+/* A link: the socket and the security over it, one protected byte stream.
  *
- * Отдельной структурой потому, что связей у соединения бывает ДВЕ: xhttp в режимах stream-up и
- * packet-up поднимает вторую под выгрузку (см. trxhttp.c), и рукопожатие у неё то же самое. */
+ * A struct of its own because a connection can have two: xhttp in stream-up and packet-up opens
+ * a second one for the upload (trxhttp.c), with the same handshake. */
 struct tr_link {
     int fd;
-    int plain;                 /* security=none: TLS нет вовсе */
-    /* Сервер перешёл на прямое копирование (команда direct в Vision): в сокете больше не наши
-     * записи TLS, а поток целевого соединения как есть. Ставится извне — тем, кто разбирает
-     * кадры Vision (transport_direct), потому что команда живёт в них. */
+    int plain;                 /* security=none: no TLS at all */
+    /* The server switched to direct copy (the Vision direct command): the socket no longer
+     * carries our TLS records but the target connection's stream as is. Set from outside by the
+     * Vision frame parser (transport_direct), because the command lives in those frames. */
     int rx_direct;
     struct tls13 tls;
 };
 
-/* Разбор потока сообщений gRPC.
+/* gRPC message stream parser.
  *
- * Состояние нужно потому, что границы сообщения gRPC, кадра HTTP/2 и записи TLS не
- * совпадают ни в одном месте: одно сообщение может приехать тремя записями, а одна
- * запись — принести полтора сообщения. Держим счётчики, а не буфер: буфер на каждое из
- * 64 соединений стоил бы мегабайт, а счётчики — двадцать байт. */
+ * State is needed because the boundaries of a gRPC message, an HTTP/2 frame and a TLS record
+ * never line up: one message can arrive in three records, one record can bring a message and a
+ * half. Counters, not a buffer: a buffer per connection would cost megabytes in total, the
+ * counters cost twenty bytes. */
 struct grpc_de {
-    unsigned char hdr[5];        /* признак сжатия(1) + длина(4) */
+    unsigned char hdr[5];        /* compressed flag (1) + length (4) */
     unsigned char hdr_n;
-    uint32_t msg_left;           /* сколько осталось от тела сообщения */
-    unsigned char pb[8];         /* тег и длина поля protobuf */
+    uint32_t msg_left;           /* bytes left of the message body */
+    unsigned char pb[8];         /* protobuf field tag and length */
     unsigned char pb_n;
-    uint32_t field_left;         /* сколько осталось от поля bytes внутри сообщения */
+    uint32_t field_left;         /* bytes left of the bytes field inside the message */
 };
 
-/* Режим xhttp. Определяет, СКОЛЬКО запросов HTTP несёт одно соединение и как они делят
- * направления — а не «формат кадров»: байты в теле у всех трёх одинаковы.
+/* xhttp mode. It decides how many HTTP requests one connection carries and how they split the
+ * directions, not the framing: the body bytes are the same in all three.
  *
- *   stream-one  один запрос POST: тело запроса наверх, тело ответа вниз. Одно соединение,
- *               один поток, наименьшая задержка. Его и выбирает Xray при reality;
- *   stream-up   два запроса: GET за загрузкой и длинный POST под выгрузку. Нужен там, где
- *               посредник не пропускает двунаправленное тело, но потоковую выгрузку терпит;
- *   packet-up   GET за загрузкой и ЧЕРЕДА коротких POST, по одному на кусок, с номером в
- *               пути. Единственное, что проходит через посредника, который выгрузку
- *               потоком не пропускает вовсе — например через CDN, буферизующий запросы.
+ *   stream-one  one POST: the request body goes up, the response body comes down. One
+ *               connection, one stream, the lowest latency. Xray picks it with reality;
+ *   stream-up   two requests: a GET for the download and a long POST for the upload. For a
+ *               proxy that does not pass a bidirectional body but tolerates a streamed upload;
+ *   packet-up   a GET for the download and a series of short POSTs, one per chunk, numbered in
+ *               the path. The only mode that passes a proxy which does not stream uploads at
+ *               all, such as a CDN that buffers requests.
  */
 enum xhttp_mode { XH_STREAM_ONE = 0, XH_STREAM_UP, XH_PACKET_UP };
 
-/* Вторая связь — под выгрузку xhttp.
+/* The second link, for the xhttp upload.
  *
- * ПОЧЕМУ ОТДЕЛЬНОЕ СОЕДИНЕНИЕ, А НЕ ВТОРОЙ ПОТОК В ТОМ ЖЕ. stream-up и packet-up требуют,
- * чтобы загрузка и выгрузка шли РАЗНЫМИ запросами и одновременно. В HTTP/2 это два потока
- * в одном соединении, и Xray делает именно так — но у нашего клиента h2 мультиплексора нет
- * по построению (см. заголовок h2.c), и заводить планировщик окон между потоками ради двух
- * ролей, одна из которых только читает, а другая только пишет, дороже, чем второе TCP.
+ * A separate connection, not a second stream on the same one. stream-up and packet-up need the
+ * download and the upload in different requests at the same time. In HTTP/2 that is two streams
+ * on one connection, and Xray does exactly that, but our h2 client has no multiplexer by design
+ * (see the head of h2.c). A window scheduler between streams, for two roles of which one only
+ * reads and the other only writes, costs more than a second TCP connection.
  *
- * Протоколу это ничем не мешает: сервер связывает запросы по идентификатору сессии в ПУТИ,
- * а не по соединению (hub.go в Xray), и по HTTP/1.1 выгрузка вообще всегда идёт отдельным
- * соединением. Цена — второе рукопожатие TLS на соединение, и платят её только эти два
- * режима. */
+ * The protocol does not mind: the server ties the requests together by the session id in the
+ * PATH, not by the connection (Xray hub.go), and over HTTP/1.1 the upload always has its own
+ * connection anyway. The price is a second TLS handshake per connection, in these two modes
+ * only. */
 struct xh_up {
     struct tr_link link;
     struct h2 h2;
-    int started;               /* HEADERS первого запроса уже отправлены */
+    int started;               /* HEADERS of the first request sent */
 };
 
-/* Состояние xhttp. У stream-one всё, кроме mode, здесь не используется. */
+/* xhttp state. stream-one uses only mode. */
 struct xh_state {
     enum xhttp_mode mode;
-    struct xh_up up;           /* выгрузка stream-up и packet-up */
-    uint64_t seq;              /* номер куска packet-up, с нуля */
-    char authority[128];       /* повторяется в каждом запросе череды */
-    char up_path[288];         /* путь с идентификатором сессии, без номера куска */
-    /* Длина набивки, объявленная узлом. Запоминается здесь, потому что запросы выгрузки
-     * (packet-up) собираются уже без узла на руках, а набивка нужна каждому: сервер
-     * проверяет её у КАЖДОГО запроса, а не только у первого. */
+    struct xh_up up;           /* upload of stream-up and packet-up */
+    uint64_t seq;              /* packet-up chunk number, from 0 */
+    char authority[128];       /* repeated in every request of the series */
+    char up_path[288];         /* path with the session id, without the chunk number */
+    /* Padding length announced by the node. Kept here because the packet-up upload requests are
+     * built without the node at hand, and each needs padding: the server checks it on EVERY
+     * request, not only the first. */
     uint16_t pad_from, pad_to;
 };
 
-/* Разбор кадров WebSocket от сервера (RFC 6455, раздел 5) — потоком, по кускам любой длины.
+/* Parser of WebSocket frames from the server (RFC 6455, section 5): streaming, chunks of any size.
  *
- * Состояние, а не буфер, по той же причине, что у grpc_de: граница кадра не совпадает с границей
- * записи TLS, и кадр в 64 КБ приезжает несколькими записями, а запись — несколькими кадрами.
- * Полезная нагрузка кадров данных отдаётся сразу, по мере прихода; копится только заголовок
- * кадра (до 14 байт) и тело служебного кадра (до 125 байт — предел RFC 6455, 5.5). */
+ * State, not a buffer, for the same reason as grpc_de: frame boundaries do not match TLS record
+ * boundaries, a 64 KB frame arrives in several records and a record carries several frames. Data
+ * frame payload is passed on as it arrives; only the frame header (up to 14 bytes) and a control
+ * frame body (up to 125 bytes, the RFC 6455 5.5 limit) are buffered. */
 struct ws_rx {
     unsigned char hdr[14];
     uint8_t hdr_n;
-    uint8_t in_payload;        /* заголовок разобран, идёт тело кадра */
-    uint8_t op;                /* опкод текущего кадра */
-    uint8_t in_msg;            /* внутри сообщения, разрезанного на кадры (ждём продолжения) */
-    uint64_t left;             /* сколько байт тела текущего кадра ещё не пришло */
-    unsigned char ctl[125];    /* тело служебного кадра */
+    uint8_t in_payload;        /* header parsed, reading the frame body */
+    uint8_t op;                /* opcode of the current frame */
+    uint8_t in_msg;            /* inside a fragmented message (waiting for a continuation) */
+    uint64_t left;             /* body bytes of the current frame not yet received */
+    unsigned char ctl[125];    /* control frame body */
     uint8_t ctl_n;
-    /* Пришёл ping — ответить pong с тем же телом. Ответ шлёт тот, кто читает (trws.c), после
-     * разбора куска: разбор чистый и в сеть не пишет, чтобы его можно было проверять в памяти.
-     * Два ping в одном куске дают один ответ на последний — это разрешает RFC 6455, 5.5.3. */
+    /* A ping arrived: answer a pong with the same body. The reader (trws.c) sends it after
+     * parsing the chunk: the parser is pure and does not write to the network, so it can be
+     * tested in memory. Two pings in one chunk get one answer, to the last, as RFC 6455 5.5.3
+     * allows. */
     uint8_t pong_due;
     uint8_t pong_n;
     unsigned char pong[125];
-    uint8_t closed;            /* пришёл close: дальше данных не будет */
-    uint8_t close_sent;        /* ответный close уже отправлен */
-    uint16_t close_code;       /* код из close; 1005 — кода не было */
+    uint8_t closed;            /* close received: no more data */
+    uint8_t close_sent;        /* our close reply is sent */
+    uint16_t close_code;       /* code from close; 1005: no code */
 };
 
-/* ws и httpupgrade: то, что остаётся после ответа 101.
+/* ws and httpupgrade: what remains after the 101 response.
  *
- * stash — байты, прочитанные вместе с ответом 101, но лежащие ЗА его заголовками: сервер вправе
- * прислать данные сразу за ответом, и одна запись TLS (или одно чтение сокета) приносит их вместе.
- * Выбросить их значило бы разъехаться с сервером на первые же байты потока — у httpupgrade это
- * начало ответа VLESS, у ws — первый кадр. В куче и только когда они есть: это редкость, а
- * буфер в каждом соединении стоил бы 16 КБ на каждое из сотен соединений пула. Кто прочитал, тот
- * и освобождает (tr_h1_free); остаток до чтения освобождает transport_close.
+ * stash holds bytes read together with the 101 response but lying past its headers: the server
+ * may send data right after the response, and one TLS record (or one socket read) brings both.
+ * Dropping them would desync the stream from its first bytes (for httpupgrade the start of the
+ * VLESS response, for ws the first frame). On the heap and only when present: this is rare, and
+ * a 16 KB buffer in each of the pool's hundreds of connections would add up. The reader frees it
+ * (tr_h1_free); transport_close frees what was not read.
  *
- * РАННИЕ ДАННЫЕ (`?ed=N` в пути, Ed у Xray) меняют, КОГДА уходит запрос и когда разбирается ответ,
- * — ровно как у Xray (подробности — trws.c и trupgrade.c):
- *   ws           запрос откладывается до первой записи (H1_DEFER); запись не длиннее Ed уезжает в
- *                Sec-WebSocket-Protocol, длиннее — отдельно, кадрами после ответа 101;
- *   httpupgrade  запрос уходит сразу, но ответа не ждём: данные идут следом, ответ разбирается
- *                первым чтением (H1_WAIT).
- * Пока ответа 101 нет (H1_WAIT), ws копит свои записи в очереди q — у Xray запись в это время
- * просто ждёт ответа, а цикл туннеля ждать не вправе; очередь уходит кадрами сразу за 101. */
+ * EARLY DATA (`?ed=N` in the path, Xray's Ed) changes when the request goes out and when the
+ * response is parsed, exactly as in Xray (details in trws.c and trupgrade.c):
+ *   ws           the request waits for the first write (H1_DEFER); a write no longer than Ed goes
+ *                in Sec-WebSocket-Protocol, a longer one separately, as frames after the 101;
+ *   httpupgrade  the request goes out at once but the response is not awaited: data follows, and
+ *                the first read parses the response (H1_WAIT).
+ * Until the 101 arrives (H1_WAIT), ws queues its writes in q. In Xray such a write just waits for
+ * the response, but the tunnel loop must not wait; the queue goes out as frames right after the
+ * 101. */
 enum { H1_OPEN = 0, H1_DEFER, H1_WAIT };
 struct h1_resp;
 struct h1_state {
     unsigned char *stash;
     uint32_t stash_n, stash_off;
-    struct ws_rx rx;           /* только ws */
+    struct ws_rx rx;           /* ws only */
     uint8_t phase;             /* H1_OPEN, H1_DEFER, H1_WAIT */
-    uint8_t upgraded;          /* ответ 101 принят: у ws при закрытии уходит close 1000 */
-    uint32_t ed;               /* Ed из пути (trpath.h) */
-    /* Для отложенного запроса ws: копия узла (сама struct tr_node живёт на стеке открывающего,
-     * указатели в ней — в узел подписки, который живёт дольше соединения). */
+    uint8_t upgraded;          /* 101 accepted: ws sends close 1000 when closing */
+    uint32_t ed;               /* Ed from the path (trpath.h) */
+    /* For the deferred ws request: a copy of the node (struct tr_node itself lives on the
+     * opener's stack; its pointers point into the parsed node, which outlives the connection). */
     struct tr_node node;
-    struct h1_resp *resp;      /* разбор ответа в H1_WAIT — в куче, на время ожидания */
-    char accept[29];           /* ожидаемый Sec-WebSocket-Accept */
-    /* ws в H1_WAIT: записи до ответа 101, каждая — [длина 4 байта][данные], в куче. */
+    struct h1_resp *resp;      /* response parser in H1_WAIT, on the heap while waiting */
+    char accept[29];           /* expected Sec-WebSocket-Accept */
+    /* ws in H1_WAIT: writes made before the 101, each [4-byte length][data], on the heap. */
     unsigned char *q;
     uint32_t q_n, q_cap;
 };
 
 struct transport;
 
-/* Транспорт — поле type= ссылки: как поток протокола уложен внутри защищённой связи.
- *
- * ws и httpupgrade (шаг 5 выпуска 1.10) — ещё две такие таблицы и два файла рядом с trgrpc.c:
- * запрос Upgrade по HTTP/1.1 в open (trupgrade.c), кадры WebSocket в write/read (trws.c; у
- * httpupgrade кадров нет — после ответа 101 поток идёт как есть), ALPN "http/1.1". Ни стек
- * туннеля, ни дайлер при этом не поменялись: они видят транспорт только через transport_write и
- * transport_read. */
+/* A transport, the link's type= field: how the protocol stream is laid inside the protected link.
+ * ws and httpupgrade send an HTTP/1.1 Upgrade request in open (trupgrade.c) with ALPN
+ * "http/1.1"; ws frames its writes and reads (trws.c), httpupgrade has no frames and passes the
+ * stream as is after the 101. The tunnel stack and the dialer see a transport only through
+ * transport_write and transport_read. */
 struct transport_ops {
-    const char *name;          /* как в ссылке узла: tcp, grpc, xhttp, ws, httpupgrade */
-    /* Что просить в ALPN, или NULL — тогда расширения нет вовсе. Hello без ALPN проверен на
-     * живых узлах, и состав Hello — это то, по чему Reality отличает нас от постороннего:
-     * добавлять расширение туда, где оно не нужно, значит менять проверенное ради ничего.
-     * Если сервер согласовал ДРУГОЕ, соединение отвергается кодом TR_ENOH2. */
+    const char *name;          /* as in the node link: tcp, grpc, xhttp, ws, httpupgrade */
+    /* What to offer in ALPN, or NULL for no ALPN extension at all. A Hello without ALPN is proven
+     * on live nodes, and Reality tells us from an outsider by the Hello's makeup: adding an
+     * extension where it is not needed changes what works for nothing. If the server negotiates
+     * SOMETHING ELSE, the connection fails with TR_ENOH2 (TR_ENOH1 when http/1.1 was asked). */
     const char *alpn;
-    /* Данные протокола лежат в записях TLS как есть: чтение вправе отдать указатель внутрь
-     * расшифрованной записи вместо копии (transport_read_zc). Правда у tcp и httpupgrade — у grpc
-     * и xhttp между TLS и данными лежит HTTP/2, у ws — кадры, и тело всё равно перекладывается. */
+    /* The protocol data sits in the TLS records as is: a read may return a pointer into the
+     * decrypted record instead of a copy (transport_read_zc). True for tcp and httpupgrade; grpc
+     * and xhttp have HTTP/2 between TLS and the data, ws has frames, and the body is copied. */
     int zc;
-    /* Открыть транспорт поверх уже защищённой связи: HTTP/2, запросы, вторая связь. NULL —
-     * открывать нечего (tcp). На отказе закрывать ничего не нужно: закроет transport_open. */
+    /* Open the transport over the already protected link: HTTP/2, requests, the second link.
+     * NULL: nothing to open (tcp). On failure nothing needs closing: transport_open closes. */
     int  (*open)(struct transport *t, const struct tr_node *n, int timeout_s);
     int  (*write)(struct transport *t, const unsigned char *d, size_t n);
-    /* 0 байт при коде 0 — законно: пришёл служебный кадр HTTP/2. Конец потока — кодом. */
+    /* 0 bytes with code 0 is valid: an HTTP/2 control frame arrived. End of stream is a code. */
     int  (*read)(struct transport *t, unsigned char *d, size_t cap, size_t *got);
-    /* Структура переехала в памяти (запасная сессия стека → таблица соединений): поправить
-     * указатели на саму себя. NULL — таких указателей у транспорта нет. */
+    /* The struct moved in memory (stack spare session -> connection table): fix the pointers to
+     * itself. NULL: the transport has none. */
     void (*moved)(struct transport *t);
-    /* Освободить своё сверх основной связи (вторую связь xhttp, остаток после 101). NULL —
-     * нечего. */
+    /* Free what the transport holds beyond the main link (the xhttp second link, the rest after
+     * the 101). NULL: nothing. */
     void (*close)(struct transport *t);
-    /* Лежит ли у транспорта своё непрочитанное, о котором ни ядро, ни связь не знают: остаток
-     * после ответа 101, отложенный конец потока ws. Без этого цикл туннеля ушёл бы ждать
-     * готовности сокета, а данные остались бы лежать до следующего пакета от сервера — которого
-     * может и не быть, если сервер уже всё сказал (см. transport_has_data). NULL — такого нет. */
+    /* Whether the transport holds unread data that neither the kernel nor the link knows of: the
+     * rest after the 101, a deferred ws end of stream. Without it the tunnel loop would wait for
+     * the socket while the data sits until the next packet from the server, which may never come
+     * if the server has said everything (see transport_has_data). NULL: never. */
     int  (*pending)(const struct transport *t);
-    /* Транспорт ещё разбирает своё поверх записей TLS (ответ 101 у httpupgrade с ранними
-     * данными): чтение без копии (zc) пока нельзя, даже когда своего непрочитанного нет. NULL —
-     * такого не бывает. */
+    /* The transport still parses its own data over the TLS records (the 101 response of
+     * httpupgrade with early data): no zero-copy read yet, even with nothing pending. NULL:
+     * never. */
     int  (*busy)(const struct transport *t);
 };
 
-/* Безопасность — поле security= ссылки. Различаются только рукопожатием (см. шапку). */
+/* Security, the link's security= field. The kinds differ only in the handshake (see the head). */
 struct security_ops {
     const char *name;          /* none | tls | reality */
-    /* Рукопожатие поверх l->fd. alpn — от транспорта. На отказе сокет НЕ закрывает: это
-     * делает вызывающий, одним и тем же образом у основной связи и у второй. */
+    /* Handshake over l->fd; alpn comes from the transport. On failure it does NOT close the
+     * socket: the caller does, the same way for the main link and the second one. */
     int (*handshake)(struct tr_link *l, const struct tr_node *n, const char *alpn);
 };
 
-/* Соединение с узлом: основная связь, транспорт над ней и его состояние. */
+/* A connection to a node: the main link, the transport over it and its state. */
 struct transport {
     struct tr_link link;
     const struct transport_ops *fr;
-    struct h2 h2;              /* только для grpc и xhttp */
-    struct grpc_de de;         /* только для grpc */
-    struct xh_state xh;        /* только для xhttp */
-    struct h1_state h1;        /* только для ws и httpupgrade */
-    struct venc *enc;          /* VLESS encryption поверх транспорта (trvenc.c), или NULL */
+    struct h2 h2;              /* grpc and xhttp only */
+    struct grpc_de de;         /* grpc only */
+    struct xh_state xh;        /* xhttp only */
+    struct h1_state h1;        /* ws and httpupgrade only */
+    struct venc *enc;          /* VLESS encryption over the transport (trvenc.c), or NULL */
 };
 
-/* VLESS encryption (trvenc.c): рукопожатие поверх открытого транспорта и записи AEAD вместо его
- * transport_write/read. Зовёт transport_open, если у узла задан encryption. */
+/* VLESS encryption (trvenc.c): a handshake over the open transport, then AEAD records in place of
+ * its transport_write/read. transport_open calls it when the node has encryption set. */
 struct venc;
 int tr_venc_open(struct transport *t, const struct tr_node *n, int timeout_s);
 int tr_venc_write(struct transport *t, const unsigned char *d, size_t n);
@@ -303,42 +299,41 @@ int tr_venc_pending(const struct transport *t);
 void tr_venc_close(struct transport *t);
 const char *tr_venc_reason(void);
 
-/* Полное установление: TCP, рукопожатие безопасности, открытие транспорта. 0 — готово; иначе
- * код отказа, и тогда ни дескриптора, ни ключей в куче за соединением не остаётся. */
+/* Full setup: TCP, the security handshake, the transport open. 0: ready; otherwise an error code,
+ * and no descriptor or heap keys are left behind. */
 int transport_open(struct transport *t, const struct tr_node *n, int timeout_s);
 
-/* Обмен данными в форме, которую требует транспорт узла. Вызывающий про транспорт не
- * знает — иначе о нём пришлось бы помнить и в туннеле, и в проверке, и в каждом новом
- * месте, а забытое место означало бы поток, который уходит не в той упаковке. */
+/* Data exchange in the form the node's transport needs. Callers do not know the transport, so
+ * no caller can forget it and send the stream in the wrong wrapping. */
 int transport_write(struct transport *t, const unsigned char *d, size_t n);
 int transport_read(struct transport *t, unsigned char *d, size_t cap, size_t *got);
 
-/* Приём БЕЗ ЛИШНЕЙ КОПИИ там, где транспорт это позволяет (transport_ops.zc).
+/* Read WITHOUT AN EXTRA COPY where the transport allows it (transport_ops.zc).
  *
- * *data указывает либо внутрь соединения (на расшифрованную на месте запись), либо в buf —
- * вызывающему всё равно, он читает по указателю. Через это место идёт весь скачиваемый
- * трафик, поэтому копия здесь стоила прохода по памяти на каждый байт загрузки.
+ * *data points either into the connection (at a record decrypted in place) or into buf; the
+ * caller reads through the pointer either way. All downloaded traffic goes through here, so a
+ * copy would cost a pass over memory per downloaded byte.
  *
- * Правило одно: использовать данные ДО следующего вызова по этому соединению. Подробнее —
- * в tls13.h у tls13_read_ref. */
+ * One rule: use the data BEFORE the next call on this connection. More in tls13.h at
+ * tls13_read_ref. */
 int transport_read_zc(struct transport *t, unsigned char *buf, size_t cap,
                       const unsigned char **data, size_t *got);
 
-/* Лежат ли у нас уже прочитанные данные, которых ядро не покажет как готовность сокета.
- * Подробности — в transport.c. */
+/* Whether we hold already read data that the kernel will not report as socket readiness. Details
+ * in transport.c. */
 int transport_has_data(const struct transport *t);
 
-/* Сервер объявил прямое копирование (Vision): дальше в сокете не записи TLS, а поток как
- * есть. Зовёт тот, кто разбирает кадры протокола. */
+/* The server announced direct copy (Vision): from now on the socket carries the stream as is, not
+ * TLS records. Called by the protocol frame parser. */
 void transport_direct(struct transport *t);
 
-/* Структура переехала в памяти — поправить указатели на саму себя (transport_ops.moved). */
+/* The struct moved in memory: fix the pointers to itself (transport_ops.moved). */
 void transport_moved(struct transport *t);
 
 static inline int transport_fd(const struct transport *t) { return t->link.fd; }
 
-/* Закрыть всё: дескрипторы обеих связей и контексты шифров в куче. Годится и для структуры,
- * которую transport_open не довёл до конца или не открывал вовсе (fd -1). */
+/* Close everything: the descriptors of both links and the cipher contexts on the heap. Also fine
+ * for a struct that transport_open did not finish or never opened (fd -1). */
 void transport_close(struct transport *t);
 
 const char *transport_strerror(int rc);
@@ -356,93 +351,95 @@ int transport_pin_host(const char *host);
 /* The addresses pinned for host (network order), at most max: how many. */
 int transport_pinned_addrs(const char *host, uint32_t *out, int max);
 
-/* Сколько места обязан дать вызывающий transport_read: транспорты поверх HTTP/2 отдают за
- * один раз до целой записи TLS. */
+/* The room a transport_read caller must give: transports over HTTP/2 return up to a whole TLS
+ * record at once. */
 #define TRANSPORT_MIN_READ_CAP H2_MIN_READ_CAP
 
-/* ---- для файлов этого каталога ------------------------------------------------------ */
+/* ---- for the files of this directory ------------------------------------------------------ */
 
 extern const struct transport_ops tr_tcp, tr_grpc, tr_xhttp, tr_ws, tr_httpupgrade;
 extern const struct security_ops tr_sec_none, tr_sec_tls, tr_sec_reality;
 
-/* ---- ws и httpupgrade: общий запрос Upgrade (trupgrade.c) и кадры (trws.c) ------------- */
+/* ---- ws and httpupgrade: the shared Upgrade request (trupgrade.c) and frames (trws.c) ------ */
 
-/* Открытие ws или httpupgrade поверх защищённой связи. Без ранних данных — запрос Upgrade и ответ
- * 101 синхронно, в пределах timeout_s (открытие идёт в потоке установщика, а не в цикле туннеля),
- * остаток за ответом — в t->h1.stash. С ранними данными — как у Xray (h1_state): ws откладывает
- * запрос до первой записи, httpupgrade шлёт его и ответа не ждёт. ws — 1 для WebSocket, 0 для
- * httpupgrade. */
+/* Open ws or httpupgrade over the protected link. Without early data: the Upgrade request and the
+ * 101 response synchronously, within timeout_s (opening runs in a connector thread, not in the
+ * tunnel loop), and the bytes past the response go to t->h1.stash. With early data, as in Xray
+ * (h1_state): ws defers the request to the first write, httpupgrade sends it and does not wait
+ * for the response. ws: 1 for WebSocket, 0 for httpupgrade. */
 int tr_h1_upgrade(struct transport *t, const struct tr_node *n, int ws, int timeout_s);
 
-/* Послать запрос Upgrade по узлу t->h1.node; у ws — с новым ключом (ожидаемый Accept — в
- * t->h1.accept) и, если ed не NULL, с ранними данными в Sec-WebSocket-Protocol (base64url без
- * выравнивания, как RawURLEncoding у Xray). */
+/* Send the Upgrade request for the node t->h1.node; for ws with a new key (the expected Accept
+ * goes to t->h1.accept) and, if ed is not NULL, with early data in Sec-WebSocket-Protocol
+ * (unpadded base64url, like Xray's RawURLEncoding). */
 int tr_h1_send(struct transport *t, int ws, const unsigned char *ed, size_t ed_n);
 
-/* Отложенный ответ (H1_WAIT): скормить кусок входа. 0 — ответ ещё не кончился, 1 — принят
- * (фаза H1_OPEN, *used — сколько байт ушло на заголовки, остальное — уже поток), иначе код TR_*. */
+/* Deferred response (H1_WAIT): feed a chunk of input. 0: the response is not over yet; 1:
+ * accepted (phase H1_OPEN, *used is the bytes taken by the headers, the rest is already the
+ * stream); otherwise a TR_* code. */
 int tr_h1_lazy(struct transport *t, int ws, const unsigned char *in, size_t n, size_t *used);
 
-/* Собрать запрос Upgrade в out — без сети, для открытия и для стенда (tests/wsmatch.c). key —
- * Sec-WebSocket-Key у ws, NULL у httpupgrade; proto — Sec-WebSocket-Protocol (ранние данные) или
- * NULL. Длина запроса либо 0: не влез или путь негоден. */
+/* Build the Upgrade request in out, without the network, for opening and for the test
+ * (tests/wsmatch.c). key: Sec-WebSocket-Key for ws, NULL for httpupgrade; proto:
+ * Sec-WebSocket-Protocol (early data) or NULL. The request length, or 0: it did not fit or the
+ * path is invalid. */
 size_t tr_h1_request(const struct tr_node *n, int ws, const char *key, const char *proto,
                      char *out, size_t cap);
 
-/* Ответ на запрос Upgrade — потоком, по кускам как угодно разрезанного входа. */
+/* The response to the Upgrade request, parsed as a stream from input cut anywhere. */
 struct h1_resp {
-    int done;                  /* заголовки ответа кончились */
-    int status;                /* код ответа, 0 — строки статуса ещё не было */
+    int done;                  /* the response headers are over */
+    int status;                /* response status; 0: no status line yet */
     uint8_t up_ok, conn_ok, acc_ok;
-    uint8_t seen;              /* какие из трёх заголовков уже встречались */
-    uint8_t bad;               /* не HTTP вовсе или длиннее предела */
-    uint32_t total;            /* байт заголовков, для предела */
+    uint8_t seen;              /* which of the three headers have been seen */
+    uint8_t bad;               /* not HTTP at all, or over the limit */
+    uint32_t total;            /* header bytes, for the limit */
     uint16_t line_n;
-    char line[256];            /* текущая строка; длиннее — обрезается (см. trupgrade.c) */
+    char line[256];            /* the current line; a longer one is cut (see trupgrade.c) */
 };
-/* Скормить кусок; *used — сколько байт ушло на заголовки (остальное — уже поток за ними).
- * accept — ожидаемый Sec-WebSocket-Accept у ws, NULL у httpupgrade. */
+/* Feed a chunk; *used is the bytes taken by the headers (the rest is already the stream after
+ * them). accept: the expected Sec-WebSocket-Accept for ws, NULL for httpupgrade. */
 void tr_h1_resp_feed(struct h1_resp *r, int ws, const char *accept,
                      const unsigned char *in, size_t n, size_t *used);
-/* Итог разобранного ответа: 0 или код TR_* (TR_EUPSTATUS, TR_ENOUPGRADE, TR_EWSACCEPT). */
+/* Verdict on the parsed response: 0 or a TR_* code (TR_EUPSTATUS, TR_ENOUPGRADE, TR_EWSACCEPT). */
 int tr_h1_resp_verdict(const struct h1_resp *r, int ws);
-/* Код ответа последнего отказа TR_EUPSTATUS в этом потоке — для текста причины. */
+/* The status of this thread's last TR_EUPSTATUS failure, for the reason text. */
 int tr_h1_last_status(void);
-/* Освободить остаток после 101 (t->h1.stash). */
+/* Free the bytes left after the 101 (t->h1.stash). */
 void tr_h1_free(struct transport *t);
-/* Случайные байты у ядра (ключ запроса ws, маска кадров). 0 или -1. */
+/* Random bytes from the kernel (ws request key, frame mask). 0 or -1. */
 int tr_h1_random(unsigned char *out, size_t n);
 
-/* Sec-WebSocket-Accept для ключа (RFC 6455, 4.2.2): base64(SHA-1(ключ + GUID)), 28 знаков. */
+/* Sec-WebSocket-Accept for a key (RFC 6455, 4.2.2): base64(SHA-1(key + GUID)), 28 characters. */
 void tr_ws_accept(const char *key, char out[29]);
 
-/* Кадр клиента: заголовок, ключ маски и замаскированное тело (RFC 6455, 5.2–5.3). Клиент ОБЯЗАН
- * маскировать каждый кадр, сервер обязан рвать соединение на незамаскированном. Длина кадра
- * либо 0, если не влез в cap. */
+/* A client frame: header, mask key and masked body (RFC 6455, 5.2-5.3). A client MUST mask every
+ * frame, and a server must drop the connection on an unmasked one. The frame length, or 0 if it
+ * does not fit in cap. */
 size_t tr_ws_frame(unsigned char *out, size_t cap, int opcode, int fin, const unsigned char key[4],
                    const unsigned char *d, size_t n);
 
-/* Разобрать кусок кадров от сервера: тела кадров данных — в out (out вправе совпадать с in:
- * разбор только сдвигает байты влево), служебные — в состояние (ping, close). Вход потребляется
- * целиком. 0 или TR_EWSFRAME; H2_ETOOBIG — не влезло в out (вызывающий дал меньше входа). */
+/* Parse a chunk of server frames: data frame bodies go to out (out may equal in: parsing only
+ * moves bytes left), control frames go to the state (ping, close). The input is consumed whole.
+ * 0 or TR_EWSFRAME; H2_ETOOBIG: did not fit in out (the caller gave less room than input). */
 int tr_ws_parse(struct ws_rx *r, const unsigned char *in, size_t n,
                 unsigned char *out, size_t cap, size_t *out_n);
 
-/* TCP до узла по всем адресам имени (trdial.c). Дескриптор либо отрицательный код TR_*. */
+/* TCP to the node over every address of its name (trdial.c). A descriptor or a negative TR_*. */
 int tr_dial(const char *host, uint16_t port, int timeout_s);
 
-/* Безопасность по полю ссылки: none, tls, иначе reality (trsec.c). */
+/* Security by the link field: none, tls, otherwise reality (trsec.c). */
 const struct security_ops *tr_security(const char *name);
 
-/* Связь целиком: сокет и рукопожатие безопасности. На отказе сокет закрыт и fd == -1. Общая
- * для основной связи и второй связи xhttp — ровно ради того, чтобы они не разошлись. */
+/* A whole link: socket and security handshake. On failure the socket is closed and fd == -1.
+ * Shared by the main link and the xhttp second link precisely so that they cannot diverge. */
 int tr_link_open(struct tr_link *l, const struct tr_node *n, const char *alpn, int timeout_s);
 
-/* Ввод-вывод основной связи в форме struct h2_io (ctx — struct tr_link). */
+/* I/O of a link in the struct h2_io form (ctx is a struct tr_link). */
 int tr_link_write(void *ctx, const unsigned char *d, size_t n);
 int tr_link_read(void *ctx, unsigned char *d, size_t cap, size_t *got);
 
-/* Закрыть связь: сокет и, если это был TLS, ключи в куче. */
+/* Close a link: the socket and, for TLS, the keys on the heap. */
 void tr_link_close(struct tr_link *l);
 
 #endif

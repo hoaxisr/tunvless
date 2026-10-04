@@ -1,10 +1,10 @@
 /* Node pool: `active` nodes work at once, new connections are spread over them, each node is
  * health checked, and a dead one is replaced by the next free candidate without restarting.
  *
- * The pool wraps the protocol's dialer (dialer.h). The protocol is unchanged — the ctx of its
- * table is still a node — but the node now belongs to each connection and lives in the pool's
- * session header. The stack asks the pool the four optional questions of the table (peer_of,
- * match, stale, lost) and still knows nothing about nodes.
+ * The pool wraps the protocol's dialer (dialer.h). The protocol does not know about it: the ctx of
+ * its table is still a node, but each connection has its own node, kept in the pool's session
+ * header. The stack asks the pool the four optional questions of the table (peer_of, match, stale,
+ * lost) and knows nothing about nodes.
  *
  * SLOTS. A slot is the place of one active node: the node (or none), whether it is alive, and a
  * generation. The generation changes when the slot's node is declared dead or replaced, and the
@@ -320,7 +320,8 @@ static void pl_check(int i) {
     fprintf(stderr, PL_LOG_W "node %s does not answer: %s — looking for a replacement\n",
             g_pl.cf.proto->name(pl_node(node)), why);
     stack_nodes_changed();
-    /* Its own node has just failed twice: only the free candidates now, it waits for the next round. */
+    /* Its own node has just failed twice: only the free candidates now; it waits for the next
+     * round. */
     pl_refill(i, 0);
 }
 

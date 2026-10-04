@@ -1,10 +1,11 @@
-// Снимает ClientHello, который собрал бы uTLS для отпечатка Chrome, — эталон для сверки облика нашего
-// Hello (tests/hellostruct.py). Запуск (Go 1.24+; модули — из go.mod Xray-core, uTLS v1.8.x):
+// Captures the ClientHello uTLS would build for a Chrome fingerprint: the reference our Hello is
+// compared with (tests/hellostruct.py). Run with Go 1.24+, modules from Xray-core's go.mod
+// (uTLS v1.8.x):
 //
 //	go run hello.go auto|133|131|120 out.bin
 //
-// «auto» у uTLS сегодня — Chrome 133: гибрид X25519MLKEM768, ALPS с новым кодом 0x44cd, ECH GREASE. Это тот же
-// отпечаток, который использует Xray-core при fp=chrome (transport/internet/tls).
+// uTLS "auto" is currently Chrome 133: the X25519MLKEM768 hybrid, ALPS with the new code 0x44cd,
+// ECH GREASE. It is the fingerprint Xray-core uses with fp=chrome (transport/internet/tls).
 package main
 
 import (
