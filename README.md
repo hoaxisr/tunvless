@@ -12,6 +12,14 @@ That command creates the `tunvless0` device and routes all IPv4 traffic into it.
 that enters the device is carried to the server over VLESS, and the tunnel's own connection to the
 server is kept out of it.
 
+Given several nodes, tunvless keeps one of them active (or several, with `-A`) and replaces a dead one
+with the next node that answers, without a restart:
+
+```sh
+tunvless sub.txt 'vless://...#spare' -r default            # failover over every node, in order
+tunvless sub.txt -n 4,0,7 -A 2 --by site -r default        # two of these three active at once
+```
+
 ## What it speaks
 
 - **VLESS** with a UUID, or the short string Xray derives a UUID from.
@@ -28,30 +36,55 @@ TLS 1.3, REALITY and HTTP/2 are tunvless's own code, so the ClientHello can foll
 wolfSSL supplies only the primitives (hashes, AEADs, X25519, ML-KEM, ML-DSA, X.509) and is linked in
 statically.
 
-## The node
+## The nodes
 
-The argument is either a `vless://` link or a file containing any of these:
+Each argument is a `vless://` link or a file containing any of these:
 
 - `vless://` links, one per line, plain or base64 (a subscription);
 - an Xray config (`outbounds` with `protocol: vless`);
 - a sing-box config (`outbounds` with `type: vless`);
 - a Clash/Mihomo YAML (`proxies` with `type: vless`).
 
-Nodes the client cannot serve (an unsupported transport, `allowInsecure` without `--insecure`,
-and similar) are skipped, and the reason is printed. `--list` numbers the usable nodes. With a file
-and no `--node`, tunvless takes the first node that answers a probe. A probe is a real VLESS request
-through the node: it is the only way to tell a REALITY server that accepted us from the decoy site
-it shows everyone else.
+The nodes of all arguments are numbered from 0 in order; `--list` prints the numbering. Nodes the
+client cannot serve (an unsupported transport, `allowInsecure` without `--insecure`, and similar)
+are skipped, and the reason is printed.
+
+The candidates are every node, or the ones `--node` names, in its order. At startup tunvless takes
+the first candidate that answers a probe. A probe is a real VLESS request through the node: it is the
+only way to tell a REALITY server that accepted us from the decoy site it shows everyone else. A
+single candidate (one `--node`, or one link) is used without a probe at startup and checked as soon as
+the device is up.
+
+### Failover
+
+The active nodes are health checked with the same probe: every `--interval` seconds (60), earlier
+after three failed connections in a row or after a connection is cut for silence. A node that fails
+twice in a row (once, after a stall) is dead: its connections are reset at once, so applications
+reconnect instead of hanging, and the next free candidate that answers takes its place. With no
+candidate answering, the search is repeated after 15 s, doubling up to 5 minutes, and the dead node
+itself is tried first. Connections through the other active nodes are not touched.
+
+With `-A N`, N nodes are active at once and new connections are spread over them by `--by`:
+
+- `connection` — each new connection goes to a random active node (the default);
+- `site` — by destination address: a site always goes through the same node, which matters for sites
+  that tie a session to the client's address;
+- `site-client` — by client and destination address.
+
+A connection stays on its node until it ends. When a node dies, only its sites move.
 
 ## Usage
 
 ```
-tunvless [options] <vless://link | file>
+tunvless [options] <vless://link | file>...
 
-  -n, --node N           use node N of the file (from 0, among usable nodes)
+  -n, --node N[,N...]    candidates, in order of preference; repeatable (default: every node)
   -l, --list             print the usable nodes and exit
-  -p, --probe            check the node (or every node of the file) and exit
-      --no-probe         take the first node of the file without checking it
+  -p, --probe            check the candidates and exit
+      --no-probe         start with the first candidate without checking it
+  -A, --active N         nodes active at once (default 1, at most 64)
+      --by MODE          spread new connections by connection, site or site-client
+      --interval S       health check period of each active node (default 60)
       --insecure         accept allowInsecure nodes; do not verify certificates (security=tls)
       --ca FILE          trusted roots (PEM) for security=tls
   -d, --dev NAME         device name (default tunvless0)
@@ -62,7 +95,7 @@ tunvless [options] <vless://link | file>
   -b, --bind-dev IFACE   send sockets to the server out of IFACE (SO_BINDTODEVICE)
   -t, --timeout S        probe and connect timeout (default 8)
       --silence S        reset a connection whose server stays silent for S seconds (default 20)
-      --no-retry         exit instead of retrying when the node does not resolve or answer
+      --no-retry         exit instead of retrying when no candidate resolves or answers at startup
 ```
 
 The device and every route into it disappear when the process exits. SIGINT, SIGTERM and SIGHUP stop
@@ -71,20 +104,20 @@ restart will not help. Exit code 1 means the tunnel did not come up, or stopped 
 
 ### Keeping the server out of the tunnel
 
-If a route into the tunnel also covers the server's address, the tunnel's own connection would
+If a route into the tunnel also covers a server's address, the tunnel's own connection would
 loop into itself. There are three ways to prevent that:
 
 - **Nothing to do (default).** When neither `--mark` nor `--bind-dev` is given, tunvless looks up
-  the route each server address takes now and pins it as a host route next to its own, as OpenVPN's
-  `redirect-gateway def1` does. It removes that host route when it stops, and leaves one you already
-  had alone.
+  the route the address of every candidate's server takes now and pins it as a host route next to its
+  own, as OpenVPN's `redirect-gateway def1` does. It removes those host routes when it stops, and
+  leaves one you already had alone.
 - `--bind-dev wan0` sends the server sockets out of the WAN interface, whatever the routing table
   says.
 - `--mark 0x100` marks the server sockets so that your own `ip rule` can route them.
 
-The server's name is resolved once, at startup. After that, new connections never wait on a DNS
-query that might itself be routed into the tunnel. To pick up a changed server address, restart
-tunvless.
+The servers' names are resolved once, at startup. After that, new connections never wait on a DNS
+query that might itself be routed into the tunnel. A candidate whose name does not resolve at
+startup is left out. To pick up a changed server address, restart tunvless.
 
 tunvless does not resolve names for the client. To send DNS through the tunnel, route your resolver's
 address into it (or use `-r default`).
@@ -96,6 +129,8 @@ tunvless --list sub.txt                                # what is in a subscripti
 tunvless --probe sub.txt                               # which nodes answer, with timings
 tunvless sub.txt -r default                            # everything through the first live node
 tunvless -n 3 sub.txt -r 10.0.0.0/8 -r 1.1.1.1/32      # only these prefixes, through node 3
+tunvless a.txt b.txt -n 2,5,0 -r default               # failover over three nodes of two files
+tunvless sub.txt -A 3 --by site -r default             # three active nodes, a site sticks to one
 tunvless link.txt -r default -b eth3                   # server traffic leaves through eth3
 tunvless link.txt -T 100 -r default -m 0x100           # routes in table 100, for your own ip rules
 ```
@@ -117,7 +152,8 @@ logread -e tunvless
 The package installs `/opt/bin/tunvless`, `/opt/etc/init.d/S99tunvless` and
 `/opt/etc/tunvless/tunvless.conf`. It depends on `libpthread`, plus `ca-bundle` for `security=tls`
 nodes. The kernel must provide `/dev/net/tun`. If WAN is not up yet at boot, tunvless keeps retrying
-on its own until the node resolves and answers.
+on its own until a node resolves and answers. `NODES` takes several links and files separated by
+spaces; `NODE`, `ACTIVE`, `BY` and `INTERVAL` set the candidates and the failover.
 
 ## Building
 
@@ -125,7 +161,8 @@ on its own until the node resolves and answers.
 make                 # out/tunvless; fetches wolfSSL (pinned version, sha256-checked) on first run
 make test            # unit and crypto tests: no root, no network
 sudo make e2e        # the tunnel in network namespaces: TCP with loss, UDP, FIN handling,
-                     # receive window, SIGPIPE storm, routes, --bind-dev, --mark, subscriptions
+                     # receive window, SIGPIPE storm, routes, --bind-dev, --mark, subscriptions,
+                     # failover (a node killed, a node gone silent mid-download, -A 2)
 make interop         # against real Xray-core / sing-box (XRAY=..., SINGBOX=...); skipped without
 ```
 
@@ -157,7 +194,8 @@ under qemu.
 ```
 src/main.c                 command line, node selection, routes, stopping
 src/tunnel/                TUN device (tun.c), user-space TCP/UDP stack (stack.c, rtx.c),
-                           device and route configuration over netlink (ifcfg.c)
+                           node pool and failover (pool.c), device and route configuration over
+                           netlink (ifcfg.c)
 src/proto/vless/           VLESS dialer for the stack, Vision, request header, node parsing
 src/proto/transport/       socket, security and transports: tcp, grpc, xhttp, ws, httpupgrade,
                            VLESS encryption

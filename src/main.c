@@ -1,10 +1,11 @@
 /* tunvless: a TUN device whose TCP and UDP traffic goes to a VLESS server.
  *
- * Everything here is the command line around three pieces: the node (a vless:// link, or a file of
- * links or an Xray / sing-box / Clash config — proto/vless/sub.c), the stack that turns the
- * device's packets into flows (tunnel/stack.c) and the VLESS dialer that carries each flow to the
- * node (proto/vless/vldial.c). The process lives as long as the device: a signal ends both, and
- * the kernel removes the device and every route into it when the process exits.
+ * Everything here is the command line around four pieces: the nodes (vless:// links, or files of
+ * links or Xray / sing-box / Clash configs — proto/vless/sub.c), the stack that turns the device's
+ * packets into flows (tunnel/stack.c), the node pool that keeps one or more of the nodes active and
+ * replaces a dead one (tunnel/pool.c), and the VLESS dialer that carries each flow to its node
+ * (proto/vless/vldial.c). The process lives as long as the device: a signal ends both, and the
+ * kernel removes the device and every route into it when the process exits.
  *
  * Exit codes: 2 — the command line or the node is wrong (restarting will not help); 1 — the
  * tunnel did not come up or stopped carrying traffic; 0 — stopped by SIGINT, SIGTERM or SIGHUP.
@@ -25,6 +26,7 @@
 #include "client.h"
 #include "vldial.h"
 #include "stack.h"
+#include "pool.h"
 #include "ifcfg.h"
 #include "transport.h"
 #include "roots.h"
@@ -38,12 +40,16 @@
 
 #define ROUTES_MAX 64
 #define RETRY_MAX_S 60
+#define ACTIVE_MAX 64
 
 struct route { uint32_t dst; int prefix; };
 
 static struct {
-    const char *source;
-    int node;                   /* -1 — not chosen on the command line */
+    char **sources;
+    int sources_n;
+    int *want;                  /* --node: candidates in order of preference */
+    size_t want_n, want_cap;
+    int active, by, interval_s;
     int list, probe, no_probe, no_retry, insecure;
     const char *ca;
     const char *bind_dev;
@@ -54,32 +60,36 @@ static struct {
     struct route routes[ROUTES_MAX];
     int routes_n;
 } g = {
-    .node = -1,
-    .silence_s = 20,
+    .active = 1,
+    .by = POOL_BY_CONNECTION,
+    .interval_s = POOL_INTERVAL_S,
+    .silence_s = POOL_SILENCE_S,
     .timeout_s = 8,
     .tc = { .dev = "tunvless0", .prefix = 32 },
 };
 
 static struct vless_node *g_nodes;
 static size_t g_cnt;
-static int g_single;            /* the node came as a link, not from a file */
+static int g_links_only;        /* every source was a link, none a file */
+static int *g_sel;              /* candidates: --node, or every node */
+static size_t g_sel_n;
 
 static void usage(FILE *f) {
     fprintf(f,
-"Usage: tunvless [options] <vless://link | file>\n"
+"Usage: tunvless [options] <vless://link | file>...\n"
 "\n"
-"Creates a TUN device and carries its TCP and UDP traffic to a VLESS server\n"
+"Creates a TUN device and carries its TCP and UDP traffic to VLESS servers\n"
 "(Reality, TLS or none; tcp, grpc, xhttp, ws or httpupgrade; Vision; VLESS encryption).\n"
 "\n"
-"The node:\n"
+"The nodes (every source adds its nodes, numbered from 0 in order, as --list shows):\n"
 "  vless://...            a VLESS link\n"
 "  file                   vless:// links (plain or base64), or an Xray, sing-box or\n"
 "                         Clash config with VLESS outbounds\n"
-"  -n, --node N           use node N of the file (from 0, among usable nodes); default:\n"
-"                         the first one that answers a probe\n"
+"  -n, --node N[,N...]    candidates, in order of preference; repeatable; default: every\n"
+"                         node. A single one is used without a probe at startup\n"
 "  -l, --list             print the usable nodes and exit\n"
-"  -p, --probe            check the node (or every node of the file) and exit\n"
-"      --no-probe         take the first node of the file without checking it\n"
+"  -p, --probe            check the candidates and exit\n"
+"      --no-probe         start with the first candidate without checking it\n"
 "      --insecure         accept allowInsecure nodes; do not verify certificates of\n"
 "                         security=tls nodes\n"
 "      --ca FILE          trusted roots (PEM) for security=tls\n"
@@ -91,8 +101,17 @@ static void usage(FILE *f) {
 "                         \"default\" means 0.0.0.0/1 and 128.0.0.0/1\n"
 "  -T, --table N          routing table for --route (default main)\n"
 "\n"
+"Failover (the first candidate that answers is active at startup; a dead active node\n"
+"is replaced by the next candidate that answers, without a restart):\n"
+"  -A, --active N         keep N nodes active at once and spread new connections over\n"
+"                         them (default 1, at most %d)\n"
+"      --by MODE          how connections are spread: connection (each to a random\n"
+"                         active node), site (by destination address), site-client\n"
+"                         (by client and destination); default connection\n"
+"      --interval S       health check period of each active node (default %d)\n"
+"\n"
 "Keeping the tunnel's own connections out of the tunnel (without either, a --route\n"
-"that covers the server gets a host route to the server through its current gateway):\n"
+"that covers a candidate's server gets a host route to it through its current gateway):\n"
 "  -m, --mark N           SO_MARK on sockets to the server\n"
 "  -b, --bind-dev IFACE   send sockets to the server out of IFACE (SO_BINDTODEVICE)\n"
 "\n"
@@ -100,10 +119,10 @@ static void usage(FILE *f) {
 "  -t, --timeout S        probe and connect timeout, seconds (default 8)\n"
 "      --silence S        reset a connection whose server stays silent for S seconds\n"
 "                         (default 20, 0 — never)\n"
-"      --no-retry         exit when the node cannot be resolved or none answers,\n"
+"      --no-retry         exit when no candidate resolves or none answers at startup,\n"
 "                         instead of retrying\n"
 "  -V, --version\n"
-"  -h, --help\n");
+"  -h, --help\n", ACTIVE_MAX, POOL_INTERVAL_S);
 }
 
 static int parse_uint(const char *s, uint32_t *out) {
@@ -130,7 +149,27 @@ static int add_route(const char *s) {
     return 0;
 }
 
-enum { OPT_NO_PROBE = 256, OPT_INSECURE, OPT_CA, OPT_SILENCE, OPT_NO_RETRY };
+/* --node "3", "3,5,7"; repeatable, so the list is appended to. */
+static int add_nodes(const char *s) {
+    char *end;
+    for (;;) {
+        errno = 0;
+        unsigned long v = strtoul(s, &end, 10);
+        if (end == s || errno || v > 1000000 || (*end && *end != ',')) return -1;
+        if (g.want_n == g.want_cap) {
+            size_t cap = g.want_cap ? g.want_cap * 2 : 8;
+            int *w = realloc(g.want, cap * sizeof(*w));
+            if (!w) return -1;
+            g.want = w;
+            g.want_cap = cap;
+        }
+        g.want[g.want_n++] = (int)v;
+        if (!*end) return 0;
+        s = end + 1;
+    }
+}
+
+enum { OPT_NO_PROBE = 256, OPT_INSECURE, OPT_CA, OPT_SILENCE, OPT_NO_RETRY, OPT_BY, OPT_INTERVAL };
 
 static int parse_args(int argc, char **argv) {
     static const struct option opts[] = {
@@ -149,6 +188,9 @@ static int parse_args(int argc, char **argv) {
         { "timeout",  required_argument, NULL, 't' },
         { "silence",  required_argument, NULL, OPT_SILENCE },
         { "no-retry", no_argument,       NULL, OPT_NO_RETRY },
+        { "active",   required_argument, NULL, 'A' },
+        { "by",       required_argument, NULL, OPT_BY },
+        { "interval", required_argument, NULL, OPT_INTERVAL },
         { "version",  no_argument,       NULL, 'V' },
         { "help",     no_argument,       NULL, 'h' },
         { NULL, 0, NULL, 0 },
@@ -156,12 +198,9 @@ static int parse_args(int argc, char **argv) {
     const char *addr = "198.51.100.1/32";
     uint32_t v;
     int c;
-    while ((c = getopt_long(argc, argv, "n:lpd:a:r:T:m:b:t:Vh", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "n:lpd:a:r:T:m:b:t:A:Vh", opts, NULL)) != -1) {
         switch (c) {
-        case 'n':
-            if (parse_uint(optarg, &v) != 0 || v > 1000000) goto bad;
-            g.node = (int)v;
-            break;
+        case 'n': if (add_nodes(optarg) != 0) goto bad; break;
         case 'l': g.list = 1; break;
         case 'p': g.probe = 1; break;
         case OPT_NO_PROBE: g.no_probe = 1; break;
@@ -191,13 +230,25 @@ static int parse_args(int argc, char **argv) {
             g.silence_s = (int)v;
             break;
         case OPT_NO_RETRY: g.no_retry = 1; break;
+        case 'A':
+            if (parse_uint(optarg, &v) != 0 || v == 0 || v > ACTIVE_MAX) goto bad;
+            g.active = (int)v;
+            break;
+        case OPT_BY:
+            if ((g.by = pool_by_parse(optarg)) < 0) goto bad;
+            break;
+        case OPT_INTERVAL:
+            if (parse_uint(optarg, &v) != 0 || v < 5 || v > 86400) goto bad;
+            g.interval_s = (int)v;
+            break;
         case 'V': printf("tunvless %s\n", TUNVLESS_VERSION); exit(0);
         case 'h': usage(stdout); exit(0);
         default: usage(stderr); return 2;
         }
     }
-    if (optind != argc - 1) { usage(stderr); return 2; }
-    g.source = argv[optind];
+    if (optind >= argc) { usage(stderr); return 2; }
+    g.sources = argv + optind;
+    g.sources_n = argc - optind;
     if (ifcfg_parse_cidr(addr, &g.tc.addr, &g.tc.prefix) != 0) {
         fprintf(stderr, "tunvless: --addr %s is not an IPv4 address\n", addr);
         return 2;
@@ -208,47 +259,83 @@ bad:
     return 2;
 }
 
-/* ---- the node ------------------------------------------------------------------------- */
+/* ---- the nodes ------------------------------------------------------------------------ */
 
-static int load_file(void) {
-    struct vless_sub_stats st;
-    g_nodes = vless_load_sub(g.source, &g_cnt, &st);
-    if (!g_nodes) {
-        fprintf(stderr, "tunvless: %s cannot be read\n", g.source);
-        return 2;
+static int append_nodes(const struct vless_node *n, size_t cnt) {
+    struct vless_node *all = realloc(g_nodes, (g_cnt + cnt) * sizeof(*all));
+    if (!all) {
+        fprintf(stderr, "tunvless: out of memory for %zu nodes\n", g_cnt + cnt);
+        return 1;
     }
-    if (g_cnt == 0 || st.skipped)
-        fprintf(stderr, "%s%s: %zu usable VLESS nodes (skipped %zu, other protocols %zu)\n",
-                g_cnt ? LOG_I : LOG_W, g.source, g_cnt, st.skipped, st.foreign);
-    for (size_t i = 0; i < st.reasons_n; i++)
-        fprintf(stderr, "%s  %s — %zu node(s)%s%s\n", g_cnt ? LOG_I : LOG_W, st.reasons[i].reason,
-                st.reasons[i].count, st.reasons[i].example[0] ? ", e.g. " : "",
-                st.reasons[i].example);
-    return g_cnt ? 0 : 2;
+    g_nodes = all;
+    memcpy(g_nodes + g_cnt, n, cnt * sizeof(*n));
+    g_cnt += cnt;
+    return 0;
 }
 
+static int load_link(const char *src) {
+    struct vless_node n;
+    memset(&n, 0, sizeof(n));
+    int r = vless_parse_url(src, &n);
+    if (r < 0) {
+        fprintf(stderr, "tunvless: not a vless:// link: %.64s\n", src);
+        return 2;
+    }
+    if (r > 0) {
+        fprintf(stderr, "tunvless: link %s cannot be used: %s\n", n.name, n.skip_reason);
+        return 2;
+    }
+    return append_nodes(&n, 1);
+}
+
+static int load_file(const char *src) {
+    struct vless_sub_stats st;
+    size_t cnt = 0;
+    struct vless_node *n = vless_load_sub(src, &cnt, &st);
+    if (!n) {
+        fprintf(stderr, "tunvless: %s cannot be read\n", src);
+        return 2;
+    }
+    if (cnt == 0 || st.skipped)
+        fprintf(stderr, "%s%s: %zu usable VLESS nodes (skipped %zu, other protocols %zu)\n",
+                cnt ? LOG_I : LOG_W, src, cnt, st.skipped, st.foreign);
+    for (size_t i = 0; i < st.reasons_n; i++)
+        fprintf(stderr, "%s  %s — %zu node(s)%s%s\n", cnt ? LOG_I : LOG_W, st.reasons[i].reason,
+                st.reasons[i].count, st.reasons[i].example[0] ? ", e.g. " : "",
+                st.reasons[i].example);
+    int rc = append_nodes(n, cnt);
+    free(n);
+    return rc;
+}
+
+/* Every source, then the candidates: --node in its order (repeats dropped), or every node. */
 static int load_nodes(void) {
-    if (!strncmp(g.source, "vless://", 8)) {
-        g_nodes = calloc(1, sizeof(*g_nodes));
-        if (!g_nodes) return 1;
-        int r = vless_parse_url(g.source, g_nodes);
-        if (r < 0) {
-            fprintf(stderr, "tunvless: not a vless:// link\n");
-            return 2;
-        }
-        if (r > 0) {
-            fprintf(stderr, "tunvless: the link cannot be used: %s\n", g_nodes->skip_reason);
-            return 2;
-        }
-        g_cnt = 1;
-        g_single = 1;
-    } else {
-        int rc = load_file();
+    g_links_only = 1;
+    for (int i = 0; i < g.sources_n; i++) {
+        const char *src = g.sources[i];
+        int link = !strncmp(src, "vless://", 8);
+        if (!link) g_links_only = 0;
+        int rc = link ? load_link(src) : load_file(src);
         if (rc) return rc;
     }
-    if (g.node >= (int)g_cnt) {
-        fprintf(stderr, "tunvless: there is no node %d (usable nodes: %zu)\n", g.node, g_cnt);
+    if (!g_cnt) {
+        fprintf(stderr, "tunvless: no usable VLESS node\n");
         return 2;
+    }
+    g_sel = calloc(g.want_n ? g.want_n : g_cnt, sizeof(*g_sel));
+    if (!g_sel) return 1;
+    if (!g.want_n) {
+        for (size_t i = 0; i < g_cnt; i++) g_sel[g_sel_n++] = (int)i;
+        return 0;
+    }
+    for (size_t i = 0; i < g.want_n; i++) {
+        int n = g.want[i], dup = 0;
+        if (n >= (int)g_cnt) {
+            fprintf(stderr, "tunvless: there is no node %d (usable nodes: %zu)\n", n, g_cnt);
+            return 2;
+        }
+        for (size_t j = 0; j < g_sel_n && !dup; j++) dup = g_sel[j] == n;
+        if (!dup) g_sel[g_sel_n++] = n;
     }
     return 0;
 }
@@ -265,16 +352,16 @@ static int cmd_list(void) {
 /* --probe: the same check as at startup, with timings. */
 static int cmd_probe(void) {
     int found = 0;
-    for (size_t i = 0; i < g_cnt; i++) {
-        if (g.node >= 0 && (int)i != g.node) continue;
+    for (size_t k = 0; k < g_sel_n; k++) {
+        int i = g_sel[k];
         char why[256] = "";
         int hs = -1, ttfb = -1;
         int rc = vless_probe_timed(&g_nodes[i], g.timeout_s, why, sizeof(why), &hs, &ttfb);
         if (rc == 0) {
             found = 1;
-            printf("%zu\t%s\tok\thandshake %d ms, first byte %d ms\n", i, g_nodes[i].name, hs, ttfb);
+            printf("%d\t%s\tok\thandshake %d ms, first byte %d ms\n", i, g_nodes[i].name, hs, ttfb);
         } else {
-            printf("%zu\t%s\tfailed\t%s\n", i, g_nodes[i].name, why);
+            printf("%d\t%s\tfailed\t%s\n", i, g_nodes[i].name, why);
         }
         fflush(stdout);
     }
@@ -290,47 +377,88 @@ static int retry_wait(unsigned *step, const char *what) {
     return 1;
 }
 
-/* The node to bring the device up with. Named one (--node, or the link itself) is not probed —
- * the person chose it; otherwise the first node of the file that answers. NULL — none. */
-static const struct vless_node *choose_node(void) {
-    if (g.node >= 0) return &g_nodes[g.node];
-    if (g_single || g.no_probe) return &g_nodes[0];
-    unsigned step = 5;
-    for (;;) {
-        for (size_t i = 0; i < g_cnt; i++) {
-            char why[256] = "";
-            if (vless_probe(&g_nodes[i], g.timeout_s, why, sizeof(why)) == 0) {
-                fprintf(stderr, LOG_I "chose %s (%s)\n", g_nodes[i].name, why);
-                return &g_nodes[i];
-            }
-            fprintf(stderr, LOG_I "%s — %s\n", g_nodes[i].name, why);
-        }
-        if (!retry_wait(&step, "no node answered")) return NULL;
-    }
+/* A single candidate named by the person (one --node, or one link and nothing else) is used
+ * without a probe at startup; the pool checks it as soon as the device is up. */
+static int named(void) {
+    return g_sel_n == 1 && (g.want_n || g_links_only);
 }
 
-/* Resolve the node's name once, before any route points into the device (trdial.c says why). */
-static int pin_node(const struct vless_node *n) {
+/* Resolve every candidate's name once, before any route points into the device (trdial.c says
+ * why). A candidate whose name does not resolve is left out: the pool could not reach it later
+ * without a DNS query that may itself go into the tunnel. -1 — none resolves. */
+static int pin_candidates(void) {
     unsigned step = 5;
+    char *ok = calloc(g_sel_n, 1);
+    if (!ok) return -1;
     for (;;) {
-        int k = transport_pin_host(n->host);
-        if (k > 0) return 0;
+        size_t n_ok = 0;
+        const char *failed = NULL;
+        for (size_t k = 0; k < g_sel_n; k++) {
+            ok[k] = transport_pin_host(g_nodes[g_sel[k]].host) > 0;
+            if (ok[k]) n_ok++;
+            else failed = g_nodes[g_sel[k]].host;
+        }
+        if (n_ok) {
+            size_t w = 0;
+            for (size_t k = 0; k < g_sel_n; k++) {
+                if (!ok[k]) {
+                    const struct vless_node *n = &g_nodes[g_sel[k]];
+                    fprintf(stderr, LOG_W "node %s: %s does not resolve — left out of the "
+                                    "candidates\n", n->name, n->host);
+                    continue;
+                }
+                g_sel[w++] = g_sel[k];
+            }
+            g_sel_n = w;
+            free(ok);
+            return 0;
+        }
         char what[192];
-        snprintf(what, sizeof(what), "%s does not resolve", n->host);
+        if (g_sel_n == 1) snprintf(what, sizeof(what), "%s does not resolve", failed);
+        else snprintf(what, sizeof(what), "no candidate's name resolves (%s, ...)", failed);
         if (!retry_wait(&step, what)) {
             fprintf(stderr, LOG_W "%s\n", what);
+            free(ok);
             return -1;
         }
     }
 }
 
+/* The node to bring the device up with: a named one, or with --no-probe the first candidate, as it
+ * is; otherwise the first candidate that answers a probe. -1 — none. *checked — it was probed. */
+static int choose_node(int *checked) {
+    *checked = 0;
+    if (named() || g.no_probe) return g_sel[0];
+    unsigned step = 5;
+    for (;;) {
+        for (size_t k = 0; k < g_sel_n; k++) {
+            const struct vless_node *n = &g_nodes[g_sel[k]];
+            char why[256] = "";
+            if (vless_probe(n, g.timeout_s, why, sizeof(why)) == 0) {
+                fprintf(stderr, LOG_I "chose %s (%s)\n", n->name, why);
+                *checked = 1;
+                return g_sel[k];
+            }
+            fprintf(stderr, LOG_I "%s — %s\n", n->name, why);
+        }
+        if (!retry_wait(&step, "no node answered")) return -1;
+    }
+}
+
+/* The pool's view of a node. */
+static int pool_probe(const void *node, int timeout_s, char *why, size_t why_n) {
+    return vless_probe(node, timeout_s, why, why_n);
+}
+static const char *pool_name(const void *node) {
+    return ((const struct vless_node *)node)->name;
+}
+
 /* ---- routes --------------------------------------------------------------------------- */
 
-/* Host routes added for the server (keep_server_out). Unlike the routes into the device, they go
+/* Host routes added for the servers (keep_server_out). Unlike the routes into the device, they go
  * through a real interface and would outlive the process, so they are removed on the way out. */
-#define KEPT_MAX 16
-static struct kept { uint32_t dst, gw; unsigned oif; } g_kept[KEPT_MAX];
-static int g_kept_n;
+static struct kept { uint32_t dst, gw; unsigned oif; } *g_kept;
+static int g_kept_n, g_kept_cap;
 static pthread_mutex_t g_kept_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void kept_remove(void) {
@@ -346,12 +474,52 @@ static int covered(uint32_t a, const struct route *r) {
     return (a & mask) == (r->dst & mask);
 }
 
-/* Without --mark and --bind-dev, sockets to the server follow the routing table, so a route that
- * covers the server would send the tunnel's own connections into the tunnel. Such addresses keep
- * the route they have now, as a host route next to ours. */
-static void keep_server_out(const struct vless_node *n) {
-    uint32_t addrs[16];
-    int k = transport_pinned_addrs(n->host, addrs, 16);
+/* Server addresses of every candidate, each once: the pool may move to any of them. */
+static int server_addrs(uint32_t **out) {
+    int n = 0, cap = 0;
+    uint32_t *all = NULL;
+    for (size_t k = 0; k < g_sel_n; k++) {
+        uint32_t a[16];
+        int an = transport_pinned_addrs(g_nodes[g_sel[k]].host, a, 16);
+        for (int i = 0; i < an; i++) {
+            int dup = 0;
+            for (int j = 0; j < n && !dup; j++) dup = all[j] == a[i];
+            if (dup) continue;
+            if (n == cap) {
+                cap = cap ? cap * 2 : 16;
+                uint32_t *p = realloc(all, (size_t)cap * sizeof(*p));
+                if (!p) { *out = all; return n; }
+                all = p;
+            }
+            all[n++] = a[i];
+        }
+    }
+    *out = all;
+    return n;
+}
+
+/* Add a host route and record it, under one lock: a stop in between would otherwise leave it. */
+static int kept_add(uint32_t dst, uint32_t gw, unsigned oif) {
+    int rc = 0;
+    pthread_mutex_lock(&g_kept_mu);
+    if (g_kept_n == g_kept_cap) {
+        int cap = g_kept_cap ? g_kept_cap * 2 : 16;
+        struct kept *p = realloc(g_kept, (size_t)cap * sizeof(*p));
+        if (p) { g_kept = p; g_kept_cap = cap; }
+        else rc = -ENOMEM;
+    }
+    if (rc == 0) rc = ifcfg_route_via(dst, gw, oif, g.table);
+    if (rc == 0) g_kept[g_kept_n++] = (struct kept){ dst, gw, oif };
+    pthread_mutex_unlock(&g_kept_mu);
+    return rc;
+}
+
+/* Without --mark and --bind-dev, sockets to the servers follow the routing table, so a route that
+ * covers a server would send the tunnel's own connections into the tunnel. Such addresses keep the
+ * route they have now, as a host route next to ours. */
+static void keep_server_out(void) {
+    uint32_t *addrs;
+    int k = server_addrs(&addrs);
     for (int i = 0; i < k; i++) {
         int hit = 0;
         for (int j = 0; j < g.routes_n && !hit; j++) hit = covered(addrs[i], &g.routes[j]);
@@ -362,12 +530,7 @@ static void keep_server_out(const struct vless_node *n) {
         unsigned oif;
         int rc = ifcfg_route_get(addrs[i], &gw, &oif);
         if (rc == 1) continue;                  /* an address of this machine */
-        /* Added and recorded under one lock: a stop in between would otherwise leave the route. */
-        pthread_mutex_lock(&g_kept_mu);
-        if (rc == 0 && g_kept_n >= KEPT_MAX) rc = -ENOSPC;
-        if (rc == 0) rc = ifcfg_route_via(addrs[i], gw, oif, g.table);
-        if (rc == 0) g_kept[g_kept_n++] = (struct kept){ addrs[i], gw, oif };
-        pthread_mutex_unlock(&g_kept_mu);
+        if (rc == 0) rc = kept_add(addrs[i], gw, oif);
         /* The table already has a host route for the server (the person's own): it stands, and it
          * is not ours to remove. */
         if (rc == -EEXIST) {
@@ -380,11 +543,12 @@ static void keep_server_out(const struct vless_node *n) {
         else
             fprintf(stderr, LOG_I "server %s keeps its route outside the tunnel\n", a);
     }
+    free(addrs);
 }
 
 static void on_ready(void *arg, const char *dev) {
-    const struct vless_node *n = arg;
-    if (g.routes_n && !g.mark && !g.bind_dev) keep_server_out(n);
+    (void)arg;
+    if (g.routes_n && !g.mark && !g.bind_dev) keep_server_out();
     int ok = 0;
     for (int i = 0; i < g.routes_n; i++) {
         int rc = ifcfg_route_add(dev, g.routes[i].dst, g.routes[i].prefix, g.table);
@@ -455,13 +619,30 @@ int main(int argc, char **argv) {
     fprintf(stderr, LOG_I "tunvless %s\n", TUNVLESS_VERSION);
     if (g.insecure)
         fprintf(stderr, LOG_W "--insecure: certificates of security=tls nodes are NOT verified\n");
-    const struct vless_node *node = choose_node();
-    if (!node) {
+    if (pin_candidates() != 0) return 1;
+    int checked;
+    int first = choose_node(&checked);
+    if (first < 0) {
         fprintf(stderr, LOG_W "no node answered\n");
         return 1;
     }
-    if (pin_node(node) != 0) return 1;
-    rc = vless_tunnel_run(&g.tc, node, g.silence_s, on_ready, (void *)node);
+    static const struct pool_proto proto = {
+        .ops = &vless_dialer, .probe = pool_probe, .name = pool_name,
+    };
+    struct pool_cfg pc = {
+        .proto = &proto,
+        .nodes = g_nodes,
+        .stride = sizeof(*g_nodes),
+        .sel = g_sel,
+        .sel_n = g_sel_n,
+        .first = first,
+        .checked = checked,
+        .active = g.active,
+        .by = g.by,
+        .interval_s = g.interval_s,
+        .silence_s = g.silence_s,
+    };
+    rc = vless_tunnel_run(&g.tc, &pc, on_ready, NULL);
     kept_remove();
     return rc;
 }

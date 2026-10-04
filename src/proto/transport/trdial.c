@@ -122,13 +122,13 @@ void transport_set_bind_dev(const char *ifname) {
     snprintf(g_bind_dev, sizeof(g_bind_dev), "%s", ifname ? ifname : "");
 }
 
-/* Addresses of a node resolved once, at startup (transport_pin_host). Once the routes point into
- * the tunnel, the DNS query for the node's name would itself go into the tunnel and wait for a
+/* Addresses of the nodes resolved once, at startup (transport_pin_host). Once the routes point into
+ * the tunnel, the DNS query for a node's name would itself go into the tunnel and wait for a
  * connection that is waiting for that query. Filled before the loop threads start and only read
  * afterwards, so no lock. */
-#define PIN_MAX 4
-static struct { char host[128]; struct in_addr ip[ADDR_MAX]; unsigned n; } g_pin[PIN_MAX];
-static unsigned g_pin_n;
+struct pin { char host[128]; struct in_addr ip[ADDR_MAX]; unsigned n; };
+static struct pin *g_pin;
+static unsigned g_pin_n, g_pin_cap;
 
 static unsigned resolve(const char *host, struct in_addr out[ADDR_MAX]) {
     struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
@@ -145,11 +145,19 @@ static unsigned resolve(const char *host, struct in_addr out[ADDR_MAX]) {
 int transport_pin_host(const char *host) {
     for (unsigned i = 0; i < g_pin_n; i++)
         if (!strcmp(g_pin[i].host, host)) return (int)g_pin[i].n;
-    if (g_pin_n >= PIN_MAX || strlen(host) >= sizeof(g_pin[0].host)) return TR_EDNS;
-    unsigned an = resolve(host, g_pin[g_pin_n].ip);
+    if (strlen(host) >= sizeof(g_pin[0].host)) return TR_EDNS;
+    if (g_pin_n == g_pin_cap) {
+        unsigned cap = g_pin_cap ? g_pin_cap * 2 : 8;
+        struct pin *p = realloc(g_pin, cap * sizeof(*p));
+        if (!p) return TR_EDNS;
+        g_pin = p;
+        g_pin_cap = cap;
+    }
+    struct pin *p = &g_pin[g_pin_n];
+    unsigned an = resolve(host, p->ip);
     if (!an) return TR_EDNS;
-    snprintf(g_pin[g_pin_n].host, sizeof(g_pin[0].host), "%s", host);
-    g_pin[g_pin_n].n = an;
+    snprintf(p->host, sizeof(p->host), "%s", host);
+    p->n = an;
     g_pin_n++;
     return (int)an;
 }

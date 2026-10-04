@@ -84,6 +84,7 @@ int nanosleep(const struct timespec *req, struct timespec *rem) {
 #include "../src/tunnel/stack.c"
 #include "vldial.h"
 #include "client.h"
+#include "../src/tunnel/pool.c"
 
 /* ---- подменённое соединение с узлом -------------------------------------------- */
 
@@ -525,7 +526,8 @@ static void run_bad(void *arg) {
     /* Имя длиннее 15 символов: tun_open откажет и сам, так что устройство не появится ни до
      * правки, ни после — различается только названа ли причина. */
     struct tun_cfg tc = { .dev = "tunnelmatch-no-such-dev", .prefix = 32 };
-    g_run_rc = vless_tunnel_run(&tc, arg, 0, NULL, NULL);
+    struct pool_cfg pc = { .nodes = arg, .stride = sizeof(struct vless_node), .first = 0 };
+    g_run_rc = vless_tunnel_run(&tc, &pc, NULL, NULL);
 }
 
 /* I-097: UUID узла не разбирается. Прежде соединение закрывалось молча — ни строки, ни
@@ -547,7 +549,7 @@ static void t_bad_uuid(void) {
     check(said && !c, "I-097: SYN к узлу с негодным UUID — отказ назван в журнале");
     if (c) conn_drop(c);
     dev_drain(NULL);
-    said = stderr_has(run_bad, &bad, "не разбирается UUID");
+    said = stderr_has(run_bad, &bad, "the UUID of node узел-стенда does not parse");
     check(said && g_run_rc == 1, "I-097: подъём называет негодный UUID до подъёма устройства");
 }
 
@@ -903,6 +905,317 @@ static void pm_sweep(void) {
     }
 }
 
+
+/* ==== NODE POOL (src/tunnel/pool.c) ========================================================
+ *
+ * The pool runs over the fake dialer above, whose nodes answer a probe while `alive` is set.
+ * Checks (pl_check) are called by hand instead of from the health thread, so every step of a
+ * failover is deterministic. */
+
+static int f_probe(const void *node, int t, char *why, size_t n) {
+    (void)t;
+    if (((const struct fnode *)node)->alive) return 0;
+    snprintf(why, n, "test node is silent");
+    return -1;
+}
+static const char *f_name(const void *node) { return ((const struct fnode *)node)->name; }
+static const struct pool_proto f_proto = { .ops = &f_ops, .probe = f_probe, .name = f_name };
+
+static int g_cand[5] = { 0, 1, 2, 3, 4 };
+
+/* A fresh pool: `active` slots, candidates 0..ncand-1, node 0 chosen at startup. */
+static void pool_new_ex(int active, int by, int ncand, int checked) {
+    while (g_conns && g_live_n) conn_drop(&g_conns[g_live[0]]);
+    free(g_pl.slot);
+    memset(&g_pl.cf, 0, sizeof g_pl.cf);
+    g_pl.sig[0] = '\0';
+    g_pl.said_up = 0;
+    g_pl.why[0] = '\0';
+    struct pool_cfg pc = {
+        .proto = &f_proto, .nodes = g_fn, .stride = sizeof(struct fnode), .sel = g_cand,
+        .sel_n = (size_t)ncand, .first = 0, .checked = checked, .active = active, .by = by,
+        .interval_s = 60, .silence_s = 20,
+    };
+    const struct dialer *d = pool_setup(&pc);
+    g_spare_want = 0;
+    stack_setup(d);
+}
+static void pool_new(int active, int by, int ncand) { pool_new_ex(active, by, ncand, 1); }
+
+static void all_alive(void) { for (int i = 0; i < 5; i++) g_fn[i].alive = 1; }
+
+static void t_pool_setup(void) {
+    check(pool_by_parse("connection") == POOL_BY_CONNECTION && pool_by_parse("site") == POOL_BY_SITE &&
+          pool_by_parse("site-client") == POOL_BY_SITE_CLIENT &&
+          pool_by_parse("site_client") == POOL_BY_SITE_CLIENT && pool_by_parse("node") == -1,
+          "--by: connection, site, site-client (and site_client) parse; anything else is refused");
+    check(!strcmp(pool_by_name(POOL_BY_SITE_CLIENT), "site-client") &&
+          !strcmp(pool_by_name(POOL_BY_SITE), "site") &&
+          !strcmp(pool_by_name(POOL_BY_CONNECTION), "connection"),
+          "pool_by_name names each mode as --by takes it");
+    all_alive();
+    pool_new(4, POOL_BY_CONNECTION, 2);
+    check(g_pl.n == 2, "more active nodes asked than candidates — one slot per candidate");
+    pool_new(2, POOL_BY_CONNECTION, 3);
+    uint64_t now = pl_now_ms();
+    check(g_pl.slot[0].node == 0 && g_pl.slot[0].up && g_pl.slot[0].due > now + 50000 &&
+          g_pl.slot[1].node == -1 && g_pl.slot[1].due <= now,
+          "startup: slot 0 holds the probed node, next check in a period; the empty slot searches now");
+    pool_new_ex(1, POOL_BY_CONNECTION, 3, 0);
+    check(g_pl.slot[0].node == 0 && g_pl.slot[0].due <= pl_now_ms(),
+          "a node not probed at startup (named) is checked at once");
+}
+
+/* The node of a connection stops being active: its connections are reset, the others stay. */
+static void t_pool_stale(void) {
+    all_alive();
+    pool_new(2, POOL_BY_CONNECTION, 4);
+    pl_check(1);
+    check(g_pl.slot[1].node == 1 && g_pl.slot[1].up, "an empty slot takes the first free candidate (1)");
+    struct conn *a = NULL, *b = NULL;
+    for (uint16_t p = 51000; p < 51100 && (!a || !b); p++) {
+        struct conn *c = pm_open(p, 0x0b0b0b0bu);
+        if (!c) continue;
+        const struct pl_sess *ps = SESS(c);
+        if (ps->slot == 0 && !a) a = c;
+        else if (ps->slot == 1 && !b) b = c;
+        else conn_reset(c, &g_tun);
+    }
+    pm_drain(NULL, NULL);
+    check(a && b, "by connection: connections land on both active nodes");
+    if (!a || !b) return;
+    struct flow_key ka = a->key, kb = b->key;
+    unsigned ep0 = __atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE);
+    g_fn[0].alive = 0;
+    pl_check(0);
+    check(g_pl.slot[0].up && g_pl.slot[0].node == 0 && __atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE) == ep0,
+          "one failed check — the node is still active (confirmed 3 s later)");
+    pl_check(0);
+    check(g_pl.slot[0].up && g_pl.slot[0].node == 2,
+          "two failed checks in a row — replaced by the next free candidate (1 is taken, 2 is used)");
+    check(__atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE) != ep0, "a replacement tells the stack the node set changed");
+    pm_sweep();
+    unsigned fl;
+    pm_drain(&fl, NULL);
+    check(!conn_find(&ka) && (fl & TCP_RST), "a connection of the dead node — RST to the client, no restart");
+    check(conn_find(&kb) != NULL, "a connection of a live node — left alone");
+    struct conn *cb = conn_find(&kb);
+    if (cb) conn_reset(cb, &g_tun);
+    pm_drain(NULL, NULL);
+}
+
+static void t_pool_pick(void) {
+    all_alive();
+    pool_new(3, POOL_BY_SITE, 5);
+    pl_check(1);
+    pl_check(2);
+    check(g_pl.slot[1].node == 1 && g_pl.slot[2].node == 2, "three slots — nodes 0, 1, 2 in candidate order");
+    int at[200], per[3] = { 0, 0, 0 }, same = 1;
+    struct flow_key k = pm_key(1, 0);
+    for (int i = 0; i < 200; i++) {
+        k.dst = htonl(0x5db80000u + (uint32_t)i * 7919u);
+        k.sport = (uint16_t)(1000 + i);
+        at[i] = pl_pick(&k);
+        k.sport = (uint16_t)(2000 + i);
+        k.src = htonl(0x0a000099u);
+        if (pl_pick(&k) != at[i]) same = 0;
+        k.src = CLI_IP;
+        per[at[i]]++;
+    }
+    check(same, "by site: a site stays on one node whatever the port and the client");
+    check(per[0] > 30 && per[1] > 30 && per[2] > 30, "by site: sites spread over all three nodes");
+    g_pl.slot[1].up = 0;
+    int kept = 1, moved = 1;
+    for (int i = 0; i < 200; i++) {
+        k.dst = htonl(0x5db80000u + (uint32_t)i * 7919u);
+        int now = pl_pick(&k);
+        if (at[i] != 1 && now != at[i]) kept = 0;
+        if (at[i] == 1 && now == 1) moved = 0;
+    }
+    check(kept, "a node goes down — the sites of live nodes stay where they are");
+    check(moved, "a node goes down — its sites move to live nodes");
+    g_pl.slot[1].up = 1;
+
+    pool_new(3, POOL_BY_SITE_CLIENT, 5);
+    pl_check(1);
+    pl_check(2);
+    k.dst = htonl(0x5db80001u);
+    int seen[3] = { 0, 0, 0 }, stable = 1;
+    for (uint32_t c = 0; c < 60; c++) {
+        k.src = htonl(0x0a000002u + c);
+        int s1 = pl_pick(&k);
+        k.sport = (uint16_t)(k.sport + 1);
+        if (pl_pick(&k) != s1) stable = 0;
+        seen[s1] = 1;
+    }
+    check(seen[0] + seen[1] + seen[2] >= 2, "by site-client: one site, different clients — different nodes");
+    check(stable, "by site-client: one client and site stay on one node whatever the port");
+
+    pool_new(3, POOL_BY_CONNECTION, 5);
+    pl_check(1);
+    pl_check(2);
+    int cnt[3] = { 0, 0, 0 };
+    for (int i = 0; i < 3000; i++) cnt[pl_pick(&k)]++;
+    check(cnt[0] > 800 && cnt[1] > 800 && cnt[2] > 800, "by connection: new connections spread evenly");
+    for (int i = 0; i < 3; i++) g_pl.slot[i].up = 0;
+    check(pl_pick(&k) == 0, "no live node — a slot that has one, so the connection fails fast");
+    for (int i = 0; i < 3; i++) g_pl.slot[i].node = -1;
+    check(pl_pick(&k) == -1, "no slot has a node — none");
+}
+
+static void t_pool_refill(void) {
+    all_alive();
+    g_fn[1].alive = 0;
+    pool_new(3, POOL_BY_CONNECTION, 5);
+    pl_check(1);
+    pl_check(2);
+    check(g_pl.slot[1].node == 2 && g_pl.slot[2].node == 3,
+          "empty slots fill in candidate order, a silent candidate skipped");
+    for (int i = 0; i < 5; i++) g_fn[i].alive = 0;
+    pl_check(0);
+    pl_check(0);
+    check(!g_pl.slot[0].up && g_pl.slot[0].node == 0 && g_pl.slot[0].retry == PL_RETRY_S * 2,
+          "no replacement answers — the slot waits for the next round, the pause doubles");
+    check(g_pl.said_up == 1, "other slots are alive — the pool is still up");
+    for (int s = 1; s < 3; s++) { pl_check(s); pl_check(s); }
+    check(g_pl.said_up == 0, "no live slot left — the pool says so");
+    g_fn[3].alive = 1;
+    pl_check(0);
+    check(!g_pl.slot[0].up, "a round: the node a dead slot waits for is not given to another slot");
+    pl_check(2);
+    check(g_pl.slot[2].up && g_pl.slot[2].node == 3 && g_pl.said_up == 1,
+          "a round: the slot's own node answers again — the slot lives on it, the pool is up again");
+    g_fn[4].alive = 1;
+    pl_check(0);
+    check(g_pl.slot[0].up && g_pl.slot[0].node == 4, "a round: a free candidate answers — the slot takes it");
+    int dup = 0;
+    for (int i = 0; i < 3; i++)
+        for (int j = i + 1; j < 3; j++)
+            if (g_pl.slot[i].up && g_pl.slot[j].up && g_pl.slot[i].node == g_pl.slot[j].node) dup = 1;
+    check(!dup, "two live slots never share a node");
+}
+
+static void t_pool_spares(void) {
+    all_alive();
+    pool_new(2, POOL_BY_SITE, 3);
+    pl_check(1);
+    static unsigned char dst[PL_HDR + sizeof(struct fsess)], src[PL_HDR + sizeof(struct fsess)];
+    struct pl_sess *d = (struct pl_sess *)dst, *s = (struct pl_sess *)src;
+    pl_clear(dst);
+    pl_clear(src);
+    struct flow_key k = pm_key(1, htonl(0x5db80001u));
+    pl_flow_open(&g_pl, dst, &k, 0);
+    pthread_mutex_lock(&g_pl.mu);
+    pl_bind(s, 1 - d->slot);
+    pthread_mutex_unlock(&g_pl.mu);
+    check(pl_match(&g_pl, dst, src) == 0, "by site: a spare to another node does not suit the site's connection");
+    pthread_mutex_lock(&g_pl.mu);
+    pl_bind(s, d->slot);
+    pthread_mutex_unlock(&g_pl.mu);
+    check(pl_match(&g_pl, dst, src) == 1, "by site: a spare to its own node suits");
+    g_pl.slot[d->slot].gen++;
+    check(pl_match(&g_pl, dst, src) == -1, "a spare to a node no longer active — dropped");
+
+    pool_new(2, POOL_BY_CONNECTION, 3);
+    pl_check(1);
+    pl_clear(dst);
+    pl_clear(src);
+    pl_flow_open(&g_pl, dst, &k, 0);
+    pthread_mutex_lock(&g_pl.mu);
+    pl_bind(s, 1 - d->slot);
+    pthread_mutex_unlock(&g_pl.mu);
+    const void *want = s->node;
+    check(pl_match(&g_pl, dst, src) == 1, "by connection: a spare to any live node suits");
+    ((struct fsess *)INNER(src))->fd = -1;
+    pl_take(dst, src);
+    const struct fsess *fd = INNER(dst);
+    check(d->node == want && fd->node == want && fd->flow_opens == 2,
+          "a spare to another node — the connection moves to it, its flow set up again for that node");
+
+    /* Spares go to the live slots in turn. */
+    int slots[2] = { -1, -1 };
+    for (int i = 0; i < 2; i++) {
+        pl_clear(src);
+        if (pl_connect(&g_pl, src, 1) == 0) slots[i] = s->slot;
+        pl_close(src);
+    }
+    check(slots[0] >= 0 && slots[1] >= 0 && slots[0] != slots[1], "spares are opened to the live nodes in turn");
+    g_pl.slot[0].up = g_pl.slot[1].up = 0;
+    pl_clear(src);
+    check(pl_connect(&g_pl, src, 1) == TR_ECONNECT && s->slot == -1, "no live node — no spare is opened");
+    g_pl.slot[0].up = g_pl.slot[1].up = 1;
+
+    /* A streak of failed connects brings the check forward. */
+    g_pl.slot[0].kick = 0;
+    pl_clear(dst);
+    pthread_mutex_lock(&g_pl.mu);
+    pl_bind(d, 0);
+    pthread_mutex_unlock(&g_pl.mu);
+    pl_seen(d, -1);
+    pl_seen(d, -1);
+    check(!g_pl.slot[0].kick, "two failed connects — no early check yet");
+    pl_seen(d, 0);
+    pl_seen(d, -1);
+    pl_seen(d, -1);
+    check(!g_pl.slot[0].kick, "a successful connect breaks the streak");
+    pl_seen(d, -1);
+    check(g_pl.slot[0].kick == 1, "three failed connects in a row — check the node now");
+    g_pl.slot[0].kick = 0;
+    g_pl.slot[0].checked_at = pl_now_ms();
+    pl_lost(&g_pl, d);
+    check(!g_pl.slot[0].kick, "a cut right after a check does not call another (cuts come in bursts)");
+
+    /* After a stall the node is dead on the first failed check. */
+    all_alive();
+    pool_new(2, POOL_BY_CONNECTION, 3);
+    pl_check(1);
+    g_pl.slot[0].checked_at = 0;
+    pthread_mutex_lock(&g_pl.mu);
+    pl_bind(d, 0);
+    pthread_mutex_unlock(&g_pl.mu);
+    pl_lost(&g_pl, d);
+    check(g_pl.slot[0].kick == 1 && g_pl.slot[0].lost == 1, "a cut connection — check its node now");
+    g_fn[0].alive = 0;
+    pl_check(0);
+    check(g_pl.slot[0].up && g_pl.slot[0].node == 2,
+          "a stall and one failed check — replaced without the 3 s confirmation");
+    g_fn[0].alive = 1;
+}
+
+static void publish(void *arg) { (void)arg; pl_publish(); }
+static void check_slot0(void *arg) { (void)arg; pl_check(0); pl_check(0); }
+
+static void t_pool_log(void) {
+    all_alive();
+    pool_new(3, POOL_BY_SITE, 5);
+    pl_check(1);
+    pl_check(2);
+    g_pl.sig[0] = '\0';
+    check(stderr_has(publish, NULL, "active: n0 (#0), n1 (#1), n2 (#2)"),
+          "the log names the active nodes with their numbers");
+    check(!stderr_has(publish, NULL, "active:"), "the same active set is not logged again");
+    g_fn[0].alive = 0;
+    check(stderr_has(check_slot0, NULL, "node n0 does not answer — n3 takes its place"),
+          "a replacement is logged with both names");
+    for (int i = 0; i < 5; i++) g_fn[i].alive = 0;
+    pool_new(1, POOL_BY_CONNECTION, 1);
+    pl_publish();
+    check(stderr_has(check_slot0, NULL, "no active node answers (test node is silent)"),
+          "the last node dies — the log says no node answers, with the reason");
+    g_fn[0].alive = 1;
+    check(stderr_has(check_slot0, NULL, "node n0 answers again"), "it comes back — the log says so");
+    all_alive();
+}
+
+static void pool_part(void) {
+    t_pool_setup();
+    t_pool_stale();
+    t_pool_pick();
+    t_pool_refill();
+    t_pool_spares();
+    t_pool_log();
+}
+
 /* ---- стек ---------------------------------------------------------------------------------- */
 
 static void t_stack_abort(void) {
@@ -1204,6 +1517,7 @@ static int stack_part(void) {
     dev_drain(NULL);
     t_stack_abort();
     t_ack_paced();
+    pool_part();
     return 0;
 }
 

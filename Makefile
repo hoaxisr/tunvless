@@ -23,7 +23,7 @@ WARN     := -Wall -Wextra
 ALL_CFLAGS = $(CFLAGS) $(WARN) $(INC) -ffunction-sections -fdata-sections
 DEFS     := -DTUNVLESS_VERSION='"$(VERSION)"'
 
-TUNNEL_SRC    := src/tunnel/tun.c src/tunnel/stack.c src/tunnel/rtx.c src/tunnel/ifcfg.c
+TUNNEL_SRC    := src/tunnel/tun.c src/tunnel/stack.c src/tunnel/rtx.c src/tunnel/ifcfg.c src/tunnel/pool.c
 VLESS_SRC     := src/proto/vless/vldial.c src/proto/vless/client.c src/proto/vless/vless_proto.c \
                  src/proto/vless/vision.c src/proto/vless/sublink.c src/proto/vless/sub.c
 TRANSPORT_SRC := src/proto/transport/transport.c src/proto/transport/trdial.c \
@@ -138,7 +138,7 @@ $(T)/tunnamematch: tests/tunnamematch.c src/tunnel/tun.c $(HDR)
 
 TUNNEL_TEST_SRC := src/tunnel/tun.c src/tunnel/rtx.c src/tunnel/ifcfg.c src/proto/vless/vless_proto.c \
                    src/proto/vless/vision.c src/proto/vless/vldial.c src/lib/osrand.c
-$(T)/tunnelmatch: tests/tunnelmatch.c src/tunnel/stack.c $(TUNNEL_TEST_SRC) $(HDR)
+$(T)/tunnelmatch: tests/tunnelmatch.c src/tunnel/stack.c src/tunnel/pool.c $(TUNNEL_TEST_SRC) $(HDR)
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/tunnelmatch.c $(TUNNEL_TEST_SRC) -lpthread -ldl
 
@@ -207,6 +207,7 @@ e2e: $(O)/tunvless
 	TUNVLESS=$(O)/tunvless sh tests/rcvwnd.sh
 	TUNVLESS=$(O)/tunvless sh tests/sigpipe.sh
 	TUNVLESS=$(O)/tunvless sh tests/routes.sh
+	TUNVLESS=$(O)/tunvless sh tests/failover.sh
 
 clean:
 	rm -rf $(O)

@@ -78,7 +78,8 @@ down() {
     i=0
     while HX ip link show vl >/dev/null 2>&1 && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
 }
-fetch() { HX wget -q -O "$W/dl" -T 15 "http://$TARGET/x" && wc -c < "$W/dl" || echo 0; }
+# One try: wget retries a reset connection, which would hide a failed one.
+fetch() { HX wget -q --tries=1 -O "$W/dl" -T 15 "http://$TARGET/x" && wc -c < "$W/dl" || echo 0; }
 WANT=$((1024 * 1024))
 
 # ---- --route default, nothing else: the server keeps its route ------------------------------------

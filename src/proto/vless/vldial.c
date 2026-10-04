@@ -24,6 +24,7 @@
 #include "client.h"
 #include "vldial.h"
 #include "stack.h"
+#include "pool.h"
 
 #define LOG_W  "tunvless[warn] tunnel: "
 
@@ -624,24 +625,20 @@ static int vl_deliver(const void *ctx, void *sess, int udp, const unsigned char 
 
 /* ---- подъём ---------------------------------------------------------------------------- */
 
-int vless_tunnel_run(const struct tun_cfg *tc, const struct vless_node *node, int silence_s,
-                     stack_ready_fn ready, void *arg) {
-    /* Идентификатор узла — ДО устройства и потоков, пока узел ещё можно назвать. Дальше он
-     * разбирается заново на каждое соединение (vl_flow_open), и отказ там означал бы туннель,
-     * который поднят, но закрывает всё подряд (I-097). */
+int vless_tunnel_run(const struct tun_cfg *tc, const struct pool_cfg *pc, stack_ready_fn ready,
+                     void *arg) {
+    /* The node's id is checked before the device and the threads exist, while the node can still be
+     * named: past this point it is parsed per connection (vl_flow_open), and a failure there would
+     * mean a tunnel that is up but closes everything. */
+    const struct vless_node *node = (const struct vless_node *)pc->nodes + pc->first;
     unsigned char id[16];
     if (vless_uuid_parse(node->uuid, id) != 0) {
-        fprintf(stderr, "tunvless[warn]: у узла %s не разбирается UUID — туннель %s не поднят; "
-                        "проверьте ссылку узла\n", node->name, tc->dev);
+        fprintf(stderr, "tunvless[warn]: the UUID of node %s does not parse — %s is not brought up; "
+                        "check the node's link\n", node->name, tc->dev);
         return 1;
     }
     g_trace = getenv("STEER_TUN_TRACE") != NULL;
-    /* One node: it is the dialer's ctx, and the stack asks nothing about other nodes. */
-    static struct dialer d;
-    d.ops = &vless_dialer;
-    d.ctx = node;
-    d.silence_s = silence_s;
-    return stack_run(tc, &d, ready, arg);
+    return pool_run(tc, pc, ready, arg);
 }
 
 const struct dialer_ops vless_dialer = {

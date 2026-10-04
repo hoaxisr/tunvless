@@ -2,9 +2,10 @@
 # tunvless — Entware init script. Settings: /opt/etc/tunvless/tunvless.conf.
 #
 # The tunnel runs in the background with its log in syslog (logread). It needs no supervisor to
-# come up late: while the node does not resolve or does not answer (no WAN yet at boot) it retries
-# by itself. `stop` sends SIGTERM: tunvless removes the host route it may have added for the
-# server, and the device with every route into it goes with the process.
+# come up late: while no node resolves or answers (no WAN yet at boot) it retries by itself, and a
+# node that dies later is replaced by another candidate. `stop` sends SIGTERM: tunvless removes the
+# host routes it may have added for the servers, and the device with every route into it goes with
+# the process.
 
 PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
 PROC=tunvless
@@ -14,6 +15,9 @@ CONF=/opt/etc/tunvless/tunvless.conf
 ENABLED=no
 NODES=/opt/etc/tunvless/nodes.txt
 NODE=
+ACTIVE=1
+BY=connection
+INTERVAL=60
 DEVICE=tunvless0
 ADDRESS=198.51.100.1/32
 ROUTES=
@@ -36,20 +40,26 @@ start() {
     fi
     [ -c /dev/net/tun ] || { modprobe tun 2>/dev/null || insmod tun 2>/dev/null; }
 
-    set -- "$NODES" -d "$DEVICE" -a "$ADDRESS"
+    # NODES and OPTS are split on spaces on purpose; links hold '?' and '*', so no globbing.
+    set -f
+    # shellcheck disable=SC2086
+    set -- $NODES -d "$DEVICE" -a "$ADDRESS"
     [ -n "$NODE" ] && set -- "$@" -n "$NODE"
+    [ -n "$ACTIVE" ] && set -- "$@" -A "$ACTIVE"
+    [ -n "$BY" ] && set -- "$@" --by "$BY"
+    [ -n "$INTERVAL" ] && set -- "$@" --interval "$INTERVAL"
     for r in $ROUTES; do set -- "$@" -r "$r"; done
     [ -n "$TABLE" ] && set -- "$@" -T "$TABLE"
     [ -n "$MARK" ] && set -- "$@" -m "$MARK"
     [ -n "$BIND_DEV" ] && set -- "$@" -b "$BIND_DEV"
 
-    # OPTS is split on spaces on purpose: it holds several options.
     # shellcheck disable=SC2086
     if command -v logger >/dev/null 2>&1; then
         ( exec </dev/null >/dev/null 2>&1; "$BIN" "$@" $OPTS 2>&1 | logger -t $PROC ) &
     else
         ( exec </dev/null >/dev/null 2>&1; exec "$BIN" "$@" $OPTS ) &
     fi
+    set +f
 
     # The device appears once a node is chosen: usually within seconds; with no WAN yet the
     # tunnel keeps trying in the background.
