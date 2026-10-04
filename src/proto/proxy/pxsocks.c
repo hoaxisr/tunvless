@@ -67,7 +67,8 @@ static int rd_full(int fd, unsigned char *b, size_t n) {
 static int wr_full(int fd, const unsigned char *b, size_t n) {
     size_t o = 0;
     while (o < n) {
-        ssize_t w = write(fd, b + o, n - o);
+        /* MSG_NOSIGNAL: сервер SOCKS, закрывший соединение посреди рукопожатия, — отказ, а не сигнал. */
+        ssize_t w = send(fd, b + o, n - o, MSG_NOSIGNAL);
         if (w <= 0) { if (w < 0 && errno == EINTR) continue; return -1; }
         o += (size_t)w;
     }

@@ -30,6 +30,7 @@
  * от их файлов — tests/buildmatch.sh сверяет это замыканием по #include. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -117,9 +118,48 @@ static int absent(const char *cmd, const char *what, int argc, char **argv) {
 #define ABSENT_TGWS   absent(cmd, "мост Telegram", argc, argv)
 #define ABSENT_OBFS   absent(cmd, "обфускатор", argc, argv)
 
+/* SIGPIPE у модульных команд выключен: запись в закрытое соединение возвращается ошибкой EPIPE
+ * вызывающему, а не убивает процесс.
+ *
+ * ЧТО БЫЛО. Демон держит SIGPIPE выключенным у себя (ctl.c), а детям возвращает умолчание —
+ * loop_child_reset: иначе запущенные им ip, nft и curl унаследовали бы чужое «игнорировать» через
+ * exec. Модуль — тоже ребёнок демона и жил с умолчанием. Запись TLS в сокет узла (tls13_write,
+ * src/proto/tls/tls13.c: write() без MSG_NOSIGNAL; файл защищённый, правке не подлежит) в
+ * соединение, которое узел уже закрыл, кончалась SIGPIPE, и умирал процесс ЦЕЛИКОМ — со всеми
+ * остальными соединениями клиентов. На высокой скорости это не случайность, а правило: узел
+ * закрывает соединение, пока стек ещё дописывает в него пакеты клиента, уже лежавшие в очереди
+ * TUN. iperf3 -P 8 вверх через steer-vless (Xray 26.3.27 в роли узла) убивал модуль в большинстве
+ * запусков: три из пяти на релизном пакете x86_64, три из трёх при повторе на сборке 404bbc3
+ * (strace: write() записи в 1482 байта → EPIPE → SIGPIPE; демон: «vless tun вышел (сигнал 13) —
+ * перезапуск через 5 с», дальше 10 и 20 с — пауза перезапуска удваивается), и всё это время
+ * туннель стоял.
+ *
+ * ЧТО СТАЛО. Запись в закрытое соединение — обычный отказ записи, как ECONNRESET или таймаут
+ * отправки: tls13_write отвечает TLS13_EIO, transport_write передаёт код, дайлер (vl_send)
+ * отвечает SEND_FATAL, а стек шлёт клиенту RST и освобождает запись (conn_reset → conn_drop →
+ * vl_close → transport_close: дескриптор и контексты шифров). Погибает одно соединение — то,
+ * которое с той стороны и так закрыто, — а не туннель.
+ *
+ * ГДЕ. Здесь, а не в main() модуля и не в супервизоре демона: сюда приходят и бинарники модулей
+ * (steer_module_main), и статические сборки, где помощник — это `steerd vless …` (телефон,
+ * стенды); помощника запускает не только демон, но и procd, и человек, и тогда выключать
+ * SIGPIPE некому. И только здесь видно, что команда МОДУЛЬНАЯ (steer_cmd_module): остальные
+ * команды steerd (status, conns, explain) печатают в `| head`, и смерть от SIGPIPE там —
+ * правильное поведение, которое ломать незачем.
+ *
+ * ЧТО ЭТО ЗАДЕВАЕТ. Закрытая труба событий (evline.c): запись в неё тоже становится EPIPE, и
+ * помощник с меткой демона (STEER_SUPD) гасит себя тем же SIGTERM, что по PDEATHSIG, — раньше
+ * это делал SIGPIPE. Мост tgws выключал SIGPIPE у себя и раньше (tgws.c), резолвер — тоже
+ * (dnsd/proxy.c); теперь так у всех помощников, а не у двух. Дети модуля (ip, nft через run())
+ * наследуют «игнорировать» — как и у детей самого демона. */
+static void module_ignore_sigpipe(const char *cmd) {
+    if (steer_cmd_module(cmd)) signal(SIGPIPE, SIG_IGN);
+}
+
 int modcmd_run(const char *cmd, int argc, char **argv, const struct cli_args *a,
                const char *spec, const char *arg, struct spec *cfg) {
     (void)cfg;
+    module_ignore_sigpipe(cmd);
     if (!strcmp(cmd, "tgws")) return cmd_tgws ? cmd_tgws(spec, arg) : ABSENT_TGWS;
     if (!strcmp(cmd, "tls-probe")) {
         /* ХОСТ[:ПОРТ]; адрес назначения — флагом --out, исходящий порт — флагом --node.

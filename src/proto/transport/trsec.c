@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stdlib.h>
+#include <sys/socket.h>
 
 #include "transport.h"
 #include "reality.h"
@@ -119,7 +120,8 @@ static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *
 
     size_t sent = 0;
     while (sent < send_n) {
-        ssize_t w = write(l->fd, send_hello + sent, send_n - sent);
+        /* MSG_NOSIGNAL: узел, закрывший соединение до ClientHello, — отказ записи, а не сигнал. */
+        ssize_t w = send(l->fd, send_hello + sent, send_n - sent, MSG_NOSIGNAL);
         if (w <= 0) {
             if (w < 0 && errno == EINTR) continue;
             free(eh);

@@ -45,7 +45,10 @@ int ctlcall_open(int timeout_s) {
 
 static int write_all(int fd, const char *p, size_t n) {
     while (n) {
-        ssize_t w = write(fd, p, n);
+        /* send с MSG_NOSIGNAL, а не write: демон, закрывший сокет раньше, чем дочитал тело, —
+         * отказ записи, после которого ответ всё равно читается (ctlcall_roundtrip, ниже), а не
+         * SIGPIPE, убивающий вызвавшего молча. Из этого файла пишут и модули (xsteer-peers). */
+        ssize_t w = send(fd, p, n, MSG_NOSIGNAL);
         if (w < 0 && errno == EINTR) continue;
         if (w <= 0) return -1;
         p += w;

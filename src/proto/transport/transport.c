@@ -15,6 +15,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/socket.h>
 
 #include "transport.h"
 #include "reality.h"
@@ -27,7 +28,11 @@ int tr_link_write(void *ctx, const unsigned char *d, size_t n) {
     if (l->plain) {
         size_t sent = 0;
         while (sent < n) {
-            ssize_t w = write(l->fd, d + sent, n - sent);
+            /* send с MSG_NOSIGNAL, а не write: закрытый узлом сокет — отказ записи (EPIPE), а не
+             * SIGPIPE, даже у процесса, который его не выключал (проба узла, стенды). Поверх TLS
+             * ту же роль для tls13_write играет выключенный SIGPIPE модульных команд
+             * (cli/modcmd.c): tls13.c защищён от правок, и флага там не поставить. */
+            ssize_t w = send(l->fd, d + sent, n - sent, MSG_NOSIGNAL);
             if (w <= 0) {
                 if (w < 0 && errno == EINTR) continue;
                 return TR_EIO;

@@ -382,6 +382,19 @@ case "$o" in
            "$(printf '%s' "$o" | grep -c '^nestlong: [0-9]* ok, 0 fail$')" ;;
 esac
 
+# Модуль туннеля переживает закрытие соединений узлом на скорости (SIGPIPE выключен у модульных команд,
+# cli/modcmd.c): демон раскладки, два выхода vless (TLS и без шифрования), поддельные узлы, закрывающие
+# соединения рано, клиент в своём пространстве. Нужны root, сетевые пространства и python3 с ssl — нет их,
+# и стенд сам говорит «пропуск».
+full="$(LIBS="$L" sh tests/sigpipe.sh 2>&1)"
+o="$(printf '%s\n' "$full" | tail -n 1)"
+case "$o" in
+    *пропуск*) echo "libs-test: $o" ;;
+    *) check "модуль переживает закрытие соединений узлом на скорости: стенд tests/sigpipe.sh" "1" \
+           "$(printf '%s' "$o" | grep -c '^sigpipe: [0-9]* ok, 0 fail$')"
+       printf '%s\n' "$o" | grep -q ', 0 fail$' || printf '%s\n' "$full" | sed 's/^/    sigpipe: /' ;;
+esac
+
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
 printf '\nвсе проверки прошли\n'
