@@ -90,18 +90,36 @@ static const struct reality_cfg CFG_PQ = {
     .pq = 1,
 };
 
-static size_t build_cfg(const struct reality_cfg *cfg, const char *cipher, unsigned char *out, size_t cap) {
+static size_t build_seeded(const struct reality_cfg *cfg, const char *cipher, uint64_t seed,
+                           unsigned char *out, size_t cap) {
     setenv("STEER_CIPHER", cipher, 1);
-    prng = 0x123456789ABCDEFull;
+    prng = seed;
     g_calls = 0;
     struct reality_state st;
     size_t n = 0;
     if (reality_build_hello(cfg, &st, out, cap, &n) != 0) return 0;
     return n;
 }
+static size_t build_cfg(const struct reality_cfg *cfg, const char *cipher,
+                        unsigned char *out, size_t cap) {
+    return build_seeded(cfg, cipher, 0x123456789ABCDEFull, out, cap);
+}
 static size_t build(const char *cipher, unsigned char *out, size_t cap) {
     return build_cfg(&CFG, cipher, out, cap);
 }
+
+/* The extension types of a built Hello (a whole record), in order; returns their number. */
+static size_t ext_types(const unsigned char *h, size_t n, unsigned *t, size_t cap) {
+    size_t p = 5 + 4 + 2 + 32, k = 0;
+    p += 1 + h[p];                                          /* session_id */
+    p += 2 + ((size_t)h[p] << 8 | h[p + 1]);                /* cipher suites */
+    p += 1 + h[p];                                          /* compression */
+    size_t end = p + 2 + ((size_t)h[p] << 8 | h[p + 1]);
+    for (p += 2; p + 4 <= end && end <= n && k < cap; p += 4 + ((size_t)h[p + 2] << 8 | h[p + 3]))
+        t[k++] = (unsigned)h[p] << 8 | h[p + 1];
+    return k;
+}
+static int is_grease(unsigned v) { return (v & 0x0F0F) == 0x0A0A && (v >> 8) == (v & 0xFF); }
 
 static void emit(const char *name, const unsigned char *b, size_t n) {
     printf("static const char %s[] =\n    \"", name);
@@ -190,6 +208,28 @@ int main(int argc, char **argv) {
         fails++;
     } else {
         printf("%-62s ok\n", "cipher suite order follows the CPU (aes and chacha differ)");
+    }
+    /* GREASE is drawn per connection, and the frozen Hello holds one draw: a rule that matters in
+     * one draw of sixteen (the two GREASE extensions must not share a type) needs many. Over 256
+     * draws: GREASE comes first and last, and no extension type repeats (a server refuses a Hello
+     * with a repeated extension). */
+    {
+        int bad = 0;
+        for (uint64_t s = 1; s <= 256; s++) {
+            unsigned char h[4096];
+            unsigned t[32];
+            size_t n = build_seeded(&CFG, "aes", s, h, sizeof(h));
+            size_t k = n ? ext_types(h, n, t, 32) : 0;
+            if (k < 3 || !is_grease(t[0]) || !is_grease(t[k - 1])) bad++;
+            for (size_t i = 0; i < k; i++)
+                for (size_t j = i + 1; j < k; j++) bad += t[i] == t[j];
+        }
+        if (bad) {
+            printf("FAIL: %d faults in the extension types of 256 random Hellos\n", bad);
+            fails++;
+        } else {
+            printf("%-62s ok\n", "256 random Hellos: GREASE first and last, no type repeats");
+        }
     }
     printf("\n%s\n", fails ? "SOME CHECKS FAILED" : "all checks passed");
     return fails ? 1 : 0;

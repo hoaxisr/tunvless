@@ -3,7 +3,8 @@
  * is the bytes i mod 251, at lengths on the block (64), chunk (1024) and tree (2, 3, 4, 31 and 100
  * chunks) boundaries. The second value is DeriveKey with those bytes as the context and
  * "VLESS-material-<length>" as the material: the shape of the NewAEAD call, where a context longer
- * than a kilobyte goes through the tree.
+ * than a kilobyte goes through the tree. Last, DeriveKey with 64 bytes out (context "ctx",
+ * material "m").
  *
  * blake3.h is self-contained, so this test needs no library and runs in `make test`. */
 #include <stdio.h>
@@ -54,12 +55,19 @@ int main(void) {
         free(in);
     }
     {
+        /* 64 bytes out, the most sc_blake3_derive_key allows: the upper half comes from the other
+         * eight state words, which no 32-byte value above reaches. Values from the same library. */
+        static const char *DK64 =
+            "6b30698a17fbfdebd8ed654e7235532153c6d15504aa25b0249e2f24304702e2"
+            "fcfd47ecbccd67bba72197c9a50ce689cdfc168ac36615eb26353d960d65deb2";
         unsigned char a[32], b[64];
+        char ah[65], bh[129];
         b3_derive_key(a, 32, "ctx", 3, "m", 1);
         b3_derive_key(b, 64, "ctx", 3, "m", 1);
-        int ok = !memcmp(a, b, 32);
+        hex(ah, a, 32); hex(bh, b, 64);
+        int ok = !strncmp(ah, DK64, 64) && !strcmp(bh, DK64);
         if (!ok) fails++;
-        printf("BLAKE3 64-byte output starts with the 32-byte output %s\n", ok ? "ok" : "FAIL");
+        printf("BLAKE3 derive_key with 32 and 64 bytes out %s\n", ok ? "ok" : "FAIL");
     }
     printf(fails ? "FAILED: %d\n" : "b3match: all matched\n", fails);
     return fails ? 1 : 0;

@@ -10,16 +10,18 @@
  *
  * Vectors:
  *   SHA-256/384/512   — FIPS 180-4 ("abc" and the two-block example), plus a context clone midway;
- *   HMAC              — RFC 4231, cases 1 and 2;
+ *   HMAC              — RFC 4231, cases 1 and 2; an empty key (Python's hmac);
  *   HKDF              — RFC 5869, cases 1 and 3 (with salt, and without salt and info);
  *   AES-GCM           — the GCM specification (McGrew–Viega), cases 2, 4, 14 and 16;
  *   ChaCha20-Poly1305 — RFC 8439 §2.8.2;
  *   X25519            — RFC 7748 §5.2 (unclamped scalar), §5.2 iterations, §6.1 (Alice and Bob);
+ *                      a secret with zero first and last bytes (Go's crypto/ecdh);
  *   AES-256-CTR       — NIST SP 800-38A F.5.5, whole and in pieces of different lengths;
  *   MD5, SHA-1, SHA-224 — RFC 1321 and FIPS 180-4 ("abc", empty string); HMAC-MD5 and HMAC-SHA1 —
  *                      RFC 2202, case 1; HKDF-SHA1 — RFC 5869, case 4;
  *   AES, one block    — FIPS 197, appendix C.1 and C.3, both directions;
- *   ML-KEM-768, ML-DSA-65 — values from Go (tests/scrypto-pq.h).
+ *   ML-KEM-768, ML-DSA-65 — values from Go (tests/scrypto-pq.h); encapsulation with fixed
+ *                      randomness from circl, the implicit-rejection secret from Go (inline).
  * Plus what vectors do not catch: IN-PLACE operation at TLS record sizes (up to 16401 bytes, a
  * size at which the tag once broke), rejection of a tampered tag and AAD, the zero X25519 secret
  * of a small-order point, no temporary intermediates left behind after a chain check, and
@@ -102,7 +104,7 @@ static void test_hmac(void) {
     unsigned char key[20], out[64];
     memset(key, 0x0b, sizeof(key));
     const char *hi = "Hi There";
-    sc_hmac(SC_SHA256, key, 20, hi, 8, out);
+    check("HMAC-SHA256 RFC 4231 #1: return code", 0, sc_hmac(SC_SHA256, key, 20, hi, 8, out));
     check_bytes("HMAC-SHA256 RFC 4231 #1", "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7", out, 32);
     sc_hmac(SC_SHA384, key, 20, hi, 8, out);
     check_bytes("HMAC-SHA384 RFC 4231 #1", "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59c"
@@ -114,8 +116,14 @@ static void test_hmac(void) {
     sc_hmac(SC_SHA256, "Jefe", 4, q, strlen(q), out);
     check_bytes("HMAC-SHA256 RFC 4231 #2", "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843", out, 32);
     unsigned char two[32];
-    sc_hmac2(SC_SHA256, "Jefe", 4, q, 10, q + 10, strlen(q) - 10, two);
+    check("HMAC in two pieces: return code", 0,
+          sc_hmac2(SC_SHA256, "Jefe", 4, q, 10, q + 10, strlen(q) - 10, two));
     check_mem("HMAC in two pieces = in one", out, two, 32);
+    /* An empty key is legal (scrypto.c hands wolfSSL a dummy pointer); value from Python's hmac. */
+    check("HMAC with an empty key: return code", 0,
+          sc_hmac(SC_SHA256, NULL, 0, "Beauty is truth", 15, out));
+    check_bytes("HMAC-SHA256 with an empty key",
+                "b3cda0832b90c5646f9d49ae89c5fccc28d5143c8c7d18c3a9627dec875ebd45", out, 32);
 }
 
 static void test_hkdf(void) {
@@ -143,6 +151,8 @@ static void test_hkdf(void) {
     static unsigned char big[255 * 32 + 1];
     check("HKDF: output longer than 255 blocks rejected", SC_EINVAL,
           sc_hkdf_expand(SC_SHA256, prk, 32, NULL, 0, big, sizeof(big)));
+    check("HKDF: output of exactly 255 blocks accepted", 0,
+          sc_hkdf_expand(SC_SHA256, prk, 32, NULL, 0, big, sizeof(big) - 1));
 }
 
 /* ---- AEAD ------------------------------------------------------------------------------------ */
@@ -229,12 +239,16 @@ static void test_aead(void) {
         for (int i = 0; i < 12; i++) nonce[i] = (unsigned char)(0x5A + i);
         struct sc_aead k;
         sc_aead_setkey(&k, algs[a], key);
-        int ok = 1;
+        int ok = 1, enc = 1;
         for (size_t s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++) {
             size_t n = sizes[s];
             for (size_t i = 0; i < n; i++) orig[i] = buf[i] = (unsigned char)(i * 31 + 7);
             nonce[11] = (unsigned char)s;
             if (sc_aead_seal(&k, nonce, aad, 5, buf, n, buf + n) != 0) ok = 0;
+            /* The round trip passes even when seal and open both skip the same bytes, so: every
+             * block of the ciphertext, the short last one too, differs from the plaintext. */
+            for (size_t i = 0; i < n; i += 16)
+                if (!memcmp(buf + i, orig + i, n - i < 16 ? n - i : 16)) enc = 0;
             unsigned char tag[16];
             memcpy(tag, buf + n, 16);
             if (sc_aead_open(&k, nonce, aad, 5, buf, n, tag) != 0) ok = 0;
@@ -244,6 +258,8 @@ static void test_aead(void) {
         char what[80];
         snprintf(what, sizeof(what), "%s: in place at TLS record sizes up to 16401", names[a]);
         check(what, 1, ok);
+        snprintf(what, sizeof(what), "%s: every block encrypted at those sizes", names[a]);
+        check(what, 1, enc);
         sc_aead_free(&k);
     }
     struct sc_aead none = { 0 };
@@ -281,21 +297,19 @@ static void test_aesctr(void) {
     check_mem("AES-256-CTR: the same keystream decrypts", p, buf, 64);
     sc_aesctr_free(&x);
 
-    /* The carry runs through all 128 bits: the counter is one big-endian number. */
-    unsigned char ivmax[16], z[32] = { 0 }, g[32], blk0[16], blk1[16];
+    /* The carry runs through all 128 bits: the counter is one big-endian number. Each block of
+     * keystream is AES of its counter, taken by sc_aes_block (FIPS 197, test_proxy_prims). */
+    unsigned char ivmax[16], z[32] = { 0 }, g[32], blk[16], zero_iv[16] = { 0 };
     memset(ivmax, 0xff, 16);
     sc_aesctr_init(&x, key, ivmax);
     sc_aesctr_xor(&x, z, g, 32);
     sc_aesctr_free(&x);
-    unsigned char zero_iv[16] = { 0 };
-    sc_aesctr_init(&x, key, ivmax);
-    sc_aesctr_xor(&x, z, blk0, 16);
-    sc_aesctr_free(&x);
-    sc_aesctr_init(&x, key, zero_iv);
-    sc_aesctr_xor(&x, z, blk1, 16);
-    sc_aesctr_free(&x);
-    check_mem("AES-256-CTR: from ff..ff, block 1 is counter ff..ff", blk0, g, 16);
-    check_mem("AES-256-CTR: from ff..ff, block 2 is counter 00..00 (wrap)", blk1, g + 16, 16);
+    sc_aes_block(key, 32, 0, ivmax, blk);
+    check_mem("AES-256-CTR: from ff..ff, block 1 is counter ff..ff", blk, g, 16);
+    sc_aes_block(key, 32, 0, zero_iv, blk);
+    check_mem("AES-256-CTR: from ff..ff, block 2 is counter 00..00 (wrap)", blk, g + 16, 16);
+    struct sc_aesctr none = { 0 };
+    check("AES-256-CTR without init gives SC_EINVAL", SC_EINVAL, sc_aesctr_xor(&none, z, g, 16));
 }
 
 /* ---- MD5, SHA-1, SHA-224, one AES block (in the layer, unused in src) ----------------------- */
@@ -368,12 +382,26 @@ static void test_mlkem(void) {
     unsigned char rnd[32];
     for (int i = 0; i < 32; i++) rnd[i] = (unsigned char)(i * 5 + 1);
     check("ML-KEM: encaps", 0, sc_mlkem768_encaps(ct, ss, ek, rnd));
+    /* Deterministic in rnd: circl's EncapsulateTo(ct, ss, m) with the same m gives these. */
+    unsigned char h[32];
+    sc_hash(SC_SHA256, ct, sizeof ct, h);
+    check_bytes("ML-KEM: encaps ciphertext matches circl (its SHA-256)",
+                "5c4a45018a4ba853e96a75d1c9d87f7d58cba50a9e804ced49e5ab977c860f6e", h, 32);
+    check_bytes("ML-KEM: encaps secret matches circl",
+                "84c2b4337af7daaec5c6d2915794a4b7b2de6303e6d850f48510d1a6cec5be36", ss, 32);
     check("ML-KEM: decaps of our ciphertext", 0, sc_mlkem768_decaps(ss2, dk, ct));
     check("ML-KEM: secrets agree", 0, memcmp(ss, ss2, 32));
     /* Implicit rejection: a corrupted ciphertext gives a DIFFERENT secret, not an error. */
     ct[10] ^= 1;
     check("ML-KEM: corrupted ct: return code 0", 0, sc_mlkem768_decaps(ss2, dk, ct));
     check("ML-KEM: corrupted ct: different secret", 1, memcmp(ss, ss2, 32) != 0);
+    /* That secret is J(z || ct), z being the second half of the seed: Go's value for Go's
+     * ciphertext with the same byte flipped. */
+    memcpy(ct, KEM_CT, sizeof ct);
+    ct[10] ^= 1;
+    sc_mlkem768_decaps(ss2, dk, ct);
+    check_bytes("ML-KEM: corrupted Go ciphertext: Go's rejection secret",
+                "96f295eb4d00fb0d98913bad878330c3934ce107c527ccf9747857b4138a1b93", ss2, 32);
     /* A coefficient 0xFFF >= q = 3329: Go rejects such a key (FIPS 203, 7.2). */
     unsigned char bad[SC_MLKEM768_EK];
     memcpy(bad, ek, sizeof bad);
@@ -418,7 +446,7 @@ static void test_x25519(void) {
     unsigned char ap[32], bp[32], apub[32], bpub[32], s1[32], s2[32];
     unhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a", ap, 32);
     unhex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb", bp, 32);
-    sc_x25519_base(apub, ap);
+    check("X25519 §6.1: Alice's public key: return code", 0, sc_x25519_base(apub, ap));
     sc_x25519_base(bpub, bp);
     check_bytes("X25519 §6.1: Alice's public key", "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a", apub, 32);
     check_bytes("X25519 §6.1: Bob's public key", "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f", bpub, 32);
@@ -428,9 +456,15 @@ static void test_x25519(void) {
     check_mem("X25519 §6.1: Bob's is the same", s1, s2, 32);
 
     /* A small-order point (u = 0 and u = 1) gives a zero secret: a failure, not a key. */
-    unsigned char zero[32] = { 0 }, one[32] = { 1 };
+    unsigned char zero[32] = { 0 }, one[32] = { 1 }, nine[32] = { 9 };
     check("X25519: u = 0 rejected", SC_ECRYPTO, sc_x25519(out, ap, zero));
     check("X25519: u = 1 rejected", SC_ECRYPTO, sc_x25519(out, ap, one));
+    /* Only an ALL-zero secret fails: one that starts and ends with a zero byte is a key (scalar
+     * and value from Go's crypto/ecdh). */
+    unhex("000021aa7794b1ceeb0825425f7c99b6d3f00d2a4764819ebbd8f5122f4c6986", k, 32);
+    check("X25519: secret with zero first and last byte accepted", 0, sc_x25519(out, k, nine));
+    check_bytes("X25519: secret with zero first and last byte",
+                "000edf1da6da6165bf86aa2eaff7952031c8f5e96e8b92d7ab78c765e7706600", out, 32);
 }
 
 /* ---- certificates --------------------------------------------------------------------------- */
@@ -498,17 +532,21 @@ static void test_sig(void) {
         sig[sn / 2] ^= 0x10;
         snprintf(what, sizeof(what), "corrupted signature %s gives SC_ESIG", v[i].name);
         check(what, SC_ESIG, sc_cert_verify_sig(v[i].cert->b, v[i].cert->n, v[i].alg, v[i].h, dg, dn, sig, sn));
+        /* A wrong digest is a failure, not "close enough": the intact signature over a digest
+         * one bit off. (A corrupted RSA signature fails in the padding, before any digest.) */
+        sig[sn / 2] ^= 0x10;
+        unsigned char other[48];
+        memcpy(other, dg, dn);
+        other[0] ^= 1;
+        snprintf(what, sizeof(what), "%s over another digest gives SC_ESIG", v[i].name);
+        check(what, SC_ESIG,
+              sc_cert_verify_sig(v[i].cert->b, v[i].cert->n, v[i].alg, v[i].h, other, dn, sig, sn));
     }
-    /* A wrong digest or a wrong scheme is a failure, not "close enough". */
+    /* Nor is a wrong scheme or key. */
     size_t sn = unhex(SIG_PSS256, sig, sizeof(sig));
     check("PSS signature checked as PKCS#1 v1.5 gives SC_ESIG", SC_ESIG,
           sc_cert_verify_sig(D_RSALEAF.b, D_RSALEAF.n, SC_SIG_RSA_PKCS1, SC_SHA256, d256, 32, sig, sn));
-    unsigned char wrong[32];
-    memcpy(wrong, d256, 32);
-    wrong[0] ^= 1;
     sn = unhex(SIG_ECDSA256, sig, sizeof(sig));
-    check("ECDSA over another digest gives SC_ESIG", SC_ESIG,
-          sc_cert_verify_sig(D_LEAF.b, D_LEAF.n, SC_SIG_ECDSA, SC_SHA256, wrong, 32, sig, sn));
     check("ECDSA signature with an RSA key rejected", 1,
           sc_cert_verify_sig(D_RSALEAF.b, D_RSALEAF.n, SC_SIG_ECDSA, SC_SHA256, d256, 32, sig, sn) != 0);
     check("wrong digest length gives SC_EINVAL", SC_EINVAL,
@@ -533,6 +571,8 @@ static void test_chain(void) {
     struct sc_roots *r = roots_of(PEM_ROOT);
     check("root store loaded", 1, r != NULL);
     if (!r) return;
+    /* On the fresh store, before any check has brought the intermediate along. */
+    check("no intermediate: rejected", SC_ECHAIN, chain(r, "good.example", 1, &D_LEAF));
     check("leaf + intermediate, name from SAN", 0, chain(r, "good.example", 2, &D_LEAF, &D_INTER));
     check("name under the wildcard *.wild.example", 0, chain(r, "a.wild.example", 2, &D_LEAF, &D_INTER));
     check("wildcard does not cover wild.example itself", SC_ECHAIN, chain(r, "wild.example", 2, &D_LEAF, &D_INTER));
@@ -541,7 +581,6 @@ static void test_chain(void) {
     check("other address rejected", SC_ECHAIN, chain(r, "192.0.2.8", 2, &D_LEAF, &D_INTER));
     check("other name rejected", SC_ECHAIN, chain(r, "bad.example", 2, &D_LEAF, &D_INTER));
     check("CN not used as a name when SAN is present", SC_ECHAIN, chain(r, "leaf", 2, &D_LEAF, &D_INTER));
-    check("no intermediate: rejected", SC_ECHAIN, chain(r, "good.example", 1, &D_LEAF));
     check("an extra certificate in the chain does no harm", 0,
           chain(r, "good.example", 3, &D_LEAF, &D_RSALEAF, &D_INTER));
     check("temporary intermediates removed after a check", SC_ECHAIN, chain(r, "good.example", 1, &D_LEAF));
