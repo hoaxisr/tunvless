@@ -65,8 +65,11 @@ struct nlreq {
     char attrs[64];
 };
 
-static void nl_attr(struct nlmsghdr *h, unsigned short type, const void *d, size_t n) {
-    struct rtattr *a = (struct rtattr *)((char *)h + NLMSG_ALIGN(h->nlmsg_len));
+/* Takes the whole request, not its header: an attribute written past &q->h is out of bounds of the
+ * object GCC sees (-Wstringop-overflow). */
+static void nl_attr(struct nlreq *q, unsigned short type, const void *d, size_t n) {
+    struct nlmsghdr *h = &q->h;
+    struct rtattr *a = (struct rtattr *)((char *)q + NLMSG_ALIGN(h->nlmsg_len));
     a->rta_type = type;
     a->rta_len = (unsigned short)RTA_LENGTH(n);
     memcpy(RTA_DATA(a), d, n);
@@ -125,8 +128,8 @@ static int addr_replace(int ifindex, uint32_t addr, int prefix) {
     q.u.ifa.ifa_prefixlen = (unsigned char)prefix;
     q.u.ifa.ifa_scope = RT_SCOPE_UNIVERSE;
     q.u.ifa.ifa_index = (unsigned)ifindex;
-    nl_attr(&q.h, IFA_LOCAL, &addr, sizeof(addr));
-    nl_attr(&q.h, IFA_ADDRESS, &addr, sizeof(addr));
+    nl_attr(&q, IFA_LOCAL, &addr, sizeof(addr));
+    nl_attr(&q, IFA_ADDRESS, &addr, sizeof(addr));
     return nl_talk(&q.h, NULL, 0);
 }
 
@@ -148,14 +151,14 @@ static int route_req(int op, uint32_t dst, int prefix, uint32_t gw, unsigned oif
     q.u.rt.rtm_type = RTN_UNICAST;
     if (table == 0) table = RT_TABLE_MAIN;
     q.u.rt.rtm_table = table < 256 ? (unsigned char)table : RT_TABLE_UNSPEC;
-    if (table >= 256) nl_attr(&q.h, RTA_TABLE, &table, sizeof(table));
+    if (table >= 256) nl_attr(&q, RTA_TABLE, &table, sizeof(table));
     if (prefix > 0) {
         uint32_t net = prefix == 32 ? dst : dst & htonl(~0u << (32 - prefix));
-        nl_attr(&q.h, RTA_DST, &net, sizeof(net));
+        nl_attr(&q, RTA_DST, &net, sizeof(net));
     }
-    if (gw) nl_attr(&q.h, RTA_GATEWAY, &gw, sizeof(gw));
+    if (gw) nl_attr(&q, RTA_GATEWAY, &gw, sizeof(gw));
     uint32_t o = oif;
-    nl_attr(&q.h, RTA_OIF, &o, sizeof(o));
+    nl_attr(&q, RTA_OIF, &o, sizeof(o));
     return nl_talk(&q.h, NULL, 0);
 }
 
@@ -172,7 +175,7 @@ int ifcfg_route_get(uint32_t dst, uint32_t *gw, unsigned *oif) {
     q.h.nlmsg_type = RTM_GETROUTE;
     q.u.rt.rtm_family = AF_INET;
     q.u.rt.rtm_dst_len = 32;
-    nl_attr(&q.h, RTA_DST, &dst, sizeof(dst));
+    nl_attr(&q, RTA_DST, &dst, sizeof(dst));
     union { struct nlmsghdr h; char b[1024]; } r;
     int rc = nl_talk(&q.h, &r.h, sizeof(r));
     if (rc != 0) return rc;

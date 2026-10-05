@@ -33,6 +33,12 @@
 #define TUN_DEV  "/dev/net/tun"
 #define TUN_HINT "load the tun kernel module (modprobe tun, or the firmware component that ships it)"
 
+/* Linux 3.8. Entware's mips and mipsel SDKs carry 3.4 headers; such a kernel refuses the flag with
+ * EINVAL and tun_open falls back to one queue. */
+#ifndef IFF_MULTI_QUEUE
+#define IFF_MULTI_QUEUE 0x0100
+#endif
+
 /* The virtio offload header that IFF_VNET_HDR adds.
  *
  * Declared here, not taken from <linux/virtio_net.h>: that pulls in virtio_types and does not

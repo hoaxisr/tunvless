@@ -10,6 +10,10 @@ on:
     branches: [main]
     paths-ignore:
       - '**.md'
+  # Catches what the CI cross jobs cannot: the SDKs' old kernel headers (3.4 on mips/mipsel).
+  pull_request:
+    paths-ignore:
+      - '**.md'
   release:
     types: [published]
   workflow_dispatch:
