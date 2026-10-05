@@ -199,10 +199,14 @@ struct conn {
     unsigned char *early;
     uint32_t early_n;
     uint32_t early_off;
-    /* When the SYN came, and whether anything went to the node yet: a client silent for
-     * SERVER_FIRST_MS waits for the server to speak first, and the node must be told where to
-     * connect without data (conn_deadlines). */
-    uint64_t syn_ns;
+    /* When the client completed the handshake (its first ACK; 0 — not yet), and whether anything
+     * went to the node yet: a client silent for SERVER_FIRST_MS after that waits for the server
+     * to speak first, and the node must be told where to connect without data (conn_deadlines).
+     * Not counted from the SYN: a client whose SYN-ACK was lost is not silent, it does not have
+     * the connection yet. Opening the flow then let the server's answer go out ahead of the
+     * handshake, and the client's repeated SYN could no longer be answered (our_seq had moved):
+     * the connection hung for good (run-tunnel.sh with 3% loss, about 1 run in 40). */
+    uint64_t estab_ns;
     uint8_t sent_any;
     /* The client gave up (RST) while the connector was working: the record must not be
      * touched, so only mark it, and close once the connector is done. */
@@ -1940,7 +1944,6 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         memset(c, 0, sizeof(*c));
         c->used = 1;
         c->born_turn = g_turn;
-        c->syn_ns = g_now_ns;
         c->key = k;
         c->fd = -1;
         /* Into the lists AFTER memset and AFTER the key: the hash uses the key, and memset would
@@ -2020,7 +2023,10 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         if (k.tcp_flags & TCP_RST) { c->client_gone = 1; return; }
         int fin = (k.tcp_flags & TCP_FIN) != 0;
         if (c->client_fin) { if (fin) c->ack_due = 1; return; }
-        if (k.tcp_flags & TCP_ACK) c->client_win = k.window;
+        if (k.tcp_flags & TCP_ACK) {
+            c->client_win = k.window;
+            if (!c->estab_ns) c->estab_ns = g_now_ns ? g_now_ns : 1;
+        }
         size_t dn = n - off;
         if ((!dn && !fin) || k.seq != c->client_seq) return;
         /* Does not fit: do not acknowledge, the client resends when the flow is ready. */
@@ -2061,6 +2067,7 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
     size_t data_n = n - off;
 
     if (k.tcp_flags & TCP_ACK) {
+        if (!c->estab_ns) c->estab_ns = g_now_ns ? g_now_ns : 1;
         /* Wraparound-safe comparison: the difference as signed. */
         if ((int32_t)(k.ack - c->client_ack) > 0) {
             /* Advance client_ack ONLY by what is acknowledged, and never past our_seq.
@@ -2346,10 +2353,11 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
         return 1;
     }
 
-    /* A client silent since the SYN: open the flow without data, so a server that speaks first
-     * can (dialer.h, send with n == 0). The early data path above covers a client that spoke. */
-    if (!c->is_udp && !c->sent_any && !c->early && !c->srv_closed &&
-        now - c->syn_ns >= SERVER_FIRST_MS * 1000000ull) {
+    /* A client silent since the handshake: open the flow without data, so a server that speaks
+     * first can (dialer.h, send with n == 0). The early data path above covers a client that
+     * spoke. */
+    if (!c->is_udp && !c->sent_any && !c->early && !c->srv_closed && c->estab_ns &&
+        now - c->estab_ns >= SERVER_FIRST_MS * 1000000ull) {
         int sr = upstream_send(c, NULL, 0);
         if (sr == SEND_FATAL) {
             conn_reset(c, tun);

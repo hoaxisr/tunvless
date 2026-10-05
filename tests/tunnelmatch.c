@@ -270,19 +270,26 @@ static void server_first(const char *flow, size_t header_n) {
         g_node.flow[0] = 0;
         return;
     }
-    cli_send(1001, 2, TCP_ACK, 65535, NULL, 0);
     char what[96];
     int calls = g_send_calls;
-    conn_deadlines(c, &g_tun, c->syn_ns + (SERVER_FIRST_MS / 2) * 1000000ull);
+    /* The SYN-ACK was lost: the client has not acknowledged it and will repeat its SYN. Opening
+     * the flow now would let the server's answer go out ahead of the handshake, after which the
+     * repeated SYN can no longer be answered: nothing may go, however long it waits. */
+    conn_deadlines(c, &g_tun, g_now_ns + 2000 * 1000000ull);
+    snprintf(what, sizeof(what), "server first%s: nothing sent before the client's ACK",
+             flow[0] ? ", Vision" : "");
+    check(g_send_calls == calls && c->our_seq == 2, what);
+    cli_send(1001, 2, TCP_ACK, 65535, NULL, 0);
+    conn_deadlines(c, &g_tun, c->estab_ns + (SERVER_FIRST_MS / 2) * 1000000ull);
     snprintf(what, sizeof(what), "server first%s: nothing sent before %d ms", flow[0] ? ", Vision" : "",
              SERVER_FIRST_MS);
     check(g_send_calls == calls, what);
-    conn_deadlines(c, &g_tun, c->syn_ns + (SERVER_FIRST_MS + 50) * 1000000ull);
+    conn_deadlines(c, &g_tun, c->estab_ns + (SERVER_FIRST_MS + 50) * 1000000ull);
     const struct vl_sess *vs = SESS(c);
     snprintf(what, sizeof(what), "server first%s: then the %zu-byte header alone",
              flow[0] ? ", Vision" : "", header_n);
     check(g_send_calls == calls + 1 && g_send_last_n == header_n && vs->header_sent, what);
-    conn_deadlines(c, &g_tun, c->syn_ns + (SERVER_FIRST_MS + 100) * 1000000ull);
+    conn_deadlines(c, &g_tun, c->estab_ns + (SERVER_FIRST_MS + 100) * 1000000ull);
     snprintf(what, sizeof(what), "server first%s: and only once", flow[0] ? ", Vision" : "");
     check(g_send_calls == calls + 1, what);
     conn_drop(c);
