@@ -274,6 +274,10 @@ struct transport_ops {
      * httpupgrade with early data): no zero-copy read yet, even with nothing pending. NULL:
      * never. */
     int  (*busy)(const struct transport *t);
+    /* How many bytes a write can take right now: the HTTP/2 send window (grpc, xhttp). A write
+     * larger than that fails with H2_EWINDOW. NULL: no limit (tcp, ws, httpupgrade: the socket
+     * buffer). */
+    long (*room)(const struct transport *t);
 };
 
 /* Security, the link's security= field. The kinds differ only in the handshake (see the head). */
@@ -313,6 +317,12 @@ int transport_open(struct transport *t, const struct tr_node *n, int timeout_s);
  * no caller can forget it and send the stream in the wrong wrapping. */
 int transport_write(struct transport *t, const unsigned char *d, size_t n);
 int transport_read(struct transport *t, unsigned char *d, size_t cap, size_t *got);
+
+/* Bytes of the caller's data a transport_write can take now, after the transport's own framing
+ * (gRPC message header, VLESS encryption records); -1: no limit. The tunnel sizes the window it
+ * gives the client by it, so the client sends what the node can take instead of finding out by
+ * retransmission timeouts (see dialer_ops.room). */
+long transport_room(const struct transport *t);
 
 /* Read WITHOUT AN EXTRA COPY where the transport allows it (transport_ops.zc).
  *

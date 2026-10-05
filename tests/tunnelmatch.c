@@ -87,6 +87,10 @@ static int g_send_rc;                 /* what transport_write returns: 0 or H2_E
 static int g_send_again_n;            /* return H2_EWINDOW this many times, then 0 */
 static int g_send_calls;
 static size_t g_send_last_n;          /* length of the last transport_write */
+/* The node's room (transport_room): -1 no limit. g_room_on_read, when not -2, becomes the room at
+ * the next read, as a WINDOW_UPDATE read from the node would make it. */
+static long g_room = -1;
+static long g_room_on_read = -2;
 static int g_recv_calls;
 static int g_recv_rc;                 /* what transport_read_zc returns: 0 or -1 (end of stream) */
 static unsigned char g_recv_buf[4096];
@@ -110,6 +114,7 @@ int transport_read_zc(struct transport *c, unsigned char *buf, size_t cap,
                       const unsigned char **data, size_t *got) {
     (void)c; (void)buf; (void)cap;
     g_recv_calls++;
+    if (g_room_on_read != -2) { g_room = g_room_on_read; g_room_on_read = -2; }
     *got = 0;
     if (g_recv_rc) return g_recv_rc;
     *data = g_recv_buf;
@@ -118,6 +123,7 @@ int transport_read_zc(struct transport *c, unsigned char *buf, size_t cap,
     return 0;
 }
 int transport_has_data(const struct transport *c) { (void)c; return 0; }
+long transport_room(const struct transport *c) { (void)c; return g_room; }
 void transport_close(struct transport *c) { c->link.fd = -1; }   /* shared pipe: keep it open */
 void transport_moved(struct transport *c) { (void)c; }
 void transport_direct(struct transport *c) { c->link.rx_direct = 1; }
@@ -151,12 +157,20 @@ static void check(int ok, const char *what) {
     if (!ok) g_fail = 1;
 }
 
-static void cli_send(uint32_t seq, uint32_t ack, unsigned char flags, uint16_t win,
-                     const unsigned char *d, size_t n) {
+/* One client packet in the middle of a TUN batch: gathered data stays gathered. */
+static void cli_send_more(uint32_t seq, uint32_t ack, unsigned char flags, uint16_t win,
+                          const unsigned char *d, size_t n) {
     unsigned char p[2048];
     size_t l = tcp_build(p, sizeof(p), CLI_IP, SRV_IP, CLI_PORT, SRV_PORT, seq, ack, flags,
                          d, n, win, 0, -1);
     handle_packet(&g_tun, p, l);
+}
+
+/* One client packet as a whole TUN batch: what the loop does after a batch, up_flush. */
+static void cli_send(uint32_t seq, uint32_t ack, unsigned char flags, uint16_t win,
+                     const unsigned char *d, size_t n) {
+    cli_send_more(seq, ack, flags, win, d, n);
+    up_flush(&g_tun);
 }
 
 /* Read everything the tunnel wrote to the device. Returns the number of packets; last gets the
@@ -279,6 +293,143 @@ static void server_first(const char *flow, size_t header_n) {
 static void t_server_first(void) {
     server_first("", 26);                    /* version, UUID, no addons, cmd, port, IPv4 */
     server_first("xtls-rprx-vision", 44);    /* plus the flow addon: 0a 10 "xtls-rprx-vision" */
+}
+
+/* The node's room caps the client's window (dialer_ops.room). Before, the client was granted the
+ * full window whatever the node could take: against a 94 KB HTTP/2 window every refusal was a
+ * "loss" and a retransmission timeout, uploads over grpc ran at 10-20 Mbit/s with stalls. */
+static void t_room_window(void) {
+    struct conn *c = open_conn(65535);
+    if (!c) { check(0, "room: test connection did not open"); return; }
+    unsigned char d[100];
+    memset(d, 'u', sizeof(d));
+    struct flow_key last;
+    uint32_t seq = 1001;
+    cli_send(seq, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d));        /* the header goes */
+    seq += sizeof(d);
+    flush_acks(&g_tun);
+    dev_drain(&last);
+    check(last.window == 65535, "room: no limit from the transport, the full window");
+
+    g_room = 5000;
+    cli_send(seq, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d));
+    seq += sizeof(d);
+    flush_acks(&g_tun);
+    memset(&last, 0, sizeof(last));
+    dev_drain(&last);
+    check(last.ack == seq && last.window == 5000, "room: the window is capped by the node's room");
+
+    g_room = 0;
+    cli_send(seq, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d));
+    seq += sizeof(d);
+    flush_acks(&g_tun);
+    memset(&last, 0, sizeof(last));
+    dev_drain(&last);
+    check(last.ack == seq && last.window == 0, "room: no room, zero window");
+
+    /* The client's zero-window probe: one number below the expected, no data. */
+    cli_send(seq - 1, 2, TCP_ACK, 65535, NULL, 0);
+    flush_acks(&g_tun);
+    memset(&last, 0, sizeof(last));
+    int n = dev_drain(&last);
+    check(n == 1 && last.ack == seq && last.window == 0, "room: a zero-window probe is answered");
+
+    /* A WINDOW_UPDATE from the node: the window update goes to the client without waiting for
+     * a packet from it. */
+    g_room_on_read = 60000;
+    g_win_woke = 0;
+    drain_conn(c, &g_tun);
+    check(c->ack_due && g_win_woke, "room: grown by a read from the node, window update due");
+    flush_acks(&g_tun);
+    g_win_woke = 0;
+    memset(&last, 0, sizeof(last));
+    n = dev_drain(&last);
+    check(n >= 1 && last.ack == seq && last.window == 60000, "room: the update carries the new window");
+
+    /* Growth below WIN_UPDATE_MIN on an open window waits for the next ACK. */
+    g_room_on_read = 60000 + WIN_UPDATE_MIN - 1;
+    drain_conn(c, &g_tun);
+    check(!c->ack_due && !g_win_woke, "room: small growth sends nothing by itself");
+
+    g_room = -1;
+    g_room_on_read = -2;
+    conn_drop(c);
+    dev_drain(NULL);
+}
+
+/* Consecutive data segments of one flow in one TUN batch go to the node as ONE send (g_up in
+ * stack.c): one TLS record and one write instead of one per 1.4 KB segment, which cost uploads
+ * 80% of the loop. Acknowledged only once the node took them, as before. */
+static void t_gather(void) {
+    struct conn *c = open_conn(65535);
+    if (!c) { check(0, "gather: test connection did not open"); return; }
+    unsigned char d[1000];
+    memset(d, 'g', sizeof(d));
+    struct flow_key last;
+    int calls = g_send_calls;
+    cli_send_more(1001, 2, TCP_ACK, 65535, d, sizeof(d));
+    cli_send_more(2001, 2, TCP_ACK, 65535, d, sizeof(d));
+    cli_send_more(3001, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d));
+    check(g_send_calls == calls && c->client_seq == 1001,
+          "gather: three segments in a batch, nothing sent or acknowledged yet");
+    up_flush(&g_tun);
+    flush_acks(&g_tun);
+    memset(&last, 0, sizeof(last));
+    dev_drain(&last);
+    check(g_send_calls == calls + 1 && g_send_last_n == 26 + 3000 && c->client_seq == 4001 &&
+          last.ack == 4001, "gather: end of batch, one send (header + 3000), one ACK of all");
+
+    /* A FIN after gathered data: the data goes first, then the FIN's own segment. */
+    calls = g_send_calls;
+    cli_send_more(4001, 2, TCP_ACK, 65535, d, sizeof(d));
+    cli_send_more(5001, 2, TCP_ACK | TCP_FIN, 65535, d, 10);
+    check(g_send_calls == calls + 2 && c->client_seq == 5012 && c->client_fin,
+          "gather: a FIN sends the gathered data first, in order");
+    conn_drop(c);
+    dev_drain(NULL);
+
+    /* A gap: the gathered bytes go, the segment past the gap is not taken. */
+    c = open_conn(65535);
+    if (!c) { check(0, "gather: test connection did not open"); return; }
+    calls = g_send_calls;
+    cli_send_more(1001, 2, TCP_ACK, 65535, d, sizeof(d));
+    cli_send_more(3001, 2, TCP_ACK, 65535, d, sizeof(d));
+    up_flush(&g_tun);
+    check(g_send_calls == calls + 1 && c->client_seq == 2001,
+          "gather: a segment past a gap sends what was gathered, and is not taken");
+
+    /* The node refuses the gathered send (window closed): nothing is acknowledged, and the
+     * continuation in the same batch is not taken either: the client resends from 2001. */
+    g_send_again_n = 1;
+    g_recv_rc = -1;                     /* no WINDOW_UPDATE comes: the wait reads end of stream */
+    cli_send_more(2001, 2, TCP_ACK, 65535, d, sizeof(d));
+    up_flush(&g_tun);
+    check(c->client_seq == 2001, "gather: send refused, nothing acknowledged");
+    g_send_again_n = 0;
+    g_recv_rc = 0;
+    conn_drop(c);
+    dev_drain(NULL);
+
+    /* The buffer is full and the next segment forces a send, which the node refuses (window
+     * closed, and still closed after the wait). That segment follows bytes that were NOT taken:
+     * it must not start a new gathering, or the stream would skip them. */
+    c = open_conn(65535);
+    if (!c) { check(0, "gather: test connection did not open"); return; }
+    uint32_t seq = 1001;
+    while (seq - 1001 + sizeof(d) <= UP_MAX) {
+        cli_send_more(seq, 2, TCP_ACK, 65535, d, sizeof(d));
+        seq += sizeof(d);
+    }
+    g_send_again_n = 2;                 /* the send and its retry after the wait */
+    g_recv_rc = 0;
+    g_recv_n = 0;
+    cli_send_more(seq, 2, TCP_ACK, 65535, d, sizeof(d));
+    up_flush(&g_tun);
+    check(c->client_seq == 1001 && g_up.c == NULL,
+          "gather: a refused send when full, the next segment is not taken either");
+    g_send_again_n = 0;
+    conn_drop(c);
+    dev_drain(NULL);
 }
 
 /* SEND_AGAIN (the HTTP/2 window to the node is closed) while the client has no window either:
@@ -871,6 +1022,7 @@ static void pm_send(uint16_t sport, uint32_t dst, uint32_t seq, uint32_t ack, un
     unsigned char p[2048];
     size_t l = tcp_build(p, sizeof(p), CLI_IP, dst, sport, 443, seq, ack, flags, d, n, 65535, 0, -1);
     handle_packet(&g_tun, p, l);
+    up_flush(&g_tun);                       /* a packet is a whole batch here, as in cli_send */
 }
 
 /* Packets the stack wrote to the device: how many, the flags of all ORed, the seq of the last. */
@@ -1667,6 +1819,8 @@ int main(void) {
     t_spare_slot();
     t_udp_early_bounds();
     t_server_first();
+    t_room_window();
+    t_gather();
     if (stack_part() != 0) check(0, "fixture: loopback listener failed");
 
     printf(g_fail ? "\ntunnelmatch: FAIL\n" : "\nall checks passed\n");

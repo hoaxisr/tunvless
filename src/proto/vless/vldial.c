@@ -623,6 +623,19 @@ int vless_tunnel_run(const struct tun_cfg *tc, const struct pool_cfg *pc, stack_
     return pool_run(tc, pc, ready, arg);
 }
 
+/* What vl_send takes now (dialer_ops.room): the transport's room less what vl_send adds in front
+ * of the data — the request header until it is sent, a Vision frame (with padding of up to
+ * about 1400 bytes) until Vision has ended padding. */
+static long vl_room(const void *ctx, const void *sess) {
+    const struct vless_node *node = ctx;
+    const struct vl_sess *s = sess;
+    long r = transport_room(&s->t);
+    if (r < 0) return -1;
+    if (!s->header_sent) r -= 64;
+    if (node->flow[0] && !s->vis.sent_end) r -= 2048;
+    return r > 0 ? r : 0;
+}
+
 const struct dialer_ops vless_dialer = {
     .name = "vless",
     .caps = DC_PRECONNECT,
@@ -638,6 +651,7 @@ const struct dialer_ops vless_dialer = {
     .has_data = vl_has_data,
     .flow_open = vl_flow_open,
     .send = vl_send,
+    .room = vl_room,
     .dgram_frame = vl_dgram_frame,
     .read = vl_read,
     .deliver = vl_deliver,
