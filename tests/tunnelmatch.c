@@ -360,6 +360,24 @@ static void t_room_window(void) {
 
     g_room = -1;
     g_room_on_read = -2;
+
+    /* The loop behind the device (a TUN batch hit TUN_DRAIN_MAX): a scaled client gets at most
+     * RCV_WND_BACKLOG, so its unacknowledged data, which waits in the device queue ahead of the
+     * ACKs of downloads, stays short; the full window again once the loop keeps up. */
+    uint32_t save_wnd = g_rcv_wnd;
+    uint8_t save_shift = g_rcv_shift;
+    rcv_window_set(4u << 20);
+    c->ws_on = 1;
+    uint32_t full = (uint32_t)rcv_win_field(c) << g_rcv_shift;
+    g_tun_backlog = 1;
+    uint32_t held = (uint32_t)rcv_win_field(c) << g_rcv_shift;
+    g_tun_backlog = 0;
+    uint32_t back = (uint32_t)rcv_win_field(c) << g_rcv_shift;
+    check(full >= (4u << 20) && held <= RCV_WND_BACKLOG && held > RCV_WND_BACKLOG / 2 && back == full,
+          "backlog: the window drops to RCV_WND_BACKLOG while behind, and comes back");
+    c->ws_on = 0;
+    g_rcv_wnd = save_wnd;
+    g_rcv_shift = save_shift;
     conn_drop(c);
     dev_drain(NULL);
 }

@@ -207,6 +207,9 @@ struct conn {
      * handshake, and the client's repeated SYN could no longer be answered (our_seq had moved):
      * the connection hung for good (run-tunnel.sh with 3% loss, about 1 run in 40). */
     uint64_t estab_ns;
+    /* The node's room (dialer_ops.room) when the client last heard our window; UINT32_MAX —
+     * not yet. room_watch compares the room now with it to tell the client it grew. */
+    uint32_t room_seen;
     uint8_t sent_any;
     /* The client gave up (RST) while the connector was working: the record must not be
      * touched, so only mark it, and close once the connector is done. */
@@ -361,12 +364,26 @@ static void rcv_window_set(uint32_t wnd) {
  * of 65535 at shift 7 would become 65408. */
 static long conn_room(const struct conn *c);
 
+/* The loop is behind the device: the last TUN batch hit TUN_DRAIN_MAX, so packets wait in the
+ * kernel's queue. Set per loop thread after each batch (worker_loop).
+ *
+ * While it is, clients get at most RCV_WND_BACKLOG of window. What a client may send unacknowledged
+ * is what waits in that queue, and the clients' ACKs for downloads wait behind it: with a window of
+ * megabytes, two uploads kept the queue full and the ACKs late, and a download, which may have only
+ * RTX_CAP in flight, moved RTX_CAP per queue wait (xhttp stream-one, 20 s: 0.6 GB down against
+ * 10.3 GB up; 2.8 GB against 7.4 GB with this cap). Only while behind: a client on Wi-Fi with a few
+ * milliseconds of round trip needs the full window to upload fast, and when the loop keeps up the
+ * queue is empty and costs nothing. */
+#define RCV_WND_BACKLOG (64u * 1024)
+static __thread uint8_t g_tun_backlog;
+
 static uint16_t rcv_win_field(const struct conn *c) {
     /* The dialer's limit (dialer_ops.rcv_wnd_max): with DC_ACK_PACED the window must fit the
      * queue to the node, and the ceiling, chosen by machine memory, would overflow it. */
     uint32_t cap = g_rcv_wnd_max;
     uint32_t w = c->ws_on ? g_rcv_wnd : RCV_WND_MIN;
     if (cap && w > cap) w = cap;
+    if (g_tun_backlog && w > RCV_WND_BACKLOG) w = RCV_WND_BACKLOG;
     /* What the node can take now (dialer_ops.room): more would come back as SEND_AGAIN and cost
      * the client a retransmission timeout. Rounded DOWN, unlike the ceiling: a window a few
      * bytes past the room is a refused segment. */
@@ -1944,6 +1961,7 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         memset(c, 0, sizeof(*c));
         c->used = 1;
         c->born_turn = g_turn;
+        c->room_seen = UINT32_MAX;
         c->key = k;
         c->fd = -1;
         /* Into the lists AFTER memset and AFTER the key: the hash uses the key, and memset would
@@ -2201,6 +2219,10 @@ static void flush_acks(const struct tun_dev *tun) {
         if (!c->ack_due) continue;
         if (ack_must_wait(c)) continue;
         c->ack_due = 0;
+        if (!c->is_udp) {
+            long r = conn_room(c);
+            if (r >= 0) c->room_seen = r > 0x7FFFFFFF ? 0x7FFFFFFFu : (uint32_t)r;
+        }
         unsigned char ackp[64];
         size_t al = tcp_build(ackp, sizeof(ackp), c->key.dst, c->key.src,
                               c->key.dport, c->key.sport,
@@ -2219,26 +2241,37 @@ static void flush_acks(const struct tun_dev *tun) {
  *
  * A function because it is called from two places, on an epoll event and on rx_ready, and both
  * must keep the same limits. */
-/* A read from the node may carry a WINDOW_UPDATE that grows the room (dialer_ops.room) the
- * client's window is capped by. The client must hear of it from us: it has no data from us to
- * carry a new window, and waits in its persist timer, which backs off like a retransmission.
- * WIN_UPDATE_MIN: smaller growth waits for the next ACK, so one WINDOW_UPDATE per gRPC frame
- * does not become one packet each. Set by drain_conn, sent by the loop (flush_acks). */
+/* The room (dialer_ops.room) the client's window is capped by grows when the node lets more in:
+ * a WINDOW_UPDATE read from the node, or, on a transport with a link of its own for the upload
+ * (xhttp stream-up, packet-up), an answer read there, which no socket event of ours reports. The
+ * client must hear of it from us: it has no data from us to carry a new window, and waits in its
+ * persist timer, which backs off like a retransmission (packet-up uploads: 11 MB in 20 s against
+ * 400 MB). So the room is compared, after each read and on each loop pass, with what the client
+ * last heard, and a grown room sends a window update. WIN_UPDATE_MIN: smaller growth waits for
+ * the next ACK, so one WINDOW_UPDATE per gRPC frame does not become one packet each. Sent by the
+ * loop (flush_acks). */
 #define WIN_UPDATE_MIN 4096
 static __thread int g_win_woke;
+
+static void room_watch(struct conn *c) {
+    if (c->is_udp || c->srv_closed || !c->used) return;
+    long r = conn_room(c);
+    if (r < 0) return;
+    uint32_t now_r = r > 0x7FFFFFFF ? 0x7FFFFFFFu : (uint32_t)r;
+    uint32_t was = c->room_seen;
+    if (was == UINT32_MAX) { c->room_seen = now_r; return; }
+    if (now_r >= was + WIN_UPDATE_MIN || (was < WIN_UPDATE_MIN && now_r > was)) {
+        c->room_seen = now_r;
+        c->ack_due = 1;
+        g_win_woke = 1;
+    }
+}
 
 static void drain_conn_reads(struct conn *c, const struct tun_dev *tun);
 
 static void drain_conn(struct conn *c, const struct tun_dev *tun) {
-    long before = conn_room(c);
     drain_conn_reads(c, tun);
-    if (before < 0 || c->srv_closed || !c->used) return;
-    long after = conn_room(c);
-    if (after >= before + WIN_UPDATE_MIN ||
-        (before < WIN_UPDATE_MIN && after > before)) {
-        c->ack_due = 1;
-        g_win_woke = 1;
-    }
+    room_watch(c);
 }
 
 static void drain_conn_reads(struct conn *c, const struct tun_dev *tun) {
@@ -2364,6 +2397,8 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
             return 1;
         }
     }
+
+    room_watch(c);
 
     /* Expired timers: resend. After packet handling, not before: an ACK that came in this turn may
      * have made it unnecessary. */
@@ -2670,7 +2705,8 @@ static void *worker_loop(void *arg) {
              * to the turn rate (measured: 1900 turns/s x ~2920 bytes per ACK = 5.5 MB/s, exactly
              * the ceiling seen). The device is non-blocking, so "nothing more" comes as EAGAIN.
              * The per-turn limit keeps one client's packets from starving the server reads. */
-            for (int k = 0; k < TUN_DRAIN_MAX; k++) {
+            int k;
+            for (k = 0; k < TUN_DRAIN_MAX; k++) {
                 uint64_t t0 = g_stats ? now_ns() : 0;
                 ssize_t rn = tun_read_packet(&tun, pkt, sizeof(pkt));
                 uint64_t t1 = g_stats ? now_ns() : 0;
@@ -2679,6 +2715,8 @@ static void *worker_loop(void *arg) {
                 handle_packet(&tun, pkt, (size_t)rn);
                 if (g_stats) g_st.pkt_ns += now_ns() - t1;
             }
+            /* Before the ACKs of this batch, so they already carry the window it calls for. */
+            g_tun_backlog = k == TUN_DRAIN_MAX;
             up_flush(&tun);
             flush_acks(&tun);
         }
@@ -2746,6 +2784,11 @@ static void *worker_loop(void *arg) {
             struct conn *c = &g_conns[g_live[li]];
             /* A job in progress: the connector writes into the session, do not touch. */
             if (c->pending || !conn_deadlines(c, &tun, now)) li++;
+        }
+        /* Window updates for rooms that grew without a read of ours (room_watch). */
+        if (g_win_woke) {
+            g_win_woke = 0;
+            flush_acks(&tun);
         }
     }
     /* Release the connectors first, and only then close the sessions; otherwise we close what
