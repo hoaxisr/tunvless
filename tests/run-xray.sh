@@ -15,6 +15,7 @@
 #      for 15 seconds;
 #   3. the pool checks the node every 10 seconds (--interval 10): its log must not say that the
 #      node does not answer, nor that a flow did not open.
+# KEEP=<dir>: copy the work directory there at the end (Xray and tunnel logs, configs).
 # CASES: the cases to run, separated by spaces (default: all of them, see case_cfg). Each case is a
 # server config (Xray streamSettings) and the matching client link, so a setting the client
 # misreads shows up as a probe or load failure against the real server.
@@ -64,6 +65,7 @@ cleanup() {
         for p in $(ip netns pids "$n" 2>/dev/null || true); do kill -9 "$p" 2>/dev/null || true; done
         ip netns delete "$n" 2>/dev/null || true
     done
+    [ -n "${KEEP:-}" ] && cp -r "$W/." "$KEEP/" 2>/dev/null
     rm -rf "$W"
 }
 trap cleanup EXIT INT TERM

@@ -205,7 +205,29 @@ static void t_stream_up(unsigned char hpack, int want_refused, const char *what)
     close(fd);
 }
 
+/* packet-up: the server answers chunks in any order. Here the CURRENT chunk (stream 3) is
+ * answered first, and the older one (stream 1) in a later read. up_drain used to stop once the
+ * current stream was done, so the older answer stayed unread: the chunk counted as unanswered for
+ * good, the window over seq filled, and the upload stalled with no chunk left to send. */
+static void t_packet_up_order(void) {
+    int fd;
+    if (new_pair(&fd) != 0) { check(0, "socket pair created"); return; }
+    struct transport c;
+    conn_init(&c, XH_PACKET_UP, fd);
+    int rc0 = transport_write(&c, piece, sizeof(piece));     /* chunk 0, stream 1 */
+    int rc1 = transport_write(&c, piece, sizeof(piece));     /* chunk 1, stream 3 */
+    srv_drain();
+    srv_headers(3, 0x88, 1);                                 /* the newer chunk first */
+    long r1 = transport_room(&c);
+    srv_headers(1, 0x88, 1);                                 /* then the older one */
+    long r2 = transport_room(&c);
+    check(rc0 == 0 && rc1 == 0 && r1 >= 0 && r2 > 0 && h2_open_streams(&c.xh.up.h2) == 0 &&
+          !unread(fd), "packet-up: an older chunk's 200 after the current one's is read");
+    close(fd);
+}
+
 int main(void) {
+    t_packet_up_order();
     t_packet_up(0x8C, 1, "packet-up: 400 to the previous chunk fails the next write, naming 400");
     t_packet_up(0x88, 0, "packet-up: 200 to the previous chunk is read and is not a refusal");
     t_packet_up_window();

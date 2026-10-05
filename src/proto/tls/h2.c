@@ -178,6 +178,26 @@ static int frame_out(struct h2 *h, unsigned char type, unsigned char flags, uint
  * One function for every request of a connection (packet-up sends a series of short POSTs):
  * two places building headers would drift apart, and the symptom would be a server that
  * answers the first request and not the second. */
+/* Track a stream's response: opened (open_add), ended (open_end). Ids past H2_OPEN_MAX are not
+ * tracked: callers that bound the count never get there. */
+static void open_add(struct h2 *h, uint32_t sid) {
+    if (h->open_n < H2_OPEN_MAX) h->open_sid[h->open_n++] = sid;
+}
+
+static void open_end(struct h2 *h, uint32_t sid) {
+    for (unsigned i = 0; i < h->open_n; i++)
+        if (h->open_sid[i] == sid) { h->open_sid[i] = h->open_sid[--h->open_n]; return; }
+}
+
+int h2_open_streams(const struct h2 *h) { return h->open_n; }
+
+uint32_t h2_oldest_open(const struct h2 *h) {
+    uint32_t m = 0;
+    for (unsigned i = 0; i < h->open_n; i++)
+        if (!m || h->open_sid[i] < m) m = h->open_sid[i];
+    return m;
+}
+
 static int put_headers(struct h2 *h, struct wbuf *b, const char *authority,
                        const char *path, const char *content_type, const char *referer,
                        int method, int end_stream) {
@@ -240,6 +260,8 @@ int h2_start_ex(struct h2 *h, const struct h2_io *io, const char *authority,
     h->io = *io;
     h->browser = browser;
     h->sid = 1;                          /* a client's first stream: the first odd id */
+    h->open_n = 0;
+    open_add(h, h->sid);
     h->send_win = 65535;                 /* the default until the server's SETTINGS */
     h->send_win_conn = 65535;
     h->peer_init_win = 65535;            /* the same default; shifts count from it */
@@ -308,6 +330,7 @@ int h2_next(struct h2 *h, const char *authority, const char *path,
     /* The id grows by two: client streams are odd (RFC 7540 §5.1.1). Reusing a closed
      * stream's id is a connection error, not a stream error: the whole connection drops. */
     h->sid += 2;
+    open_add(h, h->sid);
 
     /* Fresh STREAM state, CONNECTION state untouched. The connection window and the server's
      * settings are shared by all requests, while each stream's window is granted anew at the
@@ -434,6 +457,7 @@ static int ctl_handle(struct h2 *h) {
         }
 
         case FR_RST_STREAM:
+            open_end(h, h->frame_sid);
             /* A reset of a CLOSED stream is not our end. A Go server sends
              * RST_STREAM(NO_ERROR) on a stream whose handler has finished; with packet-up it
              * arrives for an earlier chunk while the next one is open. */
@@ -644,9 +668,11 @@ static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got)
                     rc = ctl_handle(h);
                     if (rc) H2_STOP(rc);
                 }
-                if ((h->frame_flags & FLAG_END_STREAM) && h->frame_ours &&
-                    (h->frame_type == FR_DATA || h->frame_type == FR_HEADERS))
-                    h->done = 1;
+                if ((h->frame_flags & FLAG_END_STREAM) &&
+                    (h->frame_type == FR_DATA || h->frame_type == FR_HEADERS)) {
+                    open_end(h, h->frame_sid);
+                    if (h->frame_ours) h->done = 1;
+                }
                 h->frame_type = 0xFF;
             }
             continue;
@@ -691,7 +717,11 @@ static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got)
                 rc = ctl_handle(h);
                 if (rc) H2_STOP(rc);
             }
-            if ((h->frame_flags & FLAG_END_STREAM) && h->frame_ours) h->done = 1;
+            if ((h->frame_flags & FLAG_END_STREAM) &&
+                (h->frame_type == FR_DATA || h->frame_type == FR_HEADERS)) {
+                open_end(h, h->frame_sid);
+                if (h->frame_ours) h->done = 1;
+            }
             h->frame_type = 0xFF;
         }
     }
