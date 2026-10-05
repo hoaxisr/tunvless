@@ -477,6 +477,48 @@ int main(void) {
     }
 
     {
+        /* ---- streams whose answer has not ended are counted (h2_open_streams) ----
+         *
+         * packet-up bounds its unanswered chunks by this count: a Go server tears the session
+         * down once too many chunks wait for a missing one. A stream ends with END_STREAM on its
+         * HEADERS or DATA, or with RST_STREAM, whichever comes, and only once. */
+        static const unsigned char st200[1] = { 0x88 };
+        static const unsigned char no_error[4] = { 0, 0, 0, 0 };
+        struct h2 h;
+        struct fake_io io;
+        unsigned char feed[128];
+        unsigned char out[H2_MIN_READ_CAP];
+        size_t got = 0;
+
+        h2_open(&h, &io);
+        h2_end_stream(&h);
+        h2_next(&h, "example.org", "/x/sid/1", NULL, NULL, H2_POST);
+        h2_end_stream(&h);
+        h2_next(&h, "example.org", "/x/sid/2", NULL, NULL, H2_POST);
+        check("open streams: three requests, none answered", 3, h2_open_streams(&h));
+        io.feed = feed; io.feed_pos = 0;
+        size_t fn = put_frame(feed, FR_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, st200, 1);
+        io.feed_n = fn;
+        h2_read(&h, out, sizeof(out), &got);
+        check("open streams: END_STREAM on the first", 2, h2_open_streams(&h));
+        check("open streams: the oldest is the second request", 3, (int)h2_oldest_open(&h));
+        io.feed_pos = 0;
+        fn = put_frame(feed, FR_RST_STREAM, 0, 1, no_error, 4);             /* already ended */
+        fn += put_frame(feed + fn, FR_RST_STREAM, 0, 3, no_error, 4);
+        io.feed_n = fn;
+        h2_read(&h, out, sizeof(out), &got);
+        check("open streams: RST_STREAM on the second, a late one on the first", 1,
+              h2_open_streams(&h));
+        io.feed_pos = 0;
+        fn = put_frame(feed, FR_HEADERS, FLAG_END_HEADERS, h.sid, st200, 1);
+        fn += put_frame(feed + fn, FR_DATA, FLAG_END_STREAM, h.sid, NULL, 0);
+        io.feed_n = fn;
+        h2_read(&h, out, sizeof(out), &got);
+        check("open streams: END_STREAM on an empty DATA of the current", 0, h2_open_streams(&h));
+        check("open streams: none open, no oldest", 0, (int)h2_oldest_open(&h));
+    }
+
+    {
         /* ---- the previous stream's answer does not stand for the current one's ---
          *
          * In packet-up the 200 to the previous chunk may come just before the current chunk's

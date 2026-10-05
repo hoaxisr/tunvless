@@ -137,7 +137,7 @@ struct dialer_ops {
      * retransmission timeout that doubles on every repeat. Against Xray's 94 KB gRPC window
      * that held uploads to 10-20 Mbit/s with multi-second stalls. When the room grows back
      * (WINDOW_UPDATE, read by drain_conn) the stack sends the client a window update. */
-    long (*room)(const void *ctx, const void *sess);
+    long (*room)(const void *ctx, void *sess);
     /* Frame a client datagram into stream bytes for the node. Returns the length, or 0 if it does
      * not fit. */
     size_t (*dgram_frame)(const unsigned char *p, size_t n, unsigned char *out, size_t cap);

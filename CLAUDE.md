@@ -14,6 +14,7 @@ make out/tests/rtxmatch && out/tests/rtxmatch   # one test: build its target, ru
 make O=out-asan SANITIZE=address test           # what CI also runs
 sudo make e2e                # namespace tunnel tests (iproute2, nftables, python3)
 make interop XRAY=... SINGBOX=...               # real Xray-core / sing-box; skipped without them
+sudo CASES="xhttp-packet-up grpc-gun" DUR=20 XRAY=... sh tests/run-xray.sh   # one transport setting per case; KEEP=dir keeps logs
 make CC=mipsel-linux-gnu-gcc AR=mipsel-linux-gnu-ar O=out-mipsel   # cross build
 ```
 
@@ -27,7 +28,8 @@ Data path: `main.c` (CLI, node parsing/selection, routes, signals) → `tunnel/s
 Key boundaries (each documented at length in the header comments; read them before changing a layer):
 
 - **Stack knows no protocol.** Each client flow has an opaque dialer session; all node logic goes through `struct dialer_ops`. The stack has no congestion control and no reassembly (out-of-order client segments are dropped), but does retransmit toward the client (`rtx.c`). `TUNNEL_BUF` drives flow control, not just a buffer size.
-- **Upload flow control:** the client's window is capped by `dialer_ops.room` (the HTTP/2 send window for grpc/xhttp), a WINDOW_UPDATE triggers a window-update ACK, and in-order segments of one flow within a TUN batch are gathered (`g_up`, flushed by `up_flush` at batch end) into one send. Test helpers that call `handle_packet` must `up_flush` like the loop does.
+- **Upload flow control:** the client's window is capped by `dialer_ops.room` (the HTTP/2 send window for grpc/xhttp), a WINDOW_UPDATE triggers a window-update ACK, and in-order segments of one flow within a TUN batch are gathered (`g_up`, flushed by `up_flush` at batch end) into one send. Test helpers that call `handle_packet` must `up_flush` like the loop does. While a TUN batch hits `TUN_DRAIN_MAX`, client windows drop to `RCV_WND_BACKLOG` so download ACKs are not stuck behind queued uploads.
+- **xhttp packet-up** sends one POST per write and the server reorders them (Xray tears the session down past `scMaxBufferedPosts`): chunks stay within `PACKET_INFLIGHT` of the oldest unanswered one, and `up_drain` must keep reading after the current chunk is answered.
 - **Transport = two independent tables** (`transport.h`): `security_ops` (none/tls/reality, `trsec.c`) and `transport_ops` (tcp/grpc/xhttp/ws/httpupgrade). Any pair is valid; after the handshake streams share `tr_link_*`. Socket dialing (SO_MARK, SO_BINDTODEVICE) is `trdial.c`.
 - **TLS 1.3, REALITY, ECH and HTTP/2 are our own code** (`src/proto/tls/`) so the ClientHello can mimic Chrome (uTLS `HelloChrome_Auto`). wolfSSL supplies only primitives.
 - **wolfSSL is visible in exactly one file**, `src/lib/scrypto.c`, compiled with the library's own flags. `scrypto.h` exposes no library types; contexts are fixed-size opaque storage checked by `_Static_assert` against real wolfSSL sizes. Options live in `build/wolfssl/user_settings.h`; growing a struct breaks the build on purpose.

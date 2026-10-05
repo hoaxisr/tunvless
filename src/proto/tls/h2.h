@@ -24,6 +24,8 @@ struct h2_io {
  * per-thread buffer, and only what cannot be parsed at once carries over between calls: a split
  * frame header, a control frame body and the count of unread body. A 16 KB frame buffer per
  * connection would add up to megabytes. */
+#define H2_OPEN_MAX 16
+
 struct h2 {
     struct h2_io io;
     int started;
@@ -101,6 +103,11 @@ struct h2 {
      * still counts toward the connection window, a non-200 status still goes to old_status);
      * see the frame header parsing in h2_read. */
     uint32_t sid;
+    /* Streams we opened whose response has not ended (END_STREAM or RST_STREAM from the server),
+     * by id, up to H2_OPEN_MAX. packet-up leaves each chunk's request open until its 200 comes,
+     * and the number of those is what it must bound (see packet-up in trxhttp.c). */
+    uint32_t open_sid[H2_OPEN_MAX];
+    unsigned char open_n;
 
     /* Who we claim to be in the headers: 0 — gRPC (te: trailers and its User-Agent), 1 — a
      * browser (Chrome for xhttp, see put_headers in h2.c). Kept in the STATE, not passed as an
@@ -161,6 +168,10 @@ int h2_end_stream(struct h2 *h);
 
 /* Sends the data in DATA frames, all or nothing (H2_EWINDOW); see h2.c. */
 int h2_write(struct h2 *h, const unsigned char *d, size_t n);
+/* Streams opened whose response has not ended yet (see open_sid). */
+int h2_open_streams(const struct h2 *h);
+/* The oldest of them (the lowest id), 0 if none. */
+uint32_t h2_oldest_open(const struct h2 *h);
 /* The largest n h2_write takes now: the smaller of the stream and connection windows, 0 if
  * either is closed (or negative, RFC 7540 §6.9.2). */
 long h2_room(const struct h2 *h);

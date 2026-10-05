@@ -49,6 +49,10 @@ struct vless_node {
      * pad_to == 0 — not announced: Xray's default 100..1000 applies
      * (GetNormalizedXPaddingBytes). */
     uint16_t pad_from, pad_to;
+    /* xhttp packet-up: the most a POST body may carry (Xray scMaxEachPostBytes, a number or a
+     * range; the client picks one value per connection). The server answers 413 to more.
+     * post_to == 0 — not announced: Xray's default 1000000, above any chunk we send. */
+    uint32_t post_from, post_to;
     /* Post-quantum fields of Xray-core. They are long (an ML-DSA-65 key is 2603 base64url
      * characters, a VLESS encryption string with an ML-KEM-768 key about 1600), so the strings live
      * in a shared table (sl_intern, sublink.c), not in the node: equal values share one copy, which

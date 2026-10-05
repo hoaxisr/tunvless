@@ -123,7 +123,7 @@ int transport_read_zc(struct transport *c, unsigned char *buf, size_t cap,
     return 0;
 }
 int transport_has_data(const struct transport *c) { (void)c; return 0; }
-long transport_room(const struct transport *c) { (void)c; return g_room; }
+long transport_room(struct transport *c) { (void)c; return g_room; }
 void transport_close(struct transport *c) { c->link.fd = -1; }   /* shared pipe: keep it open */
 void transport_moved(struct transport *c) { (void)c; }
 void transport_direct(struct transport *c) { c->link.rx_direct = 1; }
@@ -360,6 +360,24 @@ static void t_room_window(void) {
 
     g_room = -1;
     g_room_on_read = -2;
+
+    /* The loop behind the device (a TUN batch hit TUN_DRAIN_MAX): a scaled client gets at most
+     * RCV_WND_BACKLOG, so its unacknowledged data, which waits in the device queue ahead of the
+     * ACKs of downloads, stays short; the full window again once the loop keeps up. */
+    uint32_t save_wnd = g_rcv_wnd;
+    uint8_t save_shift = g_rcv_shift;
+    rcv_window_set(4u << 20);
+    c->ws_on = 1;
+    uint32_t full = (uint32_t)rcv_win_field(c) << g_rcv_shift;
+    g_tun_backlog = 1;
+    uint32_t held = (uint32_t)rcv_win_field(c) << g_rcv_shift;
+    g_tun_backlog = 0;
+    uint32_t back = (uint32_t)rcv_win_field(c) << g_rcv_shift;
+    check(full >= (4u << 20) && held <= RCV_WND_BACKLOG && held > RCV_WND_BACKLOG / 2 && back == full,
+          "backlog: the window drops to RCV_WND_BACKLOG while behind, and comes back");
+    c->ws_on = 0;
+    g_rcv_wnd = save_wnd;
+    g_rcv_shift = save_shift;
     conn_drop(c);
     dev_drain(NULL);
 }
@@ -1585,6 +1603,11 @@ static void t_stack_abort(void) {
      * segments (fin_recent_take): the first is taken silently, the second gets an ACK, not RST. */
     pm_send(50003, 0x0a0a0a0bu, 1001, fin_seq + 1, TCP_ACK, NULL, 0);
     check(pm_drain(NULL, NULL) == 0, "ACK of our FIN after the close: no RST");
+    /* Data after our FIN cannot be delivered: RST, as the closed server would answer. Taken
+     * silently, an uploading client blocked until its own timeout (sigpipe.sh). */
+    pm_send(50003, 0x0a0a0a0bu, 1001, fin_seq + 1, TCP_ACK | TCP_PSH, (const unsigned char *)"more", 4);
+    n = pm_drain(&fl, NULL);
+    check(n == 1 && (fl & TCP_RST), "data after our FIN: RST, not silence");
     pm_send(50003, 0x0a0a0a0bu, 1001, fin_seq + 1, TCP_FIN | TCP_ACK, NULL, 0);
     {
         unsigned char p[2048];

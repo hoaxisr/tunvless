@@ -208,7 +208,7 @@ interop: $(T)/vencprobe $(T)/xudpprobe $(O)/tunvless
 	BUILD=$(T) sh tests/venc.sh
 	BUILD=$(T) sh tests/xudp.sh
 	BUILD=$(T) sh tests/ech.sh
-	TUNVLESS=$(O)/tunvless sh tests/run-grpc.sh
+	TUNVLESS=$(O)/tunvless sh tests/run-xray.sh
 
 e2e: $(O)/tunvless
 	TUNVLESS=$(O)/tunvless sh tests/run-tunnel.sh
