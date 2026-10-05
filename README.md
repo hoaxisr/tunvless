@@ -182,12 +182,20 @@ under qemu.
 | `STEER_TUN_TRACE=1` | trace every packet and stream decision |
 | `STEER_TUN_STATS=1` | per-second statistics of the tunnel loop |
 | `STEER_TUN_SPARES=N` | pre-connected spare sessions to the node (default 4, 0 — off, max 8) |
-| `STEER_TUN_THREADS=N` | TUN queues/threads (default 1) |
+| `STEER_TUN_THREADS=N` | TUN queues/threads (default 1, max 4); for experiments only: a connection whose packets land in two queues stalls, see [docs/performance.md](docs/performance.md#threads) |
 | `STEER_TUN_RCVWND=N` | receive window ceiling for clients (0 — 65535 without scaling) |
 | `STEER_TUN_NOGSO=1`, `STEER_TUN_NOGRO=1`, `STEER_TUN_NORXGSO=1` | turn TUN offloads off |
 | `STEER_NOPQ=1` | do not offer X25519MLKEM768 |
 | `STEER_CIPHER=...` | force the cipher instead of choosing by AES support |
 | `STEER_PQ_TRACE=1`, `STEER_VENC_TRACE=1` | trace post-quantum key exchange / VLESS encryption |
+
+Under the Entware init script, `export` them in `/opt/etc/tunvless/tunvless.conf`.
+
+### Performance
+
+On a Keenetic KN-1810 (MT7621) tunvless carries a whole 84 Mbit/s uplink with REALITY using one
+hardware thread, where sing-box in TUN mode stops at 25-35 Mbit/s with all four busy. The setup,
+the numbers and what limits tunvless are in [docs/performance.md](docs/performance.md).
 
 ## Layout
 
