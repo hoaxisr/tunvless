@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Target for tests/run-grpc.sh: HTTP on one address, no keep-alive.
+"""Target for tests/run-xray.sh: HTTP on one address, no keep-alive.
 
   grpc-target.py ADDRESS PORT
 

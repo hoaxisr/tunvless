@@ -52,6 +52,9 @@ void sl_set_vcn(struct vless_node *n, const char *v);
 void sl_set_ech(struct vless_node *n, const char *v);
 /* xhttp: padding length "512" or "50-150", and the link's extra field (JSON). */
 void sl_pad_range(struct vless_node *n, const char *v);
+void sl_post_range(struct vless_node *n, const char *v);
+/* 1: this xhttp setting's value needs requests the client does not produce (see sublink.c). */
+int sl_xh_setting_bad(const char *key, const char *val);
 void sl_parse_extra(struct vless_node *n, const char *extra);
 
 /* ---- the whole link -------------------------------------------------------------------------- */
@@ -101,6 +104,8 @@ static inline void sl_tr_node(const struct vless_node *n, struct tr_node *t) {
     t->mode = n->mode;
     t->pad_from = n->pad_from;
     t->pad_to = n->pad_to;
+    t->post_from = n->post_from;
+    t->post_to = n->post_to;
     t->http_host = n->http_host;
     t->headers = n->headers;
     t->pqv = n->pqv;

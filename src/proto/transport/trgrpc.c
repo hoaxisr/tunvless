@@ -163,7 +163,7 @@ static void grpc_moved(struct transport *t) { t->h2.io.ctx = &t->link; }
 static int grpc_pending(const struct transport *t) { return t->h2.done || t->h2.pend_err; }
 
 /* A gRPC message adds 5 bytes of header and up to 4 of protobuf tag and length to each write. */
-static long grpc_room(const struct transport *t) {
+static long grpc_room(struct transport *t) {
     long r = h2_room(&t->h2) - 9;
     return r > 0 ? r : 0;
 }

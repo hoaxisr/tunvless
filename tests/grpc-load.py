@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Load for tests/run-grpc.sh: long flows both ways and short "pages" that open and close while
+"""Load for tests/run-xray.sh: long flows both ways and short "pages" that open and close while
 those run.
 
   grpc-load.py --target HOST:PORT --dur SEC [--down N] [--up N] [--rate R] [--kb K] [--report SEC]

@@ -79,6 +79,8 @@ struct tr_node {
     /* xhttp padding length announced by the node (see vless_node.pad_from in vless.h). pad_to 0:
      * not announced, the Xray default applies. */
     uint16_t pad_from, pad_to;
+    /* xhttp packet-up POST body limit (see vless_node.post_from). post_to 0: not announced. */
+    uint32_t post_from, post_to;
     /* Reality: ML-DSA-65 public key that verifies the certificate signature, base64url (1952
      * bytes decoded), or NULL. Xray's mldsa65Verify, `pqv` in the link. */
     const char *pqv;
@@ -165,6 +167,10 @@ struct xh_state {
      * built without the node at hand, and each needs padding: the server checks it on EVERY
      * request, not only the first. */
     uint16_t pad_from, pad_to;
+    /* packet-up: the most one POST carries on this connection, picked from the node's range at
+     * open (as Xray's client does); a write larger than that goes as several chunks. 0: no
+     * limit. */
+    uint32_t post_max;
 };
 
 /* Parser of WebSocket frames from the server (RFC 6455, section 5): streaming, chunks of any size.
@@ -277,7 +283,7 @@ struct transport_ops {
     /* How many bytes a write can take right now: the HTTP/2 send window (grpc, xhttp). A write
      * larger than that fails with H2_EWINDOW. NULL: no limit (tcp, ws, httpupgrade: the socket
      * buffer). */
-    long (*room)(const struct transport *t);
+    long (*room)(struct transport *t);
 };
 
 /* Security, the link's security= field. The kinds differ only in the handshake (see the head). */
@@ -322,7 +328,7 @@ int transport_read(struct transport *t, unsigned char *d, size_t cap, size_t *go
  * (gRPC message header, VLESS encryption records); -1: no limit. The tunnel sizes the window it
  * gives the client by it, so the client sends what the node can take instead of finding out by
  * retransmission timeouts (see dialer_ops.room). */
-long transport_room(const struct transport *t);
+long transport_room(struct transport *t);
 
 /* Read WITHOUT AN EXTRA COPY where the transport allows it (transport_ops.zc).
  *
