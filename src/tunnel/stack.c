@@ -1778,7 +1778,7 @@ static void fin_recent_add(const struct conn *c) {
 }
 
 /* A segment without a connection that belongs to a flow we closed with FIN: 1 — handled (taken
- * silently or its FIN acknowledged), 0 — not ours, the caller answers RST. */
+ * silently or its FIN acknowledged), 0 — not ours or carrying data, the caller answers RST. */
 static int fin_recent_take(const struct tun_dev *tun, const struct flow_key *k, size_t data_n) {
     for (unsigned i = 0; i < FIN_RECENT; i++) {
         struct fin_recent *r = &g_fin_recent[i];
@@ -1786,6 +1786,11 @@ static int fin_recent_take(const struct tun_dev *tun, const struct flow_key *k, 
             r->dport != k->dport || g_now_s - r->at > FIN_RECENT_S ||
             !(k->tcp_flags & TCP_ACK) || k->ack != r->fin_end)
             continue;
+        /* DATA after our FIN goes nowhere: the server has closed. Taken silently, it was
+         * neither acknowledged nor refused, and an uploading client blocked until its own
+         * timeout (sigpipe.sh: a write stalled for 10 s). RST, as the closed server would
+         * answer it. */
+        if (data_n) return 0;
         if (k->tcp_flags & TCP_FIN) {
             unsigned char ack[64];
             size_t al = tcp_build(ack, sizeof(ack), k->dst, k->src, k->dport, k->sport,

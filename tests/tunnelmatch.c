@@ -1603,6 +1603,11 @@ static void t_stack_abort(void) {
      * segments (fin_recent_take): the first is taken silently, the second gets an ACK, not RST. */
     pm_send(50003, 0x0a0a0a0bu, 1001, fin_seq + 1, TCP_ACK, NULL, 0);
     check(pm_drain(NULL, NULL) == 0, "ACK of our FIN after the close: no RST");
+    /* Data after our FIN cannot be delivered: RST, as the closed server would answer. Taken
+     * silently, an uploading client blocked until its own timeout (sigpipe.sh). */
+    pm_send(50003, 0x0a0a0a0bu, 1001, fin_seq + 1, TCP_ACK | TCP_PSH, (const unsigned char *)"more", 4);
+    n = pm_drain(&fl, NULL);
+    check(n == 1 && (fl & TCP_RST), "data after our FIN: RST, not silence");
     pm_send(50003, 0x0a0a0a0bu, 1001, fin_seq + 1, TCP_FIN | TCP_ACK, NULL, 0);
     {
         unsigned char p[2048];
