@@ -1701,6 +1701,7 @@ static __thread struct fin_recent {
     uint32_t src, dst;          /* the client's flow, as in its packets */
     uint16_t sport, dport;
     uint32_t fin_end;           /* our FIN's sequence number + 1: what the client acknowledges */
+    uint16_t win;               /* the window field our FIN carried, repeated in the last ACK */
     time_t at;
 } g_fin_recent[FIN_RECENT];
 static __thread unsigned g_fin_recent_i;
@@ -1712,6 +1713,7 @@ static void fin_recent_add(const struct conn *c) {
     r->sport = c->key.sport;
     r->dport = c->key.dport;
     r->fin_end = c->our_seq + 1;
+    r->win = rcv_win_field(c);
     r->at = g_now_s ? g_now_s : 1;
 }
 
@@ -1728,7 +1730,7 @@ static int fin_recent_take(const struct tun_dev *tun, const struct flow_key *k, 
             unsigned char ack[64];
             size_t al = tcp_build(ack, sizeof(ack), k->dst, k->src, k->dport, k->sport,
                                   r->fin_end, k->seq + (uint32_t)data_n + 1, TCP_ACK,
-                                  NULL, 0, 0, 0, -1);
+                                  NULL, 0, r->win, 0, -1);
             if (al) tun_write_ctl(tun, ack, al);
             r->at = 0;          /* both halves closed: the flow is over */
         }
@@ -2231,12 +2233,15 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
         if (!drained)
             TR("conn#%ld: client did not acknowledge %u bytes in %d ms, closing\n",
                (long)(c - g_conns), c->rtx.len, CLOSE_DRAIN_MS);
-        /* FIN, or the client keeps waiting for data that will never come. */
+        /* FIN, or the client keeps waiting for data that will never come. With an open window:
+         * a FIN takes a sequence number, and Linux does not send one into a zero window. The
+         * client's own FIN then waited for a window update that never came (LAST-ACK for good,
+         * tests/run-tunnel-fin.sh `separate`). */
         unsigned char fin[64];
         size_t fl = tcp_build(fin, sizeof(fin), c->key.dst, c->key.src,
                               c->key.dport, c->key.sport,
                               c->our_seq, c->client_seq, TCP_FIN | TCP_ACK,
-                              NULL, 0, 0, 0, -1);
+                              NULL, 0, rcv_win_field(c), 0, -1);
         if (fl) tun_write_ctl(tun, fin, fl);
         if (!c->is_udp) fin_recent_add(c);
         conn_drop(c);

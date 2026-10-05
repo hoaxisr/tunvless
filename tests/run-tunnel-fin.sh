@@ -13,7 +13,8 @@
 #   separate — data and FIN in separate segments;
 #   silent   — the server (port 9) neither answers nor closes: the connection must close by
 #              itself within CLOSE_DRAIN_MS, not hang until the idle cleanup.
-# An nft rule on output to vl counts that FIN and data really went in one segment.
+# An nft rule on output to vl counts that FIN and data really went in one segment. After each
+# case no client socket may be left in LAST-ACK.
 #
 # Usage: tests/run-tunnel-fin.sh   (needs root: its own network namespace)
 #   TUNVLESS=<binary>     default ./out/tunvless
@@ -106,6 +107,15 @@ PY
     after=$(ip netns exec "$NS" nft list chain inet fin out | sed -n 's/.*packets \([0-9]*\).*/\1/p')
     merged=$((after - before))
     echo "  $mode: $got (FIN+data segments: $merged)"
+    # The client's own FIN must be sent and acknowledged too: a socket left in LAST-ACK means the
+    # tunnel never took it (our FIN once carried a zero window, and Linux sends no FIN into one).
+    sleep 1
+    lastack=$(ip netns exec "$NS" ss -Htn state last-ack dst "$TARGET" | wc -l)
+    if [ "$lastack" != 0 ]; then
+        echo "  $mode: $lastack client socket(s) left in LAST-ACK"
+        ip netns exec "$NS" ss -tni state last-ack dst "$TARGET" | sed 's/^/    /'
+        fail=1
+    fi
     [ "$got" = ok ] || fail=1
     if [ "$mode" != separate ] && [ "$mode" != silent ] && [ "$merged" = 0 ]; then
         echo "  $mode: FIN did not merge with the data — case not reproduced"; fail=1
