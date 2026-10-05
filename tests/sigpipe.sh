@@ -126,6 +126,14 @@ early() { grep '^node:' "$1" | tail -n 1 | grep -o 'closed-early=[0-9]*' | sed '
 e1="$(early "$tmp/node-tls.err")"; e2="$(early "$tmp/node-none.err")"
 check "the load reached the TLS node: at least 20 connections closed early" "1" "$([ "${e1:-0}" -ge 20 ] && echo 1 || echo 0)"
 check "  and the plain node: at least 10" "1" "$([ "${e2:-0}" -ge 10 ] && echo 1 || echo 0)"
+# Port 81 speaks first: the client never sends, so the node learns the destination only from the
+# header the stack sends alone after SERVER_FIRST_MS. Without it every download got nothing.
+bin_() { grep -o 'bytes-in=[0-9]*' "$1" | sed 's/.*=//'; }
+b1="$(bin_ "$tmp/cl-tls.out")"; b2="$(bin_ "$tmp/cl-none.out")"
+check "downloads from a server that speaks first got data (TLS, plain)" "1 1" \
+    "$([ "${b1:-0}" -gt 0 ] && echo 1 || echo 0) $([ "${b2:-0}" -gt 0 ] && echo 1 || echo 0)"
+check "no upload stalled on a write (10 s socket timeout)" "0" \
+    "$(cat "$tmp/cl-tls.out" "$tmp/cl-none.out" | grep -o 'up:stalled=[0-9]*' | sed 's/.*=//' | awk '{ n += $1 } END { print n + 0 }')"
 
 # Quiet period: the stack frees closed connections within loop turns, and one closed by the node
 # but not yet acknowledged by the client after CLOSE_DRAIN_MS (5 s); the margin is the spare sessions.

@@ -98,6 +98,8 @@ def worker(kind, target, deadline, st):
                     while time.time() < deadline:
                         sent += s.send(blob)
                     st.add("up:deadline")
+                except socket.timeout:
+                    st.add("up:stalled")
                 except OSError:
                     # the node closed, the tunnel answered RST (or cut the write): the expected end
                     st.add("up:cut-by-node")

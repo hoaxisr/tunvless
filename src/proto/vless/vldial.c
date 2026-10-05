@@ -359,6 +359,10 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
         if (!len) return SEND_FATAL;
     }
 
+    /* n == 0 (the stack's call for a silent client, dialer.h): the header alone, as Xray's client
+     * flushes it after 100 ms without data. Vision starts with the first real data. */
+    if (!n && !len) return SEND_OK;
+
     /* Wrap only until Vision has ended padding: after the end frame vision_wrap is a plain
      * copy, and the data would be copied for nothing (tls13_write copies it once more, which
      * it must: encryption is done in place in the record). So there are zero or one copies
@@ -370,7 +374,7 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
      * retransmits the same packet, it goes out without the frame and the UUID, and the server
      * closes the stream. */
     struct vision vis_before = s->vis;
-    if (node->flow[0] && !s->vis.sent_end) {
+    if (node->flow[0] && !s->vis.sent_end && n) {
         size_t fn = vision_wrap(&s->vis, data, n, out + len, sizeof(out) - len);
         if (!fn) return SEND_FATAL;
         len += fn;

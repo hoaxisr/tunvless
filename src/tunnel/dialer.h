@@ -122,7 +122,9 @@ struct dialer_ops {
      * node is possible (the dialer logs why), and the stack drops the connection. */
     int  (*flow_open)(const void *ctx, void *sess, const struct flow_key *k, int udp);
     /* Client bytes to the node; for UDP, one datagram framed by dgram_frame per call. Returns
-     * SEND_*. */
+     * SEND_*. For TCP, n == 0 before any data means "the client is silent, the server may speak
+     * first" (SSH, SMTP, FTP): send whatever the node needs to open the flow now (for VLESS the
+     * request header alone). The stack makes that call once, SERVER_FIRST_MS after the SYN. */
     int  (*send)(const void *ctx, void *sess, const struct flow_key *k, int udp,
                  const unsigned char *d, size_t n);
     /* Frame a client datagram into stream bytes for the node. Returns the length, or 0 if it does

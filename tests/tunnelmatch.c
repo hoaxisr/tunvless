@@ -86,6 +86,7 @@ static int g_sess_pipe[2] = { -1, -1 };
 static int g_send_rc;                 /* what transport_write returns: 0 or H2_EWINDOW */
 static int g_send_again_n;            /* return H2_EWINDOW this many times, then 0 */
 static int g_send_calls;
+static size_t g_send_last_n;          /* length of the last transport_write */
 static int g_recv_calls;
 static int g_recv_rc;                 /* what transport_read_zc returns: 0 or -1 (end of stream) */
 static unsigned char g_recv_buf[4096];
@@ -99,8 +100,9 @@ int vless_connect(const struct vless_node *node, struct transport *conn, int tim
     return 0;
 }
 int transport_write(struct transport *c, const unsigned char *d, size_t n) {
-    (void)c; (void)d; (void)n;
+    (void)c; (void)d;
     g_send_calls++;
+    g_send_last_n = n;
     if (g_send_again_n > 0) { g_send_again_n--; return H2_EWINDOW; }
     return g_send_rc;
 }
@@ -237,6 +239,46 @@ static void t_no_connectors(void) {
           "after the failure, connectors start on the next SYN");
     if (c) conn_drop(c);
     dev_drain(NULL);
+}
+
+/* The server speaks first (SSH, SMTP): the client sends nothing after the handshake. VLESS gives
+ * the node the destination only in the request header, so the stack must send the header alone
+ * after SERVER_FIRST_MS, once, and without a Vision frame (as Xray's client does). Before this
+ * such a flow never opened: the node waited for the header, the client for the greeting. */
+static void server_first(const char *flow, size_t header_n) {
+    snprintf(g_node.flow, sizeof(g_node.flow), "%s", flow);
+    struct flow_key k = cli_key();
+    cli_send(1000, 0, TCP_SYN, 65535, NULL, 0);
+    struct conn *c = conn_find(&k);
+    if (!c || wait_ready(c, 2000) != 0) {
+        check(0, "server first: test connection did not open");
+        if (c) conn_drop(c);
+        g_node.flow[0] = 0;
+        return;
+    }
+    cli_send(1001, 2, TCP_ACK, 65535, NULL, 0);
+    char what[96];
+    int calls = g_send_calls;
+    conn_deadlines(c, &g_tun, c->syn_ns + (SERVER_FIRST_MS / 2) * 1000000ull);
+    snprintf(what, sizeof(what), "server first%s: nothing sent before %d ms", flow[0] ? ", Vision" : "",
+             SERVER_FIRST_MS);
+    check(g_send_calls == calls, what);
+    conn_deadlines(c, &g_tun, c->syn_ns + (SERVER_FIRST_MS + 50) * 1000000ull);
+    const struct vl_sess *vs = SESS(c);
+    snprintf(what, sizeof(what), "server first%s: then the %zu-byte header alone",
+             flow[0] ? ", Vision" : "", header_n);
+    check(g_send_calls == calls + 1 && g_send_last_n == header_n && vs->header_sent, what);
+    conn_deadlines(c, &g_tun, c->syn_ns + (SERVER_FIRST_MS + 100) * 1000000ull);
+    snprintf(what, sizeof(what), "server first%s: and only once", flow[0] ? ", Vision" : "");
+    check(g_send_calls == calls + 1, what);
+    conn_drop(c);
+    dev_drain(NULL);
+    g_node.flow[0] = 0;
+}
+
+static void t_server_first(void) {
+    server_first("", 26);                    /* version, UUID, no addons, cmd, port, IPv4 */
+    server_first("xtls-rprx-vision", 44);    /* plus the flow addon: 0a 10 "xtls-rprx-vision" */
 }
 
 /* SEND_AGAIN (the HTTP/2 window to the node is closed) while the client has no window either:
@@ -1624,6 +1666,7 @@ int main(void) {
     t_dns_evict();
     t_spare_slot();
     t_udp_early_bounds();
+    t_server_first();
     if (stack_part() != 0) check(0, "fixture: loopback listener failed");
 
     printf(g_fail ? "\ntunnelmatch: FAIL\n" : "\nall checks passed\n");

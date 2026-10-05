@@ -199,6 +199,11 @@ struct conn {
     unsigned char *early;
     uint32_t early_n;
     uint32_t early_off;
+    /* When the SYN came, and whether anything went to the node yet: a client silent for
+     * SERVER_FIRST_MS waits for the server to speak first, and the node must be told where to
+     * connect without data (conn_deadlines). */
+    uint64_t syn_ns;
+    uint8_t sent_any;
     /* The client gave up (RST) while the connector was working: the record must not be
      * touched, so only mark it, and close once the connector is done. */
     uint8_t client_gone;
@@ -230,6 +235,11 @@ typedef char conn_hot_size_check[sizeof(struct conn) <= 192 ? 1 : -1];
  * client retransmits once the flow is ready — the same flow control by withheld ACKs as on the
  * SEND_AGAIN path. */
 #define EARLY_CAP 8192
+
+/* How long a client may stay silent before the flow is opened without its data: SSH, SMTP, FTP
+ * and the like wait for the server's greeting, and VLESS carries the destination only with the
+ * first data. 100 ms, as Xray's own client (buf.CopyOnceTimeout in its VLESS outbound). */
+#define SERVER_FIRST_MS 100
 
 /* Unacknowledged bytes kept per connection, and therefore our in-flight limit.
  *
@@ -1205,7 +1215,9 @@ static void conn_drop(struct conn *c) {
 /* Send the client's data to the node. Its form — request header, wrappers, transport framing —
  * is the dialer's business (dialer_ops.send); the result is SEND_* (dialer.h). */
 static int upstream_send(struct conn *c, const unsigned char *data, size_t n) {
-    return g_dl->ops->send(g_dl->ctx, SESS(c), &c->key, c->is_udp, data, n);
+    int sr = g_dl->ops->send(g_dl->ctx, SESS(c), &c->key, c->is_udp, data, n);
+    if (sr == SEND_OK) c->sent_any = 1;
+    return sr;
 }
 
 /* SYN-ACK to the client. The ISN is always 1 and is not kept in our_seq: our_seq starts at 2 (the
@@ -1796,6 +1808,7 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         memset(c, 0, sizeof(*c));
         c->used = 1;
         c->born_turn = g_turn;
+        c->syn_ns = g_now_ns;
         c->key = k;
         c->fd = -1;
         /* Into the lists AFTER memset and AFTER the key: the hash uses the key, and memset would
@@ -2192,6 +2205,17 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
     if (c->early && early_flush(c) < 0) {
         conn_reset(c, tun);
         return 1;
+    }
+
+    /* A client silent since the SYN: open the flow without data, so a server that speaks first
+     * can (dialer.h, send with n == 0). The early data path above covers a client that spoke. */
+    if (!c->is_udp && !c->sent_any && !c->early && !c->srv_closed &&
+        now - c->syn_ns >= SERVER_FIRST_MS * 1000000ull) {
+        int sr = upstream_send(c, NULL, 0);
+        if (sr == SEND_FATAL) {
+            conn_reset(c, tun);
+            return 1;
+        }
     }
 
     /* Expired timers: resend. After packet handling, not before: an ACK that came in this turn may
