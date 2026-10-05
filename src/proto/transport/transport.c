@@ -157,6 +157,15 @@ int transport_write(struct transport *t, const unsigned char *d, size_t n) {
     return t->fr->write(t, d, n);
 }
 
+long transport_room(const struct transport *t) {
+    if (!t->fr || !t->fr->room) return -1;
+    long r = t->fr->room(t);
+    /* VLESS encryption wraps every write in an AEAD record: length and tag. A margin rather than
+     * the exact overhead, which depends on how the data is split into writes. */
+    if (t->enc) r -= r / 32 + 64;
+    return r > 0 ? r : 0;
+}
+
 int transport_read(struct transport *t, unsigned char *d, size_t cap, size_t *got) {
     *got = 0;
     if (t->enc) return tr_venc_read(t, d, cap, got);

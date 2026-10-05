@@ -199,6 +199,15 @@ struct conn {
     unsigned char *early;
     uint32_t early_n;
     uint32_t early_off;
+    /* When the client completed the handshake (its first ACK; 0 — not yet), and whether anything
+     * went to the node yet: a client silent for SERVER_FIRST_MS after that waits for the server
+     * to speak first, and the node must be told where to connect without data (conn_deadlines).
+     * Not counted from the SYN: a client whose SYN-ACK was lost is not silent, it does not have
+     * the connection yet. Opening the flow then let the server's answer go out ahead of the
+     * handshake, and the client's repeated SYN could no longer be answered (our_seq had moved):
+     * the connection hung for good (run-tunnel.sh with 3% loss, about 1 run in 40). */
+    uint64_t estab_ns;
+    uint8_t sent_any;
     /* The client gave up (RST) while the connector was working: the record must not be
      * touched, so only mark it, and close once the connector is done. */
     uint8_t client_gone;
@@ -230,6 +239,11 @@ typedef char conn_hot_size_check[sizeof(struct conn) <= 192 ? 1 : -1];
  * client retransmits once the flow is ready — the same flow control by withheld ACKs as on the
  * SEND_AGAIN path. */
 #define EARLY_CAP 8192
+
+/* How long a client may stay silent before the flow is opened without its data: SSH, SMTP, FTP
+ * and the like wait for the server's greeting, and VLESS carries the destination only with the
+ * first data. 100 ms, as Xray's own client (buf.CopyOnceTimeout in its VLESS outbound). */
+#define SERVER_FIRST_MS 100
 
 /* Unacknowledged bytes kept per connection, and therefore our in-flight limit.
  *
@@ -345,12 +359,23 @@ static void rcv_window_set(uint32_t wnd) {
  * window divided by the shift named in the SYN-ACK. Rounded up because the window need not be a
  * multiple of 2^shift (a ceiling set by number, or the dialer's limit): rounding down, a limit
  * of 65535 at shift 7 would become 65408. */
+static long conn_room(const struct conn *c);
+
 static uint16_t rcv_win_field(const struct conn *c) {
     /* The dialer's limit (dialer_ops.rcv_wnd_max): with DC_ACK_PACED the window must fit the
      * queue to the node, and the ceiling, chosen by machine memory, would overflow it. */
     uint32_t cap = g_rcv_wnd_max;
     uint32_t w = c->ws_on ? g_rcv_wnd : RCV_WND_MIN;
     if (cap && w > cap) w = cap;
+    /* What the node can take now (dialer_ops.room): more would come back as SEND_AGAIN and cost
+     * the client a retransmission timeout. Rounded DOWN, unlike the ceiling: a window a few
+     * bytes past the room is a refused segment. */
+    long room = conn_room(c);
+    if (room >= 0 && (uint32_t)room < w) {
+        w = (uint32_t)room;
+        if (!c->ws_on) return (uint16_t)w;
+        return (uint16_t)(w >> g_rcv_shift);
+    }
     if (!c->ws_on) return (uint16_t)w;
     uint32_t f = (w + ((1u << g_rcv_shift) - 1)) >> g_rcv_shift;
     return (uint16_t)(f > 65535u ? 65535u : f);
@@ -1103,6 +1128,14 @@ static void conn_unlink(struct conn *c) {
 
 static void conn_drop(struct conn *c);
 
+/* Client data gathered for one send to the node: see "gathering the client's segments". */
+#define UP_MAX (TUNNEL_BUF - 2048)          /* the dialer's room for a header and a Vision frame */
+static __thread struct {
+    struct conn *c;
+    uint32_t n;
+    unsigned char buf[UP_MAX];
+} g_up;
+
 /* A free slot; if there is none, evict the longest idle connection and take its slot.
  *
  * Refusing while idle connections hold the table is the worst choice: browsers keep connections
@@ -1185,6 +1218,7 @@ static struct conn *conn_new(const struct tun_dev *tun) {
  * and one after close would hand the kernel a closed number. */
 static void conn_drop(struct conn *c) {
     TR("closing conn#%ld fd=%d\n", (long)(c - g_conns), c->fd);
+    if (g_up.c == c) g_up.c = NULL;                 /* gathered bytes: never acknowledged */
     if (c->used) {
         g_dl->ops->close(SESS(c));
         conn_unlink(c);
@@ -1204,8 +1238,17 @@ static void conn_drop(struct conn *c) {
 
 /* Send the client's data to the node. Its form — request header, wrappers, transport framing —
  * is the dialer's business (dialer_ops.send); the result is SEND_* (dialer.h). */
+/* dialer_ops.room for an established TCP connection; -1: no limit or does not apply (UDP, the
+ * connector still working). */
+static long conn_room(const struct conn *c) {
+    if (c->is_udp || c->pending || c->fd < 0 || !g_dl->ops->room) return -1;
+    return g_dl->ops->room(g_dl->ctx, SESS(c));
+}
+
 static int upstream_send(struct conn *c, const unsigned char *data, size_t n) {
-    return g_dl->ops->send(g_dl->ctx, SESS(c), &c->key, c->is_udp, data, n);
+    int sr = g_dl->ops->send(g_dl->ctx, SESS(c), &c->key, c->is_udp, data, n);
+    if (sr == SEND_OK) c->sent_any = 1;
+    return sr;
 }
 
 /* SYN-ACK to the client. The ISN is always 1 and is not kept in our_seq: our_seq starts at 2 (the
@@ -1701,6 +1744,7 @@ static __thread struct fin_recent {
     uint32_t src, dst;          /* the client's flow, as in its packets */
     uint16_t sport, dport;
     uint32_t fin_end;           /* our FIN's sequence number + 1: what the client acknowledges */
+    uint16_t win;               /* the window field our FIN carried, repeated in the last ACK */
     time_t at;
 } g_fin_recent[FIN_RECENT];
 static __thread unsigned g_fin_recent_i;
@@ -1712,6 +1756,7 @@ static void fin_recent_add(const struct conn *c) {
     r->sport = c->key.sport;
     r->dport = c->key.dport;
     r->fin_end = c->our_seq + 1;
+    r->win = rcv_win_field(c);
     r->at = g_now_s ? g_now_s : 1;
 }
 
@@ -1728,7 +1773,7 @@ static int fin_recent_take(const struct tun_dev *tun, const struct flow_key *k, 
             unsigned char ack[64];
             size_t al = tcp_build(ack, sizeof(ack), k->dst, k->src, k->dport, k->sport,
                                   r->fin_end, k->seq + (uint32_t)data_n + 1, TCP_ACK,
-                                  NULL, 0, 0, 0, -1);
+                                  NULL, 0, r->win, 0, -1);
             if (al) tun_write_ctl(tun, ack, al);
             r->at = 0;          /* both halves closed: the flow is over */
         }
@@ -1738,6 +1783,102 @@ static int fin_recent_take(const struct tun_dev *tun, const struct flow_key *k, 
 }
 
 static void drain_conn(struct conn *c, const struct tun_dev *tun);
+
+/* send_or_wait: the node closed while we waited; the data will never go. */
+#define SEND_CLOSED 2
+
+/* Send client data to the node; on SEND_AGAIN (the HTTP/2 window is closed) wait briefly for it
+ * to open. Returns SEND_OK, SEND_AGAIN (still closed: do not acknowledge), SEND_FATAL or
+ * SEND_CLOSED.
+ *
+ * Before shifting the delay onto the client, process what is already in the socket: the
+ * WINDOW_UPDATE comes from there and is usually ALREADY there, sent as soon as the server freed
+ * its buffer. Without this each closed window costs the client a retransmission timeout.
+ *
+ * Wait 5 ms, not zero: the WINDOW_UPDATE sometimes lags by a fraction of a round trip. Not more:
+ * one loop serves all connections, and every millisecond here stalls the rest.
+ *
+ * Read with drain_conn, as the loop does: only it checks the client's window and, at the end of
+ * the stream, sets srv_closed instead of closing (closing would destroy the ring with the tail of
+ * the response). If the client has no window, do not read at all: the client resends.
+ *
+ * DC_ACK_PACED does not wait: for it a refusal means "the queue to the node is full", which its
+ * multiplexer drains, and reading from the node does not help. */
+static int send_or_wait(struct conn *c, const struct tun_dev *tun, const unsigned char *d,
+                        size_t n) {
+    int sr = upstream_send(c, d, n);
+    if (sr != SEND_AGAIN) return sr;
+    struct pollfd sp = { .fd = c->fd, .events = POLLIN };
+    if (!(g_dl->ops->caps & DC_ACK_PACED) && client_can_take_record(c) &&
+        poll(&sp, 1, 5) > 0 && (sp.revents & POLLIN)) {
+        drain_conn(c, tun);
+        if (c->srv_closed) return SEND_CLOSED;
+        sr = upstream_send(c, d, n);
+    }
+    return sr;
+}
+
+/* ---- gathering the client's segments ------------------------------------------------------
+ *
+ * The kernel hands the device's reader coalesced frames (receive offload, tun.h rx_gso), and
+ * tun_read_packet splits them back into MTU-sized packets. Sent one by one, each 1.4 KB segment
+ * cost the node link a TLS record, an HTTP/2 frame and a write: with uploads flowing at all
+ * (dialer_ops.room), they took 80% of the loop and downloads alongside fell from 4 Gbit/s to
+ * 160 Mbit/s. Consecutive in-order data segments of one connection within one TUN batch are
+ * therefore gathered here and go to the node as one send, acknowledged once.
+ *
+ * One connection at a time per loop thread. Whatever is not a continuation (another flow, a FIN,
+ * a bare ACK, a gap) sends the gathered bytes first, and so does the end of the batch
+ * (up_flush in worker_loop, before flush_acks). Until then client_seq does not include them:
+ * the bytes are not acknowledged until the node took them, as before. */
+/* (UP_MAX and g_up: declared before conn_drop, which forgets a dropped connection's bytes.) */
+
+/* Send what is gathered. On success the bytes are acknowledged; otherwise nothing is, and the
+ * client resends them (SEND_AGAIN) or gets RST (failure). */
+static void up_flush(const struct tun_dev *tun) {
+    struct conn *c = g_up.c;
+    if (!c) return;
+    g_up.c = NULL;
+    TR("client data %u bytes (gathered) -> server\n", g_up.n);
+    int sr = send_or_wait(c, tun, g_up.buf, g_up.n);
+    if (sr == SEND_CLOSED) return;
+    if (sr == SEND_AGAIN) {
+        TR("window closed, %u gathered bytes not acknowledged — the client will resend\n", g_up.n);
+        return;
+    }
+    if (sr != SEND_OK) {
+        conn_node_lost(c);
+        conn_reset(c, tun);
+        return;
+    }
+    c->client_seq += g_up.n;
+    c->ack_due = 1;
+}
+
+/* Gather the in-order segment (seq, d, n) of c (the caller checked the order). Sends what was
+ * gathered first when the segment would not fit after it. 0 — the segment is gathered
+ * (g_up.c == c), or too big to gather and the caller sends it itself; -1 — it does not go now:
+ * c closed, or the send before it failed and it no longer lines up (not acknowledged, the client
+ * resends it). */
+static int up_add(struct conn *c, const struct tun_dev *tun, uint32_t seq, const unsigned char *d,
+                  size_t n) {
+    long room = conn_room(c);
+    if (g_up.c == c && (g_up.n + n > UP_MAX || (room >= 0 && g_up.n + n > (size_t)room)))
+        up_flush(tun);
+    if (g_up.c && g_up.c != c) up_flush(tun);
+    if (!c->used || c->srv_closed || c->aborted) return -1;
+    if (g_up.c != c && seq != c->client_seq) return -1;
+    if (n > UP_MAX) return 0;
+    if (!g_up.c) {
+        g_up.c = c;
+        g_up.n = 0;
+    } else if (g_up.c != c) {
+        return 0;
+    }
+    memcpy(g_up.buf + g_up.n, d, n);
+    g_up.n += (uint32_t)n;
+    return 0;
+}
 
 static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, size_t n) {
     struct flow_key k;
@@ -1757,6 +1898,15 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
     }
 
     if (ip_parse(pkt, n, &k, &off) != 0) { TR("packet not parsed (%zu bytes)\n", n); return; }
+    /* Anything but the next plain data segment of the gathered flow sends the gathered bytes
+     * first: they come before it in the stream, or belong to another flow. */
+    if (g_up.c) {
+        const struct conn *u = g_up.c;
+        if (k.proto != 6 || k.src != u->key.src || k.dst != u->key.dst ||
+            k.sport != u->key.sport || k.dport != u->key.dport || n == off ||
+            (k.tcp_flags & (TCP_SYN | TCP_RST | TCP_FIN)) || k.seq != u->client_seq + g_up.n)
+            up_flush(tun);
+    }
     TR("%u.%u.%u.%u:%u -> %u.%u.%u.%u:%u proto=%u flags=0x%02x len=%zu\n",
        k.src&255,(k.src>>8)&255,(k.src>>16)&255,(k.src>>24)&255, k.sport,
        k.dst&255,(k.dst>>8)&255,(k.dst>>16)&255,(k.dst>>24)&255, k.dport,
@@ -1873,7 +2023,10 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         if (k.tcp_flags & TCP_RST) { c->client_gone = 1; return; }
         int fin = (k.tcp_flags & TCP_FIN) != 0;
         if (c->client_fin) { if (fin) c->ack_due = 1; return; }
-        if (k.tcp_flags & TCP_ACK) c->client_win = k.window;
+        if (k.tcp_flags & TCP_ACK) {
+            c->client_win = k.window;
+            if (!c->estab_ns) c->estab_ns = g_now_ns ? g_now_ns : 1;
+        }
         size_t dn = n - off;
         if ((!dn && !fin) || k.seq != c->client_seq) return;
         /* Does not fit: do not acknowledge, the client resends when the flow is ready. */
@@ -1914,6 +2067,7 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
     size_t data_n = n - off;
 
     if (k.tcp_flags & TCP_ACK) {
+        if (!c->estab_ns) c->estab_ns = g_now_ns ? g_now_ns : 1;
         /* Wraparound-safe comparison: the difference as signed. */
         if ((int32_t)(k.ack - c->client_ack) > 0) {
             /* Advance client_ack ONLY by what is acknowledged, and never past our_seq.
@@ -1965,6 +2119,10 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         return;
     }
 
+    /* A zero-window probe (or keepalive): no data, one number BELOW the expected one. The window
+     * may be zero because the node's room is (dialer_ops.room); without an answer the client
+     * only learns that it opened from our window update, and if that is lost, it waits. */
+    if (!data_n && !fin && k.seq == c->client_seq - 1) { c->ack_due = 1; return; }
     if (!data_n && !fin) return;                    /* pure ACK */
 
     /* Out of order: dropped. A reassembly buffer per connection is exactly the memory a weak box
@@ -1974,7 +2132,7 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
      * the one before it was lost, and duplicate ACKs trigger the client's fast retransmit;
      * without them the hole closes only on timeout. A repeat of data already taken means our ACK
      * was lost, and without an answer the client would retry until it gives up. */
-    if (k.seq != c->client_seq) { c->ack_due = 1; return; }
+    if (k.seq != c->client_seq + (g_up.c == c ? g_up.n : 0)) { c->ack_due = 1; return; }
 
     /* The early data tail has not gone yet (the HTTP/2 window was closed when the flow became
      * ready): fresh data must not go ahead of it, or bytes swap places. Do not acknowledge, the
@@ -1985,35 +2143,16 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         if (fr > 0) return;
     }
 
-    TR("client data %zu bytes -> server%s\n", data_n, fin ? " (and FIN)" : "");
-    int sr = data_n ? upstream_send(c, pkt + off, data_n) : SEND_OK;
-    if (sr == SEND_AGAIN) {
-        /* The window is closed. Before shifting the delay onto the client, process what is
-         * already in the socket: the WINDOW_UPDATE comes from there and is usually ALREADY there,
-         * sent as soon as the server freed its buffer. Without this each closed window costs the
-         * client a retransmission timeout, 200 ms per 64 KB (measured: upload over grpc at
-         * 200 KB/s instead of a megabyte).
-         *
-         * Wait 5 ms, not zero: the WINDOW_UPDATE sometimes lags by a fraction of a round trip.
-         * Not more: one loop serves all connections, and every millisecond here stalls the rest.
-         *
-         * Read with drain_conn, as the loop does: only it checks the client's window and, at the
-         * end of the stream, sets srv_closed instead of closing (closing would destroy the ring
-         * with the tail of the response). If the client has no window, do not read at all: the
-         * client resends the packet, as below.
-         *
-         * DC_ACK_PACED does not wait: for it a refusal means "the queue to the node is full",
-         * which its multiplexer drains, and reading from the node does not help. Such a dialer
-         * gets here only if the queue overflowed anyway (the client exceeded the window); the
-         * packet is then not acknowledged, as below. */
-        struct pollfd sp = { .fd = c->fd, .events = POLLIN };
-        if (!(g_dl->ops->caps & DC_ACK_PACED) && client_can_take_record(c) &&
-            poll(&sp, 1, 5) > 0 && (sp.revents & POLLIN)) {
-            drain_conn(c, tun);
-            if (c->srv_closed) return;          /* the packet did not go and never will */
-            sr = upstream_send(c, pkt + off, data_n);
-        }
+    /* Plain data, no FIN: gather it with the segments after it (see g_up). */
+    if (data_n && !fin) {
+        if (up_add(c, tun, k.seq, pkt + off, data_n) != 0) return;
+        if (g_up.c == c) return;                    /* gathered: sent and acknowledged later */
+        /* Larger than the gathering buffer: on its own, below. */
     }
+
+    TR("client data %zu bytes -> server%s\n", data_n, fin ? " (and FIN)" : "");
+    int sr = data_n ? send_or_wait(c, tun, pkt + off, data_n) : SEND_OK;
+    if (sr == SEND_CLOSED) return;                  /* the packet did not go and never will */
     if (sr == SEND_AGAIN) {
         /* Still not possible: do not acknowledge and do not move the counter, as if the packet
          * never came. The client resends it; this is the only way to hold the flow back without
@@ -2080,7 +2219,29 @@ static void flush_acks(const struct tun_dev *tun) {
  *
  * A function because it is called from two places, on an epoll event and on rx_ready, and both
  * must keep the same limits. */
+/* A read from the node may carry a WINDOW_UPDATE that grows the room (dialer_ops.room) the
+ * client's window is capped by. The client must hear of it from us: it has no data from us to
+ * carry a new window, and waits in its persist timer, which backs off like a retransmission.
+ * WIN_UPDATE_MIN: smaller growth waits for the next ACK, so one WINDOW_UPDATE per gRPC frame
+ * does not become one packet each. Set by drain_conn, sent by the loop (flush_acks). */
+#define WIN_UPDATE_MIN 4096
+static __thread int g_win_woke;
+
+static void drain_conn_reads(struct conn *c, const struct tun_dev *tun);
+
 static void drain_conn(struct conn *c, const struct tun_dev *tun) {
+    long before = conn_room(c);
+    drain_conn_reads(c, tun);
+    if (before < 0 || c->srv_closed || !c->used) return;
+    long after = conn_room(c);
+    if (after >= before + WIN_UPDATE_MIN ||
+        (before < WIN_UPDATE_MIN && after > before)) {
+        c->ack_due = 1;
+        g_win_woke = 1;
+    }
+}
+
+static void drain_conn_reads(struct conn *c, const struct tun_dev *tun) {
     const struct dialer_ops *d = g_dl->ops;
     void *s = SESS(c);
     int reads = 0;
@@ -2192,6 +2353,18 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
         return 1;
     }
 
+    /* A client silent since the handshake: open the flow without data, so a server that speaks
+     * first can (dialer.h, send with n == 0). The early data path above covers a client that
+     * spoke. */
+    if (!c->is_udp && !c->sent_any && !c->early && !c->srv_closed && c->estab_ns &&
+        now - c->estab_ns >= SERVER_FIRST_MS * 1000000ull) {
+        int sr = upstream_send(c, NULL, 0);
+        if (sr == SEND_FATAL) {
+            conn_reset(c, tun);
+            return 1;
+        }
+    }
+
     /* Expired timers: resend. After packet handling, not before: an ACK that came in this turn may
      * have made it unnecessary. */
     if (c->rtx.len && c->rtx_at &&
@@ -2231,12 +2404,15 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
         if (!drained)
             TR("conn#%ld: client did not acknowledge %u bytes in %d ms, closing\n",
                (long)(c - g_conns), c->rtx.len, CLOSE_DRAIN_MS);
-        /* FIN, or the client keeps waiting for data that will never come. */
+        /* FIN, or the client keeps waiting for data that will never come. With an open window:
+         * a FIN takes a sequence number, and Linux does not send one into a zero window. The
+         * client's own FIN then waited for a window update that never came (LAST-ACK for good,
+         * tests/run-tunnel-fin.sh `separate`). */
         unsigned char fin[64];
         size_t fl = tcp_build(fin, sizeof(fin), c->key.dst, c->key.src,
                               c->key.dport, c->key.sport,
                               c->our_seq, c->client_seq, TCP_FIN | TCP_ACK,
-                              NULL, 0, 0, 0, -1);
+                              NULL, 0, rcv_win_field(c), 0, -1);
         if (fl) tun_write_ctl(tun, fin, fl);
         if (!c->is_udp) fin_recent_add(c);
         conn_drop(c);
@@ -2503,6 +2679,7 @@ static void *worker_loop(void *arg) {
                 handle_packet(&tun, pkt, (size_t)rn);
                 if (g_stats) g_st.pkt_ns += now_ns() - t1;
             }
+            up_flush(&tun);
             flush_acks(&tun);
         }
         int out_woke = 0;
@@ -2544,6 +2721,12 @@ static void *worker_loop(void *arg) {
             if (!c->rx_ready || c->pending) continue;
             forced--;
             drain_conn(c, &tun);
+        }
+        /* The node's room grew back (drain_conn): the window update to the client now, not with
+         * the next TUN batch, which an upload stopped by a zero window will never send. */
+        if (g_win_woke) {
+            g_win_woke = 0;
+            flush_acks(&tun);
         }
 
         /* One pass for all deadlines: retransmission, close after the server, idle cleanup.

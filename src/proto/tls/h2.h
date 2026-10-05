@@ -161,6 +161,9 @@ int h2_end_stream(struct h2 *h);
 
 /* Sends the data in DATA frames, all or nothing (H2_EWINDOW); see h2.c. */
 int h2_write(struct h2 *h, const unsigned char *d, size_t n);
+/* The largest n h2_write takes now: the smaller of the stream and connection windows, 0 if
+ * either is closed (or negative, RFC 7540 §6.9.2). */
+long h2_room(const struct h2 *h);
 
 /* Reads the response body. cap must be at least H2_MIN_READ_CAP, so that one call returns
  * everything a record brought. 0 with *got == 0 is legal: the record held only control

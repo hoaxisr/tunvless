@@ -18,7 +18,9 @@
 
 #include "osrand.h"
 
+#ifdef SYS_getrandom
 static int g_nosys;                 /* getrandom answered ENOSYS once: do not ask again */
+#endif
 static int g_urandom = -1;
 static pthread_once_t g_urandom_once = PTHREAD_ONCE_INIT;
 

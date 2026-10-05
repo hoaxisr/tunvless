@@ -122,9 +122,22 @@ struct dialer_ops {
      * node is possible (the dialer logs why), and the stack drops the connection. */
     int  (*flow_open)(const void *ctx, void *sess, const struct flow_key *k, int udp);
     /* Client bytes to the node; for UDP, one datagram framed by dgram_frame per call. Returns
-     * SEND_*. */
+     * SEND_*. For TCP, n == 0 before any data means "the client is silent, the server may speak
+     * first" (SSH, SMTP, FTP): send whatever the node needs to open the flow now (for VLESS the
+     * request header alone). The stack makes that call once, SERVER_FIRST_MS after the client
+     * completed the handshake. */
     int  (*send)(const void *ctx, void *sess, const struct flow_key *k, int udp,
                  const unsigned char *d, size_t n);
+    /* How many client bytes send would take right now (TCP), after the dialer's own framing;
+     * -1: no limit. NULL: never limited.
+     *
+     * The stack gives the client a window no larger than this. A transport with a flow-control
+     * window of its own (HTTP/2: grpc, xhttp) otherwise refuses with SEND_AGAIN whatever goes
+     * past it; the client, granted megabytes, reads each refusal as a loss and waits out a
+     * retransmission timeout that doubles on every repeat. Against Xray's 94 KB gRPC window
+     * that held uploads to 10-20 Mbit/s with multi-second stalls. When the room grows back
+     * (WINDOW_UPDATE, read by drain_conn) the stack sends the client a window update. */
+    long (*room)(const void *ctx, const void *sess);
     /* Frame a client datagram into stream bytes for the node. Returns the length, or 0 if it does
      * not fit. */
     size_t (*dgram_frame)(const unsigned char *p, size_t n, unsigned char *out, size_t cap);
